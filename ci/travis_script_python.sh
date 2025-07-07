@@ -139,8 +139,29 @@ cmake -GNinja \
       -DCMAKE_INSTALL_PREFIX=$ARROW_HOME \
       $ARROW_CPP_DIR
 
+<<<<<<< HEAD
+  python setup.py build_ext --inplace --with-parquet --with-jemalloc
+
+  python -c "import pyarrow.parquet"
+  python -c "import pyarrow._jemalloc"
+
+  python -m pytest -vv -r sxX pyarrow --parquet
+
+  # Build documentation once
+  if [[ "$PYTHON_VERSION" == "3.6" ]]
+  then
+      conda install -y -q --file=doc/requirements.txt
+      python setup.py build_sphinx -s doc/source
+  fi
+}
+
+# run tests for python 2.7 and 3.6
+python_version_tests 2.7
+python_version_tests 3.6
+=======
 ninja $PYTHON_CPP_BUILD_TARGETS
 ninja install
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 popd
 

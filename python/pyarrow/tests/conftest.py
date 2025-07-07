@@ -25,6 +25,9 @@ except ImportError:
     import pathlib2 as pathlib  # py2 compat
 
 
+<<<<<<< HEAD
+groups = ['hdfs', 'parquet']
+=======
 # setup hypothesis profiles
 h.settings.register_profile('ci', max_examples=1000)
 h.settings.register_profile('dev', max_examples=10)
@@ -35,6 +38,7 @@ h.settings.register_profile('debug', max_examples=10,
 # variable or pass --hypothesis-profile option to pytest, to see the generated
 # examples try: pytest pyarrow -sv --only-hypothesis --hypothesis-profile=debug
 h.settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 
 groups = [

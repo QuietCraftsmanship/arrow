@@ -34,6 +34,8 @@ from pyarrow.pandas_compat import _pandas_api
 from pyarrow.tests import util
 from pyarrow.filesystem import LocalFileSystem, FileSystem
 
+<<<<<<< HEAD
+=======
 try:
     import pyarrow.parquet as pq
 except ImportError:
@@ -49,13 +51,43 @@ except ImportError:
 
 
 # Marks all of the tests in this module
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 # Ignore these with pytest ... -m 'not parquet'
 pytestmark = pytest.mark.parquet
 
 
+<<<<<<< HEAD
+def _write_table(*args, **kwargs):
+    import pyarrow.parquet as pq
+    return pq.write_table(*args, **kwargs)
+
+
+def _read_table(*args, **kwargs):
+    import pyarrow.parquet as pq
+    return pq.read_table(*args, **kwargs)
+
+
+@parquet
+def test_single_pylist_column_roundtrip(tmpdir):
+    for dtype in [int, float]:
+        filename = tmpdir.join('single_{}_column.parquet'
+                               .format(dtype.__name__))
+        data = [pa.array(list(map(dtype, range(5))))]
+        table = pa.Table.from_arrays(data, names=('a', 'b'))
+        _write_table(table, filename.strpath)
+        table_read = _read_table(filename.strpath)
+        for col_written, col_read in zip(table.itercolumns(),
+                                         table_read.itercolumns()):
+            assert col_written.name == col_read.name
+            assert col_read.data.num_chunks == 1
+            data_written = col_written.data.chunk(0)
+            data_read = col_read.data.chunk(0)
+            assert data_written.equals(data_read)
+=======
 @pytest.fixture(scope='module')
 def datadir(datadir):
     return datadir / 'parquet'
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 
 def _write_table(table, path, **kwargs):
@@ -156,19 +188,32 @@ def alltypes_sample(size=10000, seed=0, categorical=False):
     return pd.DataFrame(arrays)
 
 
+<<<<<<< HEAD
+@parquet
+def test_pandas_parquet_2_0_rountrip(tmpdir):
+    import pyarrow.parquet as pq
+    df = alltypes_sample(size=10000)
+=======
 @pytest.mark.pandas
 @pytest.mark.parametrize('chunk_size', [None, 1000])
 def test_pandas_parquet_2_0_rountrip(tempdir, chunk_size):
     df = alltypes_sample(size=10000, categorical=True)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     filename = tempdir / 'pandas_rountrip.parquet'
     arrow_table = pa.Table.from_pandas(df)
     assert arrow_table.schema.pandas_metadata is not None
 
+<<<<<<< HEAD
+    _write_table(arrow_table, filename.strpath, version="2.0")
+    table_read = pq.read_pandas(filename.strpath)
+    assert b'pandas' in table_read.schema.metadata
+=======
     _write_table(arrow_table, filename, version="2.0",
                  coerce_timestamps='ms', chunk_size=chunk_size)
     table_read = pq.read_pandas(filename)
     assert table_read.schema.pandas_metadata is not None
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     assert arrow_table.schema.metadata == table_read.schema.metadata
 
@@ -281,6 +326,12 @@ def test_pandas_parquet_datetime_tz():
     tm.assert_frame_equal(df, df_read)
 
 
+<<<<<<< HEAD
+@parquet
+def test_pandas_parquet_custom_metadata(tmpdir):
+    import pyarrow.parquet as pq
+
+=======
 @pytest.mark.pandas
 @pytest.mark.skipif(six.PY2, reason='datetime.timezone is available since '
                                     'python version 3.2')
@@ -294,13 +345,19 @@ def test_datetime_timezone_tzinfo():
 
 @pytest.mark.pandas
 def test_pandas_parquet_custom_metadata(tempdir):
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df = alltypes_sample(size=10000)
 
     filename = tempdir / 'pandas_rountrip.parquet'
     arrow_table = pa.Table.from_pandas(df)
     assert b'pandas' in arrow_table.schema.metadata
 
+<<<<<<< HEAD
+    _write_table(arrow_table, filename.strpath, version="2.0")
+    pf = pq.ParquetFile(filename.strpath)
+=======
     _write_table(arrow_table, filename, version='2.0', coerce_timestamps='ms')
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     metadata = pq.read_metadata(filename).metadata
     assert b'pandas' in metadata
@@ -312,12 +369,24 @@ def test_pandas_parquet_custom_metadata(tempdir):
                                     'step': 1}]
 
 
+<<<<<<< HEAD
+@parquet
+def test_pandas_parquet_2_0_rountrip_read_pandas_no_index_written(tmpdir):
+    import pyarrow.parquet as pq
+
+    df = alltypes_sample(size=10000)
+
+    filename = tmpdir.join('pandas_rountrip.parquet')
+    arrow_table = pa.Table.from_pandas(
+        df, timestamps_to_ms=True, preserve_index=False
+=======
 @pytest.mark.pandas
 def test_pandas_parquet_column_multiindex(tempdir):
     df = alltypes_sample(size=10)
     df.columns = pd.MultiIndex.from_tuples(
         list(zip(df.columns, df.columns[::-1])),
         names=['level_1', 'level_2']
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     )
 
     filename = tempdir / 'pandas_rountrip.parquet'
@@ -343,8 +412,13 @@ def test_pandas_parquet_2_0_rountrip_read_pandas_no_index_written(tempdir):
     # While index_columns should be empty, columns needs to be filled still.
     assert js['columns']
 
+<<<<<<< HEAD
+    _write_table(arrow_table, filename.strpath, version="2.0")
+    table_read = pq.read_pandas(filename.strpath)
+=======
     _write_table(arrow_table, filename, version='2.0', coerce_timestamps='ms')
     table_read = pq.read_pandas(filename)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     js = table_read.schema.pandas_metadata
     assert not js['index_columns']
@@ -377,8 +451,13 @@ def test_pandas_parquet_1_0_rountrip(tempdir):
     })
     filename = tempdir / 'pandas_rountrip.parquet'
     arrow_table = pa.Table.from_pandas(df)
+<<<<<<< HEAD
+    _write_table(arrow_table, filename.strpath, version="1.0")
+    table_read = _read_table(filename.strpath)
+=======
     _write_table(arrow_table, filename, version='1.0')
     table_read = _read_table(filename)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df_read = table_read.to_pandas()
 
     # We pass uint32_t as int64_t if we write Parquet version 1.0
@@ -416,6 +495,10 @@ def test_pandas_column_selection(tempdir):
     })
     filename = tempdir / 'pandas_rountrip.parquet'
     arrow_table = pa.Table.from_pandas(df)
+<<<<<<< HEAD
+    _write_table(arrow_table, filename.strpath)
+    table_read = _read_table(filename.strpath, columns=['uint8'])
+=======
     _write_table(arrow_table, filename)
     table_read = _read_table(filename, columns=['uint8'])
     df_read = table_read.to_pandas()
@@ -425,6 +508,7 @@ def test_pandas_column_selection(tempdir):
     # ARROW-4267: Selection of duplicate columns still leads to these columns
     # being read uniquely.
     table_read = _read_table(filename, columns=['uint8', 'uint8'])
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df_read = table_read.to_pandas()
 
     tm.assert_frame_equal(df[['uint8']], df_read)
@@ -468,12 +552,22 @@ def test_pandas_parquet_native_file_roundtrip(tempdir):
     arrow_table = pa.Table.from_pandas(df)
     imos = pa.BufferOutputStream()
     _write_table(arrow_table, imos, version="2.0")
+<<<<<<< HEAD
+    buf = imos.get_result()
+=======
     buf = imos.getvalue()
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     reader = pa.BufferReader(buf)
     df_read = _read_table(reader).to_pandas()
     tm.assert_frame_equal(df, df_read)
 
 
+<<<<<<< HEAD
+@parquet
+def test_read_pandas_column_subset(tmpdir):
+    import pyarrow.parquet as pq
+
+=======
 @pytest.mark.pandas
 def test_parquet_incremental_file_build(tempdir):
     df = _test_dataframe(100)
@@ -503,11 +597,16 @@ def test_parquet_incremental_file_build(tempdir):
 
 @pytest.mark.pandas
 def test_read_pandas_column_subset(tempdir):
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df = _test_dataframe(10000)
     arrow_table = pa.Table.from_pandas(df)
     imos = pa.BufferOutputStream()
     _write_table(arrow_table, imos, version="2.0")
+<<<<<<< HEAD
+    buf = imos.get_result()
+=======
     buf = imos.getvalue()
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     reader = pa.BufferReader(buf)
     df_read = pq.read_pandas(reader, columns=['strings', 'uint8']).to_pandas()
     tm.assert_frame_equal(df[['strings', 'uint8']], df_read)
@@ -539,7 +638,11 @@ def test_pandas_parquet_pyfile_roundtrip(tempdir):
 
     arrow_table = pa.Table.from_pandas(df)
 
+<<<<<<< HEAD
+    with open(filename, 'wb') as f:
+=======
     with filename.open('wb') as f:
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         _write_table(arrow_table, f, version="1.0")
 
     data = io.BytesIO(filename.read_bytes())
@@ -570,6 +673,20 @@ def test_pandas_parquet_configuration_options(tempdir):
     arrow_table = pa.Table.from_pandas(df)
 
     for use_dictionary in [True, False]:
+<<<<<<< HEAD
+        _write_table(arrow_table, filename.strpath,
+                     version="2.0",
+                     use_dictionary=use_dictionary)
+        table_read = _read_table(filename.strpath)
+        df_read = table_read.to_pandas()
+        tm.assert_frame_equal(df, df_read)
+
+    for compression in ['NONE', 'SNAPPY', 'GZIP']:
+        _write_table(arrow_table, filename.strpath,
+                     version="2.0",
+                     compression=compression)
+        table_read = _read_table(filename.strpath)
+=======
         _write_table(arrow_table, filename, version='2.0',
                      use_dictionary=use_dictionary)
         table_read = _read_table(filename)
@@ -587,10 +704,20 @@ def test_pandas_parquet_configuration_options(tempdir):
         _write_table(arrow_table, filename, version='2.0',
                      compression=compression)
         table_read = _read_table(filename)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         df_read = table_read.to_pandas()
         tm.assert_frame_equal(df, df_read)
 
 
+<<<<<<< HEAD
+def make_sample_file(df):
+    import pyarrow.parquet as pq
+
+    a_table = pa.Table.from_pandas(df, timestamps_to_ms=True)
+
+    buf = io.BytesIO()
+    _write_table(a_table, buf, compression='SNAPPY', version='2.0')
+=======
 def make_sample_file(table_or_df):
     if isinstance(table_or_df, pa.Table):
         a_table = table_or_df
@@ -600,6 +727,7 @@ def make_sample_file(table_or_df):
     buf = io.BytesIO()
     _write_table(a_table, buf, compression='SNAPPY', version='2.0',
                  coerce_timestamps='ms')
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     buf.seek(0)
     return pq.ParquetFile(buf)
@@ -870,10 +998,18 @@ def test_validate_schema_write_table(tempdir):
 def test_column_of_arrays(tempdir):
     df, schema = dataframe_with_arrays()
 
+<<<<<<< HEAD
+    filename = tmpdir.join('pandas_rountrip.parquet')
+    arrow_table = pa.Table.from_pandas(df, timestamps_to_ms=True,
+                                       schema=schema)
+    _write_table(arrow_table, filename.strpath, version="2.0")
+    table_read = _read_table(filename.strpath)
+=======
     filename = tempdir / 'pandas_rountrip.parquet'
     arrow_table = pa.Table.from_pandas(df, schema=schema)
     _write_table(arrow_table, filename, version="2.0", coerce_timestamps='ms')
     table_read = _read_table(filename)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df_read = table_read.to_pandas()
     tm.assert_frame_equal(df, df_read)
 
@@ -898,6 +1034,13 @@ def test_coerce_timestamps(tempdir):
                  dtype='datetime64[ms]'),
     ]
 
+<<<<<<< HEAD
+    filename = tmpdir.join('pandas_rountrip.parquet')
+    arrow_table = pa.Table.from_pandas(df, timestamps_to_ms=True,
+                                       schema=schema)
+    _write_table(arrow_table, filename.strpath, version="2.0")
+    table_read = _read_table(filename.strpath)
+=======
     df = pd.DataFrame(arrays)
     schema = pa.schema(fields)
 
@@ -906,6 +1049,7 @@ def test_coerce_timestamps(tempdir):
 
     _write_table(arrow_table, filename, version="2.0", coerce_timestamps='us')
     table_read = _read_table(filename)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     df_read = table_read.to_pandas()
 
     df_expected = df.copy()
@@ -1026,9 +1170,14 @@ def test_date_time_types(tempdir):
     data0 = np.arange(4, dtype='int64')
     a0 = pa.array(data0, type=t0)
 
+<<<<<<< HEAD
+        with pytest.raises(NotImplementedError):
+            _write_table(table, buf, version="2.0")
+=======
     t1 = pa.timestamp('us')
     data1 = np.arange(4, dtype='int64')
     a1 = pa.array(data1, type=t1)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     t2 = pa.timestamp('ns')
     data2 = np.arange(4, dtype='int64')
@@ -1195,7 +1344,23 @@ def test_fixed_size_binary():
     _check_roundtrip(table)
 
 
+<<<<<<< HEAD
+def _check_roundtrip(table, expected=None, **params):
+    buf = io.BytesIO()
+    _write_table(table, buf, **params)
+    buf.seek(0)
+
+    if expected is None:
+        expected = table
+
+    result = _read_table(buf)
+    assert result.equals(expected)
+
+
+@parquet
+=======
 @pytest.mark.pandas
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 def test_multithreaded_read():
     df = alltypes_sample(size=10000)
 
@@ -1205,10 +1370,17 @@ def test_multithreaded_read():
     _write_table(table, buf, compression='SNAPPY', version='2.0')
 
     buf.seek(0)
+<<<<<<< HEAD
+    table1 = _read_table(buf, nthreads=4)
+
+    buf.seek(0)
+    table2 = _read_table(buf, nthreads=1)
+=======
     table1 = _read_table(buf, use_threads=True)
 
     buf.seek(0)
     table2 = _read_table(buf, use_threads=False)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     assert table1.equals(table2)
 
@@ -1232,6 +1404,8 @@ def test_min_chunksize():
 
 @pytest.mark.pandas
 def test_pass_separate_metadata():
+    import pyarrow.parquet as pq
+
     # ARROW-471
     df = alltypes_sample(size=10000)
 
@@ -1252,6 +1426,8 @@ def test_pass_separate_metadata():
 
 @pytest.mark.pandas
 def test_read_single_row_group():
+    import pyarrow.parquet as pq
+
     # ARROW-471
     N, K = 10000, 4
     df = alltypes_sample(size=N)
@@ -1275,6 +1451,8 @@ def test_read_single_row_group():
 
 @pytest.mark.pandas
 def test_read_single_row_group_with_column_subset():
+    import pyarrow.parquet as pq
+
     N, K = 10000, 4
     df = alltypes_sample(size=N)
     a_table = pa.Table.from_pandas(df)
@@ -1297,6 +1475,16 @@ def test_read_single_row_group_with_column_subset():
     result = pa.concat_tables(row_groups)
     tm.assert_frame_equal(df[cols], result.to_pandas())
 
+<<<<<<< HEAD
+@parquet
+def test_parquet_piece_read(tmpdir):
+    import pyarrow.parquet as pq
+
+    df = _test_dataframe(1000)
+    table = pa.Table.from_pandas(df)
+
+    path = tmpdir.join('parquet_piece_read.parquet').strpath
+=======
 
 @pytest.mark.pandas
 def test_scan_contents():
@@ -1321,6 +1509,7 @@ def test_parquet_piece_read(tempdir):
     table = pa.Table.from_pandas(df)
 
     path = tempdir / 'parquet_piece_read.parquet'
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     _write_table(table, path, version='2.0')
 
     piece1 = pq.ParquetDatasetPiece(path)
@@ -1359,6 +1548,8 @@ def test_parquet_piece_open_and_get_metadata(tempdir):
 
 
 def test_parquet_piece_basics():
+    import pyarrow.parquet as pq
+
     path = '/baz.parq'
 
     piece1 = pq.ParquetDatasetPiece(path)
@@ -1377,6 +1568,8 @@ def test_parquet_piece_basics():
 
 
 def test_partition_set_dictionary_type():
+    import pyarrow.parquet as pq
+
     set1 = pq.PartitionSet('key1', [u('foo'), u('bar'), u('baz')])
     set2 = pq.PartitionSet('key2', [2007, 2008, 2009])
 
@@ -1388,6 +1581,12 @@ def test_partition_set_dictionary_type():
         set3.dictionary
 
 
+<<<<<<< HEAD
+@parquet
+def test_read_partitioned_directory(tmpdir):
+    import pyarrow.parquet as pq
+
+=======
 @pytest.mark.pandas
 def test_read_partitioned_directory(tempdir):
     fs = LocalFileSystem.get_instance()
@@ -1742,6 +1941,7 @@ def test_read_partitioned_directory_s3fs(s3_example):
 
 
 def _partition_test_for_filesystem(fs, base_path):
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     foo_keys = [0, 1]
     bar_keys = ['a', 'b', 'c']
     partition_spec = [
@@ -1796,11 +1996,15 @@ def _generate_partition_directories(fs, base_dir, partition_spec, df):
 
                 filtered_df = _filter_partition(df, this_part_keys)
                 part_table = pa.Table.from_pandas(filtered_df)
+<<<<<<< HEAD
+                _write_table(part_table, file_path)
+=======
                 with fs.open(file_path, 'wb') as f:
                     _write_table(part_table, f)
                 assert fs.exists(file_path)
 
                 (level_dir / '_SUCCESS').touch()
+>>>>>>> 5588-Better-support-for-building-UnionArrays
             else:
                 _visit_level(level_dir, level + 1, this_part_keys)
                 (level_dir / '_SUCCESS').touch()
@@ -1808,7 +2012,14 @@ def _generate_partition_directories(fs, base_dir, partition_spec, df):
     _visit_level(base_dir, 0, [])
 
 
+<<<<<<< HEAD
+@parquet
+def test_read_common_metadata_files(tmpdir):
+    import pyarrow.parquet as pq
+
+=======
 def _test_read_common_metadata_files(fs, base_path):
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     N = 100
     df = pd.DataFrame({
         'index': np.arange(N),
@@ -1819,6 +2030,10 @@ def _test_read_common_metadata_files(fs, base_path):
     data_path = os.path.join(base_path, 'data.parquet')
 
     table = pa.Table.from_pandas(df)
+<<<<<<< HEAD
+    _write_table(table, data_path)
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     with fs.open(data_path, 'wb') as f:
         _write_table(table, f)
@@ -1907,8 +2122,15 @@ def _filter_partition(df, part_keys):
     return df[predicate].drop(to_drop, axis=1)
 
 
+<<<<<<< HEAD
+@parquet
+def test_read_multiple_files(tmpdir):
+    import pyarrow.parquet as pq
+
+=======
 @pytest.mark.pandas
 def test_read_multiple_files(tempdir):
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     nfiles = 10
     size = 5
 
