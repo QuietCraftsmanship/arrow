@@ -421,6 +421,7 @@ Status BlockParser::DoParseSpecialized(const std::vector<util::string_view>& vie
   if (total_view_length > std::numeric_limits<uint32_t>::max()) {
     return Status::Invalid("CSV block too large");
   }
+<<<<<<< HEAD
 
   PresizedParsedWriter parsed_writer(pool_, static_cast<uint32_t>(total_view_length));
   uint32_t total_parsed_length = 0;
@@ -443,6 +444,21 @@ Status BlockParser::DoParseSpecialized(const std::vector<util::string_view>& vie
       if (num_cols_ == -1) {
         return ParseError("Empty CSV file or block: cannot infer number of columns");
       }
+=======
+
+  while (!finished_parsing && data < data_end && num_rows_ < max_num_rows_) {
+    // We know the number of columns, so can presize a values array for
+    // a given number of rows
+    DCHECK_GE(num_cols_, 0);
+
+    int32_t rows_in_chunk;
+    constexpr int32_t kTargetChunkSize = 32768;
+    if (num_cols_ > 0) {
+      rows_in_chunk = std::min(std::max(kTargetChunkSize / num_cols_, 512),
+                               max_num_rows_ - num_rows_);
+    } else {
+      rows_in_chunk = std::min(kTargetChunkSize, max_num_rows_ - num_rows_);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     }
 
     while (!finished_parsing && data < data_end && num_rows_ < max_num_rows_) {

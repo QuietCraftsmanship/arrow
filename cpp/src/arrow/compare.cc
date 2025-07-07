@@ -238,10 +238,22 @@ class RangeEqualsVisitor {
 
     const auto& left_type = checked_cast<const UnionType&>(*left.type());
 
+<<<<<<< HEAD
     const std::vector<int>& child_ids = left_type.child_ids();
 
     const int8_t* left_codes = left.raw_type_codes();
     const int8_t* right_codes = right.raw_type_codes();
+=======
+    // Define a mapping from the type id to child number
+    const std::vector<uint8_t>& type_codes = left_type.type_codes();
+    std::vector<uint8_t> type_id_to_child_num(left.union_type()->max_type_code() + 1, 0);
+    for (size_t i = 0; i < type_codes.size(); ++i) {
+      type_id_to_child_num[type_codes[i]] = i;
+    }
+
+    const uint8_t* left_ids = left.raw_type_ids();
+    const uint8_t* right_ids = right.raw_type_ids();
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
     for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
          ++i, ++o_i) {
@@ -253,7 +265,11 @@ class RangeEqualsVisitor {
         return false;
       }
 
+<<<<<<< HEAD
       auto child_num = child_ids[left_codes[i]];
+=======
+      auto child_num = type_id_to_child_num[left_ids[i]];
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
       // TODO(wesm): really we should be comparing stretches of non-null data
       // rather than looking at one value at a time.
@@ -796,7 +812,11 @@ class TypeEqualsVisitor {
     }
 
     result_ = std::equal(
+<<<<<<< HEAD
         left.fields().begin(), left.fields().end(), right.fields().begin(),
+=======
+        left.children().begin(), left.children().end(), right.children().begin(),
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         [this](const std::shared_ptr<Field>& l, const std::shared_ptr<Field>& r) {
           return l->Equals(r, check_metadata_);
         });

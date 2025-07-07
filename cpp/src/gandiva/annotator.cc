@@ -78,12 +78,20 @@ void Annotator::PrepareBuffersForField(const FieldDescriptor& desc,
   }
 
   uint8_t* data_buf = const_cast<uint8_t*>(array_data.buffers[buffer_idx]->data());
+<<<<<<< HEAD
   eval_batch->SetBuffer(desc.data_idx(), data_buf, array_data.offset);
+=======
+  eval_batch->SetBuffer(desc.data_idx(), data_buf);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   if (is_output) {
     // pass in the Buffer object for output data buffers. Can be used for resizing.
     uint8_t* data_buf_ptr =
         reinterpret_cast<uint8_t*>(array_data.buffers[buffer_idx].get());
+<<<<<<< HEAD
     eval_batch->SetBuffer(desc.data_buffer_ptr_idx(), data_buf_ptr, array_data.offset);
+=======
+    eval_batch->SetBuffer(desc.data_buffer_ptr_idx(), data_buf_ptr);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   }
 }
 

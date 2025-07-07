@@ -21,6 +21,7 @@ import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
 
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.UInt1ReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableUInt1Holder;
@@ -35,7 +36,11 @@ import org.apache.arrow.vector.util.TransferPair;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
 public final class UInt1Vector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class UInt1Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   private static final byte TYPE_WIDTH = 1;
   private final FieldReader reader;
 
@@ -144,6 +149,27 @@ public final class UInt1Vector extends BaseFixedWidthVector implements BaseIntVe
     }
   }
 
+<<<<<<< HEAD
+=======
+  /**
+   * Copies the value at fromIndex to thisIndex (including validity).
+   */
+  public void copyFrom(int fromIndex, int thisIndex, UInt1Vector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final byte value = from.valueBuffer.getByte(fromIndex * TYPE_WIDTH);
+    valueBuffer.setByte(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Identical to {@link #copyFrom(int, int, UInt1Vector)} but reallocates buffer if index is larger
+   * than capacity.
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, UInt1Vector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
+  }
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   /*----------------------------------------------------------------*
    |                                                                |
@@ -304,6 +330,7 @@ public final class UInt1Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   @Override
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, (int) value);
   }
@@ -316,6 +343,11 @@ public final class UInt1Vector extends BaseFixedWidthVector implements BaseIntVe
   @Override
   public long getValueAsLong(int index) {
     return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= 0xFF, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   }
 
 

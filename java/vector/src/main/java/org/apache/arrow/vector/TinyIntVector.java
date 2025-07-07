@@ -21,6 +21,7 @@ import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
 
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.TinyIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableTinyIntHolder;
@@ -35,7 +36,11 @@ import org.apache.arrow.vector.util.TransferPair;
  * byte values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
 public final class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   public static final byte TYPE_WIDTH = 1;
   private final FieldReader reader;
 
@@ -342,6 +347,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
   }
 
   @Override
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, (int) value);
   }
@@ -354,6 +360,11 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
   @Override
   public long getValueAsLong(int index) {
     return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Byte.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   }
 
   private class TransferImpl implements TransferPair {

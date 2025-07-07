@@ -45,6 +45,7 @@ const MICROSECONDS: i64 = 1_000_000;
 const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Trait for dealing with different types of array at runtime when the type of the
+<<<<<<< HEAD
 /// array is not known in advance.
 pub trait Array: fmt::Debug + Send + Sync + ArrayEqual + JsonEqual {
     /// Returns the array as [`Any`](std::any::Any) so that it can be
@@ -73,6 +74,11 @@ pub trait Array: fmt::Debug + Send + Sync + ArrayEqual + JsonEqual {
     /// # Ok(())
     /// # }
     /// ```
+=======
+/// array is not known in advance
+pub trait Array: Send + Sync + ArrayEqual {
+    /// Returns the array as `Any` so that it can be downcast to a specific implementation
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     fn as_any(&self) -> &Any;
 
     /// Returns a reference-counted pointer to the underlying data of this array.
@@ -915,8 +921,12 @@ impl<T: ArrowPrimitiveType> From<ArrayDataRef> for PrimitiveArray<T> {
     }
 }
 
+<<<<<<< HEAD
 /// Common operations for List types, currently `ListArray`, `FixedSizeListArray`, `BinaryArray`
 /// `StringArray` and `DictionaryArray`
+=======
+/// Common operations for List types, currently `ListArray` and `BinaryArray`.
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 pub trait ListArrayOps {
     fn value_offset_at(&self, i: usize) -> i32;
 }
@@ -927,18 +937,22 @@ impl ListArrayOps for ListArray {
     }
 }
 
+<<<<<<< HEAD
 impl ListArrayOps for FixedSizeListArray {
     fn value_offset_at(&self, i: usize) -> i32 {
         self.value_offset_at(i)
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 impl ListArrayOps for BinaryArray {
     fn value_offset_at(&self, i: usize) -> i32 {
         self.value_offset_at(i)
     }
 }
 
+<<<<<<< HEAD
 impl ListArrayOps for StringArray {
     fn value_offset_at(&self, i: usize) -> i32 {
         self.value_offset_at(i)
@@ -951,6 +965,8 @@ impl ListArrayOps for FixedSizeBinaryArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type.
 pub struct ListArray {
@@ -1457,6 +1473,7 @@ impl From<Vec<&[u8]>> for BinaryArray {
     }
 }
 
+<<<<<<< HEAD
 impl<'a> TryFrom<Vec<Option<&'a str>>> for StringArray {
     type Error = ArrowError;
 
@@ -1465,6 +1482,16 @@ impl<'a> TryFrom<Vec<Option<&'a str>>> for StringArray {
         for val in v {
             if let Some(s) = val {
                 builder.append_value(s)?;
+=======
+impl<'a> TryFrom<Vec<Option<&'a str>>> for BinaryArray {
+    type Error = ArrowError;
+
+    fn try_from(v: Vec<Option<&'a str>>) -> Result<Self> {
+        let mut builder = BinaryBuilder::new(v.len());
+        for val in v {
+            if let Some(s) = val {
+                builder.append_string(s)?;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
             } else {
                 builder.append(false)?;
             }
@@ -1651,6 +1678,7 @@ impl StructArray {
     pub fn num_columns(&self) -> usize {
         self.boxed_fields.len()
     }
+<<<<<<< HEAD
 
     /// Returns the fields of the struct array
     pub fn columns(&self) -> Vec<&ArrayRef> {
@@ -1680,6 +1708,8 @@ impl StructArray {
             .position(|c| c == &column_name)
             .map(|pos| self.column(pos))
     }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 impl From<ArrayDataRef> for StructArray {

@@ -17,10 +17,16 @@
 
 package org.apache.arrow.vector.dictionary;
 
+<<<<<<< HEAD
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.util.hash.ArrowBufHasher;
 import org.apache.arrow.memory.util.hash.SimpleHasher;
 import org.apache.arrow.util.Preconditions;
+=======
+import java.util.HashMap;
+import java.util.Map;
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 import org.apache.arrow.vector.BaseIntVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.ValueVector;
@@ -162,17 +168,44 @@ public class DictionaryEncoder {
     Field indexField = new Field(valueField.getName(), indexFieldType, null);
 
     // vector to hold our indices (dictionary encoded values)
+<<<<<<< HEAD
     FieldVector createdVector = indexField.createVector(allocator);
+=======
+    FieldVector createdVector = indexField.createVector(vector.getAllocator());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     if (! (createdVector instanceof BaseIntVector)) {
       throw new IllegalArgumentException("Dictionary encoding does not have a valid int type:" +
           createdVector.getClass());
     }
+<<<<<<< HEAD
 
     BaseIntVector indices = (BaseIntVector) createdVector;
     indices.allocateNew();
 
     buildIndexVector(vector, indices, hashTable, 0, vector.getValueCount());
     indices.setValueCount(vector.getValueCount());
+=======
+
+    BaseIntVector indices = (BaseIntVector) createdVector;
+    indices.allocateNew();
+
+    int count = vector.getValueCount();
+
+    for (int i = 0; i < count; i++) {
+      Object value = vector.getObject(i);
+      if (value != null) { // if it's null leave it null
+        // note: this may fail if value was not included in the dictionary
+        Integer encoded = lookUps.get(value);
+        if (encoded == null) {
+          throw new IllegalArgumentException("Dictionary encoding not defined for value:" + value);
+        }
+        indices.setEncodedValue(i, encoded);
+      }
+    }
+
+    indices.setValueCount(count);
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     return indices;
   }
 

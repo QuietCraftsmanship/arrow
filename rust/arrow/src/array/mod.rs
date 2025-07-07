@@ -86,9 +86,12 @@ mod builder;
 mod cast;
 mod data;
 mod equal;
+<<<<<<< HEAD
 mod null;
 mod ord;
 mod union;
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 use crate::datatypes::*;
 
@@ -101,6 +104,7 @@ pub use self::data::ArrayDataBuilder;
 pub use self::data::ArrayDataRef;
 
 pub use self::array::BinaryArray;
+<<<<<<< HEAD
 pub use self::array::DictionaryArray;
 pub use self::array::FixedSizeBinaryArray;
 pub use self::array::FixedSizeListArray;
@@ -233,13 +237,96 @@ pub type DurationNanosecondBuilder = PrimitiveBuilder<DurationNanosecondType>;
 
 pub use self::equal::ArrayEqual;
 pub use self::equal::JsonEqual;
+=======
+pub use self::array::ListArray;
+pub use self::array::PrimitiveArray;
+pub use self::array::StructArray;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 // --------------------- Sortable Array ---------------------
 
 pub use self::ord::{as_ordarray, OrdArray};
 
+<<<<<<< HEAD
 // --------------------- Array downcast helper functions ---------------------
 
 pub use self::cast::{
     as_boolean_array, as_null_array, as_primitive_array, as_string_array,
 };
+=======
+pub type TimestampSecondArray = PrimitiveArray<TimestampSecondType>;
+pub type TimestampMillisecondArray = PrimitiveArray<TimestampMillisecondType>;
+pub type TimestampMicrosecondArray = PrimitiveArray<TimestampMicrosecondType>;
+pub type TimestampNanosecondArray = PrimitiveArray<TimestampNanosecondType>;
+pub type Date32Array = PrimitiveArray<Date32Type>;
+pub type Date64Array = PrimitiveArray<Date64Type>;
+pub type Time32SecondArray = PrimitiveArray<Time32SecondType>;
+pub type Time32MillisecondArray = PrimitiveArray<Time32MillisecondType>;
+pub type Time64MicrosecondArray = PrimitiveArray<Time64MicrosecondType>;
+pub type Time64NanosecondArray = PrimitiveArray<Time64NanosecondType>;
+// TODO add interval
+
+pub use self::array::ListArrayOps;
+pub use self::array::PrimitiveArrayOps;
+
+// --------------------- Array Builder ---------------------
+
+pub use self::builder::BufferBuilder;
+pub use self::builder::BufferBuilderTrait;
+
+pub type BooleanBufferBuilder = BufferBuilder<BooleanType>;
+pub type Int8BufferBuilder = BufferBuilder<Int8Type>;
+pub type Int16BufferBuilder = BufferBuilder<Int16Type>;
+pub type Int32BufferBuilder = BufferBuilder<Int32Type>;
+pub type Int64BufferBuilder = BufferBuilder<Int64Type>;
+pub type UInt8BufferBuilder = BufferBuilder<UInt8Type>;
+pub type UInt16BufferBuilder = BufferBuilder<UInt16Type>;
+pub type UInt32BufferBuilder = BufferBuilder<UInt32Type>;
+pub type UInt64BufferBuilder = BufferBuilder<UInt64Type>;
+pub type Float32BufferBuilder = BufferBuilder<Float32Type>;
+pub type Float64BufferBuilder = BufferBuilder<Float64Type>;
+
+pub type TimestampSecondBufferBuilder = BufferBuilder<TimestampSecondType>;
+pub type TimestampMillisecondBufferBuilder = BufferBuilder<TimestampMillisecondType>;
+pub type TimestampMicrosecondBufferBuilder = BufferBuilder<TimestampMicrosecondType>;
+pub type TimestampNanosecondBufferBuilder = BufferBuilder<TimestampNanosecondType>;
+pub type Date32BufferBuilder = BufferBuilder<Date32Type>;
+pub type Date64BufferBuilder = BufferBuilder<Date64Type>;
+pub type Time32SecondBufferBuilder = BufferBuilder<Time32SecondType>;
+pub type Time32MillisecondBufferBuilder = BufferBuilder<Time32MillisecondType>;
+pub type Time64MicrosecondBufferBuilder = BufferBuilder<Time64MicrosecondType>;
+pub type Time64NanosecondBufferBuilder = BufferBuilder<Time64NanosecondType>;
+
+pub use self::builder::ArrayBuilder;
+pub use self::builder::BinaryBuilder;
+pub use self::builder::ListBuilder;
+pub use self::builder::PrimitiveBuilder;
+pub use self::builder::StructBuilder;
+
+pub type BooleanBuilder = PrimitiveBuilder<BooleanType>;
+pub type Int8Builder = PrimitiveBuilder<Int8Type>;
+pub type Int16Builder = PrimitiveBuilder<Int16Type>;
+pub type Int32Builder = PrimitiveBuilder<Int32Type>;
+pub type Int64Builder = PrimitiveBuilder<Int64Type>;
+pub type UInt8Builder = PrimitiveBuilder<UInt8Type>;
+pub type UInt16Builder = PrimitiveBuilder<UInt16Type>;
+pub type UInt32Builder = PrimitiveBuilder<UInt32Type>;
+pub type UInt64Builder = PrimitiveBuilder<UInt64Type>;
+pub type Float32Builder = PrimitiveBuilder<Float32Type>;
+pub type Float64Builder = PrimitiveBuilder<Float64Type>;
+
+pub type TimestampSecondBuilder = PrimitiveBuilder<TimestampSecondType>;
+pub type TimestampMillisecondBuilder = PrimitiveBuilder<TimestampMillisecondType>;
+pub type TimestampMicrosecondBuilder = PrimitiveBuilder<TimestampMicrosecondType>;
+pub type TimestampNanosecondBuilder = PrimitiveBuilder<TimestampNanosecondType>;
+pub type Date32Builder = PrimitiveBuilder<Date32Type>;
+pub type Date64Builder = PrimitiveBuilder<Date64Type>;
+pub type Time32SecondBuilder = PrimitiveBuilder<Time32SecondType>;
+pub type Time32MillisecondBuilder = PrimitiveBuilder<Time32MillisecondType>;
+pub type Time64MicrosecondBuilder = PrimitiveBuilder<Time64MicrosecondType>;
+pub type Time64NanosecondBuilder = PrimitiveBuilder<Time64NanosecondType>;
+
+// --------------------- Array Equality ---------------------
+
+pub use self::equal::ArrayEqual;
+>>>>>>> 5588-Better-support-for-building-UnionArrays

@@ -311,6 +311,7 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
       arg_addrs, output->data_buffer_ptr_idx(), output->field());
   llvm::Value* output_offset_ref =
       GetOffsetsReference(arg_addrs, output->offsets_idx(), output->field());
+<<<<<<< HEAD
 
   std::vector<llvm::Value*> slice_offsets;
   for (int idx = 0; idx < buffer_count; idx++) {
@@ -318,6 +319,8 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
     auto offset = builder->CreateLoad(offsetAddr);
     slice_offsets.push_back(offset);
   }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   // Loop body
   builder->SetInsertPoint(loop_body);

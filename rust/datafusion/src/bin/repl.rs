@@ -17,9 +17,16 @@
 
 #![allow(bare_trait_objects)]
 
+<<<<<<< HEAD
 use arrow::util::pretty;
 use clap::{crate_version, App, Arg};
 use datafusion::error::Result;
+=======
+use arrow::array::*;
+use arrow::datatypes::{DataType, TimeUnit};
+use clap::{crate_version, App, Arg};
+use datafusion::error::{ExecutionError, Result};
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 use datafusion::execution::context::ExecutionContext;
 use rustyline::Editor;
 use std::env;

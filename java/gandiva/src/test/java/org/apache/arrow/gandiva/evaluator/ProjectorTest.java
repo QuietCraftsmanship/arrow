@@ -582,6 +582,11 @@ public class ProjectorTest extends BaseEvaluatorTest {
     // test with insufficient data buffer.
     try {
       outVector.allocateNew(4, numRows);
+<<<<<<< HEAD
+=======
+      thrown.expect(GandivaException.class);
+      thrown.expectMessage("expand not implemented");
+>>>>>>> 5588-Better-support-for-building-UnionArrays
       eval.evaluate(batch, output);
     } finally {
       releaseRecordBatch(batch);

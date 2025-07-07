@@ -110,15 +110,21 @@ fi
 
 apt install -y -V libarrow-python-dev=${deb_version}
 
+<<<<<<< HEAD
 if [ "${have_plasma}" = "yes" ]; then
   apt install -y -V libplasma-glib-dev=${deb_version}
   apt install -y -V libplasma-glib-doc=${deb_version}
   apt install -y -V plasma-store-server=${deb_version}
 fi
+=======
+apt install -y -V libplasma-glib-dev=${deb_version}
+# apt install -y -V libplasma-glib-doc=${deb_version}
+apt install -y -V plasma-store-server=${deb_version}
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 if [ "${have_gandiva}" = "yes" ]; then
   apt install -y -V libgandiva-glib-dev=${deb_version}
-  apt install -y -V libgandiva-glib-doc=${deb_version}
+  # apt install -y -V libgandiva-glib-doc=${deb_version}
 fi
 
 apt install -y -V libparquet-glib-dev=${deb_version}

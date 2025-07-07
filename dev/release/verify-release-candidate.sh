@@ -134,6 +134,7 @@ test_binary() {
 }
 
 test_apt() {
+<<<<<<< HEAD
   for target in "debian:stretch" \
                 "arm64v8/debian:stretch" \
                 "debian:buster" \
@@ -163,6 +164,15 @@ test_apt() {
         ;;
     esac
     if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+=======
+  for target in debian-stretch \
+                debian-buster \
+                ubuntu-xenial \
+                ubuntu-bionic \
+                ubuntu-cosmic \
+                ubuntu-disco; do
+    if ! "${SOURCE_DIR}/../run_docker_compose.sh" \
+>>>>>>> 5588-Better-support-for-building-UnionArrays
            "${target}" \
            /arrow/dev/release/verify-apt.sh \
            "${VERSION}" \

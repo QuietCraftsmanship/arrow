@@ -554,12 +554,20 @@ constexpr int8_t UnionType::kMaxTypeCode;
 constexpr int UnionType::kInvalidChildId;
 
 UnionType::UnionType(const std::vector<std::shared_ptr<Field>>& fields,
+<<<<<<< HEAD
                      const std::vector<int8_t>& type_codes, UnionMode::type mode)
     : NestedType(Type::UNION),
       mode_(mode),
       type_codes_(type_codes),
       child_ids_(kMaxTypeCode + 1, kInvalidChildId) {
   DCHECK_OK(ValidateParameters(fields, type_codes, mode));
+=======
+                     const std::vector<uint8_t>& type_codes, UnionMode::type mode)
+    : NestedType(Type::UNION), mode_(mode), type_codes_(type_codes) {
+  DCHECK_LE(fields.size(), type_codes.size()) << "union field with unknown type id";
+  DCHECK_GE(fields.size(), type_codes.size())
+      << "type id provided without corresponding union field";
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   children_ = fields;
   for (int child_id = 0; child_id < static_cast<int>(type_codes_.size()); ++child_id) {
     const auto type_code = type_codes_[child_id];

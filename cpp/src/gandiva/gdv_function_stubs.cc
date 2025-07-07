@@ -110,6 +110,7 @@ int32_t gdv_fn_populate_varlen_vector(int64_t context_ptr, int8_t* data_ptr,
   offsets[slot + 1] = offset + entry_len;
   return 0;
 }
+<<<<<<< HEAD
 
 int32_t gdv_fn_dec_from_string(int64_t context, const char* in, int32_t in_length,
                                int32_t* precision_from_str, int32_t* scale_from_str,
@@ -140,6 +141,8 @@ char* gdv_fn_dec_to_string(int64_t context, int64_t x_high, uint64_t x_low,
   memcpy(ret, dec_str.data(), *dec_str_len);
   return ret;
 }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 namespace gandiva {
@@ -243,6 +246,7 @@ void ExportedStubFunctions::AddMappings(Engine* engine) const {
   engine->AddGlobalMappingForFunc("gdv_fn_populate_varlen_vector",
                                   types->i32_type() /*return_type*/, args,
                                   reinterpret_cast<void*>(gdv_fn_populate_varlen_vector));
+<<<<<<< HEAD
 
   // gdv_fn_random
   args = {types->i64_type()};
@@ -252,6 +256,8 @@ void ExportedStubFunctions::AddMappings(Engine* engine) const {
   args = {types->i64_type(), types->i32_type(), types->i1_type()};
   engine->AddGlobalMappingForFunc("gdv_fn_random_with_seed", types->double_type(), args,
                                   reinterpret_cast<void*>(gdv_fn_random_with_seed));
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 }  // namespace gandiva

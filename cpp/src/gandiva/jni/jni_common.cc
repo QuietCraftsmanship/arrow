@@ -673,6 +673,7 @@ err_out:
 ///
 class JavaResizableBuffer : public arrow::ResizableBuffer {
  public:
+<<<<<<< HEAD
   JavaResizableBuffer(JNIEnv* env, jobject jexpander, int32_t vector_idx, uint8_t* buffer,
                       int32_t len)
       : ResizableBuffer(buffer, len),
@@ -683,10 +684,28 @@ class JavaResizableBuffer : public arrow::ResizableBuffer {
   }
 
   Status Resize(const int64_t new_size, bool shrink_to_fit) override;
+=======
+  JavaResizableBuffer(uint8_t* buffer, int32_t len) : ResizableBuffer(buffer, len) {
+    size_ = 0;
+  }
+
+  Status Resize(const int64_t new_size, bool shrink_to_fit) override {
+    if (shrink_to_fit == true) {
+      return Status::NotImplemented("shrink not implemented");
+    } else if (new_size < capacity()) {
+      size_ = new_size;
+      return Status::OK();
+    } else {
+      // TODO: callback into java to re-alloc the buffer.
+      return Status::NotImplemented("buffer expand not implemented");
+    }
+  }
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   Status Reserve(const int64_t new_capacity) override {
     return Status::NotImplemented("reserve not implemented");
   }
+<<<<<<< HEAD
 
  private:
   JNIEnv* env_;
@@ -724,6 +743,10 @@ Status JavaResizableBuffer::Resize(const int64_t new_size, bool shrink_to_fit) {
   return Status::OK();
 }
 
+=======
+};
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 #define CHECK_OUT_BUFFER_IDX_AND_BREAK(idx, len)                               \
   if (idx >= len) {                                                            \
     status = gandiva::Status::Invalid("insufficient number of out_buf_addrs"); \
@@ -823,6 +846,7 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
       uint8_t* value_buf = reinterpret_cast<uint8_t*>(out_bufs[buf_idx++]);
       jlong data_sz = out_sizes[sz_idx++];
       if (arrow::is_binary_like(field->type()->id())) {
+<<<<<<< HEAD
         if (jexpander == nullptr) {
           status = Status::Invalid(
               "expression has variable len output columns, but the expander object is "
@@ -831,6 +855,9 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
         }
         buffers.push_back(std::make_shared<JavaResizableBuffer>(
             env, jexpander, output_vector_idx, value_buf, data_sz));
+=======
+        buffers.push_back(std::make_shared<JavaResizableBuffer>(value_buf, data_sz));
+>>>>>>> 5588-Better-support-for-building-UnionArrays
       } else {
         buffers.push_back(std::make_shared<arrow::MutableBuffer>(value_buf, data_sz));
       }

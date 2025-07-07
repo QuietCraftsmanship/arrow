@@ -37,7 +37,11 @@ import org.apache.arrow.vector.util.TransferPair;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
 public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class UInt8Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   private static final byte TYPE_WIDTH = 8;
   private final FieldReader reader;
 
@@ -276,6 +280,7 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   @Override
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, value);
   }
@@ -290,6 +295,12 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
     return this.get(index);
   }
 
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+  }
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   private class TransferImpl implements TransferPair {
     UInt8Vector to;
 
