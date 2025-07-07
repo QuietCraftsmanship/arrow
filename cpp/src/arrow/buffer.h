@@ -366,30 +366,10 @@ ARROW_EXPORT
 Status AllocateResizableBuffer(MemoryPool* pool, const int64_t size,
                                std::shared_ptr<ResizableBuffer>* out);
 
-/// \brief Allocate a resizeable buffer from a memory pool, zero its padding.
-///
-/// \param[in] pool a memory pool
-/// \param[in] size size of buffer to allocate
-/// \param[out] out the allocated buffer
-///
-/// \return Status message
-ARROW_EXPORT
-Status AllocateResizableBuffer(MemoryPool* pool, const int64_t size,
-                               std::unique_ptr<ResizableBuffer>* out);
+#ifndef ARROW_NO_DEPRECATED_API
 
-/// \brief Allocate a resizeable buffer from the default memory pool
-///
-/// \param[in] size size of buffer to allocate
-/// \param[out] out the allocated buffer
-///
-/// \return Status message
-ARROW_EXPORT
-Status AllocateResizableBuffer(const int64_t size, std::shared_ptr<ResizableBuffer>* out);
-
-/// \brief Allocate a resizeable buffer from the default memory pool
-///
-/// \param[in] size size of buffer to allocate
-/// \param[out] out the allocated buffer
+/// \brief Create Buffer referencing std::string memory
+/// \note Deprecated since 0.8.0
 ///
 /// \return Status message
 ARROW_EXPORT
@@ -398,46 +378,13 @@ Status AllocateResizableBuffer(const int64_t size, std::unique_ptr<ResizableBuff
 /// \brief Allocate a bitmap buffer from a memory pool
 /// no guarantee on values is provided.
 ///
-/// \param[in] pool memory pool to allocate memory from
-/// \param[in] length size in bits of bitmap to allocate
-/// \param[out] out the resulting buffer
-///
-/// \return Status message
-ARROW_EXPORT
-Status AllocateBitmap(MemoryPool* pool, int64_t length, std::shared_ptr<Buffer>* out);
+/// \param str std::string instance
+/// \return std::shared_ptr<Buffer>
+static inline std::shared_ptr<Buffer> GetBufferFromString(const std::string& str) {
+  return std::make_shared<Buffer>(str);
+}
 
-/// \brief Allocate a zero-initialized bitmap buffer from a memory pool
-///
-/// \param[in] pool memory pool to allocate memory from
-/// \param[in] length size in bits of bitmap to allocate
-/// \param[out] out the resulting buffer (zero-initialized).
-///
-/// \return Status message
-ARROW_EXPORT
-Status AllocateEmptyBitmap(MemoryPool* pool, int64_t length,
-                           std::shared_ptr<Buffer>* out);
-
-/// \brief Allocate a zero-initialized bitmap buffer from the default memory pool
-///
-/// \param[in] length size in bits of bitmap to allocate
-/// \param[out] out the resulting buffer
-///
-/// \return Status message
-ARROW_EXPORT
-Status AllocateEmptyBitmap(int64_t length, std::shared_ptr<Buffer>* out);
-
-/// \brief Concatenate multiple buffers into a single buffer
-///
-/// \param[in] buffers to be concatenated
-/// \param[in] pool memory pool to allocate the new buffer from
-/// \param[out] out the concatenated buffer
-///
-/// \return Status
-ARROW_EXPORT
-Status ConcatenateBuffers(const BufferVector& buffers, MemoryPool* pool,
-                          std::shared_ptr<Buffer>* out);
-
-/// @}
+#endif  // ARROW_NO_DEPRECATED_API
 
 }  // namespace arrow
 

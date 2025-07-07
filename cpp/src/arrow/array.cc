@@ -147,12 +147,17 @@ bool Array::RangeEquals(int64_t start_idx, int64_t end_idx, int64_t other_start_
   return ArrayRangeEquals(*this, other, start_idx, end_idx, other_start_idx);
 }
 
-bool Array::RangeEquals(int64_t start_idx, int64_t end_idx, int64_t other_start_idx,
-                        const std::shared_ptr<Array>& other) const {
-  if (!other) {
-    return false;
-  }
-  return ArrayRangeEquals(*this, *other, start_idx, end_idx, other_start_idx);
+static inline std::shared_ptr<ArrayData> SliceData(const ArrayData& data, int64_t offset,
+                                                   int64_t length) {
+  DCHECK_LE(offset, data.length);
+  length = std::min(data.length - offset, length);
+  offset += data.offset;
+
+  auto new_data = data.ShallowCopy();
+  new_data->length = length;
+  new_data->offset = offset;
+  new_data->null_count = kUnknownNullCount;
+  return new_data;
 }
 
 std::shared_ptr<Array> Array::Slice(int64_t offset, int64_t length) const {
