@@ -17,142 +17,53 @@
 
 #include "arrow/array/builder_nested.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <utility>
 #include <vector>
 
-#include "arrow/array.h"
 #include "arrow/buffer.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/type_traits.h"
-#include "arrow/util/bit-util.h"
-#include "arrow/util/int-util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
 // ----------------------------------------------------------------------
-// ListBuilder
+// VarLengthListLikeBuilder / BaseListBuilder / BaseListViewBuilder
 
-ListBuilder::ListBuilder(MemoryPool* pool,
-                         std::shared_ptr<ArrayBuilder> const& value_builder,
-                         const std::shared_ptr<DataType>& type)
-    : ArrayBuilder(type ? type
-                        : std::static_pointer_cast<DataType>(
-                              std::make_shared<ListType>(value_builder->type())),
-                   pool),
-      offsets_builder_(pool),
-      value_builder_(value_builder) {}
+template class VarLengthListLikeBuilder<ListType>;
+template class VarLengthListLikeBuilder<LargeListType>;
+template class VarLengthListLikeBuilder<ListViewType>;
+template class VarLengthListLikeBuilder<LargeListViewType>;
 
-Status ListBuilder::AppendValues(const int32_t* offsets, int64_t length,
-                                 const uint8_t* valid_bytes) {
-  RETURN_NOT_OK(Reserve(length));
-  UnsafeAppendToBitmap(valid_bytes, length);
-  offsets_builder_.UnsafeAppend(offsets, length);
-  return Status::OK();
-}
+template class BaseListBuilder<ListType>;
+template class BaseListBuilder<LargeListType>;
 
-Status ListBuilder::CheckNextOffset() const {
-  const int64_t num_values = value_builder_->length();
-  ARROW_RETURN_IF(
-      num_values > kListMaximumElements,
-      Status::CapacityError("ListArray cannot contain more then 2^31 - 1 child elements,",
-                            " have ", num_values));
-  return Status::OK();
-}
+template class BaseListViewBuilder<ListViewType>;
+template class BaseListViewBuilder<LargeListViewType>;
 
-Status ListBuilder::AppendNextOffset() {
-  RETURN_NOT_OK(CheckNextOffset());
-  const int64_t num_values = value_builder_->length();
-  return offsets_builder_.Append(static_cast<int32_t>(num_values));
-}
-
-Status ListBuilder::Append(bool is_valid) {
-  RETURN_NOT_OK(Reserve(1));
-  UnsafeAppendToBitmap(is_valid);
-  return AppendNextOffset();
-}
-
-Status ListBuilder::AppendNulls(int64_t length) {
-  RETURN_NOT_OK(Reserve(length));
-  RETURN_NOT_OK(CheckNextOffset());
-  UnsafeAppendToBitmap(length, false);
-  const int64_t num_values = value_builder_->length();
-  for (int64_t i = 0; i < length; ++i) {
-    offsets_builder_.UnsafeAppend(static_cast<int32_t>(num_values));
-  }
-  return Status::OK();
-}
-
-Status ListBuilder::Resize(int64_t capacity) {
-  if (capacity > kListMaximumElements) {
-    return Status::CapacityError(
-        "ListArray cannot reserve space for more then 2^31 - 1 child elements, got ",
-        capacity);
-  }
-  RETURN_NOT_OK(CheckCapacity(capacity, capacity_));
-
-  // one more then requested for offsets
-  RETURN_NOT_OK(offsets_builder_.Resize(capacity + 1));
-  return ArrayBuilder::Resize(capacity);
-}
-
-Status ListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  RETURN_NOT_OK(AppendNextOffset());
-
-  // Offset padding zeroed by BufferBuilder
-  std::shared_ptr<Buffer> offsets;
-  RETURN_NOT_OK(offsets_builder_.Finish(&offsets));
-
-  std::shared_ptr<ArrayData> items;
-  if (values_) {
-    items = values_->data();
-  } else {
-    if (value_builder_->length() == 0) {
-      // Try to make sure we get a non-null values buffer (ARROW-2744)
-      RETURN_NOT_OK(value_builder_->Resize(0));
-    }
-    RETURN_NOT_OK(value_builder_->FinishInternal(&items));
-  }
-
-  // If the type has not been specified in the constructor, infer it
-  // This is the case if the value_builder contains a DenseUnionBuilder
-  if (!arrow::internal::checked_cast<ListType&>(*type_).value_type()) {
-    type_ = std::static_pointer_cast<DataType>(
-        std::make_shared<ListType>(value_builder_->type()));
-  }
-  std::shared_ptr<Buffer> null_bitmap;
-  RETURN_NOT_OK(null_bitmap_builder_.Finish(&null_bitmap));
-  *out = ArrayData::Make(type_, length_, {null_bitmap, offsets}, null_count_);
-  (*out)->child_data.emplace_back(std::move(items));
-  Reset();
-  return Status::OK();
-}
-
-void ListBuilder::Reset() {
-  ArrayBuilder::Reset();
-  values_.reset();
-  offsets_builder_.Reset();
-  value_builder_->Reset();
-}
-
-ArrayBuilder* ListBuilder::value_builder() const {
-  DCHECK(!values_) << "Using value builder is pointless when values_ is set";
-  return value_builder_.get();
-}
 // ----------------------------------------------------------------------
 // MapBuilder
 
 MapBuilder::MapBuilder(MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& key_builder,
                        std::shared_ptr<ArrayBuilder> const& item_builder,
                        const std::shared_ptr<DataType>& type)
-    : ArrayBuilder(type, pool), key_builder_(key_builder), item_builder_(item_builder) {
-  list_builder_ = std::make_shared<ListBuilder>(
-      pool, key_builder, list(field("key", key_builder->type(), false)));
+    : ArrayBuilder(pool), key_builder_(key_builder), item_builder_(item_builder) {
+  auto map_type = internal::checked_cast<const MapType*>(type.get());
+  entries_name_ = map_type->field(0)->name();
+  key_name_ = map_type->key_field()->name();
+  item_name_ = map_type->item_field()->name();
+  item_nullable_ = map_type->item_field()->nullable();
+  keys_sorted_ = map_type->keys_sorted();
+
+  std::vector<std::shared_ptr<ArrayBuilder>> child_builders{key_builder, item_builder};
+  auto struct_builder =
+      std::make_shared<StructBuilder>(map_type->value_type(), pool, child_builders);
+
+  list_builder_ =
+      std::make_shared<ListBuilder>(pool, struct_builder, struct_builder->type());
 }
 
 MapBuilder::MapBuilder(MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& key_builder,
@@ -160,6 +71,22 @@ MapBuilder::MapBuilder(MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& ke
                        bool keys_sorted)
     : MapBuilder(pool, key_builder, item_builder,
                  map(key_builder->type(), item_builder->type(), keys_sorted)) {}
+
+MapBuilder::MapBuilder(MemoryPool* pool,
+                       const std::shared_ptr<ArrayBuilder>& struct_builder,
+                       const std::shared_ptr<DataType>& type)
+    : ArrayBuilder(pool) {
+  auto map_type = internal::checked_cast<const MapType*>(type.get());
+  entries_name_ = map_type->field(0)->name();
+  key_name_ = map_type->key_field()->name();
+  item_name_ = map_type->item_field()->name();
+  item_nullable_ = map_type->item_field()->nullable();
+  keys_sorted_ = map_type->keys_sorted();
+  key_builder_ = struct_builder->child_builder(0);
+  item_builder_ = struct_builder->child_builder(1);
+  list_builder_ =
+      std::make_shared<ListBuilder>(pool, struct_builder, struct_builder->type());
+}
 
 Status MapBuilder::Resize(int64_t capacity) {
   RETURN_NOT_OK(list_builder_->Resize(capacity));
@@ -175,16 +102,9 @@ void MapBuilder::Reset() {
 Status MapBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   ARROW_CHECK_EQ(item_builder_->length(), key_builder_->length())
       << "keys and items builders don't have the same size in MapBuilder";
-  // finish list(keys) builder
+  RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->FinishInternal(out));
-  // finish values builder
-  std::shared_ptr<ArrayData> items_data;
-  RETURN_NOT_OK(item_builder_->FinishInternal(&items_data));
-
-  auto keys_data = (*out)->child_data[0];
-  (*out)->type = type_;
-  (*out)->child_data[0] = ArrayData::Make(type_->child(0)->type(), keys_data->length,
-                                          {nullptr}, {keys_data, items_data}, 0, 0);
+  (*out)->type = type();
   ArrayBuilder::Reset();
   return Status::OK();
 }
@@ -192,6 +112,7 @@ Status MapBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 Status MapBuilder::AppendValues(const int32_t* offsets, int64_t length,
                                 const uint8_t* valid_bytes) {
   DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->AppendValues(offsets, length, valid_bytes));
   length_ = list_builder_->length();
   null_count_ = list_builder_->null_count();
@@ -200,6 +121,7 @@ Status MapBuilder::AppendValues(const int32_t* offsets, int64_t length,
 
 Status MapBuilder::Append() {
   DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->Append());
   length_ = list_builder_->length();
   return Status::OK();
@@ -207,6 +129,7 @@ Status MapBuilder::Append() {
 
 Status MapBuilder::AppendNull() {
   DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->AppendNull());
   length_ = list_builder_->length();
   null_count_ = list_builder_->null_count();
@@ -215,9 +138,40 @@ Status MapBuilder::AppendNull() {
 
 Status MapBuilder::AppendNulls(int64_t length) {
   DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->AppendNulls(length));
   length_ = list_builder_->length();
   null_count_ = list_builder_->null_count();
+  return Status::OK();
+}
+
+Status MapBuilder::AppendEmptyValue() {
+  DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
+  RETURN_NOT_OK(list_builder_->AppendEmptyValue());
+  length_ = list_builder_->length();
+  null_count_ = list_builder_->null_count();
+  return Status::OK();
+}
+
+Status MapBuilder::AppendEmptyValues(int64_t length) {
+  DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
+  RETURN_NOT_OK(list_builder_->AppendEmptyValues(length));
+  length_ = list_builder_->length();
+  null_count_ = list_builder_->null_count();
+  return Status::OK();
+}
+
+Status MapBuilder::AdjustStructBuilderLength() {
+  // If key/item builders have been appended, adjust struct builder length
+  // to match. Struct and key are non-nullable, append all valid values.
+  auto struct_builder =
+      internal::checked_cast<StructBuilder*>(list_builder_->value_builder());
+  if (struct_builder->length() < key_builder_->length()) {
+    int64_t length_diff = key_builder_->length() - struct_builder->length();
+    RETURN_NOT_OK(struct_builder->AppendValues(length_diff, NULLPTR));
+  }
   return Status::OK();
 }
 
@@ -225,19 +179,19 @@ Status MapBuilder::AppendNulls(int64_t length) {
 // FixedSizeListBuilder
 
 FixedSizeListBuilder::FixedSizeListBuilder(
-    MemoryPool* pool, std::shared_ptr<ArrayBuilder> const& value_builder,
-    int32_t list_size)
-    : ArrayBuilder(fixed_size_list(value_builder->type(), list_size), pool),
-      list_size_(list_size),
-      value_builder_(value_builder) {}
-
-FixedSizeListBuilder::FixedSizeListBuilder(
-    MemoryPool* pool, std::shared_ptr<ArrayBuilder> const& value_builder,
+    MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& value_builder,
     const std::shared_ptr<DataType>& type)
-    : ArrayBuilder(type, pool),
+    : ArrayBuilder(pool),
+      value_field_(type->field(0)),
       list_size_(
           internal::checked_cast<const FixedSizeListType*>(type.get())->list_size()),
       value_builder_(value_builder) {}
+
+FixedSizeListBuilder::FixedSizeListBuilder(
+    MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& value_builder,
+    int32_t list_size)
+    : FixedSizeListBuilder(pool, value_builder,
+                           fixed_size_list(value_builder->type(), list_size)) {}
 
 void FixedSizeListBuilder::Reset() {
   ArrayBuilder::Reset();
@@ -268,8 +222,33 @@ Status FixedSizeListBuilder::AppendNulls(int64_t length) {
   return value_builder_->AppendNulls(list_size_ * length);
 }
 
+Status FixedSizeListBuilder::ValidateOverflow(int64_t new_elements) {
+  auto new_length = value_builder_->length() + new_elements;
+  if (new_elements != list_size_) {
+    return Status::Invalid("Length of item not correct: expected ", list_size_,
+                           " but got array of size ", new_elements);
+  }
+  if (new_length > maximum_elements()) {
+    return Status::CapacityError("array cannot contain more than ", maximum_elements(),
+                                 " elements, have ", new_elements);
+  }
+  return Status::OK();
+}
+
+Status FixedSizeListBuilder::AppendEmptyValue() {
+  RETURN_NOT_OK(Reserve(1));
+  UnsafeAppendToBitmap(true);
+  return value_builder_->AppendEmptyValues(list_size_);
+}
+
+Status FixedSizeListBuilder::AppendEmptyValues(int64_t length) {
+  RETURN_NOT_OK(Reserve(length));
+  UnsafeAppendToBitmap(length, true);
+  return value_builder_->AppendEmptyValues(list_size_ * length);
+}
+
 Status FixedSizeListBuilder::Resize(int64_t capacity) {
-  RETURN_NOT_OK(CheckCapacity(capacity, capacity_));
+  RETURN_NOT_OK(CheckCapacity(capacity));
   return ArrayBuilder::Resize(capacity);
 }
 
@@ -282,16 +261,9 @@ Status FixedSizeListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   }
   RETURN_NOT_OK(value_builder_->FinishInternal(&items));
 
-  // If the type has not been specified in the constructor, infer it
-  // This is the case if the value_builder contains a DenseUnionBuilder
-  const auto& list_type = internal::checked_cast<const FixedSizeListType&>(*type_);
-  if (!list_type.value_type()) {
-    type_ = std::make_shared<FixedSizeListType>(value_builder_->type(),
-                                                list_type.list_size());
-  }
   std::shared_ptr<Buffer> null_bitmap;
   RETURN_NOT_OK(null_bitmap_builder_.Finish(&null_bitmap));
-  *out = ArrayData::Make(type_, length_, {null_bitmap}, {std::move(items)}, null_count_);
+  *out = ArrayData::Make(type(), length_, {null_bitmap}, {std::move(items)}, null_count_);
   Reset();
   return Status::OK();
 }
@@ -301,7 +273,11 @@ Status FixedSizeListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 
 StructBuilder::StructBuilder(const std::shared_ptr<DataType>& type, MemoryPool* pool,
                              std::vector<std::shared_ptr<ArrayBuilder>> field_builders)
+<<<<<<< HEAD
+    : ArrayBuilder(pool), type_(type) {
+=======
     : ArrayBuilder(type, pool) {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   children_ = std::move(field_builders);
 }
 
@@ -310,12 +286,6 @@ void StructBuilder::Reset() {
   for (const auto& field_builder : children_) {
     field_builder->Reset();
   }
-}
-
-Status StructBuilder::AppendNulls(int64_t length) {
-  ARROW_RETURN_NOT_OK(Reserve(length));
-  UnsafeAppendToBitmap(length, false);
-  return Status::OK();
 }
 
 Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
@@ -331,21 +301,20 @@ Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
     RETURN_NOT_OK(children_[i]->FinishInternal(&child_data[i]));
   }
 
-  // If the type has not been specified in the constructor, infer it
-  // This is the case if one of the children contains a DenseUnionBuilder
-  if (!type_) {
-    std::vector<std::shared_ptr<Field>> fields;
-    for (const auto& field_builder : children_) {
-      fields.push_back(field("", field_builder->type()));
-    }
-    type_ = struct_(fields);
-  }
-
-  *out = ArrayData::Make(type_, length_, {null_bitmap}, null_count_);
+  *out = ArrayData::Make(type(), length_, {null_bitmap}, null_count_);
   (*out)->child_data = std::move(child_data);
 
   capacity_ = length_ = null_count_ = 0;
   return Status::OK();
+}
+
+std::shared_ptr<DataType> StructBuilder::type() const {
+  DCHECK_EQ(type_->fields().size(), children_.size());
+  std::vector<std::shared_ptr<Field>> fields(children_.size());
+  for (int i = 0; i < static_cast<int>(fields.size()); ++i) {
+    fields[i] = type_->field(i)->WithType(children_[i]->type());
+  }
+  return struct_(std::move(fields));
 }
 
 }  // namespace arrow

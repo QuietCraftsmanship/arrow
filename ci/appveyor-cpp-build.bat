@@ -17,109 +17,147 @@
 
 @echo on
 
-@rem In release mode, disable optimizations (/Od) for faster compiling
-set CMAKE_CXX_FLAGS_RELEASE=/Od
+git config core.symlinks true
+git reset --hard
 
-if "%JOB%" == "Static_Crt_Build" (
-  @rem Since we link the CRT statically, we should also disable building
-  @rem the Arrow shared library to link the tests statically, otherwise
-  @rem the Arrow DLL and the tests end up using a different instance of
-  @rem the CRT, which wreaks havoc.
+@rem Retrieve git submodules, configure env var for Parquet unit tests
+git submodule update --init || exit /B
 
-  @rem ARROW-5403(wesm): Since changing to using gtest DLLs we can no
-  @rem longer run the unit tests because gtest.dll and the unit test
-  @rem executables have different static copies of the CRT
+set ARROW_TEST_DATA=%CD%\testing\data
+set PARQUET_TEST_DATA=%CD%\cpp\submodules\parquet-testing\data
 
-  mkdir cpp\build-debug
-  pushd cpp\build-debug
-
-  cmake -G "%GENERATOR%" ^
-        -DARROW_VERBOSE_THIRDPARTY_BUILD=ON ^
-        -DARROW_USE_STATIC_CRT=ON ^
-        -DARROW_BOOST_USE_SHARED=OFF ^
-        -DARROW_BUILD_SHARED=OFF ^
-        -DARROW_BUILD_TESTS=ON ^
-        -DARROW_BUILD_EXAMPLES=ON ^
-        -DCMAKE_BUILD_TYPE=Debug ^
-        -DARROW_TEST_LINKAGE=static ^
-        -DARROW_CXXFLAGS="/MP" ^
-        ..  || exit /B
-
-  cmake --build . --config Debug || exit /B
-  ctest --output-on-failure -j2 || exit /B
-  popd
-  rmdir /S /Q cpp\build-debug
-
-  mkdir cpp\build-release
-  pushd cpp\build-release
-
-  cmake -G "%GENERATOR%" ^
-        -DARROW_VERBOSE_THIRDPARTY_BUILD=OFF ^
-        -DARROW_USE_STATIC_CRT=ON ^
-        -DARROW_BOOST_USE_SHARED=OFF ^
-        -DARROW_BUILD_SHARED=OFF ^
-        -DARROW_BUILD_TESTS=ON ^
-        -DARROW_BUILD_EXAMPLES=ON ^
-        -DCMAKE_BUILD_TYPE=Release ^
-        -DARROW_TEST_LINKAGE=static ^
-        -DCMAKE_CXX_FLAGS_RELEASE="/MT %CMAKE_CXX_FLAGS_RELEASE%" ^
-        -DARROW_CXXFLAGS="/WX /MP" ^
-        ..  || exit /B
-
-  cmake --build . --config Release || exit /B
-  ctest --output-on-failure -j2 || exit /B
-  popd
-
-  @rem Finish Static_Crt_Build build successfully
-  exit /B 0
+@rem Enable memory debug checks if the env is not set already
+IF "%ARROW_DEBUG_MEMORY_POOL%"=="" (
+  set ARROW_DEBUG_MEMORY_POOL=trap
 )
 
-@rem In the configurations below we disable building the Arrow static library
-@rem to save some time.  Unfortunately this will still build the Parquet static
-@rem library because of PARQUET-1420 (Thrift-generated symbols not exported in DLL).
-
-if "%JOB%" == "Build_Debug" (
-  mkdir cpp\build-debug
-  pushd cpp\build-debug
-
-  cmake -G "%GENERATOR%" ^
-        -DARROW_VERBOSE_THIRDPARTY_BUILD=OFF ^
-        -DARROW_BOOST_USE_SHARED=OFF ^
-        -DARROW_BUILD_TESTS=ON ^
-        -DARROW_BUILD_EXAMPLES=ON ^
-        -DCMAKE_BUILD_TYPE=%CONFIGURATION% ^
-        -DARROW_BUILD_STATIC=OFF ^
-        -DARROW_CXXFLAGS="/MP" ^
-        ..  || exit /B
-
-  cmake --build . --config %CONFIGURATION% || exit /B
-  ctest --output-on-failure -j2 || exit /B
-  popd
-
-  @rem Finish Debug build successfully
-  exit /B 0
-)
-
-@rem Avoid Boost 1.70 because of https://github.com/boostorg/process/issues/85
-set CONDA_PACKAGES=--file=ci\conda_env_python.yml ^
-  python=%PYTHON% numpy=1.14 "boost-cpp<1.70"
-
-if "%ARROW_BUILD_GANDIVA%" == "ON" (
-  @rem Install llvmdev in the toolchain if building gandiva.dll
-  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_gandiva.yml
-)
-
-if "%JOB%" == "Toolchain" (
-  @rem Install pre-built "toolchain" packages for faster builds
-  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_cpp.yml
-)
-
-conda create -n arrow -q -y %CONDA_PACKAGES% -c conda-forge || exit /B
+set CMAKE_BUILD_PARALLEL_LEVEL=%NUMBER_OF_PROCESSORS%
+set CTEST_PARALLEL_LEVEL=%NUMBER_OF_PROCESSORS%
 
 call activate arrow
 
-@rem Use Boost from Anaconda
-set BOOST_ROOT=%CONDA_PREFIX%\Library
-set BOOST_LIBRARYDIR=%CONDA_PREFIX%\Library\lib
+@rem The "main" C++ build script for Windows CI
+@rem (i.e. for usual configurations)
 
-call ci\cpp-msvc-build-main.bat
+set ARROW_CMAKE_ARGS=-DARROW_DEPENDENCY_SOURCE=CONDA -DARROW_WITH_BZ2=ON
+
+@rem Enable warnings-as-errors
+set ARROW_CXXFLAGS=/WX /MP
+
+@rem Install GCS testbench
+set PIPX_BIN_DIR=C:\Windows\
+call %CD%\ci\scripts\install_gcs_testbench.bat
+storage-testbench -h || exit /B
+
+@rem
+@rem Build and test Arrow C++ libraries (including Parquet)
+@rem
+
+mkdir cpp\build
+pushd cpp\build
+
+@rem XXX Without forcing CMAKE_CXX_COMPILER, CMake can re-run itself and
+@rem unfortunately switch from Release to Debug mode...
+@rem
+@rem In release mode, disable optimizations (/Od) for faster compiling
+@rem and enable runtime assertions.
+
+cmake -G "%GENERATOR%" %ARROW_CMAKE_ARGS% ^
+      -DARROW_ACERO=ON ^
+      -DARROW_BOOST_USE_SHARED=ON ^
+      -DARROW_BUILD_EXAMPLES=ON ^
+      -DARROW_BUILD_STATIC=OFF ^
+      -DARROW_BUILD_TESTS=ON ^
+      -DARROW_COMPUTE=ON ^
+      -DARROW_CSV=ON ^
+      -DARROW_CXXFLAGS="%ARROW_CXXFLAGS%" ^
+      -DARROW_DATASET=ON ^
+      -DARROW_ENABLE_TIMING_TESTS=OFF ^
+      -DARROW_FILESYSTEM=ON ^
+      -DARROW_FLIGHT=%ARROW_BUILD_FLIGHT% ^
+      -DARROW_FLIGHT_SQL=%ARROW_BUILD_FLIGHT_SQL% ^
+      -DARROW_GANDIVA=%ARROW_BUILD_GANDIVA% ^
+      -DARROW_GCS=%ARROW_GCS% ^
+      -DARROW_HDFS=ON ^
+      -DARROW_JSON=ON ^
+      -DARROW_MIMALLOC=ON ^
+      -DARROW_ORC=%ARROW_ORC% ^
+      -DARROW_PARQUET=ON ^
+      -DARROW_S3=%ARROW_S3% ^
+      -DARROW_SUBSTRAIT=ON ^
+      -DARROW_VERBOSE_THIRDPARTY_BUILD=OFF ^
+      -DARROW_WITH_BROTLI=ON ^
+      -DARROW_WITH_LZ4=ON ^
+      -DARROW_WITH_SNAPPY=ON ^
+      -DARROW_WITH_ZLIB=ON ^
+      -DARROW_WITH_ZSTD=ON ^
+      -DCMAKE_BUILD_TYPE="Release" ^
+      -DCMAKE_CXX_FLAGS_RELEASE="/MD /Od /UNDEBUG" ^
+      -DCMAKE_CXX_STANDARD=17 ^
+      -DCMAKE_INSTALL_PREFIX=%CONDA_PREFIX%\Library ^
+      -DCMAKE_UNITY_BUILD=ON ^
+      -DCMAKE_VERBOSE_MAKEFILE=OFF ^
+      -DPARQUET_BUILD_EXECUTABLES=ON ^
+      -DPARQUET_REQUIRE_ENCRYPTION=ON ^
+      ..  || exit /B
+cmake --build . --target install --config Release || exit /B
+
+@rem For ORC C++
+set TZDIR=%CONDA_PREFIX%\share\zoneinfo
+
+@rem For finding Python executable for GCS tests
+set PYTHON=python
+
+ctest --output-on-failure || exit /B
+
+popd
+
+pushd python
+
+@rem
+@rem Build and install pyarrow
+@rem
+
+set PYARROW_CMAKE_GENERATOR=%GENERATOR%
+set PYARROW_CXXFLAGS=%ARROW_CXXFLAGS%
+set PYARROW_PARALLEL=2
+set PYARROW_WITH_ACERO=ON
+set PYARROW_WITH_DATASET=ON
+set PYARROW_WITH_FLIGHT=%ARROW_BUILD_FLIGHT%
+set PYARROW_WITH_GANDIVA=%ARROW_BUILD_GANDIVA%
+set PYARROW_WITH_GCS=%ARROW_GCS%
+set PYARROW_WITH_ORC=%ARROW_ORC%
+set PYARROW_WITH_PARQUET=ON
+set PYARROW_WITH_PARQUET_ENCRYPTION=ON
+set PYARROW_WITH_S3=%ARROW_S3%
+set PYARROW_WITH_SUBSTRAIT=ON
+
+set ARROW_HOME=%CONDA_PREFIX%\Library
+@rem ARROW-3075; pkgconfig is broken for Parquet for now
+set PARQUET_HOME=%CONDA_PREFIX%\Library
+
+pip install --no-deps --no-build-isolation -vv --editable .
+
+@rem
+@rem Run pyarrow tests
+@rem
+
+@rem Download IANA Timezone Database to a non-standard location to
+@rem test the configurability of the timezone database path
+curl https://data.iana.org/time-zones/releases/tzdata2024b.tar.gz --output tzdata.tar.gz || exit /B
+mkdir %USERPROFILE%\Downloads\test\tzdata
+tar --extract --file tzdata.tar.gz --directory %USERPROFILE%\Downloads\test\tzdata
+curl https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml ^
+  --output %USERPROFILE%\Downloads\test\tzdata\windowsZones.xml || exit /B
+@rem Remove the database from the default location
+rmdir /s /q %USERPROFILE%\Downloads\tzdata
+@rem Set the env var for the non-standard location of the database
+@rem (only needed for testing purposes)
+set PYARROW_TZDATA_PATH=%USERPROFILE%\Downloads\test\tzdata
+
+set AWS_EC2_METADATA_DISABLED=true
+set PYTHONDEVMODE=1
+
+python -m pytest -r sxX --durations=15 pyarrow/tests || exit /B
+
+popd

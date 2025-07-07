@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const fs = require('fs');
-const path = require(`path`);
-const pump = require(`stream`).pipeline;
-const child_process = require(`child_process`);
-const { targets, modules } = require('./argv');
-const { Observable, ReplaySubject } = require('rxjs');
-const asyncDone = require('util').promisify(require('async-done'));
+import fs from 'node:fs';
+import path from 'node:path';
+import child_process from 'node:child_process';
+import stream from 'node:stream';
+import util from 'node:util';
+import asyncDoneSync from 'async-done';
+const pump = stream.pipeline;
+import { targets, modules } from './argv.js';
+import { ReplaySubject, empty as ObservableEmpty, throwError as ObservableThrow, fromEvent as ObservableFromEvent } from 'rxjs';
+import { share, flatMap, takeUntil, defaultIfEmpty, mergeWith } from 'rxjs/operators';
+const asyncDone = util.promisify(asyncDoneSync);
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const mainExport = `Arrow`;
 const npmPkgName = `apache-arrow`;
@@ -35,15 +42,15 @@ const tasksToSkipPerTargetOrFormat = {
     cls: { test: true, package: true }
 };
 const packageJSONFields = [
-  `version`, `license`, `description`,
-  `author`, `homepage`, `repository`,
-  `bugs`, `keywords`,  `dependencies`,
-  `bin`
+    `version`, `license`, `description`,
+    `author`, `homepage`, `repository`,
+    `bugs`, `keywords`, `dependencies`,
+    `bin`
 ];
 
 const metadataFiles = [`LICENSE.txt`, `NOTICE.txt`, `README.md`].map((filename) => {
-    let err = false, prefixes = [`./`, `../`];
-    let p = prefixes.find((prefix) => {
+    const prefixes = [`./`, `../`];
+    const p = prefixes.find((prefix) => {
         try {
             fs.statSync(path.resolve(path.join(prefix, filename)));
         } catch (e) { return false; }
@@ -58,43 +65,13 @@ const metadataFiles = [`LICENSE.txt`, `NOTICE.txt`, `README.md`].map((filename) 
 // see: https://github.com/google/closure-compiler/blob/c1372b799d94582eaf4b507a4a22558ff26c403c/src/com/google/javascript/jscomp/CompilerOptions.java#L2988
 const gCCLanguageNames = {
     es5: `ECMASCRIPT5`,
- es2015: `ECMASCRIPT_2015`,
- es2016: `ECMASCRIPT_2016`,
- es2017: `ECMASCRIPT_2017`,
- esnext: `ECMASCRIPT_NEXT`
+    es2015: `ECMASCRIPT_2015`,
+    es2016: `ECMASCRIPT_2016`,
+    es2017: `ECMASCRIPT_2017`,
+    es2018: `ECMASCRIPT_2018`,
+    es2019: `ECMASCRIPT_2019`,
+    esnext: `ECMASCRIPT_NEXT`
 };
-
-const UMDSourceTargets = {
-    es5: `es5`,
- es2015: `es2015`,
- es2016: `es2015`,
- es2017: `es2015`,
- esnext: `esnext`
-};
-
-const terserLanguageNames = {
-    es5: 5, es2015: 6,
- es2016: 7, es2017: 8,
- esnext: 8 // <--- ?
-};
-
-// ES7+ keywords Terser shouldn't mangle
-// Hardcoded here since some are from ES7+, others are
-// only defined in interfaces, so difficult to get by reflection.
-const ESKeywords = [
-    // PropertyDescriptors
-    `configurable`, `enumerable`,
-    // IteratorResult, Symbol.asyncIterator
-    `done`, `value`, `Symbol.asyncIterator`, `asyncIterator`,
-    // AsyncObserver
-    `values`, `hasError`, `hasCompleted`,`errorValue`, `closed`,
-    // Observable/Subscription/Scheduler
-    `next`, `error`, `complete`, `subscribe`, `unsubscribe`, `isUnsubscribed`,
-    // EventTarget
-    `addListener`, `removeListener`, `addEventListener`, `removeEventListener`,
-    // Arrow properties
-    `low`, `high`, `data`, `index`, `field`, `columns`, 'numCols', 'numRows', `values`, `valueOffsets`, `nullBitmap`, `subarray`
-];
 
 function taskName(target, format) {
     return !format ? target : `${target}:${format}`;
@@ -123,41 +100,47 @@ function shouldRunInChildProcess(target, format) {
 
 const gulp = path.join(path.parse(require.resolve(`gulp`)).dir, `bin/gulp.js`);
 function spawnGulpCommandInChildProcess(command, target, format) {
-    const args = [gulp, command, '-t', target, '-m', format, `--silent`];
-    const opts = {
-        stdio: [`ignore`, `inherit`, `inherit`],
-        env: { ...process.env, NODE_NO_WARNINGS: `1` }
-    };
-    return asyncDone(() => child_process.spawn(`node`, args, opts))
-        .catch((e) => { throw `Error in "${command}:${taskName(target, format)}" task`; });
+    const err = [];
+    return asyncDone(() => {
+        const child = child_process.spawn(
+            `node`,
+            [gulp, command, '-t', target, '-m', format, `-L`],
+            {
+                stdio: [`ignore`, `ignore`, `pipe`],
+                env: { ...process.env, NODE_NO_WARNINGS: `1` }
+            });
+        child.stderr.on('data', (line) => err.push(line));
+        return child;
+    }).catch(() => Promise.reject(err.length > 0 ? err.join('\n')
+        : `Error in "${command}:${taskName(target, format)}" task.`));
 }
 
-const logAndDie = (e) => { if (e) { process.exit(1); } };
+const logAndDie = (e) => { if (e) { console.error(e); process.exit(1); } };
 function observableFromStreams(...streams) {
-    if (streams.length <= 0) { return Observable.empty(); }
+    if (streams.length <= 0) { return ObservableEmpty(); }
     const pumped = streams.length <= 1 ? streams[0] : pump(...streams, logAndDie);
-    const fromEvent = Observable.fromEvent.bind(null, pumped);
-    const streamObs = fromEvent(`data`)
-               .merge(fromEvent(`error`).flatMap((e) => Observable.throw(e)))
-           .takeUntil(fromEvent(`end`).merge(fromEvent(`close`)))
-           .defaultIfEmpty(`empty stream`)
-           .multicast(new ReplaySubject()).refCount();
+    const fromEvent = ObservableFromEvent.bind(null, pumped);
+    const streamObs = fromEvent(`data`).pipe(
+        mergeWith(fromEvent(`error`).pipe(flatMap((e) => ObservableThrow(e)))),
+        takeUntil(fromEvent(`end`).pipe(mergeWith(fromEvent(`close`)))),
+        defaultIfEmpty(`empty stream`),
+        share({ connector: () => new ReplaySubject(), resetOnError: false, resetOnComplete: false, resetOnRefCountZero: false })
+    );
     streamObs.stream = pumped;
     streamObs.observable = streamObs;
     return streamObs;
 }
 
 function* combinations(_targets, _modules) {
-
     const targets = known(knownTargets, _targets || [`all`]);
     const modules = known(knownModules, _modules || [`all`]);
 
-    if (_targets.indexOf(`src`) > -1) {
+    if (_targets.includes(`src`)) {
         yield [`src`, ``];
         return;
     }
 
-    if (_targets.indexOf(`all`) > -1 && _modules.indexOf(`all`) > -1) {
+    if (_targets.includes(`all`) && _modules.includes(`all`)) {
         yield [`ts`, ``];
         yield [`src`, ``];
         yield [npmPkgName, ``];
@@ -170,49 +153,30 @@ function* combinations(_targets, _modules) {
     }
 
     function known(known, values) {
-        return ~values.indexOf(`all`) ? known
-            :  ~values.indexOf(`src`) ? [`src`]
-            : Object.keys(
-                values.reduce((map, arg) => ((
-                    (known.indexOf(arg) !== -1) &&
-                    (map[arg.toLowerCase()] = true)
-                    || true) && map
-                ), {})
-            ).sort((a, b) => known.indexOf(a) - known.indexOf(b));
+        return values.includes(`all`) ? known
+            : values.includes(`src`) ? [`src`]
+                : Object.keys(
+                    values.reduce((map, arg) => ((
+                        (known.includes(arg)) &&
+                        (map[arg.toLowerCase()] = true)
+                        || true) && map
+                    ), {})
+                ).sort((a, b) => known.indexOf(a) - known.indexOf(b));
     }
 }
 
 const publicModulePaths = (dir) => [
     `${dir}/${mainExport}.dom.js`,
     `${dir}/util/int.js`,
-    `${dir}/compute/predicate.js`,
 ];
 
-const esmRequire = require(`esm`)(module, {
-    mode: `auto`,
-    cjs: {
-        /* A boolean for storing ES modules in require.cache. */
-        cache: true,
-        /* A boolean for respecting require.extensions in ESM. */
-        extensions: true,
-        /* A boolean for __esModule interoperability. */
-        interop: true,
-        /* A boolean for importing named exports of CJS modules. */
-        namedExports: true,
-        /* A boolean for following CJS path rules in ESM. */
-        paths: true,
-        /* A boolean for __dirname, __filename, and require in ESM. */
-        vars: true,
-    }
-});
-
-module.exports = {
-
+export {
     mainExport, npmPkgName, npmOrgName, metadataFiles, packageJSONFields,
 
-    knownTargets, knownModules, tasksToSkipPerTargetOrFormat,
-    gCCLanguageNames, UMDSourceTargets, terserLanguageNames,
+    knownTargets, knownModules, tasksToSkipPerTargetOrFormat, gCCLanguageNames,
 
     taskName, packageName, tsconfigName, targetDir, combinations, observableFromStreams,
-    ESKeywords, publicModulePaths, esmRequire, shouldRunInChildProcess, spawnGulpCommandInChildProcess
+    publicModulePaths, shouldRunInChildProcess, spawnGulpCommandInChildProcess,
 };
+
+export const targetAndModuleCombinations = [...combinations(targets, modules)];

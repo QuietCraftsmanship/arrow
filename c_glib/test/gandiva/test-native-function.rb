@@ -20,7 +20,7 @@ class TestGandivaNativeFunction < Test::Unit::TestCase
 
   def setup
     omit("Gandiva is required") unless defined?(::Gandiva)
-    @registry = Gandiva::FunctionRegistry.new
+    @registry = Gandiva::FunctionRegistry.default
     @not = lookup("not", [boolean_data_type], boolean_data_type)
     @isnull = lookup("isnull", [int8_data_type], boolean_data_type)
   end
@@ -32,15 +32,15 @@ class TestGandivaNativeFunction < Test::Unit::TestCase
     @registry.lookup(signature)
   end
 
-  def test_get_signature
-    assert_kind_of(Gandiva::FunctionSignature,
-                   @not.signature)
+  def test_signatures
+    assert_equal([Gandiva::FunctionSignature],
+                 @not.signatures.collect(&:class).uniq)
   end
 
   sub_test_case("equal") do
     def test_true
       assert do
-        @not == @registry.lookup(@not.signature)
+        @not == @registry.lookup(@not.signatures[0])
       end
     end
 
@@ -52,11 +52,14 @@ class TestGandivaNativeFunction < Test::Unit::TestCase
   end
 
   def test_to_string
-    assert_equal(@not.signature.to_s,
-                 @not.to_s)
+    modulo = lookup("modulo",
+                    [int64_data_type, int64_data_type],
+                    int64_data_type)
+    assert_equal(modulo.signatures.collect(&:to_s).join(", "),
+                 modulo.to_s)
   end
 
-  sub_test_case("get_result_nullbale_type") do
+  sub_test_case("get_result_nullable_type") do
     def test_if_null
       assert_equal(Gandiva::ResultNullableType::IF_NULL,
                    @not.result_nullable_type)

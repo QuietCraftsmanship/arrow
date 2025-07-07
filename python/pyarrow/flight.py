@@ -15,29 +15,55 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from __future__ import absolute_import
-
-import sys
-
-if sys.version_info < (3,):
-    raise ImportError("Python Flight bindings require Python 3")
-
-from pyarrow._flight import (  # noqa
-    Action,
-    ActionType,
-    CertKeyPair,
-    DescriptorType,
-    FlightCallOptions,
-    FlightClient,
-    FlightDescriptor,
-    FlightEndpoint,
-    FlightInfo,
-    FlightServerBase,
-    GeneratorStream,
-    Location,
-    Ticket,
-    RecordBatchStream,
-    Result,
-    ClientAuthHandler,
-    ServerAuthHandler,
-)
+try:
+    from pyarrow._flight import (  # noqa:F401
+        connect,
+        Action,
+        ActionType,
+        BasicAuth,
+        CallInfo,
+        CertKeyPair,
+        ClientAuthHandler,
+        ClientMiddleware,
+        ClientMiddlewareFactory,
+        DescriptorType,
+        FlightCallOptions,
+        FlightCancelledError,
+        FlightClient,
+        FlightDataStream,
+        FlightDescriptor,
+        FlightEndpoint,
+        FlightError,
+        FlightInfo,
+        FlightInternalError,
+        FlightMetadataReader,
+        FlightMetadataWriter,
+        FlightMethod,
+        FlightServerBase,
+        FlightServerError,
+        FlightStreamChunk,
+        FlightStreamReader,
+        FlightStreamWriter,
+        FlightTimedOutError,
+        FlightUnauthenticatedError,
+        FlightUnauthorizedError,
+        FlightUnavailableError,
+        FlightWriteSizeExceededError,
+        GeneratorStream,
+        Location,
+        MetadataRecordBatchReader,
+        MetadataRecordBatchWriter,
+        RecordBatchStream,
+        Result,
+        SchemaResult,
+        ServerAuthHandler,
+        ServerCallContext,
+        ServerMiddleware,
+        ServerMiddlewareFactory,
+        Ticket,
+        TracingServerMiddlewareFactory,
+    )
+except ImportError as exc:
+    raise ImportError(
+        f"The pyarrow installation is not built with support for 'flight' ({str(exc)})"
+    ) from None

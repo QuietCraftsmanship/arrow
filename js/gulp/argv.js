@@ -15,21 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const fs = require('fs');
-const glob = require('glob');
-const path = require('path');
-
-const argv = require(`command-line-args`)([
+import args from 'command-line-args';
+export const argv = args([
     { name: `all`, type: Boolean },
     { name: 'verbose', alias: `v`, type: Boolean },
     { name: `target`, type: String, defaultValue: `` },
     { name: `module`, type: String, defaultValue: `` },
     { name: `coverage`, type: Boolean, defaultValue: false },
+    { name: `tests`, type: String, multiple: true, defaultValue: [`test/unit/`] },
     { name: `targets`, alias: `t`, type: String, multiple: true, defaultValue: [] },
     { name: `modules`, alias: `m`, type: String, multiple: true, defaultValue: [] },
 ], { partial: true });
 
-const { targets, modules } = argv;
+export const { targets, modules } = argv;
 
 if (argv.target === `src`) {
     argv.target && !targets.length && targets.push(argv.target);
@@ -39,5 +37,3 @@ if (argv.target === `src`) {
     (argv.all || !targets.length) && targets.push(`all`);
     (argv.all || !modules.length) && modules.push(`all`);
 }
-
-module.exports = { argv, targets, modules };

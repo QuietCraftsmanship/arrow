@@ -15,57 +15,99 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This API is EXPERIMENTAL.
+
 #pragma once
 
 #include <memory>
 #include <vector>
 
+#include "arrow/compute/type_fwd.h"  // IWYU pragma: export
 #include "arrow/dataset/visibility.h"
-#include "arrow/type_fwd.h"  // IWYU pragma: export
+#include "arrow/filesystem/type_fwd.h"  // IWYU pragma: export
+#include "arrow/type_fwd.h"             // IWYU pragma: export
 
 namespace arrow {
-
-namespace fs {
-
-class FileSystem;
-
-}  // namespace fs
-
 namespace dataset {
 
 class Dataset;
-class DataFragment;
-class DataSource;
-struct DataSelector;
-using DataFragmentIterator = Iterator<std::shared_ptr<DataFragment>>;
-using DataFragmentVector = std::vector<std::shared_ptr<DataFragment>>;
+class DatasetFactory;
+using DatasetVector = std::vector<std::shared_ptr<Dataset>>;
 
-struct DiscoveryOptions;
+class UnionDataset;
+class UnionDatasetFactory;
 
-class FileBasedDataFragment;
+class Fragment;
+using FragmentIterator = Iterator<std::shared_ptr<Fragment>>;
+using FragmentVector = std::vector<std::shared_ptr<Fragment>>;
+
+class FragmentScanOptions;
+
+class FileSource;
 class FileFormat;
-class FileScanOptions;
+class FileFragment;
+class FileWriter;
 class FileWriteOptions;
+class FileSystemDataset;
+class FileSystemDatasetFactory;
+struct FileSystemDatasetWriteOptions;
+class WriteNodeOptions;
 
-class Filter;
-using FilterVector = std::vector<std::shared_ptr<Filter>>;
+/// \brief Controls what happens if files exist in an output directory during a dataset
+/// write
+enum class ExistingDataBehavior : int8_t {
+  /// Deletes all files in a directory the first time that directory is encountered
+  kDeleteMatchingPartitions,
+  /// Ignores existing files, overwriting any that happen to have the same name as an
+  /// output file
+  kOverwriteOrIgnore,
+  /// Returns an error if there are any files or subdirectories in the output directory
+  kError,
+};
 
-class Partition;
-class PartitionKey;
-class PartitionScheme;
-using PartitionVector = std::vector<std::shared_ptr<Partition>>;
-using PartitionIterator = Iterator<std::shared_ptr<Partition>>;
+class InMemoryDataset;
 
-struct ScanContext;
-class ScanOptions;
+class CsvFileFormat;
+class CsvFileWriter;
+class CsvFileWriteOptions;
+struct CsvFragmentScanOptions;
+
+class JsonFileFormat;
+class JsonFileWriter;
+class JsonFileWriteOptions;
+struct JsonFragmentScanOptions;
+
+class IpcFileFormat;
+class IpcFileWriter;
+class IpcFileWriteOptions;
+class IpcFragmentScanOptions;
+
+class ParquetFileFormat;
+class ParquetFileFragment;
+class ParquetFragmentScanOptions;
+class ParquetFileWriter;
+class ParquetFileWriteOptions;
+
+class Partitioning;
+class PartitioningFactory;
+class PartitioningOrFactory;
+struct KeyValuePartitioningOptions;
+class DirectoryPartitioning;
+class HivePartitioning;
+struct HivePartitioningOptions;
+class FilenamePartitioning;
+struct FilenamePartitioningOptions;
+
+class ScanNodeOptions;
+struct ScanOptions;
+
 class Scanner;
-class ScannerBuilder;
-class ScanTask;
-using ScanTaskIterator = Iterator<std::unique_ptr<ScanTask>>;
 
-class DatasetWriter;
-class WriteContext;
-class WriteOptions;
+class ScannerBuilder;
+
+class ScanTask;
+using ScanTaskVector = std::vector<std::shared_ptr<ScanTask>>;
+using ScanTaskIterator = Iterator<std::shared_ptr<ScanTask>>;
 
 }  // namespace dataset
 }  // namespace arrow

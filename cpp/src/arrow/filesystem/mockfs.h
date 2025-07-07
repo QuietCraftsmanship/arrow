@@ -20,35 +20,35 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "arrow/filesystem/filesystem.h"
+#include "arrow/util/windows_fixup.h"
 
-namespace arrow {
-namespace fs {
-namespace internal {
+namespace arrow::fs::internal {
 
-struct DirInfo {
+struct MockDirInfo {
   std::string full_path;
   TimePoint mtime;
 
-  bool operator==(const DirInfo& other) const {
+  bool operator==(const MockDirInfo& other) const {
     return mtime == other.mtime && full_path == other.full_path;
   }
 
-  friend ARROW_EXPORT std::ostream& operator<<(std::ostream&, const DirInfo&);
+  ARROW_FRIEND_EXPORT friend std::ostream& operator<<(std::ostream&, const MockDirInfo&);
 };
 
-struct FileInfo {
+struct MockFileInfo {
   std::string full_path;
   TimePoint mtime;
-  std::string data;
+  std::string_view data;
 
-  bool operator==(const FileInfo& other) const {
+  bool operator==(const MockFileInfo& other) const {
     return mtime == other.mtime && full_path == other.full_path && data == other.data;
   }
 
-  friend ARROW_EXPORT std::ostream& operator<<(std::ostream&, const FileInfo&);
+  ARROW_FRIEND_EXPORT friend std::ostream& operator<<(std::ostream&, const MockFileInfo&);
 };
 
 /// A mock FileSystem implementation that holds its contents in memory.
@@ -57,18 +57,31 @@ struct FileInfo {
 /// and bootstrapping FileSystem-based APIs.
 class ARROW_EXPORT MockFileSystem : public FileSystem {
  public:
-  explicit MockFileSystem(TimePoint current_time);
+  explicit MockFileSystem(TimePoint current_time,
+                          const io::IOContext& = io::default_io_context());
   ~MockFileSystem() override;
 
-  // XXX It's not very practical to have to explicitly declare inheritance
-  // of default overrides.
-  using FileSystem::GetTargetStats;
-  Status GetTargetStats(const std::string& path, FileStats* out) override;
-  Status GetTargetStats(const Selector& select, std::vector<FileStats>* out) override;
+  std::string type_name() const override { return "mock"; }
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  bool Equals(const FileSystem& other) const override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
+
+  /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
+  using FileSystem::GetFileInfo;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
+  /// \endcond
+
+  Result<FileInfo> GetFileInfo(const std::string& path) override;
+  Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
+
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -76,22 +89,30 @@ class ARROW_EXPORT MockFileSystem : public FileSystem {
 
   Status CopyFile(const std::string& src, const std::string& dest) override;
 
-  Status OpenInputStream(const std::string& path,
-                         std::shared_ptr<io::InputStream>* out) override;
-
-  Status OpenInputFile(const std::string& path,
-                       std::shared_ptr<io::RandomAccessFile>* out) override;
-
-  Status OpenOutputStream(const std::string& path,
-                          std::shared_ptr<io::OutputStream>* out) override;
-
-  Status OpenAppendStream(const std::string& path,
-                          std::shared_ptr<io::OutputStream>* out) override;
+  Result<std::shared_ptr<io::InputStream>> OpenInputStream(
+      const std::string& path) override;
+  Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
+      const std::string& path) override;
+  Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
+  Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
   // Contents-dumping helpers to ease testing.
   // Output is lexicographically-ordered by full path.
-  std::vector<DirInfo> AllDirs();
-  std::vector<FileInfo> AllFiles();
+  std::vector<MockDirInfo> AllDirs();
+  std::vector<MockFileInfo> AllFiles();
+
+  // Create a File with a content from a string.
+  Status CreateFile(const std::string& path, std::string_view content,
+                    bool recursive = true);
+
+  // Create a MockFileSystem out of (empty) FileInfo. The content of every
+  // file is empty and of size 0. All directories will be created recursively.
+  static Result<std::shared_ptr<FileSystem>> Make(TimePoint current_time,
+                                                  const std::vector<FileInfo>& infos);
 
   class Impl;
 
@@ -99,6 +120,15 @@ class ARROW_EXPORT MockFileSystem : public FileSystem {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace internal
-}  // namespace fs
-}  // namespace arrow
+class ARROW_EXPORT MockAsyncFileSystem : public MockFileSystem {
+ public:
+  explicit MockAsyncFileSystem(TimePoint current_time,
+                               const io::IOContext& io_context = io::default_io_context())
+      : MockFileSystem(current_time, io_context) {
+    default_async_is_sync_ = false;
+  }
+
+  FileInfoGenerator GetFileInfoGenerator(const FileSelector& select) override;
+};
+
+}  // namespace arrow::fs::internal

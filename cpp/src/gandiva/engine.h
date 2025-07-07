@@ -15,99 +15,123 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_ENGINE_H
-#define GANDIVA_ENGINE_H
+#pragma once
 
+#include <cinttypes>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "arrow/status.h"
-#include "arrow/util/macros.h"
+#include <llvm/Analysis/TargetTransformInfo.h>
 
+#include "arrow/util/logging.h"
+#include "arrow/util/macros.h"
 #include "gandiva/configuration.h"
+#include "gandiva/gandiva_object_cache.h"
 #include "gandiva/llvm_includes.h"
 #include "gandiva/llvm_types.h"
-#include "gandiva/logging.h"
 #include "gandiva/visibility.h"
 
-namespace gandiva {
+namespace llvm::orc {
+class LLJIT;
+}  // namespace llvm::orc
 
-class FunctionIRBuilder;
+namespace gandiva {
 
 /// \brief LLVM Execution engine wrapper.
 class GANDIVA_EXPORT Engine {
  public:
+  ~Engine();
   llvm::LLVMContext* context() { return context_.get(); }
   llvm::IRBuilder<>* ir_builder() { return ir_builder_.get(); }
-  LLVMTypes* types() { return types_.get(); }
-  llvm::Module* module() { return module_; }
+  LLVMTypes* types() { return &types_; }
+
+  /// Retrieve LLVM module in the engine.
+  /// This should only be called before `FinalizeModule` is called
+  llvm::Module* module();
 
   /// Factory method to create and initialize the engine object.
   ///
   /// \param[in] config the engine configuration
-  /// \param[out] engine the created engine
-  static Status Make(std::shared_ptr<Configuration> config,
-                     std::unique_ptr<Engine>* engine);
+  /// \param[in] cached flag to mark if the module is already compiled and cached
+  /// \param[in] object_cache an optional object_cache used for building the module
+  /// \return arrow::Result containing the created engine
+  static Result<std::unique_ptr<Engine>> Make(
+      const std::shared_ptr<Configuration>& config, bool cached,
+      std::optional<std::reference_wrapper<GandivaObjectCache>> object_cache =
+          std::nullopt);
 
   /// Add the function to the list of IR functions that need to be compiled.
   /// Compiling only the functions that are used by the module saves time.
   void AddFunctionToCompile(const std::string& fname) {
-    DCHECK(!module_finalized_);
+    ARROW_DCHECK(!module_finalized_);
     functions_to_compile_.push_back(fname);
   }
 
   /// Optimise and compile the module.
-  Status FinalizeModule(bool optimise_ir, bool dump_ir);
+  Status FinalizeModule();
+
+  /// Set LLVM ObjectCache.
+  Status SetLLVMObjectCache(GandivaObjectCache& object_cache);
 
   /// Get the compiled function corresponding to the irfunction.
-  void* CompiledFunction(llvm::Function* irFunction);
+  Result<void*> CompiledFunction(const std::string& function);
 
   // Create and add a mapping for the cpp function to make it accessible from LLVM.
   void AddGlobalMappingForFunc(const std::string& name, llvm::Type* ret_type,
                                const std::vector<llvm::Type*>& args, void* func);
 
+  /// Return the generated IR for the module.
+  const std::string& ir();
+
+  /// Load the function IRs that can be accessed in the module.
+  Status LoadFunctionIRs();
+
+  // Create a global string as a pointer with "i8*" type.
+  llvm::Constant* CreateGlobalStringPtr(const std::string& string);
+
  private:
-  /// private constructor to ensure engine is created
-  /// only through the factory.
-  Engine() : module_finalized_(false) {}
+  Engine(const std::shared_ptr<Configuration>& conf,
+         std::unique_ptr<llvm::orc::LLJIT> lljit,
+         std::unique_ptr<llvm::TargetMachine> target_machine, bool cached);
 
-  /// do one time inits.
+  // Post construction init. This _must_ be called after the constructor.
+  Status Init();
+
   static void InitOnce();
-  static bool init_once_done_;
-
-  llvm::ExecutionEngine& execution_engine() { return *execution_engine_.get(); }
 
   /// load pre-compiled IR modules from precompiled_bitcode.cc and merge them into
   /// the main module.
   Status LoadPreCompiledIR();
 
+  // load external pre-compiled bitcodes into module
+  Status LoadExternalPreCompiledIR();
+
   // Create and add mappings for cpp functions that can be accessed from LLVM.
-  void AddGlobalMappings();
+  arrow::Status AddGlobalMappings();
 
   // Remove unused functions to reduce compile time.
   Status RemoveUnusedFunctions();
 
-  /// dump the IR code to stdout with the prefix string.
-  void DumpIR(std::string prefix);
-
   std::unique_ptr<llvm::LLVMContext> context_;
-  std::unique_ptr<llvm::ExecutionEngine> execution_engine_;
-  std::unique_ptr<LLVMTypes> types_;
+  std::unique_ptr<llvm::orc::LLJIT> lljit_;
   std::unique_ptr<llvm::IRBuilder<>> ir_builder_;
-  llvm::Module* module_;  // This is owned by the execution_engine_, so doesn't need to be
-                          // explicitly deleted.
+  std::unique_ptr<llvm::Module> module_;
+  LLVMTypes types_;
 
   std::vector<std::string> functions_to_compile_;
 
-  bool module_finalized_;
-  std::string llvm_error_;
-
-  static std::set<std::string> loaded_libs_;
-  static std::mutex mtx_;
+  bool optimize_ = true;
+  bool module_finalized_ = false;
+  bool cached_;
+  bool functions_loaded_ = false;
+  std::shared_ptr<FunctionRegistry> function_registry_;
+  std::string module_ir_;
+  std::unique_ptr<llvm::TargetMachine> target_machine_;
+  const std::shared_ptr<Configuration> conf_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_ENGINE_H

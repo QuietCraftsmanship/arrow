@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Internal header.  Platform-specific definitions for gRPC.
+// Internal header. Platform-specific definitions for Flight.
 
 #pragma once
 
@@ -24,9 +24,8 @@
 // The protobuf documentation says that C4251 warnings when using the
 // library are spurious and suppressed when the build the library and
 // compiler, but must be also suppressed in downstream projects
-#pragma warning(disable : 4251)
+#  pragma warning(disable : 4251)
 
 #endif  // _MSC_VER
 
-#include "arrow/util/config.h"                 // IWYU pragma: keep
-#include "arrow/util/windows_compatibility.h"  // IWYU pragma: keep
+#include "arrow/util/config.h"  // IWYU pragma: keep

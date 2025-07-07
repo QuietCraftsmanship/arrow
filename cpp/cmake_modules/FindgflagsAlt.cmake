@@ -15,22 +15,41 @@
 # specific language governing permissions and limitations
 # under the License.
 
+if(gflagsAlt_FOUND)
+  return()
+endif()
+
+set(find_package_args)
+if(gflagsAlt_FIND_VERSION)
+  list(APPEND find_package_args ${gflagsAlt_FIND_VERSION})
+endif()
+if(gflagsAlt_FIND_QUIETLY)
+  list(APPEND find_package_args QUIET)
+endif()
+find_package(gflags ${find_package_args})
+if(gflags_FOUND)
+  set(gflagsAlt_FOUND TRUE)
+  return()
+endif()
+
+# TODO: Support version detection.
+
 if(gflags_ROOT)
   find_library(gflags_LIB
                NAMES gflags
                PATHS ${gflags_ROOT}
-               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+               PATH_SUFFIXES ${ARROW_LIBRARY_PATH_SUFFIXES}
                NO_DEFAULT_PATH)
   find_path(GFLAGS_INCLUDE_DIR
             NAMES gflags/gflags.h
             PATHS ${gflags_ROOT}
             NO_DEFAULT_PATH
-            PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES})
+            PATH_SUFFIXES ${ARROW_INCLUDE_PATH_SUFFIXES})
 else()
   find_library(gflags_LIB NAMES gflags)
   find_path(GFLAGS_INCLUDE_DIR
             NAMES gflags/gflags.h
-            PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES})
+            PATH_SUFFIXES ${ARROW_INCLUDE_PATH_SUFFIXES})
 endif()
 
 find_package_handle_standard_args(gflagsAlt REQUIRED_VARS gflags_LIB GFLAGS_INCLUDE_DIR)

@@ -17,6 +17,7 @@ using Apache.Arrow.Ipc;
 using Apache.Arrow.Memory;
 using System;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -50,16 +51,19 @@ namespace Apache.Arrow.Tests
         }
 
         [Theory]
-        [InlineData(true)]
-        [InlineData(false)]
-        public async Task Ctor_MemoryPool_AllocatesFromPool(bool shouldLeaveOpen)
+        [InlineData(true, true, 2)]
+        [InlineData(true, false, 1)]
+        [InlineData(false, true, 2)]
+        [InlineData(false, false, 1)]
+        public async Task Ctor_MemoryPool_AllocatesFromPool(bool shouldLeaveOpen, bool createDictionaryArray, int expectedAllocations)
         {
-            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100);
+            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100, createDictionaryArray: createDictionaryArray);
 
             using (MemoryStream stream = new MemoryStream())
             {
                 ArrowStreamWriter writer = new ArrowStreamWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
+                await writer.WriteEndAsync();
 
                 stream.Position = 0;
 
@@ -67,7 +71,7 @@ namespace Apache.Arrow.Tests
                 ArrowStreamReader reader = new ArrowStreamReader(stream, memoryPool, shouldLeaveOpen);
                 reader.ReadNextRecordBatch();
 
-                Assert.Equal(1, memoryPool.Statistics.Allocations);
+                Assert.Equal(expectedAllocations, memoryPool.Statistics.Allocations);
                 Assert.True(memoryPool.Statistics.BytesAllocated > 0);
 
                 reader.Dispose();
@@ -83,23 +87,31 @@ namespace Apache.Arrow.Tests
             }
         }
 
-        [Fact]
-        public async Task ReadRecordBatch_Memory()
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ReadRecordBatch_Memory(bool writeEnd)
         {
             await TestReaderFromMemory((reader, originalBatch) =>
             {
+                Assert.NotNull(reader.Schema);
+
                 ArrowReaderVerifier.VerifyReader(reader, originalBatch);
                 return Task.CompletedTask;
-            });
+            }, writeEnd);
         }
 
-        [Fact]
-        public async Task ReadRecordBatchAsync_Memory()
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ReadRecordBatchAsync_Memory(bool writeEnd)
         {
-            await TestReaderFromMemory(ArrowReaderVerifier.VerifyReaderAsync);
+            await TestReaderFromMemory(ArrowReaderVerifier.VerifyReaderAsync, writeEnd);
         }
 
-        private static async Task TestReaderFromMemory(Func<ArrowStreamReader, RecordBatch, Task> verificationFunc)
+        private static async Task TestReaderFromMemory(
+            Func<ArrowStreamReader, RecordBatch, Task> verificationFunc,
+            bool writeEnd)
         {
             RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100);
 
@@ -108,6 +120,10 @@ namespace Apache.Arrow.Tests
             {
                 ArrowStreamWriter writer = new ArrowStreamWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
+                if (writeEnd)
+                {
+                    await writer.WriteEndAsync();
+                }
                 buffer = stream.GetBuffer();
             }
 
@@ -115,30 +131,44 @@ namespace Apache.Arrow.Tests
             await verificationFunc(reader, originalBatch);
         }
 
-        [Fact]
-        public async Task ReadRecordBatch_Stream()
+        [Theory]
+        [InlineData(true, true)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        [InlineData(false, false)]
+        public async Task ReadRecordBatch_Stream(bool writeEnd, bool createDictionaryArray)
         {
             await TestReaderFromStream((reader, originalBatch) =>
             {
                 ArrowReaderVerifier.VerifyReader(reader, originalBatch);
                 return Task.CompletedTask;
-            });
+            }, writeEnd, createDictionaryArray);
         }
 
-        [Fact]
-        public async Task ReadRecordBatchAsync_Stream()
+        [Theory]
+        [InlineData(true, true)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        [InlineData(false, false)]
+        public async Task ReadRecordBatchAsync_Stream(bool writeEnd, bool createDictionaryArray)
         {
-            await TestReaderFromStream(ArrowReaderVerifier.VerifyReaderAsync);
+            await TestReaderFromStream(ArrowReaderVerifier.VerifyReaderAsync, writeEnd, createDictionaryArray);
         }
 
-        private static async Task TestReaderFromStream(Func<ArrowStreamReader, RecordBatch, Task> verificationFunc)
+        private static async Task TestReaderFromStream(
+            Func<ArrowStreamReader, RecordBatch, Task> verificationFunc,
+            bool writeEnd, bool createDictionaryArray)
         {
-            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100);
+            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100, createDictionaryArray: createDictionaryArray);
 
             using (MemoryStream stream = new MemoryStream())
             {
                 ArrowStreamWriter writer = new ArrowStreamWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
+                if (writeEnd)
+                {
+                    await writer.WriteEndAsync();
+                }
 
                 stream.Position = 0;
 
@@ -147,34 +177,39 @@ namespace Apache.Arrow.Tests
             }
         }
 
-        [Fact]
-        public async Task ReadRecordBatch_PartialReadStream()
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ReadRecordBatch_PartialReadStream(bool createDictionaryArray)
         {
             await TestReaderFromPartialReadStream((reader, originalBatch) =>
             {
                 ArrowReaderVerifier.VerifyReader(reader, originalBatch);
                 return Task.CompletedTask;
-            });
+            }, createDictionaryArray);
         }
 
-        [Fact]
-        public async Task ReadRecordBatchAsync_PartialReadStream()
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ReadRecordBatchAsync_PartialReadStream(bool createDictionaryArray)
         {
-            await TestReaderFromPartialReadStream(ArrowReaderVerifier.VerifyReaderAsync);
+            await TestReaderFromPartialReadStream(ArrowReaderVerifier.VerifyReaderAsync, createDictionaryArray);
         }
 
         /// <summary>
         /// Verifies that the stream reader reads multiple times when a stream
         /// only returns a subset of the data from each Read.
         /// </summary>
-        private static async Task TestReaderFromPartialReadStream(Func<ArrowStreamReader, RecordBatch, Task> verificationFunc)
+        private static async Task TestReaderFromPartialReadStream(Func<ArrowStreamReader, RecordBatch, Task> verificationFunc, bool createDictionaryArray)
         {
-            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100);
+            RecordBatch originalBatch = TestData.CreateSampleRecordBatch(length: 100, createDictionaryArray: createDictionaryArray);
 
             using (PartialReadStream stream = new PartialReadStream())
             {
                 ArrowStreamWriter writer = new ArrowStreamWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
+                await writer.WriteEndAsync();
 
                 stream.Position = 0;
 
@@ -191,6 +226,7 @@ namespace Apache.Arrow.Tests
             // by default return 20 bytes at a time
             public int PartialReadLength { get; set; } = 20;
 
+#if NET5_0_OR_GREATER
             public override int Read(Span<byte> destination)
             {
                 if (destination.Length > PartialReadLength)
@@ -210,6 +246,17 @@ namespace Apache.Arrow.Tests
 
                 return base.ReadAsync(destination, cancellationToken);
             }
+#else
+            public override int Read(byte[] buffer, int offset, int length)
+            {
+                return base.Read(buffer, offset, Math.Min(length, PartialReadLength));
+            }
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int length, CancellationToken cancellationToken = default)
+            {
+                return base.ReadAsync(buffer, offset, Math.Min(length, PartialReadLength), cancellationToken);
+            }
+#endif
         }
     }
 }

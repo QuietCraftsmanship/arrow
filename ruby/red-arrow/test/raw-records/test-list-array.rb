@@ -39,7 +39,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:null, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_boolean
@@ -48,7 +48,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:boolean, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_int8
@@ -57,7 +57,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:int8, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_uint8
@@ -66,7 +66,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:uint8, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_int16
@@ -75,7 +75,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:int16, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_uint16
@@ -84,7 +84,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:uint16, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_int32
@@ -93,7 +93,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:int32, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_uint32
@@ -102,7 +102,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:uint32, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_int64
@@ -111,7 +111,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:int64, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_uint64
@@ -120,7 +120,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:uint64, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_float
@@ -129,7 +129,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:float, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_double
@@ -138,7 +138,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:double, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_binary
@@ -147,7 +147,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:binary, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_string
@@ -162,7 +162,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:string, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_date32
@@ -177,7 +177,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:date32, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_date64
@@ -192,7 +192,7 @@ module RawRecordsListArrayTests
       [nil],
     ]
     target = build(:date64, records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_timestamp_second
@@ -211,7 +211,7 @@ module RawRecordsListArrayTests
                      unit: :second,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_timestamp_milli
@@ -230,7 +230,7 @@ module RawRecordsListArrayTests
                      unit: :milli,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_timestamp_micro
@@ -249,7 +249,7 @@ module RawRecordsListArrayTests
                      unit: :micro,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_timestamp_nano
@@ -268,16 +268,19 @@ module RawRecordsListArrayTests
                      unit: :nano,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
-  def test_time32_test
+  def test_time32_second
+    unit = Arrow::TimeUnit::SECOND
     records = [
       [
         [
-          60 * 10, # 00:10:00
+          # 00:10:00
+          Arrow::Time.new(unit, 60 * 10),
           nil,
-          60 * 60 * 2 + 9, # 02:00:09
+          # 02:00:09
+          Arrow::Time.new(unit, 60 * 60 * 2 + 9),
         ],
       ],
       [nil],
@@ -287,16 +290,19 @@ module RawRecordsListArrayTests
                      unit: :second,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_time32_milli
+    unit = Arrow::TimeUnit::MILLI
     records = [
       [
         [
-          (60 * 10) * 1000 + 123, # 00:10:00.123
+          # 00:10:00.123
+          Arrow::Time.new(unit, (60 * 10) * 1000 + 123),
           nil,
-          (60 * 60 * 2 + 9) * 1000 + 987, # 02:00:09.987
+          # 02:00:09.987
+          Arrow::Time.new(unit, (60 * 60 * 2 + 9) * 1000 + 987),
         ],
       ],
       [nil],
@@ -306,16 +312,19 @@ module RawRecordsListArrayTests
                      unit: :milli,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_time64_micro
+    unit = Arrow::TimeUnit::MICRO
     records = [
       [
         [
-          (60 * 10) * 1_000_000 + 123_456, # 00:10:00.123456
+          # 00:10:00.123456
+          Arrow::Time.new(unit, (60 * 10) * 1_000_000 + 123_456),
           nil,
-          (60 * 60 * 2 + 9) * 1_000_000 + 987_654, # 02:00:09.987654
+          # 02:00:09.987654
+          Arrow::Time.new(unit, (60 * 60 * 2 + 9) * 1_000_000 + 987_654),
         ],
       ],
       [nil],
@@ -325,16 +334,19 @@ module RawRecordsListArrayTests
                      unit: :micro,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_time64_nano
+    unit = Arrow::TimeUnit::NANO
     records = [
       [
         [
-          (60 * 10) * 1_000_000_000 + 123_456_789, # 00:10:00.123456789
+          # 00:10:00.123456789
+          Arrow::Time.new(unit, (60 * 10) * 1_000_000_000 + 123_456_789),
           nil,
-          (60 * 60 * 2 + 9) * 1_000_000_000 + 987_654_321, # 02:00:09.987654321
+          # 02:00:09.987654321
+          Arrow::Time.new(unit, (60 * 60 * 2 + 9) * 1_000_000_000 + 987_654_321),
         ],
       ],
       [nil],
@@ -344,7 +356,7 @@ module RawRecordsListArrayTests
                      unit: :nano,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_decimal128
@@ -364,7 +376,66 @@ module RawRecordsListArrayTests
                      scale: 2,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_decimal256
+    records = [
+      [
+        [
+          BigDecimal("92.92"),
+          nil,
+          BigDecimal("29.29"),
+        ],
+      ],
+      [nil],
+    ]
+    target = build({
+                     type: :decimal256,
+                     precision: 38,
+                     scale: 2,
+                   },
+                   records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_month_interval
+    records = [
+      [[1, nil, 12]],
+      [nil],
+    ]
+    target = build(:month_interval, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_day_time_interval
+    records = [
+      [
+        [
+          {day: 1, millisecond: 100},
+          nil,
+          {day: 2, millisecond: 300},
+        ]
+      ],
+      [nil],
+    ]
+    target = build(:day_time_interval, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_month_day_nano_interval
+    records = [
+      [
+        [
+          {month: 1, day: 1, nanosecond: 100},
+          nil,
+          {month: 2, day: 3, nanosecond: 400},
+        ]
+      ],
+      [nil],
+    ]
+    target = build(:month_day_nano_interval, records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_list
@@ -392,7 +463,7 @@ module RawRecordsListArrayTests
                      },
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
   def test_struct
@@ -416,16 +487,53 @@ module RawRecordsListArrayTests
                      ],
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 
-  def test_sparse
-    omit("Need to add support for SparseUnionArrayBuilder")
+  def test_map
+    records = [
+      [
+        [
+          {"key1" => true, "key2" => nil},
+          nil,
+        ],
+      ],
+      [nil],
+    ]
+    target = build({
+                     type: :map,
+                     key: :string,
+                     item: :boolean,
+                   },
+                   records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def remove_union_field_names(records)
+    records.collect do |record|
+      record.collect do |column|
+        if column.nil?
+          column
+        else
+          column.collect do |value|
+            if value.nil?
+              value
+            else
+              value.values[0]
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_sparse_union
     records = [
       [
         [
           {"field1" => true},
           nil,
+          {"field2" => 29},
           {"field2" => nil},
         ],
       ],
@@ -446,16 +554,17 @@ module RawRecordsListArrayTests
                      type_codes: [0, 1],
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(remove_union_field_names(records),
+                 actual_records(target))
   end
 
-  def test_dense
-    omit("Need to add support for DenseUnionArrayBuilder")
+  def test_dense_union
     records = [
       [
         [
           {"field1" => true},
           nil,
+          {"field2" => 29},
           {"field2" => nil},
         ],
       ],
@@ -476,11 +585,11 @@ module RawRecordsListArrayTests
                      type_codes: [0, 1],
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(remove_union_field_names(records),
+                 actual_records(target))
   end
 
   def test_dictionary
-    omit("Need to add support for DictionaryArrayBuilder")
     records = [
       [
         [
@@ -491,23 +600,51 @@ module RawRecordsListArrayTests
       ],
       [nil],
     ]
-    dictionary = Arrow::StringArray.new(["GLib", "Ruby"])
     target = build({
                      type: :dictionary,
                      index_data_type: :int8,
-                     dictionary: dictionary,
-                     ordered: true,
+                     value_data_type: :string,
+                     ordered: false,
                    },
                    records)
-    assert_equal(records, target.raw_records)
+    assert_equal(records, actual_records(target))
   end
 end
+
+class EachRawRecordRecordBatchListArrayTest < Test::Unit::TestCase
+  include RawRecordsListArrayTests
+
+  def build(type, records)
+    Arrow::RecordBatch.new(build_schema(type), records)
+  end
+
+  def actual_records(target)
+    target.each_raw_record.to_a
+  end
+end
+
+class EachRawRecordTableListArrayTest < Test::Unit::TestCase
+  include RawRecordsListArrayTests
+
+  def build(type, records)
+    Arrow::Table.new(build_schema(type), records)
+  end
+
+  def actual_records(target)
+    target.each_raw_record.to_a
+  end
+end
+
 
 class RawRecordsRecordBatchListArrayTest < Test::Unit::TestCase
   include RawRecordsListArrayTests
 
   def build(type, records)
     Arrow::RecordBatch.new(build_schema(type), records)
+  end
+
+  def actual_records(target)
+    target.raw_records
   end
 end
 
@@ -516,5 +653,9 @@ class RawRecordsTableListArrayTest < Test::Unit::TestCase
 
   def build(type, records)
     Arrow::Table.new(build_schema(type), records)
+  end
+
+  def actual_records(target)
+    target.raw_records
   end
 end

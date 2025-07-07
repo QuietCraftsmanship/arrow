@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { DataType } from '../../type';
-import { Duplex, DuplexOptions } from 'stream';
-import { RecordBatch } from '../../recordbatch';
-import { AsyncByteQueue } from '../../io/stream';
-import { RecordBatchReader } from '../../ipc/reader';
+import { Duplex, DuplexOptions } from 'node:stream';
+import { AsyncByteQueue } from '../../io/stream.js';
+import { RecordBatchReader } from '../../ipc/reader.js';
+import { RecordBatch } from '../../recordbatch.js';
+import { TypeMap } from '../../type.js';
 
 /** @ignore */
-export function recordBatchReaderThroughNodeStream<T extends { [key: string]: DataType } = any>(options?: DuplexOptions & { autoDestroy: boolean }) {
+export function recordBatchReaderThroughNodeStream<T extends TypeMap = any>(options?: DuplexOptions & { autoDestroy: boolean }) {
     return new RecordBatchReaderDuplex<T>(options);
 }
 
@@ -30,9 +30,9 @@ export function recordBatchReaderThroughNodeStream<T extends { [key: string]: Da
 type CB = (error?: Error | null | undefined) => void;
 
 /** @ignore */
-class RecordBatchReaderDuplex<T extends { [key: string]: DataType } = any> extends Duplex {
-    private _pulling: boolean = false;
-    private _autoDestroy: boolean = true;
+class RecordBatchReaderDuplex<T extends TypeMap = any> extends Duplex {
+    private _pulling = false;
+    private _autoDestroy = true;
     private _reader: RecordBatchReader | null;
     private _asyncQueue: AsyncByteQueue | null;
     constructor(options?: DuplexOptions & { autoDestroy: boolean }) {
@@ -44,12 +44,12 @@ class RecordBatchReaderDuplex<T extends { [key: string]: DataType } = any> exten
     }
     _final(cb?: CB) {
         const aq = this._asyncQueue;
-        aq && aq.close();
+        aq?.close();
         cb && cb();
     }
     _write(x: any, _: string, cb: CB) {
         const aq = this._asyncQueue;
-        aq && aq.write(x);
+        aq?.write(x);
         cb && cb();
         return true;
     }
@@ -75,9 +75,9 @@ class RecordBatchReaderDuplex<T extends { [key: string]: DataType } = any> exten
     async _pull(size: number, reader: RecordBatchReader<T>) {
         let r: IteratorResult<RecordBatch<T>> | null = null;
         while (this.readable && !(r = await reader.next()).done) {
-            if (!this.push(r.value) || (size != null && --size <= 0)) { break; }
+            if (!this.push(r!.value) || (size != null && --size <= 0)) { break; }
         }
-        if (!this.readable || (r && r.done && (reader.autoDestroy || (await reader.reset().open()).closed))) {
+        if (!this.readable || (r?.done && (reader.autoDestroy || (await reader.reset().open()).closed))) {
             this.push(null);
             await reader.cancel();
         }

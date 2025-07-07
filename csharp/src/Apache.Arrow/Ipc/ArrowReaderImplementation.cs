@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using FlatBuffers;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -21,13 +20,44 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Apache.Arrow.Flatbuf;
+using Apache.Arrow.Types;
+using Apache.Arrow.Memory;
+using Google.FlatBuffers;
+using Type = System.Type;
 
 namespace Apache.Arrow.Ipc
 {
     internal abstract class ArrowReaderImplementation : IDisposable
     {
-        public Schema Schema { get; protected set; }
-        protected bool HasReadSchema => Schema != null;
+        public Schema Schema
+        {
+            get
+            {
+                if (!HasReadSchema)
+                {
+                    ReadSchema();
+                }
+                return _schema;
+            }
+        }
+
+        protected internal bool HasReadSchema => _schema != null;
+
+        private protected DictionaryMemo _dictionaryMemo;
+        private protected DictionaryMemo DictionaryMemo => _dictionaryMemo ??= new DictionaryMemo();
+        private protected readonly MemoryAllocator _allocator;
+        private readonly ICompressionCodecFactory _compressionCodecFactory;
+        private protected Schema _schema;
+
+        private protected ArrowReaderImplementation() : this(null, null)
+        { }
+
+        private protected ArrowReaderImplementation(MemoryAllocator allocator, ICompressionCodecFactory compressionCodecFactory)
+        {
+            _allocator = allocator ?? MemoryAllocator.Default.Value;
+            _compressionCodecFactory = compressionCodecFactory;
+        }
 
         public void Dispose()
         {
@@ -39,14 +69,17 @@ namespace Apache.Arrow.Ipc
         {
         }
 
+        public abstract ValueTask ReadSchemaAsync(CancellationToken cancellationToken);
+        public abstract void ReadSchema();
+
         public abstract ValueTask<RecordBatch> ReadNextRecordBatchAsync(CancellationToken cancellationToken);
         public abstract RecordBatch ReadNextRecordBatch();
 
-        protected static T ReadMessage<T>(ByteBuffer bb)
+        internal static T ReadMessage<T>(ByteBuffer bb)
             where T : struct, IFlatbufferObject
         {
-            var returnType = typeof(T);
-            var msg = Flatbuf.Message.GetRootAsMessage(bb);
+            Type returnType = typeof(T);
+            Flatbuf.Message msg = Flatbuf.Message.GetRootAsMessage(bb);
 
             if (MatchEnum(msg.HeaderType, returnType))
             {
@@ -78,6 +111,16 @@ namespace Apache.Arrow.Ipc
             }
         }
 
+        /// <summary>
+        /// Create a record batch or dictionary batch from Flatbuf.Message.
+        /// </summary>
+        /// <remarks>
+        /// This method adds data to _dictionaryMemo and returns null when the message type is DictionaryBatch.
+        /// </remarks>>
+        /// <returns>
+        /// The record batch when the message type is RecordBatch.
+        /// Null when the message type is not RecordBatch.
+        /// </returns>
         protected RecordBatch CreateArrowObjectFromMessage(
             Flatbuf.Message message, ByteBuffer bodyByteBuffer, IMemoryOwner<byte> memoryOwner)
         {
@@ -87,12 +130,12 @@ namespace Apache.Arrow.Ipc
                     // TODO: Read schema and verify equality?
                     break;
                 case Flatbuf.MessageHeader.DictionaryBatch:
-                    // TODO: not supported currently
-                    Debug.WriteLine("Dictionaries are not yet supported.");
+                    Flatbuf.DictionaryBatch dictionaryBatch = message.Header<Flatbuf.DictionaryBatch>().Value;
+                    ReadDictionaryBatch(message.Version, dictionaryBatch, bodyByteBuffer, memoryOwner);
                     break;
                 case Flatbuf.MessageHeader.RecordBatch:
-                    var rb = message.Header<Flatbuf.RecordBatch>().Value;
-                    List<IArrowArray> arrays = BuildArrays(Schema, bodyByteBuffer, rb);
+                    Flatbuf.RecordBatch rb = message.Header<Flatbuf.RecordBatch>().Value;
+                    List<IArrowArray> arrays = BuildArrays(message.Version, Schema, bodyByteBuffer, rb);
                     return new RecordBatch(Schema, memoryOwner, arrays, (int)rb.Length);
                 default:
                     // NOTE: Skip unsupported message type
@@ -108,44 +151,108 @@ namespace Apache.Arrow.Ipc
             return new ByteBuffer(new ReadOnlyMemoryBufferAllocator(buffer), 0);
         }
 
+        private void ReadDictionaryBatch(
+            MetadataVersion version,
+            Flatbuf.DictionaryBatch dictionaryBatch,
+            ByteBuffer bodyByteBuffer,
+            IMemoryOwner<byte> memoryOwner)
+        {
+            long id = dictionaryBatch.Id;
+            IArrowType valueType = DictionaryMemo.GetDictionaryType(id);
+            Flatbuf.RecordBatch? recordBatch = dictionaryBatch.Data;
+
+            if (!recordBatch.HasValue)
+            {
+                throw new InvalidDataException("Dictionary must contain RecordBatch");
+            }
+
+            Field valueField = new Field("dummy", valueType, true);
+            var schema = new Schema(new[] { valueField }, default);
+            IList<IArrowArray> arrays = BuildArrays(version, schema, bodyByteBuffer, recordBatch.Value);
+
+            if (arrays.Count != 1)
+            {
+                throw new InvalidDataException("Dictionary record batch must contain only one field");
+            }
+
+            if (dictionaryBatch.IsDelta)
+            {
+                DictionaryMemo.AddDeltaDictionary(id, arrays[0], _allocator);
+            }
+            else
+            {
+                DictionaryMemo.AddOrReplaceDictionary(id, arrays[0]);
+            }
+        }
+
         private List<IArrowArray> BuildArrays(
+            MetadataVersion version,
             Schema schema,
             ByteBuffer messageBuffer,
             Flatbuf.RecordBatch recordBatchMessage)
         {
             var arrays = new List<IArrowArray>(recordBatchMessage.NodesLength);
-            int bufferIndex = 0;
 
-            for (var n = 0; n < recordBatchMessage.NodesLength; n++)
+            if (recordBatchMessage.NodesLength == 0)
             {
-                Field field = schema.GetFieldByIndex(n);
-                Flatbuf.FieldNode fieldNode = recordBatchMessage.Nodes(n).GetValueOrDefault();
+                return arrays;
+            }
 
-                ArrayData arrayData = field.DataType.IsFixedPrimitive() ?
-                    LoadPrimitiveField(field, fieldNode, recordBatchMessage, messageBuffer, ref bufferIndex) :
-                    LoadVariableField(field, fieldNode, recordBatchMessage, messageBuffer, ref bufferIndex);
+            using var bufferCreator = GetBufferCreator(recordBatchMessage.Compression);
+            var recordBatchEnumerator = new RecordBatchEnumerator(in recordBatchMessage);
+            int schemaFieldIndex = 0;
+            do
+            {
+                Field field = schema.GetFieldByIndex(schemaFieldIndex++);
+                Flatbuf.FieldNode fieldNode = recordBatchEnumerator.CurrentNode;
+
+                ArrayData arrayData = LoadField(version, ref recordBatchEnumerator, field, in fieldNode, messageBuffer, bufferCreator);
 
                 arrays.Add(ArrowArrayFactory.BuildArray(arrayData));
-            }
+            } while (recordBatchEnumerator.MoveNextNode());
 
             return arrays;
         }
 
-        private ArrayData LoadPrimitiveField(
-            Field field,
-            Flatbuf.FieldNode fieldNode,
-            Flatbuf.RecordBatch recordBatch,
-            ByteBuffer bodyData,
-            ref int bufferIndex)
+        private IBufferCreator GetBufferCreator(BodyCompression? compression)
         {
-            var nullBitmapBuffer = recordBatch.Buffers(bufferIndex++).GetValueOrDefault();
-            var valueBuffer = recordBatch.Buffers(bufferIndex++).GetValueOrDefault();
+            if (!compression.HasValue)
+            {
+                return NoOpBufferCreator.Instance;
+            }
 
-            ArrowBuffer nullArrowBuffer = BuildArrowBuffer(bodyData, nullBitmapBuffer);
-            ArrowBuffer valueArrowBuffer = BuildArrowBuffer(bodyData, valueBuffer);
+            var method = compression.Value.Method;
+            if (method != BodyCompressionMethod.BUFFER)
+            {
+                throw new NotImplementedException($"Compression method {method} is not supported");
+            }
 
-            var fieldLength = (int)fieldNode.Length;
-            var fieldNullCount = (int)fieldNode.NullCount;
+            var codec = compression.Value.Codec;
+            if (_compressionCodecFactory == null)
+            {
+                throw new Exception(
+                    $"Body is compressed with codec {codec} but no {nameof(ICompressionCodecFactory)} has been configured to decompress buffers");
+            }
+            var decompressor = codec switch
+            {
+                Apache.Arrow.Flatbuf.CompressionType.LZ4_FRAME => _compressionCodecFactory.CreateCodec(CompressionCodecType.Lz4Frame),
+                Apache.Arrow.Flatbuf.CompressionType.ZSTD => _compressionCodecFactory.CreateCodec(CompressionCodecType.Zstd),
+                _ => throw new NotImplementedException($"Compression codec {codec} is not supported")
+            };
+            return new DecompressingBufferCreator(decompressor, _allocator);
+        }
+
+        private ArrayData LoadField(
+            MetadataVersion version,
+            ref RecordBatchEnumerator recordBatchEnumerator,
+            Field field,
+            in Flatbuf.FieldNode fieldNode,
+            ByteBuffer bodyData,
+            IBufferCreator bufferCreator)
+        {
+
+            int fieldLength = (int)fieldNode.Length;
+            int fieldNullCount = (int)fieldNode.NullCount;
 
             if (fieldLength < 0)
             {
@@ -154,48 +261,93 @@ namespace Apache.Arrow.Ipc
 
             if (fieldNullCount < 0)
             {
-                throw new InvalidDataException("Null count length must be >= 0"); // TODO:Localize exception message
+                throw new InvalidDataException("Null count must be >= 0"); // TODO:Localize exception message
             }
 
-            var arrowBuff = new[] { nullArrowBuffer, valueArrowBuffer };
+            int buffers;
+            switch (field.DataType.TypeId)
+            {
+                case ArrowTypeId.Null:
+                    return new ArrayData(field.DataType, fieldLength, fieldNullCount, 0, System.Array.Empty<ArrowBuffer>());
+                case ArrowTypeId.Union:
+                    if (version < MetadataVersion.V5)
+                    {
+                        if (fieldNullCount > 0)
+                        {
+                            if (recordBatchEnumerator.CurrentBuffer.Length > 0)
+                            {
+                                // With older metadata we can get a validity bitmap. Fixing up union data is hard,
+                                // so we will just quit.
+                                throw new NotSupportedException("Cannot read pre-1.0.0 Union array with top-level validity bitmap");
+                            }
+                        }
+                        recordBatchEnumerator.MoveNextBuffer();
+                    }
+                    buffers = ((UnionType)field.DataType).Mode == Types.UnionMode.Dense ? 2 : 1;
+                    break;
+                case ArrowTypeId.Struct:
+                case ArrowTypeId.FixedSizeList:
+                    buffers = 1;
+                    break;
+                case ArrowTypeId.String:
+                case ArrowTypeId.Binary:
+                case ArrowTypeId.LargeString:
+                case ArrowTypeId.LargeBinary:
+                case ArrowTypeId.ListView:
+                    buffers = 3;
+                    break;
+                case ArrowTypeId.StringView:
+                case ArrowTypeId.BinaryView:
+                    buffers = checked((int)(2 + recordBatchEnumerator.CurrentVariadicCount));
+                    recordBatchEnumerator.MoveNextVariadicCount();
+                    break;
+                default:
+                    buffers = 2;
+                    break;
+            }
 
-            return new ArrayData(field.DataType, fieldLength, fieldNullCount, 0, arrowBuff);
+            ArrowBuffer[] arrowBuff = new ArrowBuffer[buffers];
+            for (int i = 0; i < buffers; i++)
+            {
+                arrowBuff[i] = BuildArrowBuffer(bodyData, recordBatchEnumerator.CurrentBuffer, bufferCreator);
+                recordBatchEnumerator.MoveNextBuffer();
+            }
+
+            ArrayData[] children = GetChildren(version, ref recordBatchEnumerator, field, bodyData, bufferCreator);
+
+            IArrowArray dictionary = null;
+            if (field.DataType.TypeId == ArrowTypeId.Dictionary)
+            {
+                long id = DictionaryMemo.GetId(field);
+                dictionary = DictionaryMemo.GetDictionary(id);
+            }
+
+            return new ArrayData(field.DataType, fieldLength, fieldNullCount, 0, arrowBuff, children, dictionary?.Data);
         }
 
-        private ArrayData LoadVariableField(
+        private ArrayData[] GetChildren(
+            MetadataVersion version,
+            ref RecordBatchEnumerator recordBatchEnumerator,
             Field field,
-            Flatbuf.FieldNode fieldNode,
-            Flatbuf.RecordBatch recordBatch,
             ByteBuffer bodyData,
-            ref int bufferIndex)
+            IBufferCreator bufferCreator)
         {
-            var nullBitmapBuffer = recordBatch.Buffers(bufferIndex++).GetValueOrDefault();
-            var offsetBuffer = recordBatch.Buffers(bufferIndex++).GetValueOrDefault();
-            var valueBuffer = recordBatch.Buffers(bufferIndex++).GetValueOrDefault();
+            if (!(field.DataType is NestedType type)) return null;
 
-            ArrowBuffer nullArrowBuffer = BuildArrowBuffer(bodyData, nullBitmapBuffer);
-            ArrowBuffer offsetArrowBuffer = BuildArrowBuffer(bodyData, offsetBuffer);
-            ArrowBuffer valueArrowBuffer = BuildArrowBuffer(bodyData, valueBuffer);
-
-            var fieldLength = (int)fieldNode.Length;
-            var fieldNullCount = (int)fieldNode.NullCount;
-
-            if (fieldLength < 0)
+            int childrenCount = type.Fields.Count;
+            var children = new ArrayData[childrenCount];
+            for (int index = 0; index < childrenCount; index++)
             {
-                throw new InvalidDataException("Field length must be >= 0"); // TODO: Localize exception message
+                recordBatchEnumerator.MoveNextNode();
+                Flatbuf.FieldNode childFieldNode = recordBatchEnumerator.CurrentNode;
+
+                Field childField = type.Fields[index];
+                children[index] = LoadField(version, ref recordBatchEnumerator, childField, in childFieldNode, bodyData, bufferCreator);
             }
-
-            if (fieldNullCount < 0)
-            {
-                throw new InvalidDataException("Null count length must be >= 0"); //TODO: Localize exception message
-            }
-
-            var arrowBuff = new[] { nullArrowBuffer, offsetArrowBuffer, valueArrowBuffer };
-
-            return new ArrayData(field.DataType, fieldLength, fieldNullCount, 0, arrowBuff);
+            return children;
         }
 
-        private ArrowBuffer BuildArrowBuffer(ByteBuffer bodyData, Flatbuf.Buffer buffer)
+        private ArrowBuffer BuildArrowBuffer(ByteBuffer bodyData, Flatbuf.Buffer buffer, IBufferCreator bufferCreator)
         {
             if (buffer.Length <= 0)
             {
@@ -206,7 +358,44 @@ namespace Apache.Arrow.Ipc
             int length = (int)buffer.Length;
 
             var data = bodyData.ToReadOnlyMemory(offset, length);
-            return new ArrowBuffer(data);
+            return bufferCreator.CreateBuffer(data);
+        }
+    }
+
+    internal struct RecordBatchEnumerator
+    {
+        private Flatbuf.RecordBatch RecordBatch { get; }
+        internal int CurrentBufferIndex { get; private set; }
+        internal int CurrentNodeIndex { get; private set; }
+        internal int CurrentVariadicCountIndex { get; private set; }
+
+        internal Flatbuf.Buffer CurrentBuffer => RecordBatch.Buffers(CurrentBufferIndex).GetValueOrDefault();
+
+        internal Flatbuf.FieldNode CurrentNode => RecordBatch.Nodes(CurrentNodeIndex).GetValueOrDefault();
+
+        internal long CurrentVariadicCount => RecordBatch.VariadicBufferCounts(CurrentVariadicCountIndex);
+
+        internal bool MoveNextBuffer()
+        {
+            return ++CurrentBufferIndex < RecordBatch.BuffersLength;
+        }
+
+        internal bool MoveNextNode()
+        {
+            return ++CurrentNodeIndex < RecordBatch.NodesLength;
+        }
+
+        internal bool MoveNextVariadicCount()
+        {
+            return ++CurrentVariadicCountIndex < RecordBatch.VariadicBufferCountsLength;
+        }
+
+        internal RecordBatchEnumerator(in Flatbuf.RecordBatch recordBatch)
+        {
+            RecordBatch = recordBatch;
+            CurrentBufferIndex = 0;
+            CurrentNodeIndex = 0;
+            CurrentVariadicCountIndex = 0;
         }
     }
 }

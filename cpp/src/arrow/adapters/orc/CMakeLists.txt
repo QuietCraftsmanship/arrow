@@ -20,30 +20,23 @@
 #
 
 # Headers: top level
-install(FILES adapter.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/adapters/orc")
+install(FILES adapter.h options.h
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/adapters/orc")
 
 # pkg-config support
 arrow_add_pkg_config("arrow-orc")
 
-set(ORC_MIN_TEST_LIBS GTest::Main GTest::GTest)
-
 if(ARROW_BUILD_STATIC)
-  set(ARROW_LIBRARIES_FOR_STATIC_TESTS arrow_testing_static arrow_static)
+  set(ARROW_ORC_STATIC_LINK_LIBS ${ARROW_TEST_STATIC_LINK_LIBS})
 else()
-  set(ARROW_LIBRARIES_FOR_STATIC_TESTS arrow_testing_shared arrow_shared)
+  set(ARROW_ORC_STATIC_LINK_LIBS ${ARROW_TEST_SHARED_LINK_LIBS})
 endif()
-
-if(APPLE)
-  set(ORC_MIN_TEST_LIBS ${ORC_MIN_TEST_LIBS} ${CMAKE_DL_LIBS})
-elseif(NOT MSVC)
-  set(ORC_MIN_TEST_LIBS ${ORC_MIN_TEST_LIBS} pthread ${CMAKE_DL_LIBS})
-endif()
-
-set(ORC_STATIC_TEST_LINK_LIBS ${ORC_MIN_TEST_LIBS} ${ARROW_LIBRARIES_FOR_STATIC_TESTS}
-                              orc::liborc)
-
-add_arrow_test(adapter-test
+add_arrow_test(adapter_test
                PREFIX
-               "orc"
+               "arrow-orc"
                STATIC_LINK_LIBS
-               ${ORC_STATIC_TEST_LINK_LIBS})
+               orc::orc
+               ${ARROW_ORC_STATIC_LINK_LIBS})
+
+set_source_files_properties(adapter_test.cc PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+                                                       SKIP_UNITY_BUILD_INCLUSION ON)

@@ -31,7 +31,7 @@ typedef int64_t (*add_vector_func_t)(int64_t* elements, int nelements);
 
 class TestExpressionRegistry : public ::testing::Test {
  protected:
-  FunctionRegistry registry_;
+  std::shared_ptr<FunctionRegistry> registry_ = default_function_registry();
 };
 
 // Verify all functions in registry are exported.
@@ -42,11 +42,12 @@ TEST_F(TestExpressionRegistry, VerifySupportedFunctions) {
        iter != expr_registry.function_signature_end(); iter++) {
     functions.push_back((*iter));
   }
-  for (auto& iter : registry_) {
-    auto function = iter.signature();
-    auto element = std::find(functions.begin(), functions.end(), function);
-    EXPECT_NE(element, functions.end())
-        << "function " << iter.pc_name() << " missing in supported functions.\n";
+  for (auto& iter : *registry_) {
+    for (auto& func_iter : iter.signatures()) {
+      auto element = std::find(functions.begin(), functions.end(), func_iter);
+      EXPECT_NE(element, functions.end()) << "function signature " << func_iter.ToString()
+                                          << " missing in supported functions.\n";
+    }
   }
 }
 

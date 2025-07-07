@@ -15,6 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
+<<<<<<< HEAD
+// Kitchen-sink public API for arrow::Array data structures. C++ library code
+// (especially header files) in Apache Arrow should use more specific headers
+// unless it's a file that uses most or all Array types in which case using
+// arrow/array.h is fine.
+
+#pragma once
+
+/// \defgroup numeric-arrays Concrete classes for numeric arrays
+/// @{
+/// @}
+
+/// \defgroup binary-arrays Concrete classes for binary/string arrays
+/// @{
+/// @}
+
+/// \defgroup nested-arrays Concrete classes for nested arrays
+/// @{
+/// @}
+
+/// \defgroup run-end-encoded-arrays Concrete classes for run-end encoded arrays
+/// @{
+/// @}
+
+#include "arrow/array/array_base.h"       // IWYU pragma: keep
+#include "arrow/array/array_binary.h"     // IWYU pragma: keep
+#include "arrow/array/array_decimal.h"    // IWYU pragma: keep
+#include "arrow/array/array_dict.h"       // IWYU pragma: keep
+#include "arrow/array/array_nested.h"     // IWYU pragma: keep
+#include "arrow/array/array_primitive.h"  // IWYU pragma: keep
+#include "arrow/array/array_run_end.h"    // IWYU pragma: keep
+#include "arrow/array/data.h"             // IWYU pragma: keep
+#include "arrow/array/util.h"             // IWYU pragma: keep
+=======
 #ifndef ARROW_ARRAY_H
 #define ARROW_ARRAY_H
 
@@ -1148,3 +1182,4 @@ Status ValidateArray(const Array& array);
 }  // namespace arrow
 
 #endif  // ARROW_ARRAY_H
+>>>>>>> 5588-Better-support-for-building-UnionArrays

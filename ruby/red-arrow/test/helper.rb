@@ -17,10 +17,15 @@
 
 require "arrow"
 
+require "fiddle"
+require "json"
 require "pathname"
 require "tempfile"
+require "timeout"
+require "webrick"
 require "zlib"
 
 require "test-unit"
 
 require_relative "helper/fixture"
+require_relative "helper/omittable"

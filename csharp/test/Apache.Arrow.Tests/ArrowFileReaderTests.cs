@@ -14,9 +14,9 @@
 // limitations under the License.
 
 using Apache.Arrow.Ipc;
-using Apache.Arrow.Memory;
 using System;
 using System.IO;
+using System.Reflection;
 using System.Threading.Tasks;
 using Xunit;
 
@@ -59,14 +59,14 @@ namespace Apache.Arrow.Tests
             {
                 ArrowFileWriter writer = new ArrowFileWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
-                await writer.WriteFooterAsync();
+                await writer.WriteEndAsync();
                 stream.Position = 0;
 
                 var memoryPool = new TestMemoryAllocator();
                 ArrowFileReader reader = new ArrowFileReader(stream, memoryPool, leaveOpen: shouldLeaveOpen);
                 reader.ReadNextRecordBatch();
 
-                Assert.Equal(1, memoryPool.Statistics.Allocations);
+                Assert.Equal(2, memoryPool.Statistics.Allocations);
                 Assert.True(memoryPool.Statistics.BytesAllocated > 0);
 
                 reader.Dispose();
@@ -121,7 +121,7 @@ namespace Apache.Arrow.Tests
             {
                 ArrowFileWriter writer = new ArrowFileWriter(stream, originalBatch.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch);
-                await writer.WriteFooterAsync();
+                await writer.WriteEndAsync();
                 stream.Position = 0;
 
                 ArrowFileReader reader = new ArrowFileReader(stream);
@@ -132,30 +132,41 @@ namespace Apache.Arrow.Tests
         [Fact]
         public async Task TestReadMultipleRecordBatchAsync()
         {
-            RecordBatch originalBatch1 = TestData.CreateSampleRecordBatch(length: 100);
-            RecordBatch originalBatch2 = TestData.CreateSampleRecordBatch(length: 50);
+            RecordBatch originalBatch1 = TestData.CreateSampleRecordBatch(length: 100, createDictionaryArray: false);
+            RecordBatch originalBatch2 = TestData.CreateSampleRecordBatch(length: 50, createDictionaryArray: false);
 
             using (MemoryStream stream = new MemoryStream())
             {
                 ArrowFileWriter writer = new ArrowFileWriter(stream, originalBatch1.Schema);
                 await writer.WriteRecordBatchAsync(originalBatch1);
                 await writer.WriteRecordBatchAsync(originalBatch2);
-                await writer.WriteFooterAsync();
+                await writer.WriteEndAsync();
                 stream.Position = 0;
 
-                // the recordbatches by index are in reverse order - back to front.
-                // TODO: is this a bug??
                 ArrowFileReader reader = new ArrowFileReader(stream);
                 RecordBatch readBatch1 = await reader.ReadRecordBatchAsync(0);
-                ArrowReaderVerifier.CompareBatches(originalBatch2, readBatch1);
+                ArrowReaderVerifier.CompareBatches(originalBatch1, readBatch1);
 
                 RecordBatch readBatch2 = await reader.ReadRecordBatchAsync(1);
-                ArrowReaderVerifier.CompareBatches(originalBatch1, readBatch2);
+                ArrowReaderVerifier.CompareBatches(originalBatch2, readBatch2);
 
                 // now read the first again, for random access
                 RecordBatch readBatch3 = await reader.ReadRecordBatchAsync(0);
-                ArrowReaderVerifier.CompareBatches(originalBatch2, readBatch3);
+                ArrowReaderVerifier.CompareBatches(originalBatch1, readBatch3);
             }
+        }
+
+        [Fact]
+        public void TestRecordBatchBasics()
+        {
+            RecordBatch recordBatch = TestData.CreateSampleRecordBatch(length: 1);
+            Assert.Throws<ArgumentOutOfRangeException>(() => new RecordBatch(recordBatch.Schema, recordBatch.Arrays, -1));
+
+            var col1 = recordBatch.Column(0);
+            var col2 = recordBatch.Column("list0");
+            ArrowReaderVerifier.CompareArrays(col1, col2);
+
+            recordBatch.Dispose();
         }
     }
 }

@@ -15,9 +15,64 @@
 # specific language governing permissions and limitations
 # under the License.
 
-test_that <- function(what, code) {
-  testthat::test_that(what, {
-    skip_if(!arrow::arrow_available(), "arrow C++ library not available")
-    code
+set.seed(1)
+
+MAX_INT <- 2147483647L
+
+# Make sure this is unset
+Sys.setenv(ARROW_PRE_0_15_IPC_FORMAT = "")
+
+# use the C locale for string collation (ARROW-12046)
+Sys.setlocale("LC_COLLATE", "C")
+
+# Set English language so that error messages aren't internationalized
+# (R CMD check does this, but in case you're running outside of check)
+Sys.setenv(LANGUAGE = "en")
+
+# Set this option so that the deprecation warning isn't shown
+# (except when we test for it)
+options(arrow.pull_as_vector = FALSE)
+
+with_language <- function(lang, expr) {
+  skip_on_cran()
+  old <- Sys.getenv("LANGUAGE")
+  # Check what this message is before changing languages; this will
+  # trigger caching the translations if the OS does that (some do).
+  # If the OS does cache, then we can't test changing languages safely.
+  before <- i18ize_error_messages()
+  Sys.setenv(LANGUAGE = lang)
+  on.exit({
+    Sys.setenv(LANGUAGE = old)
+    .cache$i18ized_error_pattern <<- NULL
   })
+  if (!identical(before, i18ize_error_messages())) {
+    skip(paste("This OS either does not support changing languages to", lang, "or it caches translations"))
+  }
+  force(expr)
+}
+
+# backport of 4.0.0 implementation
+if (getRversion() < "4.0.0") {
+  suppressWarnings <- function(expr, classes = "warning") {
+    withCallingHandlers(
+      expr,
+      warning = function(w) {
+        if (inherits(w, classes)) {
+          invokeRestart("muffleWarning")
+        }
+      }
+    )
+  }
+}
+
+make_temp_dir <- function() {
+  path <- tempfile()
+  dir.create(path)
+  normalizePath(path, winslash = "/")
+}
+
+arrow_cpp_version_at_least <- function(version) {
+  cpp_version <- arrow::arrow_info()$build_info$cpp_version
+  cpp_version_parsed <- package_version(sub("-SNAPSHOT$", "", cpp_version))
+  numeric_version(cpp_version_parsed) >= numeric_version(version)
 }

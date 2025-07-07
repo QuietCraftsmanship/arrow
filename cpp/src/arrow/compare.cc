@@ -30,207 +30,213 @@
 #include <vector>
 
 #include "arrow/array.h"
+#include "arrow/array/diff.h"
 #include "arrow/buffer.h"
 #include "arrow/scalar.h"
 #include "arrow/sparse_tensor.h"
 #include "arrow/status.h"
 #include "arrow/tensor.h"
 #include "arrow/type.h"
-#include "arrow/util/bit-util.h"
+#include "arrow/type_traits.h"
+#include "arrow/util/binary_view_util.h"
+#include "arrow/util/bit_run_reader.h"
+#include "arrow/util/bit_util.h"
+#include "arrow/util/bitmap_ops.h"
+#include "arrow/util/bitmap_reader.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/float16.h"
+#include "arrow/util/key_value_metadata.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/memory.h"
-#include "arrow/visitor_inline.h"
+#include "arrow/util/ree_util.h"
+#include "arrow/visit_scalar_inline.h"
+#include "arrow/visit_type_inline.h"
 
 namespace arrow {
 
 using internal::BitmapEquals;
+using internal::BitmapReader;
+using internal::BitmapUInt64Reader;
 using internal::checked_cast;
+using internal::OptionalBitmapEquals;
+using util::Float16;
 
 // ----------------------------------------------------------------------
 // Public method implementations
 
-namespace internal {
+namespace {
 
-// These helper functions assume we already checked the arrays have equal
-// sizes and null bitmaps.
+// TODO also handle HALF_FLOAT NaNs
 
-template <typename ArrowType, typename EqualityFunc>
-inline bool BaseFloatingEquals(const NumericArray<ArrowType>& left,
-                               const NumericArray<ArrowType>& right,
-                               EqualityFunc&& equals) {
-  using T = typename ArrowType::c_type;
+template <bool Approximate, bool NansEqual, bool SignedZerosEqual>
+struct FloatingEqualityFlags {
+  static constexpr bool approximate = Approximate;
+  static constexpr bool nans_equal = NansEqual;
+  static constexpr bool signed_zeros_equal = SignedZerosEqual;
+};
 
-  const T* left_data = left.raw_values();
-  const T* right_data = right.raw_values();
+template <typename T, typename Flags>
+struct FloatingEquality {
+  explicit FloatingEquality(const EqualOptions& options)
+      : epsilon(static_cast<T>(options.atol())) {}
 
-  if (left.null_count() > 0) {
-    for (int64_t i = 0; i < left.length(); ++i) {
-      if (left.IsNull(i)) continue;
-      if (!equals(left_data[i], right_data[i])) {
-        return false;
-      }
+  bool operator()(T x, T y) const {
+    if (x == y) {
+      return Flags::signed_zeros_equal || (std::signbit(x) == std::signbit(y));
     }
-  } else {
-    for (int64_t i = 0; i < left.length(); ++i) {
-      if (!equals(left_data[i], right_data[i])) {
-        return false;
-      }
+    if (Flags::nans_equal && std::isnan(x) && std::isnan(y)) {
+      return true;
+    }
+    if (Flags::approximate && (fabs(x - y) <= epsilon)) {
+      return true;
+    }
+    return false;
+  }
+
+  const T epsilon;
+};
+
+// For half-float equality.
+template <typename Flags>
+struct FloatingEquality<uint16_t, Flags> {
+  explicit FloatingEquality(const EqualOptions& options)
+      : epsilon(static_cast<float>(options.atol())) {}
+
+  bool operator()(uint16_t x, uint16_t y) const {
+    Float16 f_x = Float16::FromBits(x);
+    Float16 f_y = Float16::FromBits(y);
+    if (x == y) {
+      return Flags::signed_zeros_equal || (f_x.signbit() == f_y.signbit());
+    }
+    if (Flags::nans_equal && f_x.is_nan() && f_y.is_nan()) {
+      return true;
+    }
+    if (Flags::approximate && (fabs(f_x.ToFloat() - f_y.ToFloat()) <= epsilon)) {
+      return true;
+    }
+    return false;
+  }
+
+  const float epsilon;
+};
+
+template <typename T, typename Visitor>
+struct FloatingEqualityDispatcher {
+  const EqualOptions& options;
+  bool floating_approximate;
+  Visitor&& visit;
+
+  template <bool Approximate, bool NansEqual>
+  void DispatchL3() {
+    if (options.signed_zeros_equal()) {
+      visit(FloatingEquality<T, FloatingEqualityFlags<Approximate, NansEqual, true>>{
+          options});
+    } else {
+      visit(FloatingEquality<T, FloatingEqualityFlags<Approximate, NansEqual, false>>{
+          options});
+    }
+  }
+
+  template <bool Approximate>
+  void DispatchL2() {
+    if (options.nans_equal()) {
+      DispatchL3<Approximate, true>();
+    } else {
+      DispatchL3<Approximate, false>();
+    }
+  }
+
+  void Dispatch() {
+    if (floating_approximate) {
+      DispatchL2<true>();
+    } else {
+      DispatchL2<false>();
+    }
+  }
+};
+
+// Call `visit(equality_func)` where `equality_func` has the signature `bool(T, T)`
+// and returns true if the two values compare equal.
+template <typename T, typename Visitor>
+void VisitFloatingEquality(const EqualOptions& options, bool floating_approximate,
+                           Visitor&& visit) {
+  FloatingEqualityDispatcher<T, Visitor>{options, floating_approximate,
+                                         std::forward<Visitor>(visit)}
+      .Dispatch();
+}
+
+inline bool IdentityImpliesEqualityNansNotEqual(const DataType& type) {
+  if (type.id() == Type::FLOAT || type.id() == Type::DOUBLE) {
+    return false;
+  }
+  for (const auto& child : type.fields()) {
+    if (!IdentityImpliesEqualityNansNotEqual(*child->type())) {
+      return false;
     }
   }
   return true;
 }
 
-template <typename ArrowType>
-inline bool FloatingEquals(const NumericArray<ArrowType>& left,
-                           const NumericArray<ArrowType>& right,
-                           const EqualOptions& opts) {
-  using T = typename ArrowType::c_type;
-
-  if (opts.nans_equal()) {
-    return BaseFloatingEquals<ArrowType>(left, right, [](T x, T y) -> bool {
-      return (x == y) || (std::isnan(x) && std::isnan(y));
-    });
-  } else {
-    return BaseFloatingEquals<ArrowType>(left, right,
-                                         [](T x, T y) -> bool { return x == y; });
+inline bool IdentityImpliesEquality(const DataType& type, const EqualOptions& options) {
+  if (options.nans_equal()) {
+    return true;
   }
+  return IdentityImpliesEqualityNansNotEqual(type);
 }
 
-template <typename ArrowType>
-inline bool FloatingApproxEquals(const NumericArray<ArrowType>& left,
-                                 const NumericArray<ArrowType>& right,
-                                 const EqualOptions& opts) {
-  using T = typename ArrowType::c_type;
-  const T epsilon = static_cast<T>(opts.atol());
+bool CompareArrayRanges(const ArrayData& left, const ArrayData& right,
+                        int64_t left_start_idx, int64_t left_end_idx,
+                        int64_t right_start_idx, const EqualOptions& options,
+                        bool floating_approximate);
 
-  if (opts.nans_equal()) {
-    return BaseFloatingEquals<ArrowType>(left, right, [epsilon](T x, T y) -> bool {
-      return (fabs(x - y) <= epsilon) || (std::isnan(x) && std::isnan(y));
-    });
-  } else {
-    return BaseFloatingEquals<ArrowType>(
-        left, right, [epsilon](T x, T y) -> bool { return fabs(x - y) <= epsilon; });
-  }
-}
-
-// RangeEqualsVisitor assumes the range sizes are equal
-
-class RangeEqualsVisitor {
+class RangeDataEqualsImpl {
  public:
-  RangeEqualsVisitor(const Array& right, int64_t left_start_idx, int64_t left_end_idx,
-                     int64_t right_start_idx)
-      : right_(right),
+  // PRE-CONDITIONS:
+  // - the types are equal
+  // - the ranges are in bounds
+  RangeDataEqualsImpl(const EqualOptions& options, bool floating_approximate,
+                      const ArrayData& left, const ArrayData& right,
+                      int64_t left_start_idx, int64_t right_start_idx,
+                      int64_t range_length)
+      : options_(options),
+        floating_approximate_(floating_approximate),
+        left_(left),
+        right_(right),
         left_start_idx_(left_start_idx),
-        left_end_idx_(left_end_idx),
         right_start_idx_(right_start_idx),
+        range_length_(range_length),
         result_(false) {}
 
-  template <typename ArrayType>
-  inline Status CompareValues(const ArrayType& left) {
-    const auto& right = checked_cast<const ArrayType&>(right_);
-
-    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
-         ++i, ++o_i) {
-      const bool is_null = left.IsNull(i);
-      if (is_null != right.IsNull(o_i) ||
-          (!is_null && left.Value(i) != right.Value(o_i))) {
-        result_ = false;
-        return Status::OK();
-      }
-    }
-    result_ = true;
-    return Status::OK();
-  }
-
-  bool CompareBinaryRange(const BinaryArray& left) const {
-    const auto& right = checked_cast<const BinaryArray&>(right_);
-
-    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
-         ++i, ++o_i) {
-      const bool is_null = left.IsNull(i);
-      if (is_null != right.IsNull(o_i)) {
-        return false;
-      }
-      if (is_null) continue;
-      const int32_t begin_offset = left.value_offset(i);
-      const int32_t end_offset = left.value_offset(i + 1);
-      const int32_t right_begin_offset = right.value_offset(o_i);
-      const int32_t right_end_offset = right.value_offset(o_i + 1);
-      // Underlying can't be equal if the size isn't equal
-      if (end_offset - begin_offset != right_end_offset - right_begin_offset) {
-        return false;
-      }
-
-      if (end_offset - begin_offset > 0 &&
-          std::memcmp(left.value_data()->data() + begin_offset,
-                      right.value_data()->data() + right_begin_offset,
-                      static_cast<size_t>(end_offset - begin_offset))) {
+  bool Compare() {
+    // Compare null bitmaps
+    if (left_start_idx_ == 0 && right_start_idx_ == 0 && range_length_ == left_.length &&
+        range_length_ == right_.length) {
+      // If we're comparing entire arrays, we can first compare the cached null counts
+      if (left_.GetNullCount() != right_.GetNullCount()) {
         return false;
       }
     }
-    return true;
-  }
-
-  bool CompareLists(const ListArray& left) {
-    const auto& right = checked_cast<const ListArray&>(right_);
-
-    const std::shared_ptr<Array>& left_values = left.values();
-    const std::shared_ptr<Array>& right_values = right.values();
-
-    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
-         ++i, ++o_i) {
-      const bool is_null = left.IsNull(i);
-      if (is_null != right.IsNull(o_i)) {
-        return false;
-      }
-      if (is_null) continue;
-      const int32_t begin_offset = left.value_offset(i);
-      const int32_t end_offset = left.value_offset(i + 1);
-      const int32_t right_begin_offset = right.value_offset(o_i);
-      const int32_t right_end_offset = right.value_offset(o_i + 1);
-      // Underlying can't be equal if the size isn't equal
-      if (end_offset - begin_offset != right_end_offset - right_begin_offset) {
-        return false;
-      }
-      if (!left_values->RangeEquals(begin_offset, end_offset, right_begin_offset,
-                                    right_values)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool CompareStructs(const StructArray& left) {
-    const auto& right = checked_cast<const StructArray&>(right_);
-    bool equal_fields = true;
-    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
-         ++i, ++o_i) {
-      if (left.IsNull(i) != right.IsNull(o_i)) {
-        return false;
-      }
-      if (left.IsNull(i)) continue;
-      for (int j = 0; j < left.num_fields(); ++j) {
-        // TODO: really we should be comparing stretches of non-null data rather
-        // than looking at one value at a time.
-        equal_fields = left.field(j)->RangeEquals(i, i + 1, o_i, right.field(j));
-        if (!equal_fields) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  bool CompareUnions(const UnionArray& left) const {
-    const auto& right = checked_cast<const UnionArray&>(right_);
-
-    const UnionMode::type union_mode = left.mode();
-    if (union_mode != right.mode()) {
+    if (!OptionalBitmapEquals(left_.buffers[0], left_.offset + left_start_idx_,
+                              right_.buffers[0], right_.offset + right_start_idx_,
+                              range_length_)) {
       return false;
     }
+    // Compare values
+    return CompareWithType(*left_.type);
+  }
 
+<<<<<<< HEAD
+  bool CompareWithType(const DataType& type) {
+    result_ = true;
+    if (range_length_ != 0) {
+      ARROW_CHECK_OK(VisitTypeInline(type, this));
+    }
+    return result_;
+  }
+
+  Status Visit(const NullType&) { return Status::OK(); }
+=======
     const auto& left_type = checked_cast<const UnionType&>(*left.type());
 
     // Define a mapping from the type id to child number
@@ -239,10 +245,31 @@ class RangeEqualsVisitor {
     for (size_t i = 0; i < type_codes.size(); ++i) {
       type_id_to_child_num[type_codes[i]] = i;
     }
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
-    const uint8_t* left_ids = left.raw_type_ids();
-    const uint8_t* right_ids = right.raw_type_ids();
+  template <typename TypeClass>
+  enable_if_primitive_ctype<TypeClass, Status> Visit(const TypeClass& type) {
+    return ComparePrimitive(type);
+  }
 
+<<<<<<< HEAD
+  template <typename TypeClass>
+  enable_if_t<is_temporal_type<TypeClass>::value, Status> Visit(const TypeClass& type) {
+    return ComparePrimitive(type);
+  }
+
+  Status Visit(const BooleanType&) {
+    const uint8_t* left_bits = left_.GetValues<uint8_t>(1, 0);
+    const uint8_t* right_bits = right_.GetValues<uint8_t>(1, 0);
+    auto compare_runs = [&](int64_t i, int64_t length) -> bool {
+      if (length <= 8) {
+        // Avoid the BitmapUInt64Reader overhead for very small runs
+        for (int64_t j = i; j < i + length; ++j) {
+          if (bit_util::GetBit(left_bits, left_start_idx_ + left_.offset + j) !=
+              bit_util::GetBit(right_bits, right_start_idx_ + right_.offset + j)) {
+            return false;
+          }
+=======
     for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
          ++i, ++o_i) {
       if (left.IsNull(i) != right.IsNull(o_i)) {
@@ -260,420 +287,454 @@ class RangeEqualsVisitor {
       if (union_mode == UnionMode::SPARSE) {
         if (!left.child(child_num)->RangeEquals(i, i + 1, o_i, right.child(child_num))) {
           return false;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         }
+        return true;
+      } else if (length <= 1024) {
+        BitmapUInt64Reader left_reader(left_bits, left_start_idx_ + left_.offset + i,
+                                       length);
+        BitmapUInt64Reader right_reader(right_bits, right_start_idx_ + right_.offset + i,
+                                        length);
+        while (left_reader.position() < length) {
+          if (left_reader.NextWord() != right_reader.NextWord()) {
+            return false;
+          }
+        }
+        DCHECK_EQ(right_reader.position(), length);
       } else {
-        const int32_t offset = left.raw_value_offsets()[i];
-        const int32_t o_offset = right.raw_value_offsets()[o_i];
-        if (!left.child(child_num)->RangeEquals(offset, offset + 1, o_offset,
-                                                right.child(child_num))) {
+        // BitmapEquals is the fastest method on large runs
+        return BitmapEquals(left_bits, left_start_idx_ + left_.offset + i, right_bits,
+                            right_start_idx_ + right_.offset + i, length);
+      }
+      return true;
+    };
+    VisitValidRuns(compare_runs);
+    return Status::OK();
+  }
+
+  Status Visit(const FloatType& type) { return CompareFloating(type); }
+
+  Status Visit(const DoubleType& type) { return CompareFloating(type); }
+
+  Status Visit(const HalfFloatType& type) { return CompareFloating(type); }
+
+  // Also matches StringType
+  Status Visit(const BinaryType& type) { return CompareBinary(type); }
+
+  // Also matches StringViewType
+  Status Visit(const BinaryViewType& type) {
+    auto* left_values = left_.GetValues<BinaryViewType::c_type>(1) + left_start_idx_;
+    auto* right_values = right_.GetValues<BinaryViewType::c_type>(1) + right_start_idx_;
+
+    auto* left_buffers = left_.buffers.data() + 2;
+    auto* right_buffers = right_.buffers.data() + 2;
+    VisitValidRuns([&](int64_t i, int64_t length) {
+      for (auto end_i = i + length; i < end_i; ++i) {
+        if (!util::EqualBinaryView(left_values[i], right_values[i], left_buffers,
+                                   right_buffers)) {
           return false;
         }
       }
-    }
-    return true;
-  }
-
-  Status Visit(const BinaryArray& left) {
-    result_ = CompareBinaryRange(left);
+      return true;
+    });
     return Status::OK();
   }
 
-  Status Visit(const FixedSizeBinaryArray& left) {
-    const auto& right = checked_cast<const FixedSizeBinaryArray&>(right_);
+  // Also matches LargeStringType
+  Status Visit(const LargeBinaryType& type) { return CompareBinary(type); }
 
-    int32_t width = left.byte_width();
+  Status Visit(const FixedSizeBinaryType& type) {
+    const auto byte_width = type.byte_width();
+    const uint8_t* left_data = left_.GetValues<uint8_t>(1, 0);
+    const uint8_t* right_data = right_.GetValues<uint8_t>(1, 0);
 
-    const uint8_t* left_data = nullptr;
-    const uint8_t* right_data = nullptr;
-
-    if (left.values()) {
-      left_data = left.raw_values();
+    if (left_data != nullptr && right_data != nullptr) {
+      auto compare_runs = [&](int64_t i, int64_t length) -> bool {
+        return memcmp(left_data + (left_start_idx_ + left_.offset + i) * byte_width,
+                      right_data + (right_start_idx_ + right_.offset + i) * byte_width,
+                      length * byte_width) == 0;
+      };
+      VisitValidRuns(compare_runs);
+    } else {
+      auto compare_runs = [&](int64_t i, int64_t length) -> bool { return true; };
+      VisitValidRuns(compare_runs);
     }
+    return Status::OK();
+  }
 
-    if (right.values()) {
-      right_data = right.raw_values();
-    }
+  // Also matches MapType
+  Status Visit(const ListType& type) { return CompareList(type); }
 
-    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
-         ++i, ++o_i) {
-      const bool is_null = left.IsNull(i);
-      if (is_null != right.IsNull(o_i)) {
-        result_ = false;
-        return Status::OK();
+  Status Visit(const LargeListType& type) { return CompareList(type); }
+
+  Status Visit(const ListViewType& type) { return CompareListView(type); }
+
+  Status Visit(const LargeListViewType& type) { return CompareListView(type); }
+
+  Status Visit(const FixedSizeListType& type) {
+    const auto list_size = type.list_size();
+    const ArrayData& left_data = *left_.child_data[0];
+    const ArrayData& right_data = *right_.child_data[0];
+
+    auto compare_runs = [&](int64_t i, int64_t length) -> bool {
+      RangeDataEqualsImpl impl(options_, floating_approximate_, left_data, right_data,
+                               (left_start_idx_ + left_.offset + i) * list_size,
+                               (right_start_idx_ + right_.offset + i) * list_size,
+                               length * list_size);
+      return impl.Compare();
+    };
+    VisitValidRuns(compare_runs);
+    return Status::OK();
+  }
+
+  Status Visit(const StructType& type) {
+    const int32_t num_fields = type.num_fields();
+
+    auto compare_runs = [&](int64_t i, int64_t length) -> bool {
+      for (int32_t f = 0; f < num_fields; ++f) {
+        RangeDataEqualsImpl impl(options_, floating_approximate_, *left_.child_data[f],
+                                 *right_.child_data[f],
+                                 left_start_idx_ + left_.offset + i,
+                                 right_start_idx_ + right_.offset + i, length);
+        if (!impl.Compare()) {
+          return false;
+        }
       }
-      if (is_null) continue;
+      return true;
+    };
+    VisitValidRuns(compare_runs);
+    return Status::OK();
+  }
 
-      if (std::memcmp(left_data + width * i, right_data + width * o_i, width)) {
+  Status Visit(const SparseUnionType& type) {
+    const auto& child_ids = type.child_ids();
+    const int8_t* left_codes = left_.GetValues<int8_t>(1);
+    const int8_t* right_codes = right_.GetValues<int8_t>(1);
+
+    // Unions don't have a null bitmap
+    int64_t run_start = 0;  // Start index of the current run
+
+    for (int64_t i = 0; i < range_length_; ++i) {
+      const auto current_type_id = left_codes[left_start_idx_ + i];
+
+      if (current_type_id != right_codes[right_start_idx_ + i]) {
         result_ = false;
-        return Status::OK();
+        break;
+      }
+      // Check if the current element breaks the run
+      if (i > 0 && current_type_id != left_codes[left_start_idx_ + i - 1]) {
+        // Compare the previous run
+        const auto previous_child_num = child_ids[left_codes[left_start_idx_ + i - 1]];
+        int64_t run_length = i - run_start;
+
+        RangeDataEqualsImpl impl(
+            options_, floating_approximate_, *left_.child_data[previous_child_num],
+            *right_.child_data[previous_child_num],
+            left_start_idx_ + left_.offset + run_start,
+            right_start_idx_ + right_.offset + run_start, run_length);
+
+        if (!impl.Compare()) {
+          result_ = false;
+          break;
+        }
+
+        // Start a new run
+        run_start = i;
       }
     }
-    result_ = true;
-    return Status::OK();
-  }
 
-  Status Visit(const Decimal128Array& left) {
-    return Visit(checked_cast<const FixedSizeBinaryArray&>(left));
-  }
+    // Handle the final run
+    if (result_) {
+      const auto final_child_num = child_ids[left_codes[left_start_idx_ + run_start]];
+      int64_t final_run_length = range_length_ - run_start;
 
-  Status Visit(const NullArray& left) {
-    ARROW_UNUSED(left);
-    result_ = true;
-    return Status::OK();
-  }
+      RangeDataEqualsImpl impl(
+          options_, floating_approximate_, *left_.child_data[final_child_num],
+          *right_.child_data[final_child_num], left_start_idx_ + left_.offset + run_start,
+          right_start_idx_ + right_.offset + run_start, final_run_length);
 
-  template <typename T>
-  typename std::enable_if<std::is_base_of<PrimitiveArray, T>::value, Status>::type Visit(
-      const T& left) {
-    return CompareValues<T>(left);
-  }
-
-  Status Visit(const ListArray& left) {
-    result_ = CompareLists(left);
-    return Status::OK();
-  }
-
-  Status Visit(const FixedSizeListArray& left) {
-    const auto& right = checked_cast<const FixedSizeListArray&>(right_);
-    result_ = left.values()->RangeEquals(
-        left.value_offset(left_start_idx_), left.value_offset(left_end_idx_),
-        right.value_offset(right_start_idx_), right.values());
-    return Status::OK();
-  }
-
-  Status Visit(const StructArray& left) {
-    result_ = CompareStructs(left);
-    return Status::OK();
-  }
-
-  Status Visit(const UnionArray& left) {
-    result_ = CompareUnions(left);
-    return Status::OK();
-  }
-
-  Status Visit(const DictionaryArray& left) {
-    const auto& right = checked_cast<const DictionaryArray&>(right_);
-    if (!left.dictionary()->Equals(right.dictionary())) {
-      result_ = false;
-      return Status::OK();
+      if (!impl.Compare()) {
+        result_ = false;
+      }
     }
-    result_ = left.indices()->RangeEquals(left_start_idx_, left_end_idx_,
-                                          right_start_idx_, right.indices());
     return Status::OK();
   }
 
-  Status Visit(const ExtensionArray& left) {
-    result_ = (right_.type()->Equals(*left.type()) &&
-               ArrayRangeEquals(*left.storage(),
-                                *static_cast<const ExtensionArray&>(right_).storage(),
-                                left_start_idx_, left_end_idx_, right_start_idx_));
+  Status Visit(const DenseUnionType& type) {
+    const auto& child_ids = type.child_ids();
+    const int8_t* left_codes = left_.GetValues<int8_t>(1);
+    const int8_t* right_codes = right_.GetValues<int8_t>(1);
+    const int32_t* left_offsets = left_.GetValues<int32_t>(2);
+    const int32_t* right_offsets = right_.GetValues<int32_t>(2);
+
+    for (int64_t i = 0; i < range_length_; ++i) {
+      const auto type_id = left_codes[left_start_idx_ + i];
+      if (type_id != right_codes[right_start_idx_ + i]) {
+        result_ = false;
+        break;
+      }
+      const auto child_num = child_ids[type_id];
+      RangeDataEqualsImpl impl(
+          options_, floating_approximate_, *left_.child_data[child_num],
+          *right_.child_data[child_num], left_offsets[left_start_idx_ + i],
+          right_offsets[right_start_idx_ + i], 1);
+      if (!impl.Compare()) {
+        result_ = false;
+        break;
+      }
+    }
     return Status::OK();
   }
 
-  bool result() const { return result_; }
+  Status Visit(const DictionaryType& type) {
+    // Compare dictionaries
+    result_ &= CompareArrayRanges(
+        *left_.dictionary, *right_.dictionary,
+        /*left_start_idx=*/0,
+        /*left_end_idx=*/std::max(left_.dictionary->length, right_.dictionary->length),
+        /*right_start_idx=*/0, options_, floating_approximate_);
+    if (result_) {
+      // Compare indices
+      result_ &= CompareWithType(*type.index_type());
+    }
+    return Status::OK();
+  }
+
+  Status Visit(const RunEndEncodedType& type) {
+    switch (type.run_end_type()->id()) {
+      case Type::INT16:
+        return CompareRunEndEncoded<int16_t>();
+      case Type::INT32:
+        return CompareRunEndEncoded<int32_t>();
+      case Type::INT64:
+        return CompareRunEndEncoded<int64_t>();
+      default:
+        return Status::Invalid("invalid run ends type: ", *type.run_end_type());
+    }
+  }
+
+  Status Visit(const ExtensionType& type) {
+    // Compare storages
+    result_ &= CompareWithType(*type.storage_type());
+    return Status::OK();
+  }
 
  protected:
-  const Array& right_;
-  int64_t left_start_idx_;
-  int64_t left_end_idx_;
-  int64_t right_start_idx_;
+  template <typename TypeClass, typename CType = typename TypeClass::c_type>
+  Status ComparePrimitive(const TypeClass&) {
+    const CType* left_values = left_.GetValues<CType>(1);
+    const CType* right_values = right_.GetValues<CType>(1);
+    VisitValidRuns([&](int64_t i, int64_t length) {
+      return memcmp(left_values + left_start_idx_ + i,
+                    right_values + right_start_idx_ + i, length * sizeof(CType)) == 0;
+    });
+    return Status::OK();
+  }
+
+  template <typename TypeClass>
+  Status CompareFloating(const TypeClass&) {
+    using CType = typename TypeClass::c_type;
+    const CType* left_values = left_.GetValues<CType>(1);
+    const CType* right_values = right_.GetValues<CType>(1);
+
+    auto visitor = [&](auto&& compare_func) {
+      VisitValues([&](int64_t i) {
+        const CType x = left_values[i + left_start_idx_];
+        const CType y = right_values[i + right_start_idx_];
+        return compare_func(x, y);
+      });
+    };
+    VisitFloatingEquality<CType>(options_, floating_approximate_, std::move(visitor));
+    return Status::OK();
+  }
+
+  template <typename TypeClass>
+  Status CompareBinary(const TypeClass&) {
+    const uint8_t* left_data = left_.GetValues<uint8_t>(2, 0);
+    const uint8_t* right_data = right_.GetValues<uint8_t>(2, 0);
+
+    if (left_data != nullptr && right_data != nullptr) {
+      const auto compare_ranges = [&](int64_t left_offset, int64_t right_offset,
+                                      int64_t length) -> bool {
+        return memcmp(left_data + left_offset, right_data + right_offset, length) == 0;
+      };
+      CompareWithOffsets<typename TypeClass::offset_type>(1, compare_ranges);
+    } else {
+      // One of the arrays is an array of empty strings and nulls.
+      // We just need to compare the offsets.
+      // (note we must not call memcmp() with null data pointers)
+      CompareWithOffsets<typename TypeClass::offset_type>(1, [](...) { return true; });
+    }
+    return Status::OK();
+  }
+
+  template <typename TypeClass>
+  Status CompareList(const TypeClass&) {
+    const ArrayData& left_data = *left_.child_data[0];
+    const ArrayData& right_data = *right_.child_data[0];
+
+    const auto compare_ranges = [&](int64_t left_offset, int64_t right_offset,
+                                    int64_t length) -> bool {
+      RangeDataEqualsImpl impl(options_, floating_approximate_, left_data, right_data,
+                               left_offset, right_offset, length);
+      return impl.Compare();
+    };
+
+    CompareWithOffsets<typename TypeClass::offset_type>(1, compare_ranges);
+    return Status::OK();
+  }
+
+  template <typename TypeClass>
+  Status CompareListView(const TypeClass& type) {
+    const ArrayData& left_values = *left_.child_data[0];
+    const ArrayData& right_values = *right_.child_data[0];
+
+    using offset_type = typename TypeClass::offset_type;
+    const auto* left_offsets = left_.GetValues<offset_type>(1) + left_start_idx_;
+    const auto* right_offsets = right_.GetValues<offset_type>(1) + right_start_idx_;
+    const auto* left_sizes = left_.GetValues<offset_type>(2) + left_start_idx_;
+    const auto* right_sizes = right_.GetValues<offset_type>(2) + right_start_idx_;
+
+    auto compare_view = [&](int64_t i, int64_t length) -> bool {
+      for (int64_t j = i; j < i + length; ++j) {
+        if (left_sizes[j] != right_sizes[j]) {
+          return false;
+        }
+        const offset_type size = left_sizes[j];
+        if (size == 0) {
+          continue;
+        }
+        RangeDataEqualsImpl impl(options_, floating_approximate_, left_values,
+                                 right_values, left_offsets[j], right_offsets[j], size);
+        if (!impl.Compare()) {
+          return false;
+        }
+      }
+      return true;
+    };
+    VisitValidRuns(std::move(compare_view));
+    return Status::OK();
+  }
+
+  template <typename RunEndCType>
+  Status CompareRunEndEncoded() {
+    auto left_span = ArraySpan(left_);
+    auto right_span = ArraySpan(right_);
+    left_span.SetSlice(left_.offset + left_start_idx_, range_length_);
+    right_span.SetSlice(right_.offset + right_start_idx_, range_length_);
+    const ree_util::RunEndEncodedArraySpan<RunEndCType> left(left_span);
+    const ree_util::RunEndEncodedArraySpan<RunEndCType> right(right_span);
+
+    const auto& left_values = *left_.child_data[1];
+    const auto& right_values = *right_.child_data[1];
+
+    auto it = ree_util::MergedRunsIterator(left, right);
+    for (; !it.is_end(); ++it) {
+      RangeDataEqualsImpl impl(options_, floating_approximate_, left_values, right_values,
+                               it.index_into_left_array(), it.index_into_right_array(),
+                               /*range_length=*/1);
+      if (!impl.Compare()) {
+        result_ = false;
+        return Status::OK();
+      }
+    }
+    return Status::OK();
+  }
+
+  template <typename offset_type, typename CompareRanges>
+  void CompareWithOffsets(int offsets_buffer_index, CompareRanges&& compare_ranges) {
+    const offset_type* left_offsets =
+        left_.GetValues<offset_type>(offsets_buffer_index) + left_start_idx_;
+    const offset_type* right_offsets =
+        right_.GetValues<offset_type>(offsets_buffer_index) + right_start_idx_;
+
+    const auto compare_runs = [&](int64_t i, int64_t length) {
+      for (int64_t j = i; j < i + length; ++j) {
+        if (left_offsets[j + 1] - left_offsets[j] !=
+            right_offsets[j + 1] - right_offsets[j]) {
+          return false;
+        }
+      }
+      if (!compare_ranges(left_offsets[i], right_offsets[i],
+                          left_offsets[i + length] - left_offsets[i])) {
+        return false;
+      }
+      return true;
+    };
+
+    VisitValidRuns(compare_runs);
+  }
+
+  template <typename CompareValues>
+  void VisitValues(CompareValues&& compare_values) {
+    internal::VisitSetBitRunsVoid(left_.buffers[0], left_.offset + left_start_idx_,
+                                  range_length_, [&](int64_t position, int64_t length) {
+                                    for (int64_t i = 0; i < length; ++i) {
+                                      result_ &= compare_values(position + i);
+                                    }
+                                  });
+  }
+
+  // Visit and compare runs of non-null values
+  template <typename CompareRuns>
+  void VisitValidRuns(CompareRuns&& compare_runs) {
+    const uint8_t* left_null_bitmap = left_.GetValues<uint8_t>(0, 0);
+    if (left_null_bitmap == nullptr) {
+      result_ = compare_runs(0, range_length_);
+      return;
+    }
+    internal::SetBitRunReader reader(left_null_bitmap, left_.offset + left_start_idx_,
+                                     range_length_);
+    while (true) {
+      const auto run = reader.NextRun();
+      if (run.length == 0) {
+        return;
+      }
+      if (!compare_runs(run.position, run.length)) {
+        result_ = false;
+        return;
+      }
+    }
+  }
+
+  const EqualOptions& options_;
+  const bool floating_approximate_;
+  const ArrayData& left_;
+  const ArrayData& right_;
+  const int64_t left_start_idx_;
+  const int64_t right_start_idx_;
+  const int64_t range_length_;
 
   bool result_;
 };
 
-static bool IsEqualPrimitive(const PrimitiveArray& left, const PrimitiveArray& right) {
-  const auto& size_meta = checked_cast<const FixedWidthType&>(*left.type());
-  const int byte_width = size_meta.bit_width() / CHAR_BIT;
-
-  const uint8_t* left_data = nullptr;
-  const uint8_t* right_data = nullptr;
-
-  if (left.values()) {
-    left_data = left.values()->data() + left.offset() * byte_width;
-  }
-
-  if (right.values()) {
-    right_data = right.values()->data() + right.offset() * byte_width;
-  }
-
-  if (byte_width == 0) {
-    // Special case 0-width data, as the data pointers may be null
-    for (int64_t i = 0; i < left.length(); ++i) {
-      if (left.IsNull(i) != right.IsNull(i)) {
-        return false;
-      }
-    }
-    return true;
-  } else if (left.null_count() > 0) {
-    for (int64_t i = 0; i < left.length(); ++i) {
-      const bool left_null = left.IsNull(i);
-      const bool right_null = right.IsNull(i);
-      if (left_null != right_null) {
-        return false;
-      }
-      if (!left_null && memcmp(left_data, right_data, byte_width) != 0) {
-        return false;
-      }
-      left_data += byte_width;
-      right_data += byte_width;
-    }
-    return true;
-  } else {
-    auto number_of_bytes_to_compare = static_cast<size_t>(byte_width * left.length());
-    return memcmp(left_data, right_data, number_of_bytes_to_compare) == 0;
-  }
-}
-
-// A bit confusing: ArrayEqualsVisitor inherits from RangeEqualsVisitor but
-// doesn't share the same preconditions.
-// When RangeEqualsVisitor is called, we only know the range sizes equal.
-// When ArrayEqualsVisitor is called, we know the sizes and null bitmaps are equal.
-
-class ArrayEqualsVisitor : public RangeEqualsVisitor {
- public:
-  explicit ArrayEqualsVisitor(const Array& right, const EqualOptions& opts)
-      : RangeEqualsVisitor(right, 0, right.length(), 0), opts_(opts) {}
-
-  Status Visit(const NullArray& left) {
-    ARROW_UNUSED(left);
-    result_ = true;
-    return Status::OK();
-  }
-
-  Status Visit(const BooleanArray& left) {
-    const auto& right = checked_cast<const BooleanArray&>(right_);
-
-    if (left.null_count() > 0) {
-      const uint8_t* left_data = left.values()->data();
-      const uint8_t* right_data = right.values()->data();
-
-      for (int64_t i = 0; i < left.length(); ++i) {
-        if (left.IsValid(i) && BitUtil::GetBit(left_data, i + left.offset()) !=
-                                   BitUtil::GetBit(right_data, i + right.offset())) {
-          result_ = false;
-          return Status::OK();
-        }
-      }
-      result_ = true;
-    } else {
-      result_ = BitmapEquals(left.values()->data(), left.offset(), right.values()->data(),
-                             right.offset(), left.length());
-    }
-    return Status::OK();
-  }
-
-  template <typename T>
-  typename std::enable_if<std::is_base_of<PrimitiveArray, T>::value &&
-                              !std::is_base_of<FloatArray, T>::value &&
-                              !std::is_base_of<DoubleArray, T>::value &&
-                              !std::is_base_of<BooleanArray, T>::value,
-                          Status>::type
-  Visit(const T& left) {
-    result_ = IsEqualPrimitive(left, checked_cast<const PrimitiveArray&>(right_));
-    return Status::OK();
-  }
-
-  // TODO nan-aware specialization for half-floats
-
-  Status Visit(const FloatArray& left) {
-    result_ =
-        FloatingEquals<FloatType>(left, checked_cast<const FloatArray&>(right_), opts_);
-    return Status::OK();
-  }
-
-  Status Visit(const DoubleArray& left) {
-    result_ =
-        FloatingEquals<DoubleType>(left, checked_cast<const DoubleArray&>(right_), opts_);
-    return Status::OK();
-  }
-
-  template <typename ArrayType>
-  bool ValueOffsetsEqual(const ArrayType& left) {
-    const auto& right = checked_cast<const ArrayType&>(right_);
-
-    if (left.offset() == 0 && right.offset() == 0) {
-      return left.value_offsets()->Equals(*right.value_offsets(),
-                                          (left.length() + 1) * sizeof(int32_t));
-    } else {
-      // One of the arrays is sliced; logic is more complicated because the
-      // value offsets are not both 0-based
-      auto left_offsets =
-          reinterpret_cast<const int32_t*>(left.value_offsets()->data()) + left.offset();
-      auto right_offsets =
-          reinterpret_cast<const int32_t*>(right.value_offsets()->data()) +
-          right.offset();
-
-      for (int64_t i = 0; i < left.length() + 1; ++i) {
-        if (left_offsets[i] - left_offsets[0] != right_offsets[i] - right_offsets[0]) {
-          return false;
-        }
-      }
-      return true;
-    }
-  }
-
-  bool CompareBinary(const BinaryArray& left) {
-    const auto& right = checked_cast<const BinaryArray&>(right_);
-
-    bool equal_offsets = ValueOffsetsEqual<BinaryArray>(left);
-    if (!equal_offsets) {
-      return false;
-    }
-
-    if (!left.value_data() && !(right.value_data())) {
-      return true;
-    }
-    if (left.value_offset(left.length()) == left.value_offset(0)) {
-      return true;
-    }
-
-    const uint8_t* left_data = left.value_data()->data();
-    const uint8_t* right_data = right.value_data()->data();
-
-    if (left.null_count() == 0) {
-      // Fast path for null count 0, single memcmp
-      if (left.offset() == 0 && right.offset() == 0) {
-        return std::memcmp(left_data, right_data,
-                           left.raw_value_offsets()[left.length()]) == 0;
-      } else {
-        const int64_t total_bytes =
-            left.value_offset(left.length()) - left.value_offset(0);
-        return std::memcmp(left_data + left.value_offset(0),
-                           right_data + right.value_offset(0),
-                           static_cast<size_t>(total_bytes)) == 0;
-      }
-    } else {
-      // ARROW-537: Only compare data in non-null slots
-      const int32_t* left_offsets = left.raw_value_offsets();
-      const int32_t* right_offsets = right.raw_value_offsets();
-      for (int64_t i = 0; i < left.length(); ++i) {
-        if (left.IsNull(i)) {
-          continue;
-        }
-        if (std::memcmp(left_data + left_offsets[i], right_data + right_offsets[i],
-                        left.value_length(i))) {
-          return false;
-        }
-      }
-      return true;
-    }
-  }
-
-  Status Visit(const BinaryArray& left) {
-    result_ = CompareBinary(left);
-    return Status::OK();
-  }
-
-  Status Visit(const ListArray& left) {
-    const auto& right = checked_cast<const ListArray&>(right_);
-    bool equal_offsets = ValueOffsetsEqual<ListArray>(left);
-    if (!equal_offsets) {
-      result_ = false;
-      return Status::OK();
-    }
-
-    result_ =
-        left.values()->RangeEquals(left.value_offset(0), left.value_offset(left.length()),
-                                   right.value_offset(0), right.values());
-    return Status::OK();
-  }
-
-  Status Visit(const FixedSizeListArray& left) {
-    const auto& right = checked_cast<const FixedSizeListArray&>(right_);
-    result_ =
-        left.values()->RangeEquals(left.value_offset(0), left.value_offset(left.length()),
-                                   right.value_offset(0), right.values());
-    return Status::OK();
-  }
-
-  Status Visit(const DictionaryArray& left) {
-    const auto& right = checked_cast<const DictionaryArray&>(right_);
-    if (!left.dictionary()->Equals(right.dictionary())) {
-      result_ = false;
-    } else {
-      result_ = left.indices()->Equals(right.indices());
-    }
-    return Status::OK();
-  }
-
-  template <typename T>
-  typename std::enable_if<std::is_base_of<NestedType, typename T::TypeClass>::value,
-                          Status>::type
-  Visit(const T& left) {
-    return RangeEqualsVisitor::Visit(left);
-  }
-
-  Status Visit(const ExtensionArray& left) {
-    result_ = (right_.type()->Equals(*left.type()) &&
-               ArrayEquals(*left.storage(),
-                           *static_cast<const ExtensionArray&>(right_).storage()));
-    return Status::OK();
-  }
-
- protected:
-  const EqualOptions opts_;
-};
-
-class ApproxEqualsVisitor : public ArrayEqualsVisitor {
- public:
-  explicit ApproxEqualsVisitor(const Array& right, const EqualOptions& opts)
-      : ArrayEqualsVisitor(right, opts) {}
-
-  using ArrayEqualsVisitor::Visit;
-
-  // TODO half-floats
-
-  Status Visit(const FloatArray& left) {
-    result_ = FloatingApproxEquals<FloatType>(
-        left, checked_cast<const FloatArray&>(right_), opts_);
-    return Status::OK();
-  }
-
-  Status Visit(const DoubleArray& left) {
-    result_ = FloatingApproxEquals<DoubleType>(
-        left, checked_cast<const DoubleArray&>(right_), opts_);
-    return Status::OK();
-  }
-};
-
-static bool BaseDataEquals(const Array& left, const Array& right) {
-  if (left.length() != right.length() || left.null_count() != right.null_count() ||
-      left.type_id() != right.type_id()) {
+bool CompareArrayRanges(const ArrayData& left, const ArrayData& right,
+                        int64_t left_start_idx, int64_t left_end_idx,
+                        int64_t right_start_idx, const EqualOptions& options,
+                        bool floating_approximate) {
+  if (left.type->id() != right.type->id() ||
+      !TypeEquals(*left.type, *right.type, false /* check_metadata */)) {
     return false;
   }
-  // ARROW-2567: Ensure that not only the type id but also the type equality
-  // itself is checked.
-  if (!TypeEquals(*left.type(), *right.type(), false /* check_metadata */)) {
+
+  const int64_t range_length = left_end_idx - left_start_idx;
+  DCHECK_GE(range_length, 0);
+  if (left_start_idx + range_length > left.length) {
+    // Left range too small
     return false;
   }
-  if (left.null_count() > 0 && left.null_count() < left.length()) {
-    return BitmapEquals(left.null_bitmap()->data(), left.offset(),
-                        right.null_bitmap()->data(), right.offset(), left.length());
+  if (right_start_idx + range_length > right.length) {
+    // Right range too small
+    return false;
   }
-  return true;
-}
-
-template <typename VISITOR, typename... Extra>
-inline bool ArrayEqualsImpl(const Array& left, const Array& right, Extra&&... extra) {
-  bool are_equal;
-  // The arrays are the same object
-  if (&left == &right) {
-    are_equal = true;
-  } else if (!BaseDataEquals(left, right)) {
-    are_equal = false;
-  } else if (left.length() == 0) {
-    are_equal = true;
-  } else if (left.null_count() == left.length()) {
-    are_equal = true;
-  } else {
-    VISITOR visitor(right, std::forward<Extra>(extra)...);
-    auto error = VisitArrayInline(left, &visitor);
-    if (!error.ok()) {
-      DCHECK(false) << "Arrays are not comparable: " << error.ToString();
-    }
-    are_equal = visitor.result();
+  if (&left == &right && left_start_idx == right_start_idx &&
+      IdentityImpliesEquality(*left.type, options)) {
+    return true;
   }
-  return are_equal;
+  // Compare values
+  RangeDataEqualsImpl impl(options, floating_approximate, left, right, left_start_idx,
+                           right_start_idx, range_length);
+  return impl.Compare();
 }
 
 class TypeEqualsVisitor {
@@ -681,14 +742,22 @@ class TypeEqualsVisitor {
   explicit TypeEqualsVisitor(const DataType& right, bool check_metadata)
       : right_(right), check_metadata_(check_metadata), result_(false) {}
 
+  bool MetadataEqual(const Field& left, const Field& right) {
+    if (left.HasMetadata() && right.HasMetadata()) {
+      return left.metadata()->Equals(*right.metadata());
+    } else {
+      return !left.HasMetadata() && !right.HasMetadata();
+    }
+  }
+
   Status VisitChildren(const DataType& left) {
-    if (left.num_children() != right_.num_children()) {
+    if (left.num_fields() != right_.num_fields()) {
       result_ = false;
       return Status::OK();
     }
 
-    for (int i = 0; i < left.num_children(); ++i) {
-      if (!left.child(i)->Equals(right_.child(i), check_metadata_)) {
+    for (int i = 0; i < left.num_fields(); ++i) {
+      if (!left.field(i)->Equals(right_.field(i), check_metadata_)) {
         result_ = false;
         return Status::OK();
       }
@@ -698,27 +767,30 @@ class TypeEqualsVisitor {
   }
 
   template <typename T>
-  typename std::enable_if<std::is_base_of<NoExtraMeta, T>::value ||
-                              std::is_base_of<PrimitiveCType, T>::value,
-                          Status>::type
+  enable_if_t<is_null_type<T>::value || is_primitive_ctype<T>::value ||
+                  is_base_binary_type<T>::value,
+              Status>
   Visit(const T&) {
     result_ = true;
     return Status::OK();
   }
 
+  Status Visit(const BinaryViewType&) {
+    result_ = true;
+    return Status::OK();
+  }
+
   template <typename T>
-  typename std::enable_if<std::is_base_of<IntervalType, T>::value, Status>::type Visit(
-      const T& left) {
+  enable_if_interval<T, Status> Visit(const T& left) {
     const auto& right = checked_cast<const IntervalType&>(right_);
     result_ = right.interval_type() == left.interval_type();
     return Status::OK();
   }
 
   template <typename T>
-  typename std::enable_if<std::is_base_of<TimeType, T>::value ||
-                              std::is_base_of<DateType, T>::value ||
-                              std::is_base_of<DurationType, T>::value,
-                          Status>::type
+  enable_if_t<is_time_type<T>::value || is_date_type<T>::value ||
+                  is_duration_type<T>::value,
+              Status>
   Visit(const T& left) {
     const auto& right = checked_cast<const T&>(right_);
     result_ = left.unit() == right.unit();
@@ -737,13 +809,32 @@ class TypeEqualsVisitor {
     return Status::OK();
   }
 
-  Status Visit(const Decimal128Type& left) {
-    const auto& right = checked_cast<const Decimal128Type&>(right_);
-    result_ = left.precision() == right.precision() && left.scale() == right.scale();
+  Status Visit(const DecimalType& left) {
+    const auto& right = checked_cast<const DecimalType&>(right_);
+    result_ = left.byte_width() == right.byte_width() &&
+              left.precision() == right.precision() && left.scale() == right.scale();
     return Status::OK();
   }
 
-  Status Visit(const ListType& left) { return VisitChildren(left); }
+  template <typename T>
+  enable_if_t<is_list_type<T>::value || is_list_view_type<T>::value, Status> Visit(
+      const T& left) {
+    std::shared_ptr<Field> left_field = left.field(0);
+    std::shared_ptr<Field> right_field = checked_cast<const T&>(right_).field(0);
+    bool equal_names = !check_metadata_ || (left_field->name() == right_field->name());
+    bool equal_metadata = !check_metadata_ || MetadataEqual(*left_field, *right_field);
+
+    result_ = equal_names && equal_metadata &&
+              (left_field->nullable() == right_field->nullable()) &&
+              left_field->type()->Equals(*right_field->type(), check_metadata_);
+
+    return Status::OK();
+  }
+
+  template <typename T>
+  enable_if_t<is_struct_type<T>::value, Status> Visit(const T& left) {
+    return VisitChildren(left);
+  }
 
   Status Visit(const MapType& left) {
     const auto& right = checked_cast<const MapType&>(right_);
@@ -751,12 +842,22 @@ class TypeEqualsVisitor {
       result_ = false;
       return Status::OK();
     }
-    return VisitChildren(left);
+    if (check_metadata_ && (left.item_field()->name() != right.item_field()->name() ||
+                            left.key_field()->name() != right.key_field()->name() ||
+                            left.value_field()->name() != right.value_field()->name())) {
+      result_ = false;
+      return Status::OK();
+    }
+    if (check_metadata_ && !(MetadataEqual(*left.item_field(), *right.item_field()) &&
+                             MetadataEqual(*left.key_field(), *right.key_field()) &&
+                             MetadataEqual(*left.value_field(), *right.value_field()))) {
+      result_ = false;
+      return Status::OK();
+    }
+    result_ = left.key_type()->Equals(*right.key_type(), check_metadata_) &&
+              left.item_type()->Equals(*right.item_type(), check_metadata_);
+    return Status::OK();
   }
-
-  Status Visit(const FixedSizeListType& left) { return VisitChildren(left); }
-
-  Status Visit(const StructType& left) { return VisitChildren(left); }
 
   Status Visit(const UnionType& left) {
     const auto& right = checked_cast<const UnionType&>(right_);
@@ -767,7 +868,11 @@ class TypeEqualsVisitor {
     }
 
     result_ = std::equal(
+<<<<<<< HEAD
+        left.fields().begin(), left.fields().end(), right.fields().begin(),
+=======
         left.children().begin(), left.children().end(), right.children().begin(),
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         [this](const std::shared_ptr<Field>& l, const std::shared_ptr<Field>& r) {
           return l->Equals(r, check_metadata_);
         });
@@ -779,6 +884,13 @@ class TypeEqualsVisitor {
     result_ = left.index_type()->Equals(right.index_type()) &&
               left.value_type()->Equals(right.value_type()) &&
               (left.ordered() == right.ordered());
+    return Status::OK();
+  }
+
+  Status Visit(const RunEndEncodedType& left) {
+    const auto& right = checked_cast<const RunEndEncodedType&>(right_);
+    result_ = left.value_type()->Equals(right.value_type()) &&
+              left.run_end_type()->Equals(right.run_end_type());
     return Status::OK();
   }
 
@@ -795,17 +907,37 @@ class TypeEqualsVisitor {
   bool result_;
 };
 
+bool ArrayEquals(const Array& left, const Array& right, const EqualOptions& opts,
+                 bool floating_approximate);
+bool ScalarEquals(const Scalar& left, const Scalar& right, const EqualOptions& options,
+                  bool floating_approximate);
+
 class ScalarEqualsVisitor {
  public:
-  explicit ScalarEqualsVisitor(const Scalar& right) : right_(right), result_(false) {}
+  // PRE-CONDITIONS:
+  // - the types are equal
+  // - the scalars are non-null
+  explicit ScalarEqualsVisitor(const Scalar& right, const EqualOptions& opts,
+                               bool floating_approximate)
+      : right_(right),
+        options_(opts),
+        floating_approximate_(floating_approximate),
+        result_(false) {}
 
   Status Visit(const NullScalar& left) {
     result_ = true;
     return Status::OK();
   }
 
+  Status Visit(const BooleanScalar& left) {
+    const auto& right = checked_cast<const BooleanScalar&>(right_);
+    result_ = left.value == right.value;
+    return Status::OK();
+  }
+
   template <typename T>
-  typename std::enable_if<std::is_base_of<internal::PrimitiveScalar, T>::value,
+  typename std::enable_if<(is_primitive_ctype<typename T::TypeClass>::value ||
+                           is_temporal_type<typename T::TypeClass>::value),
                           Status>::type
   Visit(const T& left_) {
     const auto& right = checked_cast<const T&>(right_);
@@ -813,12 +945,28 @@ class ScalarEqualsVisitor {
     return Status::OK();
   }
 
+  Status Visit(const FloatScalar& left) { return CompareFloating(left); }
+
+  Status Visit(const DoubleScalar& left) { return CompareFloating(left); }
+
+  Status Visit(const HalfFloatScalar& left) { return CompareFloating(left); }
+
   template <typename T>
-  typename std::enable_if<std::is_base_of<BinaryScalar, T>::value, Status>::type Visit(
-      const T& left_) {
-    const auto& left = checked_cast<const BinaryScalar&>(left_);
-    const auto& right = checked_cast<const BinaryScalar&>(right_);
+  enable_if_t<std::is_base_of<BaseBinaryScalar, T>::value, Status> Visit(const T& left) {
+    const auto& right = checked_cast<const BaseBinaryScalar&>(right_);
     result_ = internal::SharedPtrEquals(left.value, right.value);
+    return Status::OK();
+  }
+
+  Status Visit(const Decimal32Scalar& left) {
+    const auto& right = checked_cast<const Decimal32Scalar&>(right_);
+    result_ = left.value == right.value;
+    return Status::OK();
+  }
+
+  Status Visit(const Decimal64Scalar& left) {
+    const auto& right = checked_cast<const Decimal64Scalar&>(right_);
+    result_ = left.value == right.value;
     return Status::OK();
   }
 
@@ -828,22 +976,45 @@ class ScalarEqualsVisitor {
     return Status::OK();
   }
 
+  Status Visit(const Decimal256Scalar& left) {
+    const auto& right = checked_cast<const Decimal256Scalar&>(right_);
+    result_ = left.value == right.value;
+    return Status::OK();
+  }
+
   Status Visit(const ListScalar& left) {
     const auto& right = checked_cast<const ListScalar&>(right_);
-    result_ = internal::SharedPtrEquals(left.value, right.value);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
+  }
+
+  Status Visit(const LargeListScalar& left) {
+    const auto& right = checked_cast<const LargeListScalar&>(right_);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
+  }
+
+  Status Visit(const ListViewScalar& left) {
+    const auto& right = checked_cast<const ListViewScalar&>(right_);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
+  }
+
+  Status Visit(const LargeListViewScalar& left) {
+    const auto& right = checked_cast<const LargeListViewScalar&>(right_);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
     return Status::OK();
   }
 
   Status Visit(const MapScalar& left) {
     const auto& right = checked_cast<const MapScalar&>(right_);
-    result_ = internal::SharedPtrEquals(left.keys, right.keys) &&
-              internal::SharedPtrEquals(left.items, right.items);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
     return Status::OK();
   }
 
   Status Visit(const FixedSizeListScalar& left) {
     const auto& right = checked_cast<const FixedSizeListScalar&>(right_);
-    result_ = internal::SharedPtrEquals(left.value, right.value);
+    result_ = ArrayEquals(*left.value, *right.value, options_, floating_approximate_);
     return Status::OK();
   }
 
@@ -855,7 +1026,8 @@ class ScalarEqualsVisitor {
     } else {
       bool all_equals = true;
       for (size_t i = 0; i < left.value.size() && all_equals; i++) {
-        all_equals &= internal::SharedPtrEquals(left.value[i], right.value[i]);
+        all_equals &= ScalarEquals(*left.value[i], *right.value[i], options_,
+                                   floating_approximate_);
       }
       result_ = all_equals;
     }
@@ -863,99 +1035,238 @@ class ScalarEqualsVisitor {
     return Status::OK();
   }
 
-  Status Visit(const UnionScalar& left) { return Status::NotImplemented("union"); }
+  Status Visit(const DenseUnionScalar& left) {
+    const auto& right = checked_cast<const DenseUnionScalar&>(right_);
+    result_ = ScalarEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
+  }
+
+  Status Visit(const SparseUnionScalar& left) {
+    const auto& right = checked_cast<const SparseUnionScalar&>(right_);
+    result_ = ScalarEquals(*left.value[left.child_id], *right.value[right.child_id],
+                           options_, floating_approximate_);
+    return Status::OK();
+  }
 
   Status Visit(const DictionaryScalar& left) {
-    return Status::NotImplemented("dictionary");
+    const auto& right = checked_cast<const DictionaryScalar&>(right_);
+    result_ = ScalarEquals(*left.value.index, *right.value.index, options_,
+                           floating_approximate_) &&
+              ArrayEquals(*left.value.dictionary, *right.value.dictionary, options_,
+                          floating_approximate_);
+    return Status::OK();
+  }
+
+  Status Visit(const RunEndEncodedScalar& left) {
+    const auto& right = checked_cast<const RunEndEncodedScalar&>(right_);
+    result_ = ScalarEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
   }
 
   Status Visit(const ExtensionScalar& left) {
-    return Status::NotImplemented("extension");
+    const auto& right = checked_cast<const ExtensionScalar&>(right_);
+    result_ = ScalarEquals(*left.value, *right.value, options_, floating_approximate_);
+    return Status::OK();
   }
 
   bool result() const { return result_; }
 
  protected:
+  template <typename ScalarType>
+  Status CompareFloating(const ScalarType& left) {
+    using CType = decltype(left.value);
+    const auto& right = checked_cast<const ScalarType&>(right_);
+
+    auto visitor = [&](auto&& compare_func) {
+      result_ = compare_func(left.value, right.value);
+    };
+    VisitFloatingEquality<CType>(options_, floating_approximate_, std::move(visitor));
+    return Status::OK();
+  }
+
   const Scalar& right_;
+  const EqualOptions options_;
+  const bool floating_approximate_;
   bool result_;
 };
 
-}  // namespace internal
+Status PrintDiff(const Array& left, const Array& right, std::ostream* os);
 
-bool ArrayEquals(const Array& left, const Array& right, const EqualOptions& opts) {
-  return internal::ArrayEqualsImpl<internal::ArrayEqualsVisitor>(left, right, opts);
+Status PrintDiff(const Array& left, const Array& right, int64_t left_offset,
+                 int64_t left_length, int64_t right_offset, int64_t right_length,
+                 std::ostream* os) {
+  if (os == nullptr) {
+    return Status::OK();
+  }
+
+  if (!left.type()->Equals(right.type())) {
+    *os << "# Array types differed: " << *left.type() << " vs " << *right.type()
+        << std::endl;
+    return Status::OK();
+  }
+
+  if (left.type()->id() == Type::DICTIONARY) {
+    *os << "# Dictionary arrays differed" << std::endl;
+
+    const auto& left_dict = checked_cast<const DictionaryArray&>(left);
+    const auto& right_dict = checked_cast<const DictionaryArray&>(right);
+
+    *os << "## dictionary diff";
+    auto pos = os->tellp();
+    RETURN_NOT_OK(PrintDiff(*left_dict.dictionary(), *right_dict.dictionary(), os));
+    if (os->tellp() == pos) {
+      *os << std::endl;
+    }
+
+    *os << "## indices diff";
+    pos = os->tellp();
+    RETURN_NOT_OK(PrintDiff(*left_dict.indices(), *right_dict.indices(), os));
+    if (os->tellp() == pos) {
+      *os << std::endl;
+    }
+    return Status::OK();
+  }
+
+  const auto left_slice = left.Slice(left_offset, left_length);
+  const auto right_slice = right.Slice(right_offset, right_length);
+  ARROW_ASSIGN_OR_RAISE(auto edits,
+                        Diff(*left_slice, *right_slice, default_memory_pool()));
+  ARROW_ASSIGN_OR_RAISE(auto formatter, MakeUnifiedDiffFormatter(*left.type(), os));
+  return formatter(*edits, *left_slice, *right_slice);
 }
 
-bool ArrayApproxEquals(const Array& left, const Array& right, const EqualOptions& opts) {
-  return internal::ArrayEqualsImpl<internal::ApproxEqualsVisitor>(left, right, opts);
+Status PrintDiff(const Array& left, const Array& right, std::ostream* os) {
+  return PrintDiff(left, right, 0, left.length(), 0, right.length(), os);
 }
 
 bool ArrayRangeEquals(const Array& left, const Array& right, int64_t left_start_idx,
-                      int64_t left_end_idx, int64_t right_start_idx) {
-  bool are_equal;
-  if (&left == &right) {
-    are_equal = true;
-  } else if (left.type_id() != right.type_id()) {
-    are_equal = false;
-  } else if (left.length() == 0) {
-    are_equal = true;
-  } else {
-    internal::RangeEqualsVisitor visitor(right, left_start_idx, left_end_idx,
-                                         right_start_idx);
-    auto error = VisitArrayInline(left, &visitor);
-    if (!error.ok()) {
-      DCHECK(false) << "Arrays are not comparable: " << error.ToString();
-    }
-    are_equal = visitor.result();
+                      int64_t left_end_idx, int64_t right_start_idx,
+                      const EqualOptions& options, bool floating_approximate) {
+  bool are_equal =
+      CompareArrayRanges(*left.data(), *right.data(), left_start_idx, left_end_idx,
+                         right_start_idx, options, floating_approximate);
+  if (!are_equal) {
+    ARROW_IGNORE_EXPR(PrintDiff(
+        left, right, left_start_idx, left_end_idx, right_start_idx,
+        right_start_idx + (left_end_idx - left_start_idx), options.diff_sink()));
   }
   return are_equal;
 }
 
-bool StridedTensorContentEquals(int dim_index, int64_t left_offset, int64_t right_offset,
-                                int elem_size, const Tensor& left, const Tensor& right) {
+bool ArrayEquals(const Array& left, const Array& right, const EqualOptions& opts,
+                 bool floating_approximate) {
+  if (left.length() != right.length()) {
+    ARROW_IGNORE_EXPR(PrintDiff(left, right, opts.diff_sink()));
+    return false;
+  }
+  return ArrayRangeEquals(left, right, 0, left.length(), 0, opts, floating_approximate);
+}
+
+bool ScalarEquals(const Scalar& left, const Scalar& right, const EqualOptions& options,
+                  bool floating_approximate) {
+  if (&left == &right && IdentityImpliesEquality(*left.type, options)) {
+    return true;
+  }
+  if (!left.type->Equals(right.type)) {
+    return false;
+  }
+  if (left.is_valid != right.is_valid) {
+    return false;
+  }
+  if (!left.is_valid) {
+    return true;
+  }
+  ScalarEqualsVisitor visitor(right, options, floating_approximate);
+  auto error = VisitScalarInline(left, &visitor);
+  DCHECK_OK(error);
+  return visitor.result();
+}
+
+}  // namespace
+
+bool ArrayRangeEquals(const Array& left, const Array& right, int64_t left_start_idx,
+                      int64_t left_end_idx, int64_t right_start_idx,
+                      const EqualOptions& options) {
+  const bool floating_approximate = false;
+  return ArrayRangeEquals(left, right, left_start_idx, left_end_idx, right_start_idx,
+                          options, floating_approximate);
+}
+
+bool ArrayRangeApproxEquals(const Array& left, const Array& right, int64_t left_start_idx,
+                            int64_t left_end_idx, int64_t right_start_idx,
+                            const EqualOptions& options) {
+  const bool floating_approximate = true;
+  return ArrayRangeEquals(left, right, left_start_idx, left_end_idx, right_start_idx,
+                          options, floating_approximate);
+}
+
+bool ArrayEquals(const Array& left, const Array& right, const EqualOptions& opts) {
+  const bool floating_approximate = false;
+  return ArrayEquals(left, right, opts, floating_approximate);
+}
+
+bool ArrayApproxEquals(const Array& left, const Array& right, const EqualOptions& opts) {
+  const bool floating_approximate = true;
+  return ArrayEquals(left, right, opts, floating_approximate);
+}
+
+bool ScalarEquals(const Scalar& left, const Scalar& right, const EqualOptions& options) {
+  const bool floating_approximate = false;
+  return ScalarEquals(left, right, options, floating_approximate);
+}
+
+bool ScalarApproxEquals(const Scalar& left, const Scalar& right,
+                        const EqualOptions& options) {
+  const bool floating_approximate = true;
+  return ScalarEquals(left, right, options, floating_approximate);
+}
+
+namespace {
+
+bool StridedIntegerTensorContentEquals(const int dim_index, int64_t left_offset,
+                                       int64_t right_offset, int elem_size,
+                                       const Tensor& left, const Tensor& right) {
+  const auto n = left.shape()[dim_index];
+  const auto left_stride = left.strides()[dim_index];
+  const auto right_stride = right.strides()[dim_index];
   if (dim_index == left.ndim() - 1) {
-    for (int64_t i = 0; i < left.shape()[dim_index]; ++i) {
-      if (memcmp(left.raw_data() + left_offset + i * left.strides()[dim_index],
-                 right.raw_data() + right_offset + i * right.strides()[dim_index],
-                 elem_size) != 0) {
+    for (int64_t i = 0; i < n; ++i) {
+      if (memcmp(left.raw_data() + left_offset + i * left_stride,
+                 right.raw_data() + right_offset + i * right_stride, elem_size) != 0) {
         return false;
       }
     }
     return true;
   }
-  for (int64_t i = 0; i < left.shape()[dim_index]; ++i) {
-    if (!StridedTensorContentEquals(dim_index + 1, left_offset, right_offset, elem_size,
-                                    left, right)) {
+  for (int64_t i = 0; i < n; ++i) {
+    if (!StridedIntegerTensorContentEquals(dim_index + 1, left_offset, right_offset,
+                                           elem_size, left, right)) {
       return false;
     }
-    left_offset += left.strides()[dim_index];
-    right_offset += right.strides()[dim_index];
+    left_offset += left_stride;
+    right_offset += right_stride;
   }
   return true;
 }
 
-bool TensorEquals(const Tensor& left, const Tensor& right) {
+bool IntegerTensorEquals(const Tensor& left, const Tensor& right) {
   bool are_equal;
   // The arrays are the same object
   if (&left == &right) {
     are_equal = true;
-  } else if (left.type_id() != right.type_id()) {
-    are_equal = false;
-  } else if (left.size() == 0) {
-    are_equal = true;
   } else {
-    if (!left.is_contiguous() || !right.is_contiguous()) {
-      const auto& shape = left.shape();
-      if (shape != right.shape()) {
-        are_equal = false;
-      } else {
-        const auto& type = checked_cast<const FixedWidthType&>(*left.type());
-        are_equal =
-            StridedTensorContentEquals(0, 0, 0, type.bit_width() / 8, left, right);
-      }
+    const bool left_row_major_p = left.is_row_major();
+    const bool left_column_major_p = left.is_column_major();
+    const bool right_row_major_p = right.is_row_major();
+    const bool right_column_major_p = right.is_column_major();
+
+    if (!(left_row_major_p && right_row_major_p) &&
+        !(left_column_major_p && right_column_major_p)) {
+      const auto& type = checked_cast<const FixedWidthType&>(*left.type());
+      are_equal =
+          StridedIntegerTensorContentEquals(0, 0, 0, type.byte_width(), left, right);
     } else {
-      const auto& size_meta = checked_cast<const FixedWidthType&>(*left.type());
-      const int byte_width = size_meta.bit_width() / CHAR_BIT;
+      const int byte_width = left.type()->byte_width();
       DCHECK_GT(byte_width, 0);
 
       const uint8_t* left_data = left.data()->data();
@@ -968,24 +1279,143 @@ bool TensorEquals(const Tensor& left, const Tensor& right) {
   return are_equal;
 }
 
+template <typename DataType>
+bool StridedFloatTensorContentEquals(const int dim_index, int64_t left_offset,
+                                     int64_t right_offset, const Tensor& left,
+                                     const Tensor& right, const EqualOptions& opts) {
+  using c_type = typename DataType::c_type;
+  static_assert(std::is_floating_point<c_type>::value,
+                "DataType must be a floating point type");
+
+  const auto n = left.shape()[dim_index];
+  const auto left_stride = left.strides()[dim_index];
+  const auto right_stride = right.strides()[dim_index];
+  if (dim_index == left.ndim() - 1) {
+    // Leaf dimension, compare values
+    auto left_data = left.raw_data();
+    auto right_data = right.raw_data();
+    bool result = true;
+
+    auto visitor = [&](auto&& compare_func) {
+      for (int64_t i = 0; i < n; ++i) {
+        c_type left_value =
+            *reinterpret_cast<const c_type*>(left_data + left_offset + i * left_stride);
+        c_type right_value = *reinterpret_cast<const c_type*>(right_data + right_offset +
+                                                              i * right_stride);
+        if (!compare_func(left_value, right_value)) {
+          result = false;
+          return;
+        }
+      }
+    };
+
+    VisitFloatingEquality<c_type>(opts, /*floating_approximate=*/false,
+                                  std::move(visitor));
+    return result;
+  }
+
+  // Outer dimension, recurse into inner
+  for (int64_t i = 0; i < n; ++i) {
+    if (!StridedFloatTensorContentEquals<DataType>(dim_index + 1, left_offset,
+                                                   right_offset, left, right, opts)) {
+      return false;
+    }
+    left_offset += left_stride;
+    right_offset += right_stride;
+  }
+  return true;
+}
+
+template <typename DataType>
+bool FloatTensorEquals(const Tensor& left, const Tensor& right,
+                       const EqualOptions& opts) {
+  return StridedFloatTensorContentEquals<DataType>(0, 0, 0, left, right, opts);
+}
+
+}  // namespace
+
+bool TensorEquals(const Tensor& left, const Tensor& right, const EqualOptions& opts) {
+  if (left.type_id() != right.type_id()) {
+    return false;
+  } else if (left.size() == 0 && right.size() == 0) {
+    return true;
+  } else if (left.shape() != right.shape()) {
+    return false;
+  }
+
+  switch (left.type_id()) {
+    // TODO: Support half-float tensors
+    // case Type::HALF_FLOAT:
+    case Type::FLOAT:
+      return FloatTensorEquals<FloatType>(left, right, opts);
+
+    case Type::DOUBLE:
+      return FloatTensorEquals<DoubleType>(left, right, opts);
+
+    default:
+      return IntegerTensorEquals(left, right);
+  }
+}
+
 namespace {
 
 template <typename LeftSparseIndexType, typename RightSparseIndexType>
 struct SparseTensorEqualsImpl {
   static bool Compare(const SparseTensorImpl<LeftSparseIndexType>& left,
-                      const SparseTensorImpl<RightSparseIndexType>& right) {
+                      const SparseTensorImpl<RightSparseIndexType>& right,
+                      const EqualOptions&) {
     // TODO(mrkn): should we support the equality among different formats?
     return false;
   }
 };
 
+bool IntegerSparseTensorDataEquals(const uint8_t* left_data, const uint8_t* right_data,
+                                   const int byte_width, const int64_t length) {
+  if (left_data == right_data) {
+    return true;
+  }
+  return memcmp(left_data, right_data, static_cast<size_t>(byte_width * length)) == 0;
+}
+
+template <typename DataType>
+bool FloatSparseTensorDataEquals(const typename DataType::c_type* left_data,
+                                 const typename DataType::c_type* right_data,
+                                 const int64_t length, const EqualOptions& opts) {
+  using c_type = typename DataType::c_type;
+  static_assert(std::is_floating_point<c_type>::value,
+                "DataType must be a floating point type");
+  if (opts.nans_equal()) {
+    if (left_data == right_data) {
+      return true;
+    }
+
+    for (int64_t i = 0; i < length; ++i) {
+      const auto left = left_data[i];
+      const auto right = right_data[i];
+      if (left != right && !(std::isnan(left) && std::isnan(right))) {
+        return false;
+      }
+    }
+  } else {
+    for (int64_t i = 0; i < length; ++i) {
+      if (left_data[i] != right_data[i]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 template <typename SparseIndexType>
 struct SparseTensorEqualsImpl<SparseIndexType, SparseIndexType> {
   static bool Compare(const SparseTensorImpl<SparseIndexType>& left,
-                      const SparseTensorImpl<SparseIndexType>& right) {
+                      const SparseTensorImpl<SparseIndexType>& right,
+                      const EqualOptions& opts) {
     DCHECK(left.type()->id() == right.type()->id());
     DCHECK(left.shape() == right.shape());
-    DCHECK(left.non_zero_length() == right.non_zero_length());
+
+    const auto length = left.non_zero_length();
+    DCHECK(length == right.non_zero_length());
 
     const auto& left_index = checked_cast<const SparseIndexType&>(*left.sparse_index());
     const auto& right_index = checked_cast<const SparseIndexType&>(*right.sparse_index());
@@ -994,34 +1424,61 @@ struct SparseTensorEqualsImpl<SparseIndexType, SparseIndexType> {
       return false;
     }
 
-    const auto& size_meta = checked_cast<const FixedWidthType&>(*left.type());
-    const int byte_width = size_meta.bit_width() / CHAR_BIT;
+    const int byte_width = left.type()->byte_width();
     DCHECK_GT(byte_width, 0);
 
     const uint8_t* left_data = left.data()->data();
     const uint8_t* right_data = right.data()->data();
+    switch (left.type()->id()) {
+      // TODO: Support half-float tensors
+      // case Type::HALF_FLOAT:
+      case Type::FLOAT:
+        return FloatSparseTensorDataEquals<FloatType>(
+            reinterpret_cast<const float*>(left_data),
+            reinterpret_cast<const float*>(right_data), length, opts);
 
-    return memcmp(left_data, right_data,
-                  static_cast<size_t>(byte_width * left.non_zero_length()));
+      case Type::DOUBLE:
+        return FloatSparseTensorDataEquals<DoubleType>(
+            reinterpret_cast<const double*>(left_data),
+            reinterpret_cast<const double*>(right_data), length, opts);
+
+      default:  // Integer cases
+        return IntegerSparseTensorDataEquals(left_data, right_data, byte_width, length);
+    }
   }
 };
 
 template <typename SparseIndexType>
 inline bool SparseTensorEqualsImplDispatch(const SparseTensorImpl<SparseIndexType>& left,
-                                           const SparseTensor& right) {
+                                           const SparseTensor& right,
+                                           const EqualOptions& opts) {
   switch (right.format_id()) {
     case SparseTensorFormat::COO: {
       const auto& right_coo =
           checked_cast<const SparseTensorImpl<SparseCOOIndex>&>(right);
-      return SparseTensorEqualsImpl<SparseIndexType, SparseCOOIndex>::Compare(left,
-                                                                              right_coo);
+      return SparseTensorEqualsImpl<SparseIndexType, SparseCOOIndex>::Compare(
+          left, right_coo, opts);
     }
 
     case SparseTensorFormat::CSR: {
       const auto& right_csr =
           checked_cast<const SparseTensorImpl<SparseCSRIndex>&>(right);
-      return SparseTensorEqualsImpl<SparseIndexType, SparseCSRIndex>::Compare(left,
-                                                                              right_csr);
+      return SparseTensorEqualsImpl<SparseIndexType, SparseCSRIndex>::Compare(
+          left, right_csr, opts);
+    }
+
+    case SparseTensorFormat::CSC: {
+      const auto& right_csc =
+          checked_cast<const SparseTensorImpl<SparseCSCIndex>&>(right);
+      return SparseTensorEqualsImpl<SparseIndexType, SparseCSCIndex>::Compare(
+          left, right_csc, opts);
+    }
+
+    case SparseTensorFormat::CSF: {
+      const auto& right_csf =
+          checked_cast<const SparseTensorImpl<SparseCSFIndex>&>(right);
+      return SparseTensorEqualsImpl<SparseIndexType, SparseCSFIndex>::Compare(
+          left, right_csf, opts);
     }
 
     default:
@@ -1031,12 +1488,11 @@ inline bool SparseTensorEqualsImplDispatch(const SparseTensorImpl<SparseIndexTyp
 
 }  // namespace
 
-bool SparseTensorEquals(const SparseTensor& left, const SparseTensor& right) {
-  if (&left == &right) {
-    return true;
-  } else if (left.type()->id() != right.type()->id()) {
+bool SparseTensorEquals(const SparseTensor& left, const SparseTensor& right,
+                        const EqualOptions& opts) {
+  if (left.type()->id() != right.type()->id()) {
     return false;
-  } else if (left.size() == 0) {
+  } else if (left.size() == 0 && right.size() == 0) {
     return true;
   } else if (left.shape() != right.shape()) {
     return false;
@@ -1047,12 +1503,22 @@ bool SparseTensorEquals(const SparseTensor& left, const SparseTensor& right) {
   switch (left.format_id()) {
     case SparseTensorFormat::COO: {
       const auto& left_coo = checked_cast<const SparseTensorImpl<SparseCOOIndex>&>(left);
-      return SparseTensorEqualsImplDispatch(left_coo, right);
+      return SparseTensorEqualsImplDispatch(left_coo, right, opts);
     }
 
     case SparseTensorFormat::CSR: {
       const auto& left_csr = checked_cast<const SparseTensorImpl<SparseCSRIndex>&>(left);
-      return SparseTensorEqualsImplDispatch(left_csr, right);
+      return SparseTensorEqualsImplDispatch(left_csr, right, opts);
+    }
+
+    case SparseTensorFormat::CSC: {
+      const auto& left_csc = checked_cast<const SparseTensorImpl<SparseCSCIndex>&>(left);
+      return SparseTensorEqualsImplDispatch(left_csc, right, opts);
+    }
+
+    case SparseTensorFormat::CSF: {
+      const auto& left_csf = checked_cast<const SparseTensorImpl<SparseCSFIndex>&>(left);
+      return SparseTensorEqualsImplDispatch(left_csf, right, opts);
     }
 
     default:
@@ -1061,38 +1527,35 @@ bool SparseTensorEquals(const SparseTensor& left, const SparseTensor& right) {
 }
 
 bool TypeEquals(const DataType& left, const DataType& right, bool check_metadata) {
-  bool are_equal;
   // The arrays are the same object
   if (&left == &right) {
-    are_equal = true;
+    return true;
   } else if (left.id() != right.id()) {
-    are_equal = false;
+    return false;
   } else {
-    internal::TypeEqualsVisitor visitor(right, check_metadata);
+    // First try to compute fingerprints
+    if (check_metadata) {
+      const auto& left_metadata_fp = left.metadata_fingerprint();
+      const auto& right_metadata_fp = right.metadata_fingerprint();
+      if (left_metadata_fp != right_metadata_fp) {
+        return false;
+      }
+    }
+
+    const auto& left_fp = left.fingerprint();
+    const auto& right_fp = right.fingerprint();
+    if (!left_fp.empty() && !right_fp.empty()) {
+      return left_fp == right_fp;
+    }
+
+    // TODO remove check_metadata here?
+    TypeEqualsVisitor visitor(right, check_metadata);
     auto error = VisitTypeInline(left, &visitor);
     if (!error.ok()) {
       DCHECK(false) << "Types are not comparable: " << error.ToString();
     }
-    are_equal = visitor.result();
+    return visitor.result();
   }
-  return are_equal;
-}
-
-bool ScalarEquals(const Scalar& left, const Scalar& right) {
-  bool are_equal = false;
-  if (&left == &right) {
-    are_equal = true;
-  } else if (!left.type->Equals(right.type)) {
-    are_equal = false;
-  } else if (left.is_valid != right.is_valid) {
-    are_equal = false;
-  } else {
-    internal::ScalarEqualsVisitor visitor(right);
-    auto error = VisitScalarInline(left, &visitor);
-    DCHECK_OK(error);
-    are_equal = visitor.result();
-  }
-  return are_equal;
 }
 
 }  // namespace arrow

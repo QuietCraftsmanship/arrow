@@ -20,22 +20,20 @@ namespace Apache.Arrow
 {
     public partial class Schema
     {
-
         public class Builder
         {
             private readonly List<Field> _fields;
-            private readonly Dictionary<string, string> _metadata;
+            private Dictionary<string, string> _metadata;
 
             public Builder()
             {
                 _fields = new List<Field>();
-                _metadata = new Dictionary<string, string>();
             }
 
             public Builder Clear()
             {
                 _fields.Clear();
-                _metadata.Clear();
+                _metadata?.Clear();
                 return this;
             }
 
@@ -53,7 +51,7 @@ namespace Apache.Arrow
 
                 var fieldBuilder = new Field.Builder();
                 fieldBuilderAction(fieldBuilder);
-                var field = fieldBuilder.Build();
+                Field field = fieldBuilder.Build();
 
                 _fields.Add(field);
                 return this;
@@ -65,6 +63,8 @@ namespace Apache.Arrow
                 {
                     throw new ArgumentNullException(nameof(key));
                 }
+
+                _metadata ??= new Dictionary<string, string>();
 
                 _metadata[key] = value;
                 return this;
@@ -78,7 +78,7 @@ namespace Apache.Arrow
                 }
                 foreach (KeyValuePair<string, string> entry in dictionary)
                 {
-                    this.Metadata(entry.Key, entry.Value);
+                    Metadata(entry.Key, entry.Value);
                 }
                 return this;
             }

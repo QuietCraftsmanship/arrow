@@ -23,9 +23,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-.vscode/**
-!.vscode/launch.json
-
 # Runtime data
 pids
 *.pid
@@ -41,12 +38,6 @@ coverage
 # nyc test coverage
 .nyc_output
 
-# Grunt intermediate storage (http://gruntjs.com/creating-plugins#storing-task-files)
-.grunt
-
-# Bower dependency directory (https://bower.io/)
-bower_components
-
 # node-waf configuration
 .lock-wscript
 
@@ -61,7 +52,7 @@ jspm_packages/
 .npm
 
 # JS package manager files
-yarn.lock
+package-lock.json
 
 # Optional eslint cache
 .eslintcache
@@ -87,5 +78,14 @@ targets
 test/data/**/*.json
 test/data/**/*.arrow
 
+# test bundles
+test/bundle/**/*-bundle.js*
+
 # jest snapshots (too big)
 test/__snapshots__/
+
+# jest cache
+.jest-cache/
+
+# VSCode
+!.vscode

@@ -18,13 +18,16 @@
 .. default-domain:: cpp
 .. highlight:: cpp
 
-========================
-Two-dimensional Datasets
-========================
+============
+Tabular Data
+============
+
+.. seealso::
+   :doc:`Table and RecordBatch API reference <api/table>`.
 
 While arrays and chunked arrays represent a one-dimensional sequence of
-homogenous values, data often comes in the form of two-dimensional sets of
-heterogenous data (such as database tables, CSV files...).  Arrow provides
+homogeneous values, data often comes in the form of two-dimensional sets of
+heterogeneous data (such as database tables, CSV files...).  Arrow provides
 several abstractions to handle such data conveniently and efficiently.
 
 Fields
@@ -56,20 +59,13 @@ function overloads::
    field_b = arrow::field("B", arrow::utf8());
    schema = arrow::schema({field_a, field_b});
 
-Columns
-=======
-
-A :class:`arrow::Column` is a chunked array tied together with a field.
-The field describes the column's name (for lookup in a larger dataset)
-and its metadata.
-
 Tables
 ======
 
-A :class:`arrow::Table` is a two-dimensional dataset of a number of columns,
-together with a schema.  The columns' names and types must match the schema.
-Also, each column must have the same logical length in number of elements
-(although each column can be chunked in a different way).
+A :class:`arrow::Table` is a two-dimensional dataset with chunked arrays for
+columns, together with a schema providing field names.  Also, each chunked
+column must have the same logical length in number of elements (although each
+column can be chunked in a different way).
 
 Record Batches
 ==============
@@ -81,6 +77,18 @@ has a schema which must match its arrays' datatypes.
 Record batches are a convenient unit of work for various serialization
 and computation functions, possibly incremental.
 
+.. image:: tables-versus-record-batches.svg
+   :alt: A graphical representation of an Arrow Table and a Record Batch, with
+         structure as described in text above.
+
+Record batches can be sent between implementations, such as via
+:ref:`IPC <format-ipc>` or
+via the :doc:`C Data Interface <../format/CDataInterface>`. Tables and
+chunked arrays, on the other hand, are concepts in the C++ implementation,
+not in the Arrow format itself, so they aren't directly portable.
+
+However, a table can be converted to and built from a sequence of record
+batches easily without needing to copy the underlying array buffers.
 A table can be streamed as an arbitrary number of record batches using
 a :class:`arrow::TableBatchReader`.  Conversely, a logical sequence of
 record batches can be assembled to form a table using one of the

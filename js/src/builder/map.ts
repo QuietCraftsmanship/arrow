@@ -15,16 +15,56 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Field } from '../schema';
-import { Builder } from '../builder';
-import { DataType, Map_ } from '../type';
+import { Field } from '../schema.js';
+import { DataType, Map_, Struct } from '../type.js';
+import { Builder, VariableWidthBuilder } from '../builder.js';
+
+/** @ignore */ type MapValue<K extends DataType = any, V extends DataType = any> = Map_<K, V>['TValue'];
+/** @ignore */ type MapValues<K extends DataType = any, V extends DataType = any> = Map<number, MapValue<K, V> | undefined>;
+/** @ignore */ type MapValueExt<K extends DataType = any, V extends DataType = any> = MapValue<K, V> | { [key: string]: V } | { [key: number]: V };
 
 /** @ignore */
-export class MapBuilder<T extends { [key: string]: DataType } = any, TNull = any> extends Builder<Map_<T>, TNull> {
-    public addChild(child: Builder, name = `${this.numChildren}`) {
-        const { children, keysSorted } = this.type;
-        const childIndex = this.children.push(child);
-        this.type = new Map_([...children, new Field(name, child.type, true)], keysSorted);
-        return childIndex;
+export class MapBuilder<K extends DataType = any, V extends DataType = any, TNull = any> extends VariableWidthBuilder<Map_<K, V>, TNull> {
+
+    declare protected _pending: MapValues<K, V> | undefined;
+    public set(index: number, value: MapValueExt<K, V> | TNull) {
+        return super.set(index, value as MapValue<K, V> | TNull);
+    }
+
+    public setValue(index: number, value: MapValueExt<K, V>) {
+        const row = (value instanceof Map ? value : new Map(Object.entries(value))) as MapValue<K, V>;
+        const pending = this._pending || (this._pending = new Map() as MapValues<K, V>);
+        const current = pending.get(index) as Map<K, V> | undefined;
+        current && (this._pendingLength -= current.size);
+        this._pendingLength += row.size;
+        pending.set(index, row);
+    }
+
+    public addChild(child: Builder<Struct<{ key: K; value: V }>>, name = `${this.numChildren}`) {
+        if (this.numChildren > 0) {
+            throw new Error('ListBuilder can only have one child.');
+        }
+        this.children[this.numChildren] = child;
+        this.type = new Map_<K, V>(new Field(name, child.type, true), this.type.keysSorted);
+        return this.numChildren - 1;
+    }
+
+    protected _flushPending(pending: MapValues<K, V>) {
+        const offsets = this._offsets;
+        const [child] = this.children;
+        for (const [index, value] of pending) {
+            if (value === undefined) {
+                offsets.set(index, 0);
+            } else {
+                let {
+                    [index]: idx,
+                    [index + 1]: end
+                } = offsets.set(index, value.size).buffer;
+                for (const val of value.entries()) {
+                    child.set(idx, val);
+                    if (++idx >= end) break;
+                }
+            }
+        }
     }
 }

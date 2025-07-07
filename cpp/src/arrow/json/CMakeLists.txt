@@ -17,12 +17,22 @@
 
 add_arrow_test(test
                SOURCES
-               chunker-test.cc
-               converter-test.cc
-               parser-test.cc
-               reader-test.cc
+               chunked_builder_test.cc
+               chunker_test.cc
+               converter_test.cc
+               parser_test.cc
+               reader_test.cc
                PREFIX
-               "arrow-json")
+               "arrow-json"
+               EXTRA_LINK_LIBS
+               RapidJSON)
 
-add_arrow_benchmark(parser-benchmark PREFIX "arrow-json")
+add_arrow_benchmark(parser_benchmark
+                    PREFIX
+                    "arrow-json"
+                    EXTRA_LINK_LIBS
+                    RapidJSON)
 arrow_install_all_headers("arrow/json")
+
+# pkg-config support
+arrow_add_pkg_config("arrow-json")

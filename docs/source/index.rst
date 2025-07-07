@@ -15,54 +15,115 @@
 .. specific language governing permissions and limitations
 .. under the License.
 
+:html_theme.sidebar_secondary.remove:
+
 Apache Arrow
 ============
 
-Apache Arrow is a development platform for in-memory analytics. It contains a
-set of technologies that enable big data systems to process and move data
-fast. It specifies a standardized language-independent columnar memory format
-for flat and hierarchical data, organized for efficient analytic operations on
-modern hardware.
+Apache Arrow is a universal columnar format and multi-language toolbox for fast
+data interchange and in-memory analytics.
 
-The project is developing a multi-language collection of libraries for solving
-systems problems related to in-memory analytical data processing. This includes
-such topics as:
+The project specifies a language-independent column-oriented memory format
+for flat and hierarchical data, organized for efficient analytic operations on
+modern hardware. The project houses an actively developed collection of
+libraries in many languages for solving problems related to data transfer and
+in-memory analytical processing. This includes such topics as:
 
 * Zero-copy shared memory and RPC-based data movement
 * Reading and writing file formats (like CSV, Apache ORC, and Apache Parquet)
 * In-memory analytics and query processing
 
+**To learn how to use Arrow refer to the documentation specific to your
+target environment.**
+
+.. grid:: 1 2 2 2
+   :gutter: 4
+   :padding: 2 2 0 0
+   :class-container: sd-text-center
+
+   .. grid-item-card:: Specifications
+      :class-card: contrib-card
+      :shadow: none
+
+      Read about the Apache Arrow format and its related specifications and
+      protocols.
+
+      +++
+
+      .. button-ref:: format
+         :ref-type: ref
+         :click-parent:
+         :color: primary
+         :expand:
+
+         To Specifications
+
+   .. grid-item-card:: Development
+      :class-card: contrib-card
+      :shadow: none
+
+      Find documentation on building the libraries from source, building the
+      documentation, contributing and code reviews, continuous integration,
+      benchmarking, and the release process.
+
+      +++
+
+      .. button-ref:: developers
+         :ref-type: ref
+         :click-parent:
+         :color: primary
+         :expand:
+
+         To Development
+
 .. _toc.columnar:
 
 .. toctree::
-   :maxdepth: 1
-   :caption: Arrow Columnar Format
-
-   format/README
-   format/Guidelines
-   format/Layout
-   format/Metadata
-   format/IPC
-   format/Flight
-
-.. _toc.usage:
-
-.. toctree::
    :maxdepth: 2
-   :caption: Arrow Libraries
+   :hidden:
 
-   cpp/index
-   python/index
+   format/index
 
 .. _toc.development:
 
 .. toctree::
    :maxdepth: 2
-   :caption: Development and Contributing
+   :hidden:
 
-   developers/contributing
-   developers/cpp
-   developers/python
-   developers/integration
-   developers/benchmarks
-   developers/documentation
+   developers/index
+
+Implementations
+---------------
+
+.. _toc.usage:
+
+.. toctree::
+   :maxdepth: 1
+
+   C/GLib <c_glib/index>
+   C++ <cpp/index>
+   C# <https://github.com/apache/arrow/blob/main/csharp/README.md>
+   Go <https://arrow.apache.org/go/>
+   Java <java/index>
+   JavaScript <js/index>
+   Julia <https://arrow.apache.org/julia/>
+   MATLAB <https://github.com/apache/arrow/blob/main/matlab/README.md>
+   nanoarrow <https://arrow.apache.org/nanoarrow/>
+   Python <python/index>
+   R <r/index>
+   Ruby <https://github.com/apache/arrow/blob/main/ruby/README.md>
+   Rust <https://docs.rs/crate/arrow/>
+   status
+
+Examples
+--------
+
+.. _toc.cookbook:
+
+.. toctree::
+   :maxdepth: 1
+
+   C++ cookbook <https://arrow.apache.org/cookbook/cpp/>
+   Java cookbook <https://arrow.apache.org/cookbook/java/>
+   Python cookbook <https://arrow.apache.org/cookbook/py/>
+   R cookbook <https://arrow.apache.org/cookbook/r/>

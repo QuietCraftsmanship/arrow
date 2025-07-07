@@ -18,44 +18,81 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
+#include "arrow/dataset/dataset.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
+#include "arrow/ipc/type_fwd.h"
 #include "arrow/json/options.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
+#include "arrow/util/future.h"
+#include "arrow/util/macros.h"
 
-namespace arrow {
-namespace dataset {
+namespace arrow::dataset {
 
-class ARROW_DS_EXPORT JsonScanOptions : public FileScanOptions {
- public:
-  ///
-  std::string file_type() const override;
+/// \addtogroup dataset-file-formats
+///
+/// @{
 
- private:
-  json::ParseOptions parse_options_;
-  json::ReadOptions read_options_;
-};
-
-class ARROW_DS_EXPORT JsonWriteOptions : public FileWriteOptions {
- public:
-  std::string file_type() const override;
-};
+constexpr char kJsonTypeName[] = "json";
 
 /// \brief A FileFormat implementation that reads from JSON files
 class ARROW_DS_EXPORT JsonFileFormat : public FileFormat {
  public:
-  std::string name() const override;
+  JsonFileFormat();
 
-  /// \brief Return true if the given file extension
-  bool IsKnownExtension(const std::string& ext) const override;
+  std::string type_name() const override { return kJsonTypeName; }
 
-  /// \brief Open a file for scanning
-  Status ScanFile(const FileSource& location, std::shared_ptr<ScanOptions> scan_options,
-                  std::shared_ptr<ScanContext> scan_context,
-                  std::unique_ptr<ScanTaskIterator>* out) const override;
+  bool Equals(const FileFormat& other) const override;
+
+  Result<bool> IsSupported(const FileSource& source) const override;
+
+  Result<std::shared_ptr<Schema>> Inspect(const FileSource& source) const override;
+
+  Future<std::shared_ptr<InspectedFragment>> InspectFragment(
+      const FileSource& source, const FragmentScanOptions* format_options,
+      compute::ExecContext* exec_context) const override;
+
+  Future<std::shared_ptr<FragmentScanner>> BeginScan(
+      const FragmentScanRequest& scan_request, const InspectedFragment& inspected,
+      const FragmentScanOptions* format_options,
+      compute::ExecContext* exec_context) const override;
+
+  Result<RecordBatchGenerator> ScanBatchesAsync(
+      const std::shared_ptr<ScanOptions>& scan_options,
+      const std::shared_ptr<FileFragment>& file) const override;
+
+  Future<std::optional<int64_t>> CountRows(
+      const std::shared_ptr<FileFragment>& file, compute::Expression predicate,
+      const std::shared_ptr<ScanOptions>& scan_options) override;
+
+  Result<std::shared_ptr<FileWriter>> MakeWriter(
+      std::shared_ptr<io::OutputStream> destination, std::shared_ptr<Schema> schema,
+      std::shared_ptr<FileWriteOptions> options,
+      fs::FileLocator destination_locator) const override {
+    return Status::NotImplemented("Writing JSON files is not currently supported");
+  }
+
+  std::shared_ptr<FileWriteOptions> DefaultWriteOptions() override { return NULLPTR; }
 };
 
-}  // namespace dataset
-}  // namespace arrow
+/// \brief Per-scan options for JSON fragments
+struct ARROW_DS_EXPORT JsonFragmentScanOptions : public FragmentScanOptions {
+  std::string type_name() const override { return kJsonTypeName; }
+
+  /// @brief Options that affect JSON parsing
+  ///
+  /// Note: `explicit_schema` and `unexpected_field_behavior` are ignored.
+  json::ParseOptions parse_options = json::ParseOptions::Defaults();
+
+  /// @brief Options that affect JSON reading
+  json::ReadOptions read_options = json::ReadOptions::Defaults();
+};
+
+/// @}
+
+}  // namespace arrow::dataset

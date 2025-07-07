@@ -26,13 +26,14 @@ standardized open-source columnar storage format for use in data analysis
 systems. It was created originally for use in `Apache Hadoop
 <http://hadoop.apache.org/>`_ with systems like `Apache Drill
 <http://drill.apache.org>`_, `Apache Hive <http://hive.apache.org>`_, `Apache
-Impala (incubating) <http://impala.apache.org>`_, and `Apache Spark
+Impala <http://impala.apache.org>`_, and `Apache Spark
 <http://spark.apache.org>`_ adopting it as a shared standard for high
 performance data IO.
 
 Apache Arrow is an ideal in-memory transport layer for data that is being read
 or written with Parquet files. We have been concurrently developing the `C++
-implementation of Apache Parquet <http://github.com/apache/parquet-cpp>`_,
+implementation of
+Apache Parquet <https://github.com/apache/arrow/tree/main/cpp/tools/parquet>`_,
 which includes a native, multithreaded C++ adapter to and from in-memory Arrow
 data. PyArrow includes Python bindings to this code, which thus enables reading
 and writing Parquet files with pandas as well.
@@ -47,16 +48,17 @@ support bundled:
 
    import pyarrow.parquet as pq
 
-If you are building ``pyarrow`` from source, you must use
-``-DARROW_PARQUET=ON`` when compiling the C++ libraries and enable the Parquet
-extensions when building ``pyarrow``. See the :ref:`Python Development
-<python-development>` page for more details.
+If you are building ``pyarrow`` from source, you must use ``-DARROW_PARQUET=ON``
+when compiling the C++ libraries and enable the Parquet extensions when
+building ``pyarrow``. If you want to use Parquet Encryption, then you must
+use ``-DPARQUET_REQUIRE_ENCRYPTION=ON`` too when compiling the C++ libraries.
+See the :ref:`Python Development <python-development>` page for more details.
 
 Reading and Writing Single Files
 --------------------------------
 
 The functions :func:`~.parquet.read_table` and :func:`~.parquet.write_table`
-read and write the :ref:`pyarrow.Table <data.table>` objects, respectively.
+read and write the :ref:`pyarrow.Table <data.table>` object, respectively.
 
 Let's look at a simple table:
 
@@ -102,7 +104,7 @@ source, we use ``read_pandas`` to maintain any additional index column data:
 
    pq.read_pandas('example.parquet', columns=['two']).to_pandas()
 
-We need not use a string to specify the origin of the file. It can be any of:
+We do not need to use a string to specify the origin of the file. It can be any of:
 
 * A file path as a string
 * A :ref:`NativeFile <io.native_file>` from PyArrow
@@ -112,19 +114,44 @@ In general, a Python file object will have the worst read performance, while a
 string file path or an instance of :class:`~.NativeFile` (especially memory
 maps) will perform the best.
 
+.. _parquet_mmap:
+
+Reading Parquet and Memory Mapping
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Because Parquet data needs to be decoded from the Parquet format
+and compression, it can't be directly mapped from disk.
+Thus the ``memory_map`` option might perform better on some systems
+but won't help much with resident memory consumption.
+
+.. code-block:: python
+
+      >>> pq_array = pa.parquet.read_table("area1.parquet", memory_map=True)
+      >>> print("RSS: {}MB".format(pa.total_allocated_bytes() >> 20))
+      RSS: 4299MB
+
+      >>> pq_array = pa.parquet.read_table("area1.parquet", memory_map=False)
+      >>> print("RSS: {}MB".format(pa.total_allocated_bytes() >> 20))
+      RSS: 4299MB
+
+If you need to deal with Parquet data bigger than memory,
+the :ref:`dataset` and partitioning is probably what you are looking for.
+
 Parquet file writing options
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 :func:`~pyarrow.parquet.write_table()` has a number of options to
 control various settings when writing a Parquet file.
 
-* ``version``, the Parquet format version to use, whether ``'1.0'``
-  for compatibility with older readers, or ``'2.0'`` to unlock more
-  recent features.
+* ``version``, the Parquet format version to use.  ``'1.0'`` ensures
+  compatibility with older readers, while ``'2.4'`` and greater values
+  enable more Parquet types and encodings.
 * ``data_page_size``, to control the approximate size of encoded data
-  pages within a column chunk. This currently defaults to 1MB
+  pages within a column chunk. This currently defaults to 1MB.
 * ``flavor``, to set compatibility options particular to a Parquet
   consumer like ``'spark'`` for Apache Spark.
+
+See the :func:`~pyarrow.parquet.write_table()` docstring for more details.
 
 There are some additional data type handling-specific options
 described below.
@@ -183,21 +210,39 @@ We can similarly write a Parquet file with multiple row groups by using
 
 .. ipython:: python
 
-   writer = pq.ParquetWriter('example2.parquet', table.schema)
-   for i in range(3):
-       writer.write_table(table)
-   writer.close()
+   with pq.ParquetWriter('example2.parquet', table.schema) as writer:
+      for i in range(3):
+         writer.write_table(table)
 
    pf2 = pq.ParquetFile('example2.parquet')
    pf2.num_row_groups
 
-Alternatively python ``with`` syntax can also be use:
+Inspecting the Parquet File Metadata
+------------------------------------
+
+The ``FileMetaData`` of a Parquet file can be accessed through
+:class:`~.ParquetFile` as shown above:
 
 .. ipython:: python
 
-   with pq.ParquetWriter('example3.parquet', table.schema) as writer:
-       for i in range(3):
-           writer.write_table(table)
+   parquet_file = pq.ParquetFile('example.parquet')
+   metadata = parquet_file.metadata
+
+or can also be read directly using :func:`~parquet.read_metadata`:
+
+.. ipython:: python
+
+   metadata = pq.read_metadata('example.parquet')
+   metadata
+
+The returned ``FileMetaData`` object allows to inspect the
+`Parquet file metadata <https://github.com/apache/parquet-format#metadata>`__,
+such as the row groups and column chunk metadata and statistics:
+
+.. ipython:: python
+
+   metadata.row_group(0)
+   metadata.row_group(0).column(0)
 
 .. ipython:: python
    :suppress:
@@ -210,13 +255,30 @@ Alternatively python ``with`` syntax can also be use:
 Data Type Handling
 ------------------
 
+Reading types as DictionaryArray
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``read_dictionary`` option in ``read_table`` and ``ParquetDataset`` will
+cause columns to be read as ``DictionaryArray``, which will become
+``pandas.Categorical`` when converted to pandas. This option is only valid for
+string and binary column types, and it can yield significantly lower memory use
+and improved performance for columns with many repeated string values.
+
+.. code-block:: python
+
+   pq.read_table(table, where, read_dictionary=['binary_c0', 'stringb_c2'])
+
 Storing timestamps
 ~~~~~~~~~~~~~~~~~~
 
 Some Parquet readers may only support timestamps stored in millisecond
 (``'ms'``) or microsecond (``'us'``) resolution. Since pandas uses nanoseconds
-to represent timestamps, this can occasionally be a nuisance. We provide the
-``coerce_timestamps`` option to allow you to select the desired resolution:
+to represent timestamps, this can occasionally be a nuisance. By default
+(when writing version 1.0 Parquet files), the nanoseconds will be cast to
+microseconds ('us').
+
+In addition, We provide the ``coerce_timestamps`` option to allow you to select
+the desired resolution:
 
 .. code-block:: python
 
@@ -230,6 +292,18 @@ an exception will be raised. This can be suppressed by passing
 
    pq.write_table(table, where, coerce_timestamps='ms',
                   allow_truncated_timestamps=True)
+
+Timestamps with nanoseconds can be stored without casting when using the
+more recent Parquet format version 2.6:
+
+.. code-block:: python
+
+   pq.write_table(table, where, version='2.6')
+
+However, many Parquet readers do not yet support this newer format version, and
+therefore the default is to write version 1.0 files. When compatibility across
+different processing frameworks is required, it is recommended to use the
+default version 1.0.
 
 Older Parquet implementations use ``INT96`` based storage of
 timestamps, but this is now deprecated. This includes some older
@@ -255,13 +329,16 @@ plain encoding. Whether dictionary encoding is used can be toggled using the
 
 The data pages within a column in a row group can be compressed after the
 encoding passes (dictionary, RLE encoding). In PyArrow we use Snappy
-compression by default, but Brotli, Gzip, and uncompressed are also supported:
+compression by default, but Brotli, Gzip, ZSTD, LZ4, and uncompressed are
+also supported:
 
 .. code-block:: python
 
    pq.write_table(table, where, compression='snappy')
    pq.write_table(table, where, compression='gzip')
    pq.write_table(table, where, compression='brotli')
+   pq.write_table(table, where, compression='zstd')
+   pq.write_table(table, where, compression='lz4')
    pq.write_table(table, where, compression='none')
 
 Snappy generally results in better performance, while Gzip may yield smaller
@@ -305,7 +382,7 @@ A dataset partitioned by year and month may look like on disk:
      ...
 
 Writing to Partitioned Datasets
-------------------------------------------------
+-------------------------------
 
 You can write a partitioned dataset for any ``pyarrow`` file system that is a
 file-store (e.g. local, HDFS, S3). The default behaviour when no filesystem is
@@ -329,7 +406,8 @@ individual table writes are wrapped using ``with`` statements so the
 .. code-block:: python
 
    # Remote file-system example
-   fs = pa.hdfs.connect(host, port, user=user, kerb_ticket=ticket_cache_path)
+   from pyarrow.fs import HadoopFileSystem
+   fs = HadoopFileSystem(host, port, user=user, kerb_ticket=ticket_cache_path)
    pq.write_to_dataset(table, root_path='dataset_name',
                        partition_cols=['one', 'two'], filesystem=fs)
 
@@ -337,11 +415,80 @@ Compatibility Note: if using ``pq.write_to_dataset`` to create a table that
 will then be used by HIVE then partition column values must be compatible with
 the allowed character set of the HIVE version you are running.
 
+Writing ``_metadata`` and ``_common_metadata`` files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some processing frameworks such as Spark or Dask (optionally) use ``_metadata``
+and ``_common_metadata`` files with partitioned datasets.
+
+Those files include information about the schema of the full dataset (for
+``_common_metadata``) and potentially all row group metadata of all files in the
+partitioned dataset as well (for ``_metadata``). The actual files are
+metadata-only Parquet files. Note this is not a Parquet standard, but a
+convention set in practice by those frameworks.
+
+Using those files can give a more efficient creation of a parquet Dataset,
+since it can use the stored schema and file paths of all row groups,
+instead of inferring the schema and crawling the directories for all Parquet
+files (this is especially the case for filesystems where accessing files
+is expensive).
+
+The :func:`~pyarrow.parquet.write_to_dataset` function does not automatically
+write such metadata files, but you can use it to gather the metadata and
+combine and write them manually:
+
+.. code-block:: python
+
+   # Write a dataset and collect metadata information of all written files
+   metadata_collector = []
+   pq.write_to_dataset(table, root_path, metadata_collector=metadata_collector)
+
+   # Write the ``_common_metadata`` parquet file without row groups statistics
+   pq.write_metadata(table.schema, root_path / '_common_metadata')
+
+   # Write the ``_metadata`` parquet file with row groups statistics of all files
+   pq.write_metadata(
+       table.schema, root_path / '_metadata',
+       metadata_collector=metadata_collector
+   )
+
+When not using the :func:`~pyarrow.parquet.write_to_dataset` function, but
+writing the individual files of the partitioned dataset using
+:func:`~pyarrow.parquet.write_table` or :class:`~pyarrow.parquet.ParquetWriter`,
+the ``metadata_collector`` keyword can also be used to collect the FileMetaData
+of the written files. In this case, you need to ensure to set the file path
+contained in the row group metadata yourself before combining the metadata, and
+the schemas of all different files and collected FileMetaData objects should be
+the same:
+
+.. code-block:: python
+
+   metadata_collector = []
+   pq.write_table(
+       table1, root_path / "year=2017/data1.parquet",
+       metadata_collector=metadata_collector
+   )
+
+   # set the file path relative to the root of the partitioned dataset
+   metadata_collector[-1].set_file_path("year=2017/data1.parquet")
+
+   # combine and write the metadata
+   metadata = metadata_collector[0]
+   for _meta in metadata_collector[1:]:
+       metadata.append_row_groups(_meta)
+   metadata.write_metadata_file(root_path / "_metadata")
+
+   # or use pq.write_metadata to combine and write in a single step
+   pq.write_metadata(
+       table1.schema, root_path / "_metadata",
+       metadata_collector=metadata_collector
+   )
+
 Reading from Partitioned Datasets
 ------------------------------------------------
 
 The :class:`~.ParquetDataset` class accepts either a directory name or a list
-or file paths, and can discover and infer some common partition structures,
+of file paths, and can discover and infer some common partition structures,
 such as those produced by Hive:
 
 .. code-block:: python
@@ -363,6 +510,22 @@ partition columns is not preserved through the save/load process. If reading
 from a remote filesystem into a pandas dataframe you may need to run
 ``sort_index`` to maintain row ordering (as long as the ``preserve_index``
 option was enabled on write).
+
+Other features:
+
+- Filtering on all columns (using row group statistics) instead of only on
+  the partition keys.
+- Fine-grained partitioning: support for a directory partitioning scheme
+  in addition to the Hive-like partitioning (e.g. "/2019/11/15/" instead of
+  "/year=2019/month=11/day=15/"), and the ability to specify a schema for
+  the partition keys.
+
+Note:
+
+- The partition keys need to be explicitly included in the ``columns``
+  keyword when you want to include them in the result while reading a
+  subset of the columns
+
 
 Using with Spark
 ----------------
@@ -386,46 +549,236 @@ This can be disabled by specifying ``use_threads=False``.
    The number of threads to use concurrently is automatically inferred by Arrow
    and can be inspected using the :func:`~pyarrow.cpu_count()` function.
 
+Reading from cloud storage
+--------------------------
 
-Reading a Parquet File from Azure Blob storage
-----------------------------------------------
-
-The code below shows how to use Azure's storage sdk along with pyarrow to read
-a parquet file into a Pandas dataframe.
-This is suitable for executing inside a Jupyter notebook running on a Python 3
-kernel.
-
-Dependencies:
-
-* python 3.6.2
-* azure-storage 0.36.0
-* pyarrow 0.8.0
+In addition to local files, pyarrow supports other filesystems, such as cloud
+filesystems, through the ``filesystem`` keyword:
 
 .. code-block:: python
 
-   import pyarrow.parquet as pq
-   from io import BytesIO
-   from azure.storage.blob import BlockBlobService
+    from pyarrow import fs
 
-   account_name = '...'
-   account_key = '...'
-   container_name = '...'
-   parquet_file = 'mysample.parquet'
+    s3  = fs.S3FileSystem(region="us-east-2")
+    table = pq.read_table("bucket/object/key/prefix", filesystem=s3)
 
-   byte_stream = io.BytesIO()
-   block_blob_service = BlockBlobService(account_name=account_name, account_key=account_key)
-   try:
-      block_blob_service.get_blob_to_stream(container_name=container_name, blob_name=parquet_file, stream=byte_stream)
-      df = pq.read_table(source=byte_stream).to_pandas()
-      # Do work on df ...
-   finally:
-      # Add finally block to ensure closure of the stream
-      byte_stream.close()
+Currently, :class:`HDFS <pyarrow.fs.HadoopFileSystem>` and
+:class:`Amazon S3-compatible storage <pyarrow.fs.S3FileSystem>` are
+supported. See the :ref:`filesystem` docs for more details. For those
+built-in filesystems, the filesystem can also be inferred from the file path,
+if specified as a URI:
 
-Notes:
+.. code-block:: python
 
-* The ``account_key`` can be found under ``Settings -> Access keys`` in the
-  Microsoft Azure portal for a given container
-* The code above works for a container with private access, Lease State =
-  Available, Lease Status = Unlocked
-* The parquet file was Blob Type = Block blob
+    table = pq.read_table("s3://bucket/object/key/prefix")
+
+Other filesystems can still be supported if there is an
+`fsspec <https://filesystem-spec.readthedocs.io/en/latest/>`__-compatible
+implementation available. See :ref:`filesystem-fsspec` for more details.
+One example is Azure Blob storage, which can be interfaced through the
+`adlfs <https://github.com/dask/adlfs>`__ package.
+
+.. code-block:: python
+
+    from adlfs import AzureBlobFileSystem
+
+    abfs = AzureBlobFileSystem(account_name="XXXX", account_key="XXXX", container_name="XXXX")
+    table = pq.read_table("file.parquet", filesystem=abfs)
+
+Parquet Modular Encryption (Columnar Encryption)
+------------------------------------------------
+
+Columnar encryption is supported for Parquet files in C++ starting from
+Apache Arrow 4.0.0 and in PyArrow starting from Apache Arrow 6.0.0.
+
+Parquet uses the envelope encryption practice, where file parts are encrypted
+with "data encryption keys" (DEKs), and the DEKs are encrypted with "master
+encryption keys" (MEKs). The DEKs are randomly generated by Parquet for each
+encrypted file/column. The MEKs are generated, stored and managed in a Key
+Management Service (KMS) of user’s choice.
+
+Reading and writing encrypted Parquet files involves passing file encryption
+and decryption properties to :class:`~pyarrow.parquet.ParquetWriter` and to
+:class:`~.ParquetFile`, respectively.
+
+Writing an encrypted Parquet file:
+
+.. code-block:: python
+
+   encryption_properties = crypto_factory.file_encryption_properties(
+                                    kms_connection_config, encryption_config)
+   with pq.ParquetWriter(filename, schema,
+                        encryption_properties=encryption_properties) as writer:
+      writer.write_table(table)
+
+Reading an encrypted Parquet file:
+
+.. code-block:: python
+
+   decryption_properties = crypto_factory.file_decryption_properties(
+                                                    kms_connection_config)
+   parquet_file = pq.ParquetFile(filename,
+                                 decryption_properties=decryption_properties)
+
+
+In order to create the encryption and decryption properties, a
+:class:`pyarrow.parquet.encryption.CryptoFactory` should be created and
+initialized with KMS Client details, as described below.
+
+
+KMS Client
+~~~~~~~~~~
+
+The master encryption keys should be kept and managed in a production-grade
+Key Management System (KMS), deployed in the user's organization. Using Parquet
+encryption requires implementation of a client class for the KMS server.
+Any KmsClient implementation should implement the informal interface
+defined by :class:`pyarrow.parquet.encryption.KmsClient` as following:
+
+.. code-block:: python
+
+   import pyarrow.parquet.encryption as pe
+
+   class MyKmsClient(pe.KmsClient):
+
+      """An example KmsClient implementation skeleton"""
+      def __init__(self, kms_connection_configuration):
+         pe.KmsClient.__init__(self)
+         # Any KMS-specific initialization based on
+         # kms_connection_configuration comes here
+
+      def wrap_key(self, key_bytes, master_key_identifier):
+         wrapped_key = ... # call KMS to wrap key_bytes with key specified by
+                           # master_key_identifier
+         return wrapped_key
+
+      def unwrap_key(self, wrapped_key, master_key_identifier):
+         key_bytes = ... # call KMS to unwrap wrapped_key with key specified by
+                         # master_key_identifier
+         return key_bytes
+
+The concrete implementation will be loaded at runtime by a factory function
+provided by the user. This factory function will be used to initialize the
+:class:`pyarrow.parquet.encryption.CryptoFactory` for creating file encryption
+and decryption properties.
+
+For example, in order to use the ``MyKmsClient`` defined above:
+
+.. code-block:: python
+
+   def kms_client_factory(kms_connection_configuration):
+      return MyKmsClient(kms_connection_configuration)
+
+   crypto_factory = CryptoFactory(kms_client_factory)
+
+An :download:`example <../../../python/examples/parquet_encryption/sample_vault_kms_client.py>`
+of such a class for an open source
+`KMS <https://www.vaultproject.io/api/secret/transit>`_ can be found in the Apache
+Arrow GitHub repository. The production KMS client should be designed in
+cooperation with an organization's security administrators, and built by
+developers with experience in access control management. Once such a class is
+created, it can be passed to applications via a factory method and leveraged
+by general PyArrow users as shown in the encrypted parquet write/read sample
+above.
+
+KMS connection configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Configuration of connection to KMS (:class:`pyarrow.parquet.encryption.KmsConnectionConfig`
+used when creating file encryption and decryption properties) includes the
+following options:
+
+* ``kms_instance_url``, URL of the KMS instance.
+* ``kms_instance_id``, ID of the KMS instance that will be used for encryption
+  (if multiple KMS instances are available).
+* ``key_access_token``, authorization token that will be passed to KMS.
+* ``custom_kms_conf``, a string dictionary with KMS-type-specific configuration.
+
+Encryption configuration
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`pyarrow.parquet.encryption.EncryptionConfiguration` (used when
+creating file encryption properties) includes the following options:
+
+* ``footer_key``, the ID of the master key for footer encryption/signing.
+* ``column_keys``, which columns to encrypt with which key. Dictionary with
+  master key IDs as the keys, and column name lists as the values,
+  e.g. ``{key1: [col1, col2], key2: [col3]}``. See notes on nested fields below.
+* ``encryption_algorithm``, the Parquet encryption algorithm.
+  Can be ``AES_GCM_V1`` (default) or ``AES_GCM_CTR_V1``.
+* ``plaintext_footer``, whether to write the file footer in plain text (otherwise it is encrypted).
+* ``double_wrapping``, whether to use double wrapping - where data encryption keys (DEKs)
+  are encrypted with key encryption keys (KEKs), which in turn are encrypted
+  with master encryption keys (MEKs). If set to ``false``, single wrapping is
+  used - where DEKs are encrypted directly with MEKs.
+* ``cache_lifetime``, the lifetime of cached entities (key encryption keys,
+  local wrapping keys, KMS client objects) represented as a ``datetime.timedelta``.
+* ``internal_key_material``, whether to store key material inside Parquet file footers;
+  this mode doesn’t produce additional files. If set to ``false``, key material is
+  stored in separate files in the same folder, which enables key rotation for
+  immutable Parquet files.
+* ``data_key_length_bits``, the length of data encryption keys (DEKs), randomly
+  generated by Parquet key management tools. Can be 128, 192 or 256 bits.
+
+.. note::
+   When ``double_wrapping`` is true, Parquet implements a "double envelope
+   encryption" mode that minimizes the interaction of the program with a KMS
+   server. In this mode, the DEKs are encrypted with "key encryption keys"
+   (KEKs, randomly generated by Parquet). The KEKs are encrypted with "master
+   encryption keys" (MEKs) in the KMS; the result and the KEK itself are
+   cached in the process memory.
+
+An example encryption configuration:
+
+.. code-block:: python
+
+   encryption_config = pq.EncryptionConfiguration(
+      footer_key="footer_key_name",
+      column_keys={
+         "column_key_name": ["Column1", "Column2"],
+      },
+   )
+
+.. note::
+
+   Encrypting columns that have nested fields (struct, map or list data types)
+   requires column keys for the inner fields, not the outer column itself.
+   Configuring a column key for the outer column causes
+   this error (here the column name is ``col``):
+
+   .. code-block::
+
+      OSError: Encrypted column col not in file schema
+
+An example encryption configuration for columns with nested fields, where
+all columns will be encrypted with the same key identified by ``column_key_id``:
+
+.. code-block:: python
+
+   import pyarrow.parquet.encryption as pe
+
+   schema = pa.schema([
+     ("ListColumn", pa.list_(pa.int32())),
+     ("MapColumn", pa.map_(pa.string(), pa.int32())),
+     ("StructColumn", pa.struct([("f1", pa.int32()), ("f2", pa.string())])),
+   ])
+
+   encryption_config = pe.EncryptionConfiguration(
+      footer_key="footer_key_name",
+      column_keys={
+         "column_key_id": [
+           "ListColumn.list.element",
+           "MapColumn.key_value.key", "MapColumn.key_value.value",
+           "StructColumn.f1", "StructColumn.f2"
+         ],
+      },
+   )
+
+Decryption configuration
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`pyarrow.parquet.encryption.DecryptionConfiguration` (used when creating
+file decryption properties) is optional and it includes the following options:
+
+* ``cache_lifetime``, the lifetime of cached entities (key encryption keys, local
+  wrapping keys, KMS client objects) represented as a ``datetime.timedelta``.

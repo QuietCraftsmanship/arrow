@@ -16,40 +16,44 @@
 using Apache.Arrow.Memory;
 using Apache.Arrow.Types;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 
 namespace Apache.Arrow
 {
-    public class BooleanArray: Array
+    public class BooleanArray: Array, IReadOnlyList<bool?>, ICollection<bool?>
     {
         public class Builder : IArrowArrayBuilder<bool, BooleanArray, Builder>
         {
-            private ArrowBuffer.Builder<byte> ValueBuffer { get; }
+            private ArrowBuffer.BitmapBuilder ValueBuffer { get; }
+            private ArrowBuffer.BitmapBuilder ValidityBuffer { get; }
 
-            public int Length { get; protected set; }
-            public int Capacity => BitUtility.ByteCount(ValueBuffer.Capacity);
+            public int Length => ValueBuffer.Length;
+            public int Capacity => ValueBuffer.Capacity;
+            public int NullCount => ValidityBuffer.UnsetBitCount;
 
             public Builder()
             {
-                ValueBuffer = new ArrowBuffer.Builder<byte>();
-                Length = 0;
+                ValueBuffer = new ArrowBuffer.BitmapBuilder();
+                ValidityBuffer = new ArrowBuffer.BitmapBuilder();
             }
 
             public Builder Append(bool value)
             {
-                if (Length % 8 == 0)
-                {
-                    // append a new byte to the buffer when needed
-                    ValueBuffer.Append(0);
-                }
-                BitUtility.SetBit(ValueBuffer.Span, Length, value);
-                Length++;
+                return NullableAppend(value);
+            }
+
+            public Builder NullableAppend(bool? value)
+            {
+                // Note that we rely on the fact that null values are false in the value buffer.
+                ValueBuffer.Append(value ?? false);
+                ValidityBuffer.Append(value.HasValue);
                 return this;
             }
 
             public Builder Append(ReadOnlySpan<bool> span)
             {
-                foreach (var value in span)
+                foreach (bool value in span)
                 {
                     Append(value);
                 }
@@ -58,24 +62,33 @@ namespace Apache.Arrow
 
             public Builder AppendRange(IEnumerable<bool> values)
             {
-                foreach (var value in values)
+                foreach (bool value in values)
                 {
                     Append(value);
                 }
                 return this;
             }
 
+            public Builder AppendNull()
+            {
+                return NullableAppend(null);
+            }
+
             public BooleanArray Build(MemoryAllocator allocator = default)
             {
+                ArrowBuffer validityBuffer = NullCount > 0
+                                        ? ValidityBuffer.Build(allocator)
+                                        : ArrowBuffer.Empty;
+
                 return new BooleanArray(
-                    ValueBuffer.Build(allocator), ArrowBuffer.Empty,
-                    Length, 0, 0);
+                    ValueBuffer.Build(allocator), validityBuffer,
+                    Length, NullCount, 0);
             }
 
             public Builder Clear()
             {
                 ValueBuffer.Clear();
-                Length = 0;
+                ValidityBuffer.Clear();
                 return this;
             }
 
@@ -86,7 +99,8 @@ namespace Apache.Arrow
                     throw new ArgumentOutOfRangeException(nameof(capacity));
                 }
 
-                ValueBuffer.Reserve(BitUtility.ByteCount(capacity));
+                ValueBuffer.Reserve(capacity);
+                ValidityBuffer.Reserve(capacity);
                 return this;
             }
 
@@ -97,29 +111,35 @@ namespace Apache.Arrow
                     throw new ArgumentOutOfRangeException(nameof(length));
                 }
 
-                ValueBuffer.Resize(BitUtility.ByteCount(length));
-                Length = length;
+                ValueBuffer.Resize(length);
+                ValidityBuffer.Resize(length);
                 return this;
             }
 
             public Builder Toggle(int index)
             {
                 CheckIndex(index);
-                BitUtility.ToggleBit(ValueBuffer.Span, index);
+
+                // If there is a null at this index, assume it was set to false in the value buffer, and so becomes
+                // true/non-null after toggling.
+                ValueBuffer.Toggle(index);
+                ValidityBuffer.Set(index);
                 return this;
             }
 
             public Builder Set(int index)
             {
                 CheckIndex(index);
-                BitUtility.SetBit(ValueBuffer.Span, index);
+                ValueBuffer.Set(index);
+                ValidityBuffer.Set(index);
                 return this;
             }
 
             public Builder Set(int index, bool value)
             {
                 CheckIndex(index);
-                BitUtility.SetBit(ValueBuffer.Span, index, value);
+                ValueBuffer.Set(index, value);
+                ValidityBuffer.Set(index);
                 return this;
             }
 
@@ -127,10 +147,8 @@ namespace Apache.Arrow
             {
                 CheckIndex(i);
                 CheckIndex(j);
-                var bi = BitUtility.GetBit(ValueBuffer.Span, i);
-                var bj = BitUtility.GetBit(ValueBuffer.Span, j);
-                BitUtility.SetBit(ValueBuffer.Span, i, bj);
-                BitUtility.SetBit(ValueBuffer.Span, j, bi);
+                ValueBuffer.Swap(i, j);
+                ValidityBuffer.Swap(i, j);
                 return this;
             }
 
@@ -153,7 +171,7 @@ namespace Apache.Arrow
                 new[] { nullBitmapBuffer, valueBuffer }))
         { }
 
-        public BooleanArray(ArrayData data) 
+        public BooleanArray(ArrayData data)
             : base(data)
         {
             data.EnsureDataType(ArrowTypeId.Boolean);
@@ -161,9 +179,56 @@ namespace Apache.Arrow
 
         public override void Accept(IArrowArrayVisitor visitor) => Accept(this, visitor);
 
+        [Obsolete("GetBoolean does not support null values. Use GetValue instead (which this method invokes internally).")]
         public bool GetBoolean(int index)
         {
-            return BitUtility.GetBit(Values, index);
+            return GetValue(index).GetValueOrDefault();
+        }
+
+        public bool? GetValue(int index)
+        {
+            return IsNull(index)
+                ? null
+                : BitUtility.GetBit(ValueBuffer.Span, index + Offset);
+        }
+
+        int IReadOnlyCollection<bool?>.Count => Length;
+
+        bool? IReadOnlyList<bool?>.this[int index] => GetValue(index);
+
+        IEnumerator<bool?> IEnumerable<bool?>.GetEnumerator()
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                yield return GetValue(index);
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<bool?>)this).GetEnumerator();
+
+        int ICollection<bool?>.Count => Length;
+        bool ICollection<bool?>.IsReadOnly => true;
+        void ICollection<bool?>.Add(bool? item) => throw new NotSupportedException("Collection is read-only.");
+        bool ICollection<bool?>.Remove(bool? item) => throw new NotSupportedException("Collection is read-only.");
+        void ICollection<bool?>.Clear() => throw new NotSupportedException("Collection is read-only.");
+
+        bool ICollection<bool?>.Contains(bool? item)
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                if (GetValue(index).Equals(item))
+                    return true;
+            }
+
+            return false;
+        }
+
+        void ICollection<bool?>.CopyTo(bool?[] array, int arrayIndex)
+        {
+            for (int srcIndex = 0, destIndex = arrayIndex; srcIndex < Length; srcIndex++, destIndex++)
+            {
+                array[destIndex] = GetValue(srcIndex);
+            }
         }
     }
 }

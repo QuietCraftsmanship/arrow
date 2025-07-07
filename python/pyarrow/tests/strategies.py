@@ -15,12 +15,33 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import pytz
+import datetime
+import sys
+
+import pytest
 import hypothesis as h
 import hypothesis.strategies as st
-import hypothesis.extra.numpy as npst
-import hypothesis.extra.pytz as tzst
-import numpy as np
+try:
+    import hypothesis.extra.numpy as npst
+except ImportError:
+    npst = None
+try:
+    import hypothesis.extra.pytz as tzst
+except ImportError:
+    tzst = None
+try:
+    import zoneinfo
+except ImportError:
+    zoneinfo = None
+if sys.platform == 'win32':
+    try:
+        import tzdata  # noqa:F401
+    except ImportError:
+        zoneinfo = None
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 import pyarrow as pa
 
@@ -38,6 +59,19 @@ bool_type = st.just(pa.bool_())
 
 binary_type = st.just(pa.binary())
 string_type = st.just(pa.string())
+large_binary_type = st.just(pa.large_binary())
+large_string_type = st.just(pa.large_string())
+fixed_size_binary_type = st.builds(
+    pa.binary,
+    st.integers(min_value=0, max_value=16)
+)
+binary_like_types = st.one_of(
+    binary_type,
+    string_type,
+    large_binary_type,
+    large_string_type,
+    fixed_size_binary_type
+)
 
 signed_integer_types = st.sampled_from([
     pa.int8(),
@@ -58,12 +92,28 @@ floating_types = st.sampled_from([
     pa.float32(),
     pa.float64()
 ])
-decimal_type = st.builds(
+decimal32_type = st.builds(
+    pa.decimal32,
+    precision=st.integers(min_value=1, max_value=9),
+    scale=st.integers(min_value=1, max_value=9)
+)
+decimal64_type = st.builds(
+    pa.decimal64,
+    precision=st.integers(min_value=1, max_value=18),
+    scale=st.integers(min_value=1, max_value=18)
+)
+decimal128_type = st.builds(
     pa.decimal128,
     precision=st.integers(min_value=1, max_value=38),
     scale=st.integers(min_value=1, max_value=38)
 )
-numeric_types = st.one_of(integer_types, floating_types, decimal_type)
+decimal256_type = st.builds(
+    pa.decimal256,
+    precision=st.integers(min_value=1, max_value=76),
+    scale=st.integers(min_value=1, max_value=76)
+)
+numeric_types = st.one_of(integer_types, floating_types,
+                          decimal128_type, decimal256_type)
 
 date_types = st.sampled_from([
     pa.date32(),
@@ -75,52 +125,106 @@ time_types = st.sampled_from([
     pa.time64('us'),
     pa.time64('ns')
 ])
+
+if tzst and zoneinfo:
+    timezones = st.one_of(st.none(), tzst.timezones(), st.timezones())
+elif tzst:
+    timezones = st.one_of(st.none(), tzst.timezones())
+elif zoneinfo:
+    timezones = st.one_of(st.none(), st.timezones())
+else:
+    timezones = st.none()
 timestamp_types = st.builds(
     pa.timestamp,
     unit=st.sampled_from(['s', 'ms', 'us', 'ns']),
-    tz=tzst.timezones()
+    tz=timezones
 )
-temporal_types = st.one_of(date_types, time_types, timestamp_types)
+duration_types = st.builds(
+    pa.duration,
+    st.sampled_from(['s', 'ms', 'us', 'ns'])
+)
+interval_types = st.just(pa.month_day_nano_interval())
+temporal_types = st.one_of(
+    date_types,
+    time_types,
+    timestamp_types,
+    duration_types,
+    interval_types
+)
 
 primitive_types = st.one_of(
     null_type,
     bool_type,
-    binary_type,
-    string_type,
     numeric_types,
-    temporal_types
+    temporal_types,
+    binary_like_types
 )
 
 metadata = st.dictionaries(st.text(), st.text())
 
 
-def fields(type_strategy=primitive_types):
-    return st.builds(pa.field, name=custom_text, type=type_strategy,
-                     nullable=st.booleans(), metadata=metadata)
+@st.composite
+def fields(draw, type_strategy=primitive_types):
+    name = draw(custom_text)
+    typ = draw(type_strategy)
+    if pa.types.is_null(typ):
+        nullable = True
+    else:
+        nullable = draw(st.booleans())
+    meta = draw(metadata)
+    return pa.field(name, type=typ, nullable=nullable, metadata=meta)
 
 
 def list_types(item_strategy=primitive_types):
-    return st.builds(pa.list_, item_strategy)
+    return (
+        st.builds(pa.list_, item_strategy) |
+        st.builds(pa.large_list, item_strategy) |
+        st.builds(
+            pa.list_,
+            item_strategy,
+            st.integers(min_value=0, max_value=16)
+        ) |
+        st.builds(pa.list_view, item_strategy) |
+        st.builds(pa.large_list_view, item_strategy)
+    )
 
 
-def struct_types(item_strategy=primitive_types):
-    return st.builds(pa.struct, st.lists(fields(item_strategy)))
+@st.composite
+def struct_types(draw, item_strategy=primitive_types):
+    fields_strategy = st.lists(fields(item_strategy))
+    fields_rendered = draw(fields_strategy)
+    field_names = [field.name for field in fields_rendered]
+    # check that field names are unique, see ARROW-9997
+    h.assume(len(set(field_names)) == len(field_names))
+    return pa.struct(fields_rendered)
 
 
-def complex_types(inner_strategy=primitive_types):
-    return list_types(inner_strategy) | struct_types(inner_strategy)
+def dictionary_types(key_strategy=None, value_strategy=None):
+    if key_strategy is None:
+        key_strategy = signed_integer_types
+    if value_strategy is None:
+        value_strategy = st.one_of(
+            bool_type,
+            integer_types,
+            st.sampled_from([pa.float32(), pa.float64()]),
+            binary_type,
+            string_type,
+            fixed_size_binary_type,
+        )
+    return st.builds(pa.dictionary, key_strategy, value_strategy)
 
 
-def nested_list_types(item_strategy=primitive_types, max_leaves=3):
-    return st.recursive(item_strategy, list_types, max_leaves=max_leaves)
+@st.composite
+def map_types(draw, key_strategy=primitive_types,
+              item_strategy=primitive_types):
+    key_type = draw(key_strategy)
+    h.assume(not pa.types.is_null(key_type))
+    value_type = draw(item_strategy)
+    return pa.map_(key_type, value_type)
 
 
-def nested_struct_types(item_strategy=primitive_types, max_leaves=3):
-    return st.recursive(item_strategy, struct_types, max_leaves=max_leaves)
-
-
-def nested_complex_types(inner_strategy=primitive_types, max_leaves=3):
-    return st.recursive(inner_strategy, complex_types, max_leaves=max_leaves)
+# union type
+# extension type
 
 
 def schemas(type_strategy=primitive_types, max_fields=None):
@@ -128,10 +232,17 @@ def schemas(type_strategy=primitive_types, max_fields=None):
     return st.builds(pa.schema, children)
 
 
-complex_schemas = schemas(complex_types())
-
-
-all_types = st.one_of(primitive_types, complex_types(), nested_complex_types())
+all_types = st.deferred(
+    lambda: (
+        primitive_types |
+        list_types() |
+        struct_types() |
+        dictionary_types() |
+        map_types() |
+        list_types(all_types) |
+        struct_types(all_types)
+    )
+)
 all_fields = fields(all_types)
 all_schemas = schemas(all_types)
 
@@ -140,10 +251,26 @@ _default_array_sizes = st.integers(min_value=0, max_value=20)
 
 
 @st.composite
-def arrays(draw, type, size=None):
+def _pylist(draw, value_type, size, nullable=True):
+    arr = draw(arrays(value_type, size=size, nullable=False))
+    return arr.to_pylist()
+
+
+@st.composite
+def _pymap(draw, key_type, value_type, size, nullable=True):
+    length = draw(size)
+    keys = draw(_pylist(key_type, size=length, nullable=False))
+    values = draw(_pylist(value_type, size=length, nullable=nullable))
+    return list(zip(keys, values))
+
+
+@st.composite
+def arrays(draw, type, size=None, nullable=True):
     if isinstance(type, st.SearchStrategy):
-        type = draw(type)
-    elif not isinstance(type, pa.DataType):
+        ty = draw(type)
+    elif isinstance(type, pa.DataType):
+        ty = type
+    else:
         raise TypeError('Type must be a pyarrow DataType')
 
     if isinstance(size, st.SearchStrategy):
@@ -153,56 +280,89 @@ def arrays(draw, type, size=None):
     elif not isinstance(size, int):
         raise TypeError('Size must be an integer')
 
-    shape = (size,)
-
-    if pa.types.is_list(type):
-        offsets = draw(npst.arrays(np.uint8(), shape=shape)).cumsum() // 20
-        offsets = np.insert(offsets, 0, 0, axis=0)  # prepend with zero
-        values = draw(arrays(type.value_type, size=int(offsets.sum())))
-        return pa.ListArray.from_arrays(offsets, values)
-
-    if pa.types.is_struct(type):
-        h.assume(len(type) > 0)
-        names, child_arrays = [], []
-        for field in type:
-            names.append(field.name)
-            child_arrays.append(draw(arrays(field.type, size=size)))
-        # fields' metadata are lost here, because from_arrays doesn't accept
-        # a fields argumentum, only names
-        return pa.StructArray.from_arrays(child_arrays, names=names)
-
-    if (pa.types.is_boolean(type) or pa.types.is_integer(type) or
-            pa.types.is_floating(type)):
-        values = npst.arrays(type.to_pandas_dtype(), shape=(size,))
-        np_arr = draw(values)
-        if pa.types.is_floating(type):
-            # Workaround ARROW-4952: no easy way to assert array equality
-            # in a NaN-tolerant way.
-            np_arr[np.isnan(np_arr)] = -42.0
-        return pa.array(np_arr, type=type)
-
-    if pa.types.is_null(type):
+    if pa.types.is_null(ty):
+        h.assume(nullable)
         value = st.none()
-    elif pa.types.is_time(type):
-        value = st.times()
-    elif pa.types.is_date(type):
-        value = st.dates()
-    elif pa.types.is_timestamp(type):
-        tz = pytz.timezone(type.tz) if type.tz is not None else None
-        value = st.datetimes(timezones=st.just(tz))
-    elif pa.types.is_binary(type):
-        value = st.binary()
-    elif pa.types.is_string(type):
-        value = st.text()
-    elif pa.types.is_decimal(type):
+    elif pa.types.is_boolean(ty):
+        value = st.booleans()
+    elif pa.types.is_integer(ty):
+        values = draw(npst.arrays(ty.to_pandas_dtype(), shape=(size,)))
+        return pa.array(values, type=ty)
+    elif pa.types.is_floating(ty):
+        values = draw(npst.arrays(ty.to_pandas_dtype(), shape=(size,)))
+        # Workaround ARROW-4952: no easy way to assert array equality
+        # in a NaN-tolerant way.
+        values[np.isnan(values)] = -42.0
+        return pa.array(values, type=ty)
+    elif pa.types.is_decimal(ty):
         # TODO(kszucs): properly limit the precision
         # value = st.decimals(places=type.scale, allow_infinity=False)
         h.reject()
+    elif pa.types.is_time(ty):
+        value = st.times()
+    elif pa.types.is_date(ty):
+        value = st.dates()
+    elif pa.types.is_timestamp(ty):
+        if zoneinfo is None:
+            pytest.skip('no module named zoneinfo (or tzdata on Windows)')
+        if ty.tz is None:
+            pytest.skip('requires timezone not None')
+        min_int64 = -(2**63)
+        max_int64 = 2**63 - 1
+        min_datetime = datetime.datetime.fromtimestamp(
+            min_int64 // 10**9) + datetime.timedelta(hours=12)
+        max_datetime = datetime.datetime.fromtimestamp(
+            max_int64 // 10**9) - datetime.timedelta(hours=12)
+        try:
+            offset = ty.tz.split(":")
+            offset_hours = int(offset[0])
+            offset_min = int(offset[1])
+            tz = datetime.timedelta(hours=offset_hours, minutes=offset_min)
+        except ValueError:
+            tz = zoneinfo.ZoneInfo(ty.tz)
+        value = st.datetimes(timezones=st.just(tz), min_value=min_datetime,
+                             max_value=max_datetime)
+    elif pa.types.is_duration(ty):
+        value = st.timedeltas()
+    elif pa.types.is_interval(ty):
+        value = st.timedeltas()
+    elif pa.types.is_binary(ty) or pa.types.is_large_binary(ty):
+        value = st.binary()
+    elif pa.types.is_string(ty) or pa.types.is_large_string(ty):
+        value = st.text()
+    elif pa.types.is_fixed_size_binary(ty):
+        value = st.binary(min_size=ty.byte_width, max_size=ty.byte_width)
+    elif pa.types.is_list(ty):
+        value = _pylist(ty.value_type, size=size, nullable=nullable)
+    elif pa.types.is_large_list(ty):
+        value = _pylist(ty.value_type, size=size, nullable=nullable)
+    elif pa.types.is_fixed_size_list(ty):
+        value = _pylist(ty.value_type, size=ty.list_size, nullable=nullable)
+    elif pa.types.is_list_view(ty):
+        value = _pylist(ty.value_type, size=size, nullable=nullable)
+    elif pa.types.is_large_list_view(ty):
+        value = _pylist(ty.value_type, size=size, nullable=nullable)
+    elif pa.types.is_dictionary(ty):
+        values = _pylist(ty.value_type, size=size, nullable=nullable)
+        return pa.array(draw(values), type=ty)
+    elif pa.types.is_map(ty):
+        value = _pymap(ty.key_type, ty.item_type, size=_default_array_sizes,
+                       nullable=nullable)
+    elif pa.types.is_struct(ty):
+        h.assume(len(ty) > 0)
+        fields, child_arrays = [], []
+        for field in ty:
+            fields.append(field)
+            child_arrays.append(draw(arrays(field.type, size=size)))
+        return pa.StructArray.from_arrays(child_arrays, fields=fields)
     else:
-        raise NotImplementedError(type)
+        raise NotImplementedError(ty)
 
+    if nullable:
+        value = st.one_of(st.none(), value)
     values = st.lists(value, min_size=size, max_size=size)
-    return pa.array(draw(values), type=type)
+
+    return pa.array(draw(values), type=ty)
 
 
 @st.composite
@@ -219,13 +379,6 @@ def chunked_arrays(draw, type, min_chunks=0, max_chunks=None, chunk_size=None):
     return pa.chunked_array(draw(chunks), type=type)
 
 
-def columns(type, min_chunks=0, max_chunks=None, chunk_size=None):
-    chunked_array = chunked_arrays(type, chunk_size=chunk_size,
-                                   min_chunks=min_chunks,
-                                   max_chunks=max_chunks)
-    return st.builds(pa.column, st.text(), chunked_array)
-
-
 @st.composite
 def record_batches(draw, type, rows=None, max_fields=None):
     if isinstance(rows, st.SearchStrategy):
@@ -237,9 +390,9 @@ def record_batches(draw, type, rows=None, max_fields=None):
 
     schema = draw(schemas(type, max_fields=max_fields))
     children = [draw(arrays(field.type, size=rows)) for field in schema]
-    # TODO(kszucs): the names and schame arguments are not consistent with
+    # TODO(kszucs): the names and schema arguments are not consistent with
     #               Table.from_array's arguments
-    return pa.RecordBatch.from_arrays(children, names=schema)
+    return pa.RecordBatch.from_arrays(children, schema=schema)
 
 
 @st.composite
@@ -258,6 +411,63 @@ def tables(draw, type, rows=None, max_fields=None):
 
 all_arrays = arrays(all_types)
 all_chunked_arrays = chunked_arrays(all_types)
-all_columns = columns(all_types)
 all_record_batches = record_batches(all_types)
 all_tables = tables(all_types)
+
+
+# Define the same rules as above for pandas tests by excluding certain types
+# from the generation because of known issues.
+
+pandas_compatible_primitive_types = st.one_of(
+    null_type,
+    bool_type,
+    integer_types,
+    st.sampled_from([pa.float32(), pa.float64()]),
+    decimal128_type,
+    date_types,
+    time_types,
+    # Need to exclude timestamp and duration types otherwise hypothesis
+    # discovers ARROW-10210
+    # timestamp_types,
+    # duration_types
+    interval_types,
+    binary_type,
+    string_type,
+    large_binary_type,
+    large_string_type,
+)
+
+# Need to exclude floating point types otherwise hypothesis discovers
+# ARROW-10211
+pandas_compatible_dictionary_value_types = st.one_of(
+    bool_type,
+    integer_types,
+    binary_type,
+    string_type,
+    fixed_size_binary_type,
+)
+
+
+def pandas_compatible_list_types(
+    item_strategy=pandas_compatible_primitive_types
+):
+    # Need to exclude fixed size list type otherwise hypothesis discovers
+    # ARROW-10194
+    return (
+        st.builds(pa.list_, item_strategy) |
+        st.builds(pa.large_list, item_strategy)
+    )
+
+
+pandas_compatible_types = st.deferred(
+    lambda: st.one_of(
+        pandas_compatible_primitive_types,
+        pandas_compatible_list_types(pandas_compatible_primitive_types),
+        struct_types(pandas_compatible_primitive_types),
+        dictionary_types(
+            value_strategy=pandas_compatible_dictionary_value_types
+        ),
+        pandas_compatible_list_types(pandas_compatible_types),
+        struct_types(pandas_compatible_types)
+    )
+)

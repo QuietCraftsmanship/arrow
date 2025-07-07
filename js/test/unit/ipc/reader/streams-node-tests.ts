@@ -15,34 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../../data/tables';
+import { generateRandomTables } from '../../../data/tables.js';
+import { ArrowIOTestHelper } from '../helpers.js';
+import { validateRecordBatchAsyncIterator } from '../validate.js';
 
 import {
-    Table,
     RecordBatchReader,
-    RecordBatchStreamWriter
-} from '../../../Arrow';
-
-import { ArrowIOTestHelper } from '../helpers';
-import { validateRecordBatchAsyncIterator } from '../validate';
+    RecordBatchStreamWriter,
+    Table
+} from 'apache-arrow';
 
 (() => {
-
     if (process.env.TEST_NODE_STREAMS !== 'true') {
-        return test('not testing node streams because process.env.TEST_NODE_STREAMS !== "true"', () => {});
+        return test('not testing node streams because process.env.TEST_NODE_STREAMS !== "true"', () => { });
     }
-
-    /* tslint:disable */
-    const { Readable, PassThrough } = require('stream');
-    /* tslint:disable */
-    const { parse: bignumJSONParse } = require('json-bignum');
-    /* tslint:disable */
-    const concatStream = ((multistream) => (...xs: any[]) =>
-        new Readable().wrap(multistream(...xs))
-    )(require('multistream'));
 
     for (const table of generateRandomTables([10, 20, 30])) {
 
@@ -69,7 +55,7 @@ import { validateRecordBatchAsyncIterator } from '../validate';
         describe(`toNodeStream (${name})`, () => {
 
             describe(`RecordBatchJSONReader`, () => {
-                test('Uint8Array', json.buffer((source) => validate(bignumJSONParse(`${Buffer.from(source)}`))));
+                test('Uint8Array', json.buffer((source) => validate(JSON.parse(`${Buffer.from(source)}`))));
             });
 
             describe(`RecordBatchFileReader`, () => {
@@ -114,12 +100,14 @@ import { validateRecordBatchAsyncIterator } from '../validate';
     }
 
     it('readAll() should pipe to separate NodeJS WritableStreams', async () => {
+        const { default: MultiStream } = await import('multistream');
+        const { PassThrough } = await import('node:stream');
 
         expect.hasAssertions();
 
         const tables = [...generateRandomTables([10, 20, 30])];
 
-        const stream = concatStream(tables.map((table) =>
+        const stream = new MultiStream(tables.map((table) =>
             () => RecordBatchStreamWriter.writeAll(table).toNodeStream()
         )) as NodeJS.ReadableStream;
 
@@ -137,7 +125,8 @@ import { validateRecordBatchAsyncIterator } from '../validate';
             validateStreamState(reader, output, false);
 
             const sourceTable = tables[++tableIndex];
-            const streamTable = await Table.from(output);
+            const streamReader = await RecordBatchReader.from(output);
+            const streamTable = new Table(await streamReader.readAll());
             expect(streamTable).toEqualTable(sourceTable);
             expect(Boolean(output.readableFlowing)).toBe(false);
         }
@@ -148,12 +137,13 @@ import { validateRecordBatchAsyncIterator } from '../validate';
     });
 
     it('should not close the underlying NodeJS ReadableStream when reading multiple tables to completion', async () => {
+        const { default: MultiStream } = await import('multistream');
 
         expect.hasAssertions();
 
         const tables = [...generateRandomTables([10, 20, 30])];
 
-        const stream = concatStream(tables.map((table) =>
+        const stream = new MultiStream(tables.map((table) =>
             () => RecordBatchStreamWriter.writeAll(table).toNodeStream()
         )) as NodeJS.ReadableStream;
 
@@ -167,7 +157,7 @@ import { validateRecordBatchAsyncIterator } from '../validate';
             validateStreamState(reader, stream, false);
 
             const sourceTable = tables[++tableIndex];
-            const streamTable = await Table.from(reader);
+            const streamTable = new Table(await reader.readAll());
             expect(streamTable).toEqualTable(sourceTable);
         }
 
@@ -176,12 +166,13 @@ import { validateRecordBatchAsyncIterator } from '../validate';
     });
 
     it('should close the underlying NodeJS ReadableStream when reading multiple tables and we break early', async () => {
+        const { default: MultiStream } = await import('multistream');
 
         expect.hasAssertions();
 
         const tables = [...generateRandomTables([10, 20, 30])];
 
-        const stream = concatStream(tables.map((table) =>
+        const stream = new MultiStream(tables.map((table) =>
             () => RecordBatchStreamWriter.writeAll(table).toNodeStream()
         )) as NodeJS.ReadableStream;
 
@@ -196,10 +187,10 @@ import { validateRecordBatchAsyncIterator } from '../validate';
 
             let batchIndex = -1;
             const sourceTable = tables[++tableIndex];
-            const breakEarly = tableIndex === (tables.length / 2 | 0);
+            const breakEarly = tableIndex === (Math.trunc(tables.length / 2));
 
             for await (const streamBatch of reader) {
-                expect(streamBatch).toEqualRecordBatch(sourceTable.chunks[++batchIndex]);
+                expect(streamBatch).toEqualRecordBatch(sourceTable.batches[++batchIndex]);
                 if (breakEarly && batchIndex === 1) { break; }
             }
             if (breakEarly) {
@@ -210,7 +201,7 @@ import { validateRecordBatchAsyncIterator } from '../validate';
         }
 
         validateStreamState(reader, stream, true, true);
-        expect(tableIndex).toBe(tables.length / 2 | 0);
+        expect(tableIndex).toBe(Math.trunc(tables.length / 2));
     });
 })();
 

@@ -18,64 +18,30 @@
 #
 # Messaging and interprocess communication
 
-add_arrow_test(feather-test)
-add_arrow_test(read-write-test PREFIX "arrow-ipc")
-add_arrow_test(json-simple-test PREFIX "arrow-ipc")
-add_arrow_test(json-test PREFIX "arrow-ipc")
+function(ADD_ARROW_IPC_TEST REL_TEST_NAME)
+  set(options)
+  set(one_value_args PREFIX)
+  set(multi_value_args)
+  cmake_parse_arguments(ARG
+                        "${options}"
+                        "${one_value_args}"
+                        "${multi_value_args}"
+                        ${ARGN})
 
-# json-integration-test is two things at the same time:
-# - an executable that can be called to answer integration test requests
-# - a self-(unit)test for the C++ side of integration testing
-if(ARROW_BUILD_TESTS)
-  add_arrow_test(json-integration-test EXTRA_LINK_LIBS ${GFLAGS_LIBRARIES})
-  add_dependencies(arrow-integration arrow-json-integration-test)
-elseif(ARROW_BUILD_INTEGRATION)
-  add_executable(arrow-json-integration-test json-integration-test.cc)
-  target_link_libraries(arrow-json-integration-test ${ARROW_TEST_LINK_LIBS}
-                        ${GFLAGS_LIBRARIES} GTest::GTest)
+  if(ARG_PREFIX)
+    set(PREFIX ${ARG_PREFIX})
+  else()
+    set(PREFIX "arrow-ipc")
+  endif()
 
-  add_dependencies(arrow-json-integration-test arrow arrow_testing)
-  add_dependencies(arrow-integration arrow-json-integration-test)
-endif()
+  add_arrow_test(${REL_TEST_NAME} PREFIX ${PREFIX} ${ARG_UNPARSED_ARGUMENTS})
+endfunction()
 
-# make clean will delete the generated file
-set_source_files_properties(Message_generated.h PROPERTIES GENERATED TRUE)
-set_source_files_properties(feather_generated.h PROPERTIES GENERATED TRUE)
-set_source_files_properties(File_generated.h PROPERTIES GENERATED TRUE)
-
-set(OUTPUT_DIR ${ARROW_BINARY_DIR}/src/arrow/ipc)
-set(FBS_OUTPUT_FILES "${OUTPUT_DIR}/File_generated.h" "${OUTPUT_DIR}/Message_generated.h"
-                     "${OUTPUT_DIR}/feather_generated.h")
-
-set(FBS_SRC
-    ${ARROW_SOURCE_DIR}/../format/Message.fbs
-    ${ARROW_SOURCE_DIR}/../format/File.fbs
-    ${ARROW_SOURCE_DIR}/../format/Schema.fbs
-    ${ARROW_SOURCE_DIR}/../format/Tensor.fbs
-    ${ARROW_SOURCE_DIR}/../format/SparseTensor.fbs
-    ${CMAKE_CURRENT_SOURCE_DIR}/feather.fbs)
-
-foreach(FIL ${FBS_SRC})
-  get_filename_component(ABS_FIL ${FIL} ABSOLUTE)
-  list(APPEND ABS_FBS_SRC ${ABS_FIL})
-endforeach()
-
-get_target_property(FLATC_EXECUTABLE flatbuffers::flatc IMPORTED_LOCATION)
-if(NOT FLATC_EXECUTABLE)
-  get_target_property(FLATC_EXECUTABLE flatbuffers::flatc IMPORTED_LOCATION_RELEASE)
-endif()
-message(STATUS "flatc: ${FLATC_EXECUTABLE}")
-add_custom_command(OUTPUT ${FBS_OUTPUT_FILES}
-                   COMMAND ${FLATC_EXECUTABLE}
-                           -c
-                           -o
-                           ${OUTPUT_DIR}
-                           ${ABS_FBS_SRC}
-                   DEPENDS flatbuffers::flatc
-                   COMMENT "Running flatc compiler on ${ABS_FBS_SRC}"
-                   VERBATIM)
-
-add_custom_target(metadata_fbs DEPENDS ${FBS_OUTPUT_FILES})
+add_arrow_test(feather_test)
+add_arrow_ipc_test(json_simple_test)
+add_arrow_ipc_test(message_internal_test)
+add_arrow_ipc_test(read_write_test)
+add_arrow_ipc_test(tensor_test)
 
 # Headers: top level
 arrow_install_all_headers("arrow/ipc")
@@ -87,10 +53,15 @@ else()
 endif()
 
 if(ARROW_BUILD_UTILITIES OR ARROW_BUILD_INTEGRATION)
-  add_executable(arrow-file-to-stream file-to-stream.cc)
+  add_executable(arrow-file-to-stream file_to_stream.cc)
   target_link_libraries(arrow-file-to-stream ${ARROW_UTIL_LIB})
-  add_executable(arrow-stream-to-file stream-to-file.cc)
+  add_executable(arrow-stream-to-file stream_to_file.cc)
   target_link_libraries(arrow-stream-to-file ${ARROW_UTIL_LIB})
+
+  if(ARROW_BUILD_UTILITIES)
+    install(TARGETS arrow-file-to-stream arrow-stream-to-file ${INSTALL_IS_OPTIONAL}
+            DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
 
   if(ARROW_BUILD_INTEGRATION)
     add_dependencies(arrow-integration arrow-file-to-stream)
@@ -98,5 +69,23 @@ if(ARROW_BUILD_UTILITIES OR ARROW_BUILD_INTEGRATION)
   endif()
 endif()
 
-add_arrow_benchmark(read-write-benchmark PREFIX "arrow-ipc")
-add_arrow_fuzzing(fuzzing-test PREFIX "arrow-ipc")
+add_arrow_benchmark(read_write_benchmark PREFIX "arrow-ipc")
+
+if(ARROW_FUZZING
+   OR (ARROW_BUILD_UTILITIES
+       AND ARROW_TESTING
+       AND ARROW_WITH_LZ4
+       AND ARROW_WITH_ZSTD
+      ))
+  add_executable(arrow-ipc-generate-fuzz-corpus generate_fuzz_corpus.cc)
+  target_link_libraries(arrow-ipc-generate-fuzz-corpus ${ARROW_UTIL_LIB}
+                        ${ARROW_TEST_LINK_LIBS})
+
+  add_executable(arrow-ipc-generate-tensor-fuzz-corpus generate_tensor_fuzz_corpus.cc)
+  target_link_libraries(arrow-ipc-generate-tensor-fuzz-corpus ${ARROW_UTIL_LIB}
+                        ${ARROW_TEST_LINK_LIBS})
+endif()
+
+add_arrow_fuzz_target(file_fuzz PREFIX "arrow-ipc")
+add_arrow_fuzz_target(stream_fuzz PREFIX "arrow-ipc")
+add_arrow_fuzz_target(tensor_stream_fuzz PREFIX "arrow-ipc")

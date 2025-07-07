@@ -15,247 +15,281 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This API is EXPERIMENTAL.
+
 #pragma once
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "arrow/compute/type_fwd.h"
-#include "arrow/status.h"
-#include "arrow/util/macros.h"
-#include "arrow/util/visibility.h"
+#include "arrow/datum.h"
+#include "arrow/type_fwd.h"
+#include "arrow/util/small_vector.h"
 
 namespace arrow {
 namespace compute {
 
-class LogicalType;
-class ExprVisitor;
-class Operation;
+/// \defgroup expression-core Expressions to describe data transformations
+///
+/// @{
 
-/// \brief Base class for all analytic expressions. Expressions may represent
-/// data values (scalars, arrays, tables)
-class ARROW_EXPORT Expr {
+/// An unbound expression which maps a single Datum to another Datum.
+/// An expression is one of
+/// - A literal Datum.
+/// - A reference to a single (potentially nested) field of the input Datum.
+/// - A call to a compute function, with arguments specified by other Expressions.
+class ARROW_EXPORT Expression {
  public:
-  /// \brief Instantiate expression from an abstract operation
-  /// \param[in] op the operation that generates the expression
-  explicit Expr(ConstOpPtr op);
+  struct Call {
+    std::string function_name;
+    std::vector<Expression> arguments;
+    std::shared_ptr<FunctionOptions> options;
+    // Cached hash value
+    size_t hash;
 
-  virtual ~Expr() = default;
+    // post-Bind properties:
+    std::shared_ptr<Function> function;
+    const Kernel* kernel = NULLPTR;
+    std::shared_ptr<KernelState> kernel_state;
+    TypeHolder type;
 
-  /// \brief A unique string identifier for the kind of expression
-  virtual std::string kind() const = 0;
-
-  /// \brief Accept expression visitor
-  /// TODO(wesm)
-  // virtual Status Accept(ExprVisitor* visitor) const = 0;
-
-  /// \brief The underlying operation
-  ConstOpPtr op() const { return op_; }
-
- protected:
-  ConstOpPtr op_;
-};
-
-/// The value cardinality: one or many. These correspond to the arrow::Scalar
-/// and arrow::Array types
-enum class ValueRank { SCALAR, ARRAY };
-
-/// \brief Base class for a data-generated expression with a fixed and known
-/// type. This includes arrays and scalars
-class ARROW_EXPORT ValueExpr : public Expr {
- public:
-  /// \brief The name of the expression, if any. The default is unnamed
-  // virtual const ExprName& name() const;
-  LogicalTypePtr type() const;
-
-  /// \brief The value cardinality (scalar or array) of the expression
-  virtual ValueRank rank() const = 0;
-
- protected:
-  ValueExpr(ConstOpPtr op, LogicalTypePtr type);
-
-  /// \brief The semantic data type of the expression
-  LogicalTypePtr type_;
-};
-
-class ARROW_EXPORT ArrayExpr : public ValueExpr {
- protected:
-  using ValueExpr::ValueExpr;
-  std::string kind() const override;
-  ValueRank rank() const override;
-};
-
-class ARROW_EXPORT ScalarExpr : public ValueExpr {
- protected:
-  using ValueExpr::ValueExpr;
-  std::string kind() const override;
-  ValueRank rank() const override;
-};
-
-namespace value {
-
-// These are mixin classes to provide a type hierarchy for values identify
-class ValueMixin {};
-class Null : public ValueMixin {};
-class Bool : public ValueMixin {};
-class Number : public ValueMixin {};
-class Integer : public Number {};
-class SignedInteger : public Integer {};
-class Int8 : public SignedInteger {};
-class Int16 : public SignedInteger {};
-class Int32 : public SignedInteger {};
-class Int64 : public SignedInteger {};
-class UnsignedInteger : public Integer {};
-class UInt8 : public UnsignedInteger {};
-class UInt16 : public UnsignedInteger {};
-class UInt32 : public UnsignedInteger {};
-class UInt64 : public UnsignedInteger {};
-class Floating : public Number {};
-class Float16 : public Floating {};
-class Float32 : public Floating {};
-class Float64 : public Floating {};
-class Binary : public ValueMixin {};
-class Utf8 : public Binary {};
-class List : public ValueMixin {};
-class Struct : public ValueMixin {};
-
-}  // namespace value
-
-#define SIMPLE_EXPR_FACTORY(NAME) ARROW_EXPORT ExprPtr NAME(ConstOpPtr op);
-
-namespace scalar {
-
-#define DECLARE_SCALAR_EXPR(TYPE)                                   \
-  class ARROW_EXPORT TYPE : public ScalarExpr, public value::TYPE { \
-   public:                                                          \
-    explicit TYPE(ConstOpPtr op);                                   \
-    using ScalarExpr::kind;                                         \
+    void ComputeHash();
   };
 
-DECLARE_SCALAR_EXPR(Null)
-DECLARE_SCALAR_EXPR(Bool)
-DECLARE_SCALAR_EXPR(Int8)
-DECLARE_SCALAR_EXPR(Int16)
-DECLARE_SCALAR_EXPR(Int32)
-DECLARE_SCALAR_EXPR(Int64)
-DECLARE_SCALAR_EXPR(UInt8)
-DECLARE_SCALAR_EXPR(UInt16)
-DECLARE_SCALAR_EXPR(UInt32)
-DECLARE_SCALAR_EXPR(UInt64)
-DECLARE_SCALAR_EXPR(Float16)
-DECLARE_SCALAR_EXPR(Float32)
-DECLARE_SCALAR_EXPR(Float64)
-DECLARE_SCALAR_EXPR(Binary)
-DECLARE_SCALAR_EXPR(Utf8)
-
-#undef DECLARE_SCALAR_EXPR
-
-SIMPLE_EXPR_FACTORY(null);
-SIMPLE_EXPR_FACTORY(boolean);
-SIMPLE_EXPR_FACTORY(int8);
-SIMPLE_EXPR_FACTORY(int16);
-SIMPLE_EXPR_FACTORY(int32);
-SIMPLE_EXPR_FACTORY(int64);
-SIMPLE_EXPR_FACTORY(uint8);
-SIMPLE_EXPR_FACTORY(uint16);
-SIMPLE_EXPR_FACTORY(uint32);
-SIMPLE_EXPR_FACTORY(uint64);
-SIMPLE_EXPR_FACTORY(float16);
-SIMPLE_EXPR_FACTORY(float32);
-SIMPLE_EXPR_FACTORY(float64);
-SIMPLE_EXPR_FACTORY(binary);
-SIMPLE_EXPR_FACTORY(utf8);
-
-class ARROW_EXPORT List : public ScalarExpr, public value::List {
- public:
-  List(ConstOpPtr op, LogicalTypePtr type);
-  using ScalarExpr::kind;
-};
-
-class ARROW_EXPORT Struct : public ScalarExpr, public value::Struct {
- public:
-  Struct(ConstOpPtr op, LogicalTypePtr type);
-  using ScalarExpr::kind;
-};
-
-}  // namespace scalar
-
-namespace array {
-
-#define DECLARE_ARRAY_EXPR(TYPE)                                   \
-  class ARROW_EXPORT TYPE : public ArrayExpr, public value::TYPE { \
-   public:                                                         \
-    explicit TYPE(ConstOpPtr op);                                  \
-    using ArrayExpr::kind;                                         \
+  std::string ToString() const;
+  bool Equals(const Expression& other) const;
+  size_t hash() const;
+  struct Hash {
+    size_t operator()(const Expression& expr) const { return expr.hash(); }
   };
 
-DECLARE_ARRAY_EXPR(Null)
-DECLARE_ARRAY_EXPR(Bool)
-DECLARE_ARRAY_EXPR(Int8)
-DECLARE_ARRAY_EXPR(Int16)
-DECLARE_ARRAY_EXPR(Int32)
-DECLARE_ARRAY_EXPR(Int64)
-DECLARE_ARRAY_EXPR(UInt8)
-DECLARE_ARRAY_EXPR(UInt16)
-DECLARE_ARRAY_EXPR(UInt32)
-DECLARE_ARRAY_EXPR(UInt64)
-DECLARE_ARRAY_EXPR(Float16)
-DECLARE_ARRAY_EXPR(Float32)
-DECLARE_ARRAY_EXPR(Float64)
-DECLARE_ARRAY_EXPR(Binary)
-DECLARE_ARRAY_EXPR(Utf8)
+  /// Bind this expression to the given input type, looking up Kernels and field types.
+  /// Some expression simplification may be performed and implicit casts will be inserted.
+  /// Any state necessary for execution will be initialized and returned.
+  Result<Expression> Bind(const TypeHolder& in, ExecContext* = NULLPTR) const;
+  Result<Expression> Bind(const Schema& in_schema, ExecContext* = NULLPTR) const;
 
-#undef DECLARE_ARRAY_EXPR
+  // XXX someday
+  // Clone all KernelState in this bound expression. If any function referenced by this
+  // expression has mutable KernelState, it is not safe to execute or apply simplification
+  // passes to it (or copies of it!) from multiple threads. Cloning state produces new
+  // KernelStates where necessary to ensure that Expressions may be manipulated safely
+  // on multiple threads.
+  // Result<ExpressionState> CloneState() const;
+  // Status SetState(ExpressionState);
 
-SIMPLE_EXPR_FACTORY(null);
-SIMPLE_EXPR_FACTORY(boolean);
-SIMPLE_EXPR_FACTORY(int8);
-SIMPLE_EXPR_FACTORY(int16);
-SIMPLE_EXPR_FACTORY(int32);
-SIMPLE_EXPR_FACTORY(int64);
-SIMPLE_EXPR_FACTORY(uint8);
-SIMPLE_EXPR_FACTORY(uint16);
-SIMPLE_EXPR_FACTORY(uint32);
-SIMPLE_EXPR_FACTORY(uint64);
-SIMPLE_EXPR_FACTORY(float16);
-SIMPLE_EXPR_FACTORY(float32);
-SIMPLE_EXPR_FACTORY(float64);
-SIMPLE_EXPR_FACTORY(binary);
-SIMPLE_EXPR_FACTORY(utf8);
+  /// Return true if all an expression's field references have explicit types
+  /// and all of its functions' kernels are looked up.
+  bool IsBound() const;
 
-class ARROW_EXPORT List : public ArrayExpr, public value::List {
- public:
-  List(ConstOpPtr op, LogicalTypePtr type);
-  using ArrayExpr::kind;
+  /// Return true if this expression is composed only of Scalar literals, field
+  /// references, and calls to ScalarFunctions.
+  bool IsScalarExpression() const;
+
+  /// Return true if this expression is literal and entirely null.
+  bool IsNullLiteral() const;
+
+  /// Return true if this expression could evaluate to true. Will return true for any
+  /// unbound or non-boolean Expressions. IsSatisfiable does not (currently) do any
+  /// canonicalization or simplification of the expression, so even Expressions
+  /// which are unsatisfiable may spuriously return `true` here. This function is
+  /// intended for use in predicate pushdown where a filter expression is simplified
+  /// by a guarantee, so it assumes that trying to simplify again would be redundant.
+  bool IsSatisfiable() const;
+
+  // XXX someday
+  // Result<PipelineGraph> GetPipelines();
+
+  bool is_valid() const { return impl_ != NULLPTR; }
+
+  /// Access a Call or return nullptr if this expression is not a call
+  const Call* call() const;
+  /// Access a Datum or return nullptr if this expression is not a literal
+  const Datum* literal() const;
+  /// Access a FieldRef or return nullptr if this expression is not a field_ref
+  const FieldRef* field_ref() const;
+
+  /// The type to which this expression will evaluate
+  const DataType* type() const;
+  // XXX someday
+  // NullGeneralization::type nullable() const;
+
+  struct Parameter {
+    FieldRef ref;
+
+    // post-bind properties
+    TypeHolder type;
+    ::arrow::internal::SmallVector<int, 2> indices;
+  };
+  const Parameter* parameter() const;
+
+  Expression() = default;
+  explicit Expression(Call call);
+  explicit Expression(Datum literal);
+  explicit Expression(Parameter parameter);
+
+ private:
+  using Impl = std::variant<Datum, Parameter, Call>;
+  std::shared_ptr<Impl> impl_;
+
+  ARROW_FRIEND_EXPORT friend bool Identical(const Expression& l, const Expression& r);
 };
 
-class ARROW_EXPORT Struct : public ArrayExpr, public value::Struct {
- public:
-  Struct(ConstOpPtr op, LogicalTypePtr type);
-  using ArrayExpr::kind;
-};
+inline bool operator==(const Expression& l, const Expression& r) { return l.Equals(r); }
+inline bool operator!=(const Expression& l, const Expression& r) { return !l.Equals(r); }
 
-}  // namespace array
+ARROW_EXPORT void PrintTo(const Expression&, std::ostream*);
 
-#undef SIMPLE_EXPR_FACTORY
+// Factories
 
-template <typename T, typename ObjectType>
-inline bool InheritsFrom(const ObjectType* obj) {
-  return dynamic_cast<const T*>(obj) != NULLPTR;
+ARROW_EXPORT
+Expression literal(Datum lit);
+
+template <typename Arg>
+Expression literal(Arg&& arg) {
+  return literal(Datum(std::forward<Arg>(arg)));
 }
 
-template <typename T, typename ObjectType>
-inline bool InheritsFrom(const ObjectType& obj) {
-  return dynamic_cast<const T*>(&obj) != NULLPTR;
+ARROW_EXPORT
+Expression field_ref(FieldRef ref);
+
+ARROW_EXPORT
+Expression call(std::string function, std::vector<Expression> arguments,
+                std::shared_ptr<FunctionOptions> options = NULLPTR);
+
+template <typename Options, typename = typename std::enable_if<
+                                std::is_base_of<FunctionOptions, Options>::value>::type>
+Expression call(std::string function, std::vector<Expression> arguments,
+                Options options) {
+  return call(std::move(function), std::move(arguments),
+              std::make_shared<Options>(std::move(options)));
 }
 
-/// \brief Construct a ScalarExpr containing an Operation given a logical type
+/// Assemble a list of all fields referenced by an Expression at any depth.
 ARROW_EXPORT
-Status GetScalarExpr(ConstOpPtr op, LogicalTypePtr ty, ExprPtr* out);
+std::vector<FieldRef> FieldsInExpression(const Expression&);
 
-/// \brief Construct an ArrayExpr containing an Operation given a logical type
+/// Check if the expression references any fields.
 ARROW_EXPORT
-Status GetArrayExpr(ConstOpPtr op, LogicalTypePtr ty, ExprPtr* out);
+bool ExpressionHasFieldRefs(const Expression&);
+
+struct ARROW_EXPORT KnownFieldValues;
+
+/// Assemble a mapping from field references to known values. This derives known values
+/// from "equal" and "is_null" Expressions referencing a field and a literal.
+ARROW_EXPORT
+Result<KnownFieldValues> ExtractKnownFieldValues(
+    const Expression& guaranteed_true_predicate);
+
+/// @}
+
+/// \defgroup expression-passes Functions for modification of Expressions
+///
+/// @{
+///
+/// These transform bound expressions. Some transforms utilize a guarantee, which is
+/// provided as an Expression which is guaranteed to evaluate to true. The
+/// guaranteed_true_predicate need not be bound, but canonicalization is currently
+/// deferred to producers of guarantees. For example in order to be recognized as a
+/// guarantee on a field value, an Expression must be a call to "equal" with field_ref LHS
+/// and literal RHS. Flipping the arguments, "is_in" with a one-long value_set, ... or
+/// other semantically identical Expressions will not be recognized.
+
+/// Weak canonicalization which establishes guarantees for subsequent passes. Even
+/// equivalent Expressions may result in different canonicalized expressions.
+/// TODO this could be a strong canonicalization
+ARROW_EXPORT
+Result<Expression> Canonicalize(Expression, ExecContext* = NULLPTR);
+
+/// Simplify Expressions based on literal arguments (for example, add(null, x) will always
+/// be null so replace the call with a null literal). Includes early evaluation of all
+/// calls whose arguments are entirely literal.
+ARROW_EXPORT
+Result<Expression> FoldConstants(Expression);
+
+/// Simplify Expressions by replacing with known values of the fields which it references.
+ARROW_EXPORT
+Result<Expression> ReplaceFieldsWithKnownValues(const KnownFieldValues& known_values,
+                                                Expression);
+
+/// Simplify an expression by replacing subexpressions based on a guarantee:
+/// a boolean expression which is guaranteed to evaluate to `true`. For example, this is
+/// used to remove redundant function calls from a filter expression or to replace a
+/// reference to a constant-value field with a literal.
+ARROW_EXPORT
+Result<Expression> SimplifyWithGuarantee(Expression,
+                                         const Expression& guaranteed_true_predicate);
+
+/// Replace all named field refs (e.g. "x" or "x.y") with field paths (e.g. [0] or [1,3])
+///
+/// This isn't usually needed and does not offer any simplification by itself.  However,
+/// it can be useful to normalize an expression to paths to make it simpler to work with.
+ARROW_EXPORT Result<Expression> RemoveNamedRefs(Expression expression);
+
+/// @}
+
+// Execution
+
+/// Create an ExecBatch suitable for passing to ExecuteScalarExpression() from a
+/// RecordBatch which may have missing or incorrectly ordered columns.
+/// Missing fields will be replaced with null scalars.
+ARROW_EXPORT Result<ExecBatch> MakeExecBatch(const Schema& full_schema,
+                                             const Datum& partial,
+                                             Expression guarantee = literal(true));
+
+/// Execute a scalar expression against the provided state and input ExecBatch. This
+/// expression must be bound.
+ARROW_EXPORT
+Result<Datum> ExecuteScalarExpression(const Expression&, const ExecBatch& input,
+                                      ExecContext* = NULLPTR);
+
+/// Convenience function for invoking against a RecordBatch
+ARROW_EXPORT
+Result<Datum> ExecuteScalarExpression(const Expression&, const Schema& full_schema,
+                                      const Datum& partial_input, ExecContext* = NULLPTR);
+
+// Serialization
+
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> Serialize(const Expression&);
+
+ARROW_EXPORT
+Result<Expression> Deserialize(std::shared_ptr<Buffer>);
+
+/// \defgroup expression-convenience Helpers for convenient expression creation
+///
+/// @{
+
+ARROW_EXPORT Expression project(std::vector<Expression> values,
+                                std::vector<std::string> names);
+
+ARROW_EXPORT Expression equal(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression not_equal(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression less(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression less_equal(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression greater(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression greater_equal(Expression lhs, Expression rhs);
+
+ARROW_EXPORT Expression is_null(Expression lhs, bool nan_is_null = false);
+
+ARROW_EXPORT Expression is_valid(Expression lhs);
+
+ARROW_EXPORT Expression and_(Expression lhs, Expression rhs);
+ARROW_EXPORT Expression and_(const std::vector<Expression>&);
+ARROW_EXPORT Expression or_(Expression lhs, Expression rhs);
+ARROW_EXPORT Expression or_(const std::vector<Expression>&);
+ARROW_EXPORT Expression not_(Expression operand);
+
+/// @}
 
 }  // namespace compute
 }  // namespace arrow

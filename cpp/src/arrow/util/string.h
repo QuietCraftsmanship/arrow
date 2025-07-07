@@ -15,54 +15,159 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_UTIL_STRING_UTIL_H
-#define ARROW_UTIL_STRING_UTIL_H
+#pragma once
 
-#include <algorithm>
+#include <cassert>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "arrow/status.h"
-#include "arrow/util/string_view.h"
+#if __has_include(<charconv>)
+#  include <charconv>
+#endif
+
+#include "arrow/result.h"
+#include "arrow/util/visibility.h"
 
 namespace arrow {
 
-static const char* kAsciiTable = "0123456789ABCDEF";
+class Status;
 
-static inline std::string HexEncode(const uint8_t* data, size_t length) {
-  std::string hex_string;
-  hex_string.reserve(length * 2);
-  for (size_t j = 0; j < length; ++j) {
-    // Convert to 2 base16 digits
-    hex_string.push_back(kAsciiTable[data[j] >> 4]);
-    hex_string.push_back(kAsciiTable[data[j] & 15]);
+ARROW_EXPORT std::string HexEncode(const uint8_t* data, size_t length);
+
+ARROW_EXPORT std::string Escape(const char* data, size_t length);
+
+ARROW_EXPORT std::string HexEncode(const char* data, size_t length);
+
+ARROW_EXPORT std::string HexEncode(std::string_view str);
+
+ARROW_EXPORT std::string Escape(std::string_view str);
+
+ARROW_EXPORT Status ParseHexValue(const char* hex_pair, uint8_t* out);
+
+ARROW_EXPORT Status ParseHexValues(std::string_view hex_string, uint8_t* out);
+
+namespace internal {
+
+/// Like std::string_view::starts_with in C++20
+inline bool StartsWith(std::string_view s, std::string_view prefix) {
+  return s.length() >= prefix.length() &&
+         (s.empty() || s.substr(0, prefix.length()) == prefix);
+}
+
+/// Like std::string_view::ends_with in C++20
+inline bool EndsWith(std::string_view s, std::string_view suffix) {
+  return s.length() >= suffix.length() &&
+         (s.empty() || s.substr(s.length() - suffix.length()) == suffix);
+}
+
+/// \brief Split a string with a delimiter
+ARROW_EXPORT
+std::vector<std::string_view> SplitString(std::string_view v, char delim,
+                                          int64_t limit = 0);
+
+/// \brief Join strings with a delimiter
+ARROW_EXPORT
+std::string JoinStrings(const std::vector<std::string_view>& strings,
+                        std::string_view delimiter);
+
+/// \brief Join strings with a delimiter
+ARROW_EXPORT
+std::string JoinStrings(const std::vector<std::string>& strings,
+                        std::string_view delimiter);
+
+/// \brief Trim whitespace from left and right sides of string
+ARROW_EXPORT
+std::string TrimString(std::string value);
+
+ARROW_EXPORT
+bool AsciiEqualsCaseInsensitive(std::string_view left, std::string_view right);
+
+ARROW_EXPORT
+std::string AsciiToLower(std::string_view value);
+
+ARROW_EXPORT
+std::string AsciiToUpper(std::string_view value);
+
+/// \brief Search for the first instance of a token and replace it or return nullopt if
+/// the token is not found.
+ARROW_EXPORT
+std::optional<std::string> Replace(std::string_view s, std::string_view token,
+                                   std::string_view replacement);
+
+/// \brief Get boolean value from string
+///
+/// If "1", "true" (case-insensitive), returns true
+/// If "0", "false" (case-insensitive), returns false
+/// Otherwise, returns Status::Invalid
+ARROW_EXPORT
+arrow::Result<bool> ParseBoolean(std::string_view value);
+
+#if __has_include(<charconv>)
+
+namespace detail {
+template <typename T, typename = void>
+struct can_to_chars : public std::false_type {};
+
+template <typename T>
+struct can_to_chars<
+    T, std::void_t<decltype(std::to_chars(std::declval<char*>(), std::declval<char*>(),
+                                          std::declval<std::remove_reference_t<T>>()))>>
+    : public std::true_type {};
+}  // namespace detail
+
+/// \brief Whether std::to_chars exists for the current value type.
+///
+/// This is useful as some C++ libraries do not implement all specified overloads
+/// for std::to_chars.
+template <typename T>
+inline constexpr bool have_to_chars = detail::can_to_chars<T>::value;
+
+/// \brief An ergonomic wrapper around std::to_chars, returning a std::string
+///
+/// For most inputs, the std::string result will not incur any heap allocation
+/// thanks to small string optimization.
+///
+/// Compared to std::to_string, this function gives locale-agnostic results
+/// and might also be faster.
+template <typename T, typename... Args>
+std::string ToChars(T value, Args&&... args) {
+  if constexpr (!have_to_chars<T>) {
+    // Some C++ standard libraries do not yet implement std::to_chars for all types,
+    // in which case we have to fallback to std::string.
+    return std::to_string(value);
+  } else {
+    // According to various sources, the GNU libstdc++ and Microsoft's C++ STL
+    // allow up to 15 bytes of small string optimization, while clang's libc++
+    // goes up to 22 bytes. Choose the pessimistic value.
+    std::string out(15, 0);
+    auto res = std::to_chars(&out.front(), &out.back(), value, args...);
+    while (res.ec != std::errc{}) {
+      assert(res.ec == std::errc::value_too_large);
+      out.resize(out.capacity() * 2);
+      res = std::to_chars(&out.front(), &out.back(), value, args...);
+    }
+    const auto length = res.ptr - out.data();
+    assert(length <= static_cast<int64_t>(out.length()));
+    out.resize(length);
+    return out;
   }
-  return hex_string;
 }
 
-static inline std::string HexEncode(const char* data, size_t length) {
-  return HexEncode(reinterpret_cast<const uint8_t*>(data), length);
+#else  // !__has_include(<charconv>)
+
+template <typename T>
+inline constexpr bool have_to_chars = false;
+
+template <typename T, typename... Args>
+std::string ToChars(T value, Args&&... args) {
+  return std::to_string(value);
 }
 
-static inline std::string HexEncode(util::string_view str) {
-  return HexEncode(str.data(), str.size());
-}
+#endif
 
-static inline Status ParseHexValue(const char* data, uint8_t* out) {
-  char c1 = data[0];
-  char c2 = data[1];
-
-  const char* pos1 = std::lower_bound(kAsciiTable, kAsciiTable + 16, c1);
-  const char* pos2 = std::lower_bound(kAsciiTable, kAsciiTable + 16, c2);
-
-  // Error checking
-  if (*pos1 != c1 || *pos2 != c2) {
-    return Status::Invalid("Encountered non-hex digit");
-  }
-
-  *out = static_cast<uint8_t>((pos1 - kAsciiTable) << 4 | (pos2 - kAsciiTable));
-  return Status::OK();
-}
-
+}  // namespace internal
 }  // namespace arrow
-
-#endif  // ARROW_UTIL_STRING_UTIL_H

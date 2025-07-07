@@ -15,25 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { FixedWidthBuilder } from '../builder';
-import { Float, Float16, Float32, Float64 } from '../type';
+import { float64ToUint16 } from '../util/math.js';
+import { FixedWidthBuilder } from '../builder.js';
+import { Float, Float16, Float32, Float64 } from '../type.js';
 
 /** @ignore */
-export class FloatBuilder<T extends Float = Float, TNull = any> extends FixedWidthBuilder<T, TNull> {}
-
-/** @ignore */
-export class Float16Builder<TNull = any> extends FloatBuilder<Float16, TNull> {}
-
-/** @ignore */
-export class Float32Builder<TNull = any> extends FloatBuilder<Float32, TNull> {
+export class FloatBuilder<T extends Float = Float, TNull = any> extends FixedWidthBuilder<T, TNull> {
     public setValue(index: number, value: number) {
         this._values.set(index, value);
     }
 }
 
 /** @ignore */
-export class Float64Builder<TNull = any> extends FloatBuilder<Float64, TNull> {
+export class Float16Builder<TNull = any> extends FloatBuilder<Float16, TNull> {
     public setValue(index: number, value: number) {
-        this._values.set(index, value);
+        // convert JS float64 to a uint16
+        super.setValue(index, float64ToUint16(value));
     }
 }
+
+/** @ignore */
+export class Float32Builder<TNull = any> extends FloatBuilder<Float32, TNull> { }
+
+/** @ignore */
+export class Float64Builder<TNull = any> extends FloatBuilder<Float64, TNull> { }

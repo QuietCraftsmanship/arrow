@@ -15,132 +15,121 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include R6.R
+#' Read a JSON file
+#'
+#' Wrapper around [JsonTableReader] to read a newline-delimited JSON (ndjson) file into a
+#' data frame or Arrow Table.
+#'
+#' If passed a path, will detect and handle compression from the file extension
+#' (e.g. `.json.gz`).
+#'
+#' If `schema` is not provided, Arrow data types are inferred from the data:
+#' - JSON null values convert to the [null()] type, but can fall back to any other type.
+#' - JSON booleans convert to [boolean()].
+#' - JSON numbers convert to [int64()], falling back to [float64()] if a non-integer is encountered.
+#' - JSON strings of the kind "YYYY-MM-DD" and "YYYY-MM-DD hh:mm:ss" convert to [`timestamp(unit = "s")`][timestamp()],
+#'   falling back to [utf8()] if a conversion error occurs.
+#' - JSON arrays convert to a [list_of()] type, and inference proceeds recursively on the JSON arrays' values.
+#' - Nested JSON objects convert to a [struct()] type, and inference proceeds recursively on the JSON objects' values.
+#'
+#' When `as_data_frame = TRUE`, Arrow types are further converted to R types.
+#'
+#' @inheritParams read_delim_arrow
+#' @param schema [Schema] that describes the table.
+#' @param ... Additional options passed to `JsonTableReader$create()`
+#'
+#' @return A `tibble`, or a Table if `as_data_frame = FALSE`.
+#' @export
+#' @examplesIf arrow_with_json()
+#' tf <- tempfile()
+#' on.exit(unlink(tf))
+#' writeLines('
+#'     { "hello": 3.5, "world": false, "yo": "thing" }
+#'     { "hello": 3.25, "world": null }
+#'     { "hello": 0.0, "world": true, "yo": null }
+#'   ', tf, useBytes = TRUE)
+#'
+#' read_json_arrow(tf)
+#'
+#' # Read directly from strings with `I()`
+#' read_json_arrow(I(c('{"x": 1, "y": 2}', '{"x": 3, "y": 4}')))
+read_json_arrow <- function(file,
+                            col_select = NULL,
+                            as_data_frame = TRUE,
+                            schema = NULL,
+                            ...) {
+  if (inherits(file, "AsIs")) {
+    if (is.raw(file)) {
+      file <- unclass(file)
+    } else {
+      file <- charToRaw(paste(file, collapse = "\n"))
+    }
+  }
 
-#' @include R6.R
-#'
-#' @title class arrow::json::TableReader
-#'
+  if (!inherits(file, "InputStream")) {
+    compression <- detect_compression(file)
+    file <- make_readable_file(file)
+    if (compression != "uncompressed") {
+      # TODO: accept compression and compression_level as args
+      file <- CompressedInputStream$create(file, compression)
+    }
+    on.exit(file$close())
+  }
+  tab <- JsonTableReader$create(file, schema = schema, ...)$Read()
+
+  col_select <- enquo(col_select)
+  if (!quo_is_null(col_select)) {
+    sim_df <- as.data.frame(tab$schema)
+    tab <- tab[eval_select(col_select, sim_df)]
+  }
+
+  if (isTRUE(as_data_frame)) {
+    tab <- collect.ArrowTabular(tab)
+  }
+  tab
+}
+
+#' @include arrow-object.R
+#' @rdname CsvTableReader
 #' @usage NULL
 #' @format NULL
 #' @docType class
-#'
-#' @section Methods:
-#'
-#' - `Read()` : read the JSON file as an [arrow::Table][arrow__Table]
-#'
-#' @rdname arrow__json__TableReader
-#' @name arrow__json__TableReader
-`arrow::json::TableReader` <- R6Class("arrow::json::TableReader", inherit = `arrow::Object`,
+#' @export
+JsonTableReader <- R6Class("JsonTableReader",
+  inherit = ArrowObject,
   public = list(
-    Read = function() shared_ptr(`arrow::Table`, json___TableReader__Read(self))
+    Read = function() json___TableReader__Read(self)
   )
 )
-
-`arrow::json::ReadOptions` <- R6Class("arrow::json::ReadOptions", inherit = `arrow::Object`)
-`arrow::json::ParseOptions` <- R6Class("arrow::json::ParseOptions", inherit = `arrow::Object`)
-
-#' @rdname csv_read_options
-#' @export
-json_read_options <- function(use_threads = TRUE, block_size = 1048576L) {
-  shared_ptr(`arrow::json::ReadOptions`, json___ReadOptions__initialize(
-    list(
-      use_threads = use_threads,
-      block_size = block_size
-    )
-  ))
+JsonTableReader$create <- function(file,
+                                   read_options = JsonReadOptions$create(),
+                                   parse_options = JsonParseOptions$create(schema = schema),
+                                   schema = NULL,
+                                   ...) {
+  assert_is(file, "InputStream")
+  json___TableReader__Make(file, read_options, parse_options)
 }
 
-#' @rdname csv_parse_options
+#' @rdname CsvReadOptions
+#' @usage NULL
+#' @format NULL
+#' @docType class
 #' @export
-json_parse_options <- function(newlines_in_values = FALSE) {
-  shared_ptr(`arrow::json::ParseOptions`, json___ParseOptions__initialize(
-    list(
-      newlines_in_values = newlines_in_values
-    )
-  ))
+JsonReadOptions <- R6Class("JsonReadOptions", inherit = ArrowObject)
+JsonReadOptions$create <- function(use_threads = option_use_threads(), block_size = 1048576L) {
+  json___ReadOptions__initialize(use_threads, block_size)
 }
 
-#' @rdname csv_table_reader
+#' @rdname CsvReadOptions
+#' @usage NULL
+#' @format NULL
+#' @docType class
 #' @export
-json_table_reader <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-){
-  UseMethod("json_table_reader")
-}
-
-#' @importFrom rlang abort
-#' @export
-json_table_reader.default <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-) {
-  abort("unsupported")
-}
-
-#' @export
-`json_table_reader.character` <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-){
-  json_table_reader(fs::path_abs(file),
-    read_options = read_options,
-    parse_options = parse_options,
-    ...
-  )
-}
-
-#' @export
-`json_table_reader.fs_path` <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-){
-  json_table_reader(ReadableFile(file),
-    read_options = read_options,
-    parse_options = parse_options,
-    ...
-  )
-}
-
-#' @export
-`json_table_reader.arrow::io::InputStream` <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-){
-  shared_ptr(`arrow::json::TableReader`,
-    json___TableReader__Make(file, read_options, parse_options)
-  )
-}
-
-#' @export
-`json_table_reader.arrow::json::TableReader` <- function(file,
-  read_options = json_read_options(),
-  parse_options = json_parse_options(),
-  ...
-){
-  file
-}
-
-#' Read a JSON file
-#'
-#' Use [arrow::json::TableReader][arrow__json__TableReader] from [json_table_reader()]
-#'
-#' @inheritParams read_delim_arrow
-#' @param ... Additional options, passed to `json_table_reader()`
-#'
-#' @return A `data.frame`, or an `arrow::Table` if `as_tibble = FALSE`.
-#' @export
-read_json_arrow <- function(file, col_select = NULL, as_tibble = TRUE, ...) {
-  tab <- json_table_reader(file, ...)$Read()$select(!!enquo(col_select))
-
-  if (isTRUE(as_tibble)) {
-    tab <- as.data.frame(tab)
+JsonParseOptions <- R6Class("JsonParseOptions", inherit = ArrowObject)
+JsonParseOptions$create <- function(newlines_in_values = FALSE, schema = NULL) {
+  if (is.null(schema)) {
+    json___ParseOptions__initialize1(newlines_in_values)
+  } else {
+    json___ParseOptions__initialize2(newlines_in_values, schema)
   }
-  tab
 }

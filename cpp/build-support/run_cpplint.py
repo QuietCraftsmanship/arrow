@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -26,22 +26,6 @@ import platform
 from functools import partial
 
 
-# NOTE(wesm):
-#
-# * readability/casting is disabled as it aggressively warns about functions
-#   with names like "int32", so "int32(x)", where int32 is a function name,
-#   warns with
-_filters = '''
--whitespace/comments
--readability/casting
--readability/todo
--build/header_guard
--build/c++11
--runtime/references
--build/include_order
-'''.split()
-
-
 def _get_chunk_key(filenames):
     # lists are not hashable so key on the first filename in a chunk
     return filenames[0]
@@ -65,6 +49,7 @@ if __name__ == "__main__":
                         "that should be excluded from the checks")
     parser.add_argument("--source_dir",
                         required=True,
+                        action="append",
                         help="Root directory of the source code")
     parser.add_argument("--quiet", default=False,
                         action="store_true",
@@ -73,18 +58,17 @@ if __name__ == "__main__":
 
     exclude_globs = []
     if arguments.exclude_globs:
-        for line in open(arguments.exclude_globs):
-            exclude_globs.append(line.strip())
+        with open(arguments.exclude_globs) as f:
+            exclude_globs.extend(line.strip() for line in f)
 
     linted_filenames = []
-    for path in lintutils.get_sources(arguments.source_dir, exclude_globs):
-        linted_filenames.append(str(path))
+    for source_dir in arguments.source_dir:
+        for path in lintutils.get_sources(source_dir, exclude_globs):
+            linted_filenames.append(str(path))
 
     cmd = [
         arguments.cpplint_binary,
         '--verbose=2',
-        '--linelength=90',
-        '--filter=' + ','.join(_filters)
     ]
     if (arguments.cpplint_binary.endswith('.py') and
             platform.system() == 'Windows'):

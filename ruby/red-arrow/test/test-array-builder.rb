@@ -28,6 +28,13 @@ class ArrayBuilderTest < Test::Unit::TestCase
                      ["Hello", nil, "World"])
       end
 
+      test("symbols") do
+        array = Arrow::ArrayBuilder.build([:hello, nil, :world])
+        expected_builder = Arrow::StringDictionaryArrayBuilder.new
+        assert_equal(expected_builder.build(["hello", nil, "world"]),
+                     array)
+      end
+
       test("boolean") do
         assert_build(Arrow::ArrayBuilder,
                      [true, nil, false])
@@ -58,6 +65,85 @@ class ArrayBuilderTest < Test::Unit::TestCase
                      [
                        DateTime.new(2018, 1, 4, 23, 18, 23),
                        DateTime.new(2018, 1, 5, 0, 23, 21),
+                     ])
+      end
+
+      test("decimal + string") do
+        raw_array = [BigDecimal("10.1"), "10.1"]
+        array = Arrow::ArrayBuilder.build(raw_array)
+        assert_equal(raw_array.collect(&:to_s), array.to_a)
+      end
+
+      test("NaN") do
+        raw_array = [BigDecimal("10.1"), BigDecimal::NAN]
+        array = Arrow::ArrayBuilder.build(raw_array)
+        assert_equal(raw_array.collect(&:to_s), array.to_a)
+      end
+
+      test("Infinity") do
+        raw_array = [BigDecimal("10.1"), BigDecimal::INFINITY]
+        array = Arrow::ArrayBuilder.build(raw_array)
+        assert_equal(raw_array.collect(&:to_s), array.to_a)
+      end
+
+      test("decimal128") do
+        values = [
+          BigDecimal("10.1"),
+          BigDecimal("1.11"),
+          BigDecimal("1"),
+        ]
+        array = Arrow::Array.new(values)
+        data_type = Arrow::Decimal128DataType.new(3, 2)
+        assert_equal({
+                       data_type: data_type,
+                       values: [
+                         BigDecimal("10.1"),
+                         BigDecimal("1.11"),
+                         BigDecimal("1"),
+                       ],
+                     },
+                     {
+                       data_type: array.value_data_type,
+                       values: array.to_a,
+                     })
+      end
+
+      test("decimal256") do
+        values = [
+          BigDecimal("1" * 40 + ".1"),
+          BigDecimal("1" * 38 + ".11"),
+          BigDecimal("1" * 37),
+        ]
+        array = Arrow::Array.new(values)
+        data_type = Arrow::Decimal256DataType.new(41, 2)
+        assert_equal({
+                       data_type: data_type,
+                       values: [
+                         BigDecimal("1" * 40 + ".1"),
+                         BigDecimal("1" * 38 + ".11"),
+                         BigDecimal("1" * 37),
+                       ],
+                     },
+                     {
+                       data_type: array.value_data_type,
+                       values: array.to_a,
+                     })
+      end
+
+      test("list<boolean>s") do
+        assert_build(Arrow::ArrayBuilder,
+                     [
+                       [nil, true, false],
+                       nil,
+                       [false],
+                     ])
+      end
+
+      test("list<string>s") do
+        assert_build(Arrow::ArrayBuilder,
+                     [
+                       ["Hello", "World"],
+                       ["Apache Arrow"],
                      ])
       end
     end

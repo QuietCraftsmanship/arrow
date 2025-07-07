@@ -18,22 +18,32 @@
 
 #pragma once
 
+#include <cstddef>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "arrow/status.h"
-#include "arrow/util/macros.h"
-#include "arrow/util/variant.h"
+#include "arrow/util/aligned_storage.h"
+#include "arrow/util/compare.h"
 
 namespace arrow {
+
+template <typename>
+struct EnsureResult;
 
 namespace internal {
 
 ARROW_EXPORT void DieWithMessage(const std::string& msg);
 
+ARROW_EXPORT void InvalidValueOrDie(const Status& st);
+
+ARROW_EXPORT Status UninitializedResult();
+
 }  // namespace internal
 
-// A class for representing either a usable value, or an error.
+/// A class for representing either a usable value, or an error.
 ///
 /// A Result object either contains a value of type `T` or a Status object
 /// explaining why such a value is not present. The type `T` must be
@@ -86,14 +96,16 @@ ARROW_EXPORT void DieWithMessage(const std::string& msg);
 ///   arrow::Result<int> CalculateFoo();
 /// ```
 template <class T>
-class Result {
+class [[nodiscard]] Result : public util::EqualityComparable<Result<T>> {
   template <typename U>
   friend class Result;
-  using VariantType = arrow::util::variant<T, Status, const char*>;
+
   static_assert(!std::is_same<T, Status>::value,
                 "this assert indicates you have probably made a metaprogramming error");
 
  public:
+  using ValueType = T;
+
   /// Constructs a Result object that contains a non-OK status.
   ///
   /// This constructor is marked `explicit` to prevent attempts to `return {}`
@@ -101,10 +113,10 @@ class Result {
   /// `Result<std::vector<int>>`. While `return {}` seems like it would return
   /// an empty vector, it will actually invoke the default constructor of
   /// Result.
-  explicit Result()  // NOLINT(runtime/explicit)
-      : variant_(Status::UnknownError("Unknown error")) {}
+  explicit Result() noexcept  // NOLINT(runtime/explicit)
+      : status_(internal::UninitializedResult()) {}
 
-  ~Result() = default;
+  ~Result() noexcept { Destroy(); }
 
   /// Constructs a Result object with the given non-OK Status object. All
   /// calls to ValueOrDie() on this object will abort. The given `status` must
@@ -115,9 +127,9 @@ class Result {
   /// implicitly converted to the appropriate return type as a matter of
   /// convenience.
   ///
-  /// \param status The non-OK Status object to initalize to.
-  Result(const Status& status)  // NOLINT(runtime/explicit)
-      : variant_(status) {
+  /// \param status The non-OK Status object to initialize to.
+  Result(const Status& status) noexcept  // NOLINT(runtime/explicit)
+      : status_(status) {
     if (ARROW_PREDICT_FALSE(status.ok())) {
       internal::DieWithMessage(std::string("Constructed with a non-error status: ") +
                                status.ToString());
@@ -149,8 +161,24 @@ class Result {
                 !std::is_same<typename std::remove_reference<
                                   typename std::remove_cv<U>::type>::type,
                               Status>::value>::type>
-  Result(U&& value)  // NOLINT(runtime/explicit)
-      : variant_(std::forward<U>(value)) {}
+  Result(U&& value) noexcept {  // NOLINT(runtime/explicit)
+    ConstructValue(std::forward<U>(value));
+  }
+
+  /// Constructs a Result object that contains `value`. The resulting object
+  /// is considered to have an OK status. The wrapped element can be accessed
+  /// with ValueOrDie().
+  ///
+  /// This constructor is made implicit so that a function with a return type of
+  /// `Result<T>` can return an object of type `T`, implicitly converting
+  /// it to a `Result<T>` object.
+  ///
+  /// \param value The value to initialize to.
+  // NOTE `Result(U&& value)` above should be sufficient, but some compilers
+  // fail matching it.
+  Result(T&& value) noexcept {  // NOLINT(runtime/explicit)
+    ConstructValue(std::move(value));
+  }
 
   /// Copy constructor.
   ///
@@ -162,7 +190,11 @@ class Result {
   /// object results in a compilation error.
   ///
   /// \param other The value to copy from.
-  Result(const Result& other) = default;
+  Result(const Result& other) noexcept : status_(other.status_) {
+    if (ARROW_PREDICT_TRUE(status_.ok())) {
+      ConstructValue(other.ValueUnsafe());
+    }
+  }
 
   /// Templatized constructor that constructs a `Result<T>` from a const
   /// reference to a `Result<U>`.
@@ -170,17 +202,30 @@ class Result {
   /// `T` must be implicitly constructible from `const U &`.
   ///
   /// \param other The value to copy from.
-  template <typename U,
-            typename E = typename std::enable_if<std::is_constructible<T, U>::value &&
-                                                 std::is_convertible<U, T>::value>::type>
-  Result(const Result<U>& other) : variant_("unitialized") {
-    AssignVariant(other.variant_);
+  template <typename U, typename E = typename std::enable_if<
+                            std::is_constructible<T, const U&>::value &&
+                            std::is_convertible<U, T>::value>::type>
+  Result(const Result<U>& other) noexcept : status_(other.status_) {
+    if (ARROW_PREDICT_TRUE(status_.ok())) {
+      ConstructValue(other.ValueUnsafe());
+    }
   }
 
   /// Copy-assignment operator.
   ///
   /// \param other The Result object to copy.
-  Result& operator=(const Result& other) = default;
+  Result& operator=(const Result& other) noexcept {
+    // Check for self-assignment.
+    if (ARROW_PREDICT_FALSE(this == &other)) {
+      return *this;
+    }
+    Destroy();
+    status_ = other.status_;
+    if (ARROW_PREDICT_TRUE(status_.ok())) {
+      ConstructValue(other.ValueUnsafe());
+    }
+    return *this;
+  }
 
   /// Templatized constructor which constructs a `Result<T>` by moving the
   /// contents of a `Result<U>`. `T` must be implicitly constructible from `U
@@ -191,11 +236,17 @@ class Result {
   ///
   /// \param other The Result object to move from and set to a non-OK status.
   template <typename U,
-            typename E = typename std::enable_if<std::is_constructible<T, U>::value &&
+            typename E = typename std::enable_if<std::is_constructible<T, U&&>::value &&
                                                  std::is_convertible<U, T>::value>::type>
-  Result(Result<U>&& other) : variant_("unitialized") {
-    AssignVariant(std::move(other.variant_));
-    other.variant_ = "Value was moved to another Result.";
+  Result(Result<U>&& other) noexcept {
+    if (ARROW_PREDICT_TRUE(other.status_.ok())) {
+      status_ = std::move(other.status_);
+      ConstructValue(other.MoveValueUnsafe());
+    } else {
+      // If we moved the status, the other status may become ok but the other
+      // value hasn't been constructed => crash on other destructor.
+      status_ = other.status_;
+    }
   }
 
   /// Move-assignment operator.
@@ -204,15 +255,29 @@ class Result {
   ///
   /// \param other The Result object to assign from and set to a non-OK
   /// status.
-  Result& operator=(Result&& other) {
+  Result& operator=(Result&& other) noexcept {
     // Check for self-assignment.
-    if (this == &other) {
+    if (ARROW_PREDICT_FALSE(this == &other)) {
       return *this;
     }
-    AssignVariant(std::move(other.variant_));
-    other.variant_ = "Value was moved to another Result.";
-
+    Destroy();
+    if (ARROW_PREDICT_TRUE(other.status_.ok())) {
+      status_ = std::move(other.status_);
+      ConstructValue(other.MoveValueUnsafe());
+    } else {
+      // If we moved the status, the other status may become ok but the other
+      // value hasn't been constructed => crash on other destructor.
+      status_ = other.status_;
+    }
     return *this;
+  }
+
+  /// Compare to another Result.
+  bool Equals(const Result& other) const {
+    if (ARROW_PREDICT_TRUE(status_.ok())) {
+      return other.status_.ok() && ValueUnsafe() == other.ValueUnsafe();
+    }
+    return status_ == other.status_;
   }
 
   /// Indicates whether the object contains a `T` value.  Generally instead
@@ -222,17 +287,26 @@ class Result {
   /// \return True if this Result object's status is OK (i.e. a call to ok()
   /// returns true). If this function returns true, then it is safe to access
   /// the wrapped element through a call to ValueOrDie().
-  bool ok() const { return arrow::util::holds_alternative<T>(variant_); }
+  constexpr bool ok() const { return status_.ok(); }
 
-  /// \brief Equivelant to ok().
+  /// \brief Equivalent to ok().
   // operator bool() const { return ok(); }
 
   /// Gets the stored status object, or an OK status if a `T` value is stored.
   ///
   /// \return The stored non-OK status object, or an OK status if this object
   ///         has a value.
-  Status status() const {
-    return ok() ? Status::OK() : arrow::util::get<Status>(variant_);
+  constexpr const Status& status() const& { return status_; }
+
+  /// Gets the stored status object, or an OK status if a `T` value is stored.
+  ///
+  /// \return The stored non-OK status object, or an OK status if this object
+  ///         has a value.
+  Status status() && {
+    if (ARROW_PREDICT_TRUE(ok())) return Status::OK();
+    auto tmp = internal::UninitializedResult();
+    std::swap(status_, tmp);
+    return tmp;
   }
 
   /// Gets the stored `T` value.
@@ -243,12 +317,12 @@ class Result {
   /// \return The stored `T` value.
   const T& ValueOrDie() const& {
     if (ARROW_PREDICT_FALSE(!ok())) {
-      internal::DieWithMessage(std::string("ValueOrDie called on an error: ") +
-                               status().ToString());
+      internal::InvalidValueOrDie(status_);
     }
-    return arrow::util::get<T>(variant_);
+    return ValueUnsafe();
   }
   const T& operator*() const& { return ValueOrDie(); }
+  const T* operator->() const { return &ValueOrDie(); }
 
   /// Gets a mutable reference to the stored `T` value.
   ///
@@ -258,12 +332,12 @@ class Result {
   /// \return The stored `T` value.
   T& ValueOrDie() & {
     if (ARROW_PREDICT_FALSE(!ok())) {
-      internal::DieWithMessage(std::string("ValueOrDie called on an error: ") +
-                               status().ToString());
+      internal::InvalidValueOrDie(status_);
     }
-    return arrow::util::get<T>(variant_);
+    return ValueUnsafe();
   }
   T& operator*() & { return ValueOrDie(); }
+  T* operator->() { return &ValueOrDie(); }
 
   /// Moves and returns the internally-stored `T` value.
   ///
@@ -275,70 +349,173 @@ class Result {
   /// \return The stored `T` value.
   T ValueOrDie() && {
     if (ARROW_PREDICT_FALSE(!ok())) {
-      internal::DieWithMessage(std::string("ValueOrDie called on an error: ") +
-                               status().ToString());
+      internal::InvalidValueOrDie(status_);
     }
-    T tmp(std::move(arrow::util::get<T>(variant_)));
-    variant_ = "Object already returned with ValueOrDie";
-    return tmp;
+    return MoveValueUnsafe();
   }
-  T operator*() && { return ValueOrDie(); }
+  T operator*() && { return std::move(*this).ValueOrDie(); }
+
+  /// Helper method for implementing Status returning functions in terms of semantically
+  /// equivalent Result returning functions. For example:
+  ///
+  /// Status GetInt(int *out) { return GetInt().Value(out); }
+  template <typename U, typename E = typename std::enable_if<
+                            std::is_constructible<U, T>::value>::type>
+  Status Value(U* out) && {
+    if (!ok()) {
+      return std::move(*this).status();
+    }
+    *out = U(MoveValueUnsafe());
+    return Status::OK();
+  }
+
+  /// Move and return the internally stored value or alternative if an error is stored.
+  T ValueOr(T alternative) && {
+    if (!ok()) {
+      return alternative;
+    }
+    return MoveValueUnsafe();
+  }
+
+  /// Retrieve the value if ok(), falling back to an alternative generated by the provided
+  /// factory
+  template <typename G>
+  T ValueOrElse(G&& generate_alternative) && {
+    if (ok()) {
+      return MoveValueUnsafe();
+    }
+    return std::forward<G>(generate_alternative)();
+  }
+
+  /// Apply a function to the internally stored value to produce a new result or propagate
+  /// the stored error.
+  template <typename M>
+  typename EnsureResult<decltype(std::declval<M&&>()(std::declval<T&&>()))>::type Map(
+      M&& m) && {
+    if (!ok()) {
+      return std::move(*this).status();
+    }
+    return std::forward<M>(m)(MoveValueUnsafe());
+  }
+
+  /// Apply a function to the internally stored value to produce a new result or propagate
+  /// the stored error.
+  template <typename M>
+  typename EnsureResult<decltype(std::declval<M&&>()(std::declval<const T&>()))>::type
+  Map(M&& m) const& {
+    if (!ok()) {
+      return status();
+    }
+    return std::forward<M>(m)(ValueUnsafe());
+  }
+
+  /// Cast the internally stored value to produce a new result or propagate the stored
+  /// error.
+  template <typename U, typename E = typename std::enable_if<
+                            std::is_constructible<U, T>::value>::type>
+  Result<U> As() && {
+    if (!ok()) {
+      return std::move(*this).status();
+    }
+    return U(MoveValueUnsafe());
+  }
+
+  /// Cast the internally stored value to produce a new result or propagate the stored
+  /// error.
+  template <typename U, typename E = typename std::enable_if<
+                            std::is_constructible<U, const T&>::value>::type>
+  Result<U> As() const& {
+    if (!ok()) {
+      return status();
+    }
+    return U(ValueUnsafe());
+  }
+
+  constexpr const T& ValueUnsafe() const& { return *storage_.get(); }
+
+  constexpr T& ValueUnsafe() & { return *storage_.get(); }
+
+  T ValueUnsafe() && { return MoveValueUnsafe(); }
+
+  T MoveValueUnsafe() { return std::move(*storage_.get()); }
 
  private:
-  // Assignment is disabled by default so we need to destruct/reconstruct
-  // the value.
+  Status status_;  // pointer-sized
+  internal::AlignedStorage<T> storage_;
+
   template <typename U>
-  void AssignVariant(arrow::util::variant<U, Status, const char*>&& other) {
-    variant_.~variant();
-    if (arrow::util::holds_alternative<U>(other)) {
-      // Reuse memory of variant_ for construction
-      new (&variant_) VariantType(arrow::util::get<U>(std::move(other)));
-    } else {
-      new (&variant_) VariantType(arrow::util::get<Status>(std::move(other)));
-    }
+  void ConstructValue(U&& u) noexcept {
+    storage_.construct(std::forward<U>(u));
   }
 
-  // Assignment is disabled by default so we need to destruct/reconstruct
-  // the value.
-  template <typename U>
-  void AssignVariant(const arrow::util::variant<U, Status, const char*>& other) {
-    variant_.~variant();
-    if (arrow::util::holds_alternative<U>(other)) {
-      // Reuse memory of variant_ for construction
-      new (&variant_) VariantType(arrow::util::get<U>(other));
-    } else {
-      new (&variant_) VariantType(arrow::util::get<Status>(other));
+  void Destroy() noexcept {
+    if (ARROW_PREDICT_TRUE(status_.ok())) {
+      static_assert(offsetof(Result<T>, status_) == 0,
+                    "Status is guaranteed to be at the start of Result<>");
+      storage_.destroy();
     }
   }
-
-  arrow::util::variant<T, Status, const char*> variant_;
 };
 
-#define ARROW_ASSIGN_OR_RAISE_IMPL(status_name, lhs, rexpr) \
-  auto status_name = (rexpr);                               \
-  ARROW_RETURN_NOT_OK(status_name.status());                \
-  lhs = std::move(status_name).ValueOrDie();
+#define ARROW_ASSIGN_OR_RAISE_IMPL(result_name, lhs, rexpr)                              \
+  auto&& result_name = (rexpr);                                                          \
+  ARROW_RETURN_IF_(!(result_name).ok(), (result_name).status(), ARROW_STRINGIFY(rexpr)); \
+  lhs = std::move(result_name).ValueUnsafe();
 
 #define ARROW_ASSIGN_OR_RAISE_NAME(x, y) ARROW_CONCAT(x, y)
 
-// Executes an expression that returns a Result, extracting its value
-// into the variable defined by lhs (or returning on error).
-//
-// Example: Assigning to an existing value
-//   ValueType value;
-//   ARROW_ASSIGN_OR_RAISE(value, MaybeGetValue(arg));
-//
-// WARNING: ASSIGN_OR_RAISE expands into multiple statements; it cannot be used
-//  in a single statement (e.g. as the body of an if statement without {})!
+/// \brief Execute an expression that returns a Result, extracting its value
+/// into the variable defined by `lhs` (or returning a Status on error).
+///
+/// Example: Assigning to a new value:
+///   ARROW_ASSIGN_OR_RAISE(auto value, MaybeGetValue(arg));
+///
+/// Example: Assigning to an existing value:
+///   ValueType value;
+///   ARROW_ASSIGN_OR_RAISE(value, MaybeGetValue(arg));
+///
+/// WARNING: ARROW_ASSIGN_OR_RAISE expands into multiple statements;
+/// it cannot be used in a single statement (e.g. as the body of an if
+/// statement without {})!
+///
+/// WARNING: ARROW_ASSIGN_OR_RAISE `std::move`s its right operand. If you have
+/// an lvalue Result which you *don't* want to move out of cast appropriately.
+///
+/// WARNING: ARROW_ASSIGN_OR_RAISE is not a single expression; it will not
+/// maintain lifetimes of all temporaries in `rexpr` (e.g.
+/// `ARROW_ASSIGN_OR_RAISE(auto x, MakeTemp().GetResultRef());`
+/// will most likely segfault)!
 #define ARROW_ASSIGN_OR_RAISE(lhs, rexpr)                                              \
   ARROW_ASSIGN_OR_RAISE_IMPL(ARROW_ASSIGN_OR_RAISE_NAME(_error_or_value, __COUNTER__), \
                              lhs, rexpr);
 
 namespace internal {
 
-// For Cython, because of https://github.com/cython/cython/issues/3018
-template <class T>
-using CResult = Result<T>;
+template <typename T>
+inline const Status& GenericToStatus(const Result<T>& res) {
+  return res.status();
+}
+
+template <typename T>
+inline Status GenericToStatus(Result<T>&& res) {
+  return std::move(res).status();
+}
 
 }  // namespace internal
+
+template <typename T, typename R = typename EnsureResult<T>::type>
+R ToResult(T t) {
+  return R(std::move(t));
+}
+
+template <typename T>
+struct EnsureResult {
+  using type = Result<T>;
+};
+
+template <typename T>
+struct EnsureResult<Result<T>> {
+  using type = Result<T>;
+};
+
 }  // namespace arrow
