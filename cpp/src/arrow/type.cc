@@ -1217,6 +1217,7 @@ std::string DurationType::ToString(bool show_metadata) const {
 // ----------------------------------------------------------------------
 // Union type
 
+<<<<<<< HEAD
 constexpr int8_t UnionType::kMaxTypeCode;
 constexpr int UnionType::kInvalidChildId;
 
@@ -1248,6 +1249,15 @@ Status UnionType::ValidateParameters(const FieldVector& fields,
     }
   }
   return Status::OK();
+=======
+UnionType::UnionType(const std::vector<std::shared_ptr<Field>>& fields,
+                     const std::vector<uint8_t>& type_codes, UnionMode::type mode)
+    : NestedType(Type::UNION), mode_(mode), type_codes_(type_codes) {
+  DCHECK_LE(fields.size(), type_codes.size()) << "union field with unknown type id";
+  DCHECK_GE(fields.size(), type_codes.size())
+      << "type id provided without corresponding union field";
+  children_ = fields;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 DataTypeLayout UnionType::layout() const {
@@ -1267,7 +1277,11 @@ uint8_t UnionType::max_type_code() const {
              : *std::max_element(type_codes_.begin(), type_codes_.end());
 }
 
+<<<<<<< HEAD
 std::string UnionType::ToString(bool show_metadata) const {
+=======
+std::string UnionType::ToString() const {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   std::stringstream s;
 
   s << name() << "<";

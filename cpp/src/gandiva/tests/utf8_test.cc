@@ -622,6 +622,7 @@ TEST_F(TestUtf8, TestVarlenOutput) {
 
   // Validate results
   EXPECT_ARROW_ARRAY_EQUALS(exp, outputs.at(0));
+<<<<<<< HEAD
 }
 
 TEST_F(TestUtf8, TestConvertUtf8) {
@@ -672,6 +673,8 @@ TEST_F(TestUtf8, TestConvertUtf8) {
   auto exp = MakeArrowArrayBool({true, true, true}, {true, true, true});
   // Validate results
   EXPECT_ARROW_ARRAY_EQUALS(exp, outputs[0]);
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 TEST_F(TestUtf8, TestCastVarChar) {

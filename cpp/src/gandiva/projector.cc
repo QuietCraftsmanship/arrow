@@ -186,46 +186,82 @@ Status Projector::Evaluate(const arrow::RecordBatch& batch,
 
 // TODO : handle complex vectors (list/map/..)
 Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
+<<<<<<< HEAD
                                  arrow::MemoryPool* pool,
                                  ArrayDataPtr* array_data) const {
+=======
+                                 arrow::MemoryPool* pool, ArrayDataPtr* array_data) {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   arrow::Status astatus;
   std::vector<std::shared_ptr<arrow::Buffer>> buffers;
 
   // The output vector always has a null bitmap.
+<<<<<<< HEAD
   int64_t size = arrow::bit_util::BytesForBits(num_records);
   ARROW_ASSIGN_OR_RAISE(auto bitmap_buffer, arrow::AllocateBuffer(size, pool));
   buffers.push_back(std::move(bitmap_buffer));
+=======
+  std::shared_ptr<arrow::Buffer> bitmap_buffer;
+  int64_t size = arrow::BitUtil::BytesForBits(num_records);
+  ARROW_RETURN_NOT_OK(arrow::AllocateBuffer(pool, size, &bitmap_buffer));
+  buffers.push_back(bitmap_buffer);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   // String/Binary vectors have an offsets array.
   auto type_id = type->id();
   if (arrow::is_binary_like(type_id)) {
+<<<<<<< HEAD
     auto offsets_len = arrow::bit_util::BytesForBits((num_records + 1) * 32);
 
     ARROW_ASSIGN_OR_RAISE(auto offsets_buffer, arrow::AllocateBuffer(offsets_len, pool));
     buffers.push_back(std::move(offsets_buffer));
+=======
+    std::shared_ptr<arrow::Buffer> offsets_buffer;
+    auto offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+
+    ARROW_RETURN_NOT_OK(arrow::AllocateBuffer(pool, offsets_len, &offsets_buffer));
+    buffers.push_back(offsets_buffer);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   }
 
   // The output vector always has a data array.
   int64_t data_len;
+<<<<<<< HEAD
   if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
     const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*type);
     data_len = arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
+=======
+  std::shared_ptr<arrow::ResizableBuffer> data_buffer;
+  if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
+    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*type);
+    data_len = arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   } else if (arrow::is_binary_like(type_id)) {
     // we don't know the expected size for varlen output vectors.
     data_len = 0;
   } else {
     return Status::Invalid("Unsupported output data type " + type->ToString());
   }
+<<<<<<< HEAD
   ARROW_ASSIGN_OR_RAISE(auto data_buffer, arrow::AllocateResizableBuffer(data_len, pool));
+=======
+  ARROW_RETURN_NOT_OK(arrow::AllocateResizableBuffer(pool, data_len, &data_buffer));
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   // This is not strictly required but valgrind gets confused and detects this
   // as uninitialized memory access. See arrow::util::SetBitTo().
   if (type->id() == arrow::Type::BOOL) {
     memset(data_buffer->mutable_data(), 0, data_len);
   }
+<<<<<<< HEAD
   buffers.push_back(std::move(data_buffer));
 
   *array_data = arrow::ArrayData::Make(type, num_records, std::move(buffers));
+=======
+  buffers.push_back(data_buffer);
+
+  *array_data = arrow::ArrayData::Make(type, num_records, buffers);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   return Status::OK();
 }
 
@@ -254,7 +290,11 @@ Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
   auto type_id = field.type()->id();
   if (arrow::is_binary_like(type_id)) {
     // validate size of offsets buffer.
+<<<<<<< HEAD
     int64_t min_offsets_len = arrow::bit_util::BytesForBits((num_records + 1) * 32);
+=======
+    int64_t min_offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     int64_t offsets_len = array_data.buffers[1]->capacity();
     ARROW_RETURN_IF(
         offsets_len < min_offsets_len,
@@ -268,9 +308,15 @@ Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
         Status::Invalid("data buffer for varlen output vectors must be resizable"));
   } else if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
     // verify size of data buffer.
+<<<<<<< HEAD
     const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*field.type());
     int64_t min_data_len =
         arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
+=======
+    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*field.type());
+    int64_t min_data_len =
+        arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     int64_t data_len = array_data.buffers[1]->capacity();
     ARROW_RETURN_IF(data_len < min_data_len,
                     Status::Invalid("Data buffer too small for ", field.name()));

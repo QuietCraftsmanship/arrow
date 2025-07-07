@@ -189,7 +189,11 @@ llvm::Value* LLVMGenerator::GetValidityReference(llvm::Value* arg_addrs, int idx
 llvm::Value* LLVMGenerator::GetDataBufferPtrReference(llvm::Value* arg_addrs, int idx,
                                                       FieldPtr field) {
   const std::string& name = field->name();
+<<<<<<< HEAD
   llvm::Value* load = LoadVectorAtIndex(arg_addrs, types()->i64_type(), idx, name);
+=======
+  llvm::Value* load = LoadVectorAtIndex(arg_addrs, idx, name);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   return ir_builder()->CreateIntToPtr(load, types()->i8_ptr_type(), name + "_buf_ptr");
 }
 
@@ -347,6 +351,7 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
 
   llvm::Value* output_ref =
       GetDataReference(arg_addrs, output->data_idx(), output->field());
+<<<<<<< HEAD
   llvm::Value* output_buffer_ptr_ref =
       arrow::is_binary_like(output_type_id)
           ? GetDataBufferPtrReference(arg_addrs, output->data_buffer_ptr_idx(),
@@ -364,6 +369,12 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
     auto offset = builder->CreateLoad(types()->i64_type(), offsetAddr);
     slice_offsets.push_back(offset);
   }
+=======
+  llvm::Value* output_buffer_ptr_ref = GetDataBufferPtrReference(
+      arg_addrs, output->data_buffer_ptr_idx(), output->field());
+  llvm::Value* output_offset_ref =
+      GetOffsetsReference(arg_addrs, output->offsets_idx(), output->field());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   // Loop body
   builder->SetInsertPoint(loop_body);
@@ -397,6 +408,10 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
   // save the value in the output vector.
   builder->SetInsertPoint(loop_body_tail);
 
+<<<<<<< HEAD
+=======
+  auto output_type_id = output->Type()->id();
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   if (output_type_id == arrow::Type::BOOL) {
     SetPackedBitValue(output_ref, loop_var, output_value->data());
   } else if (arrow::is_primitive(output_type_id) ||

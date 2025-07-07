@@ -487,6 +487,7 @@ class BlockParserImpl {
       data += sizeof(WordType);
     }
   }
+<<<<<<< HEAD
 
   template <typename SpecializedOptions, typename ValueDescWriter, typename DataWriter,
             typename BulkFilter>
@@ -525,6 +526,21 @@ class BlockParserImpl {
         }
         data = line_end;
       }
+=======
+
+  while (!finished_parsing && data < data_end && num_rows_ < max_num_rows_) {
+    // We know the number of columns, so can presize a values array for
+    // a given number of rows
+    DCHECK_GE(num_cols_, 0);
+
+    int32_t rows_in_chunk;
+    constexpr int32_t kTargetChunkSize = 32768;
+    if (num_cols_ > 0) {
+      rows_in_chunk = std::min(std::max(kTargetChunkSize / num_cols_, 512),
+                               max_num_rows_ - num_rows_);
+    } else {
+      rows_in_chunk = std::min(kTargetChunkSize, max_num_rows_ - num_rows_);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
     }
 
     if (batch_.num_rows_ > start_num_rows && batch_.num_cols_ > 0) {

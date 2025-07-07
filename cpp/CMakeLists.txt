@@ -148,10 +148,23 @@ if(IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}")
 else()
   set(ARROW_PKG_CONFIG_BINDIR "\${prefix}/${CMAKE_INSTALL_BINDIR}")
 endif()
+<<<<<<< HEAD
 if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
   set(ARROW_PKG_CONFIG_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
 else()
   set(ARROW_PKG_CONFIG_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+=======
+
+if(POLICY CMP0068)
+  # https://cmake.org/cmake/help/v3.9/policy/CMP0068.html
+  cmake_policy(SET CMP0068 NEW)
+endif()
+
+# don't ignore <PackageName>_ROOT variables in find_package
+if(POLICY CMP0074)
+  # https://cmake.org/cmake/help/v3.12/policy/CMP0074.html
+  cmake_policy(SET CMP0074 NEW)
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 endif()
 if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
   set(ARROW_PKG_CONFIG_LIBDIR "${CMAKE_INSTALL_LIBDIR}")

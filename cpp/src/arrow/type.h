@@ -1467,6 +1467,7 @@ class ARROW_EXPORT UnionType : public NestedType {
   /// (instead of 0).
   const std::vector<int8_t>& type_codes() const { return type_codes_; }
 
+<<<<<<< HEAD
   /// An array mapping logical type ids to physical child ids.
   const std::vector<int>& child_ids() const { return child_ids_; }
 
@@ -1480,6 +1481,11 @@ class ARROW_EXPORT UnionType : public NestedType {
   static Status ValidateParameters(const FieldVector& fields,
                                    const std::vector<int8_t>& type_codes,
                                    UnionMode::type mode);
+=======
+  uint8_t max_type_code() const;
+
+  UnionMode::type mode() const { return mode_; }
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
  private:
   std::string ComputeFingerprint() const override;

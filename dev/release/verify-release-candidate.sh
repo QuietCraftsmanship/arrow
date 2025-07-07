@@ -198,6 +198,7 @@ check_verification_result_on_github() {
 }
 
 test_apt() {
+<<<<<<< HEAD
   show_header "Testing APT packages"
 
   if [ "${GITHUB_ACTIONS}" != "true" ]; then
@@ -245,6 +246,24 @@ test_apt() {
       done
       ;;
   esac
+=======
+  for target in debian-stretch \
+                debian-buster \
+                ubuntu-xenial \
+                ubuntu-bionic \
+                ubuntu-cosmic \
+                ubuntu-disco; do
+    if ! "${SOURCE_DIR}/../run_docker_compose.sh" \
+           "${target}" \
+           /arrow/dev/release/verify-apt.sh \
+           "${VERSION}" \
+           "yes" \
+           "${BINTRAY_REPOSITORY}"; then
+      echo "Failed to verify the APT repository for ${target}"
+      exit 1
+    fi
+  done
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 test_yum() {
@@ -776,10 +795,37 @@ test_js() {
   maybe_setup_nodejs
   maybe_setup_conda nodejs=18
 
+<<<<<<< HEAD
   if ! command -v yarn &> /dev/null; then
     npm install yarn
     PATH=$PWD/node_modules/yarn/bin:$PATH
   fi
+=======
+  export PATH=$RUSTUP_HOME/bin:$PATH
+  source $RUSTUP_HOME/env
+
+  # build and test rust
+  pushd rust
+
+  # raises on any formatting errors
+  rustup component add rustfmt --toolchain stable
+  cargo +stable fmt --all -- --check
+
+  # we are targeting Rust nightly for releases
+  rustup default nightly
+
+  # use local modules because we don't publish modules to crates.io yet
+  sed \
+    -i.bak \
+    -E \
+    -e 's/^arrow = "([^"]*)"/arrow = { version = "\1", path = "..\/arrow" }/g' \
+    -e 's/^parquet = "([^"]*)"/parquet = { version = "\1", path = "..\/parquet" }/g' \
+    */Cargo.toml
+
+  # raises on any warnings
+  RUSTFLAGS="-D warnings" cargo build
+  cargo test
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   pushd js
   yarn --frozen-lockfile

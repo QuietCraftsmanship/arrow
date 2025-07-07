@@ -70,7 +70,11 @@ class GANDIVA_EXPORT Annotator {
   /// contents are represent by the annotated descriptor 'desc'.
   void PrepareBuffersForField(const FieldDescriptor& desc,
                               const arrow::ArrayData& array_data, EvalBatch* eval_batch,
+<<<<<<< HEAD
                               bool is_output) const;
+=======
+                              bool is_output);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   /// The list of input/output buffers (includes bitmap buffers, value buffers and
   /// offset buffers).

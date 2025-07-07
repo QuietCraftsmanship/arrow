@@ -130,7 +130,11 @@ class GANDIVA_EXPORT Projector {
 
   /// Allocate an ArrowData of length 'length'.
   Status AllocArrayData(const DataTypePtr& type, int64_t num_records,
+<<<<<<< HEAD
                         arrow::MemoryPool* pool, ArrayDataPtr* array_data) const;
+=======
+                        arrow::MemoryPool* pool, ArrayDataPtr* array_data);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   /// Validate that the ArrayData has sufficient capacity to accommodate 'num_records'.
   Status ValidateArrayDataCapacity(const arrow::ArrayData& array_data,

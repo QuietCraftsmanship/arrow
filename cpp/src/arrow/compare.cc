@@ -226,6 +226,7 @@ class RangeDataEqualsImpl {
     return CompareWithType(*left_.type);
   }
 
+<<<<<<< HEAD
   bool CompareWithType(const DataType& type) {
     result_ = true;
     if (range_length_ != 0) {
@@ -235,12 +236,23 @@ class RangeDataEqualsImpl {
   }
 
   Status Visit(const NullType&) { return Status::OK(); }
+=======
+    const auto& left_type = checked_cast<const UnionType&>(*left.type());
+
+    // Define a mapping from the type id to child number
+    const std::vector<uint8_t>& type_codes = left_type.type_codes();
+    std::vector<uint8_t> type_id_to_child_num(left.union_type()->max_type_code() + 1, 0);
+    for (size_t i = 0; i < type_codes.size(); ++i) {
+      type_id_to_child_num[type_codes[i]] = i;
+    }
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
   template <typename TypeClass>
   enable_if_primitive_ctype<TypeClass, Status> Visit(const TypeClass& type) {
     return ComparePrimitive(type);
   }
 
+<<<<<<< HEAD
   template <typename TypeClass>
   enable_if_t<is_temporal_type<TypeClass>::value, Status> Visit(const TypeClass& type) {
     return ComparePrimitive(type);
@@ -257,6 +269,25 @@ class RangeDataEqualsImpl {
               bit_util::GetBit(right_bits, right_start_idx_ + right_.offset + j)) {
             return false;
           }
+=======
+    for (int64_t i = left_start_idx_, o_i = right_start_idx_; i < left_end_idx_;
+         ++i, ++o_i) {
+      if (left.IsNull(i) != right.IsNull(o_i)) {
+        return false;
+      }
+      if (left.IsNull(i)) continue;
+      if (left_ids[i] != right_ids[o_i]) {
+        return false;
+      }
+
+      auto child_num = type_id_to_child_num[left_ids[i]];
+
+      // TODO(wesm): really we should be comparing stretches of non-null data
+      // rather than looking at one value at a time.
+      if (union_mode == UnionMode::SPARSE) {
+        if (!left.child(child_num)->RangeEquals(i, i + 1, o_i, right.child(child_num))) {
+          return false;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         }
         return true;
       } else if (length <= 1024) {
@@ -837,7 +868,11 @@ class TypeEqualsVisitor {
     }
 
     result_ = std::equal(
+<<<<<<< HEAD
         left.fields().begin(), left.fields().end(), right.fields().begin(),
+=======
+        left.children().begin(), left.children().end(), right.children().begin(),
+>>>>>>> 5588-Better-support-for-building-UnionArrays
         [this](const std::shared_ptr<Field>& l, const std::shared_ptr<Field>& r) {
           return l->Equals(r, check_metadata_);
         });

@@ -164,9 +164,20 @@ c++ -o arrow-example example.cc $(pkg-config --cflags --libs arrow) -std=c++17
 popd
 echo "::endgroup::"
 
+<<<<<<< HEAD
 
 echo "::group::Test Apache Arrow GLib"
 export G_DEBUG=fatal-warnings
+=======
+apt install -y -V libplasma-glib-dev=${deb_version}
+# apt install -y -V libplasma-glib-doc=${deb_version}
+apt install -y -V plasma-store-server=${deb_version}
+
+if [ "${have_gandiva}" = "yes" ]; then
+  apt install -y -V libgandiva-glib-dev=${deb_version}
+  # apt install -y -V libgandiva-glib-doc=${deb_version}
+fi
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 ${APT_INSTALL} libarrow-glib-dev=${package_version}
 ${APT_INSTALL} libarrow-glib-doc=${package_version}
