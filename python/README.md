@@ -48,6 +48,26 @@ to install the [Visual C++ Redistributable for Visual Studio 2015][6].
 
 See [Python Development][2] in the documentation subproject.
 
+### Running the unit tests
+
+We are using [pytest][4] to develop our unit test suite. After building the
+project using `setup.py build_ext --inplace`, you can run its unit tests like
+so:
+
+```bash
+pytest pyarrow
+```
+
+The project has a number of custom command line options for its test
+suite. Some tests are disabled by default, for example. To see all the options,
+run
+
+```bash
+pytest pyarrow --help
+```
+
+and look for the "custom options" section.
+
 ### Building the documentation
 
 See [documentation build instructions][1] in the documentation subproject.
@@ -55,5 +75,9 @@ See [documentation build instructions][1] in the documentation subproject.
 [1]: https://github.com/apache/arrow/blob/main/docs/source/developers/documentation.rst
 [2]: https://github.com/apache/arrow/blob/main/docs/source/developers/python.rst
 [3]: https://github.com/pandas-dev/pandas
+
+[4]: https://docs.pytest.org/en/latest/
+
 [5]: https://arrow.apache.org/docs/latest/python/benchmarks.html
 [6]: https://www.microsoft.com/en-us/download/details.aspx?id=48145
+
