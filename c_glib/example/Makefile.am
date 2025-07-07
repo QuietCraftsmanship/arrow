@@ -18,9 +18,13 @@
 SUBDIRS	=					\
 	lua
 
+EXTRA_DIST =					\
+	meson.build
+
 AM_CPPFLAGS =					\
 	-I$(top_builddir)			\
-	-I$(top_srcdir)
+	-I$(top_srcdir)				\
+	-DGARROW_DISABLE_DEPRECATED
 
 AM_CFLAGS =					\
 	$(GLIB_CFLAGS)				\
@@ -29,6 +33,10 @@ AM_CFLAGS =					\
 AM_LDFLAGS =						\
 	$(GLIB_LIBS)					\
 	$(builddir)/../arrow-glib/libarrow-glib.la
+if USE_ARROW_BUILD_DIR
+AM_LDFLAGS +=					\
+	$(ARROW_LIBS)
+endif
 
 noinst_PROGRAMS =				\
 	build					\

@@ -1,36 +1,44 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package org.apache.arrow.tools;
 
-import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
-import com.fasterxml.jackson.core.util.DefaultPrettyPrinter.NopIndenter;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
+import static org.apache.arrow.tools.ArrowFileTestFixtures.validateOutput;
+import static org.apache.arrow.tools.ArrowFileTestFixtures.write;
+import static org.apache.arrow.tools.ArrowFileTestFixtures.writeData;
+import static org.apache.arrow.tools.ArrowFileTestFixtures.writeInput;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.Map;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.tools.Integration.Command;
-import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.NonNullableStructVector;
 import org.apache.arrow.vector.complex.impl.ComplexWriterImpl;
 import org.apache.arrow.vector.complex.writer.BaseWriter.ComplexWriter;
-import org.apache.arrow.vector.complex.writer.BaseWriter.MapWriter;
+import org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter;
 import org.apache.arrow.vector.complex.writer.BigIntWriter;
 import org.apache.arrow.vector.complex.writer.Float8Writer;
 import org.apache.arrow.vector.complex.writer.IntWriter;
@@ -40,20 +48,10 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.StringReader;
-import java.util.Map;
-
-import static org.apache.arrow.tools.ArrowFileTestFixtures.validateOutput;
-import static org.apache.arrow.tools.ArrowFileTestFixtures.write;
-import static org.apache.arrow.tools.ArrowFileTestFixtures.writeData;
-import static org.apache.arrow.tools.ArrowFileTestFixtures.writeInput;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter.NopIndenter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 
 public class TestIntegration {
 
@@ -76,9 +74,9 @@ public class TestIntegration {
     try (
         BufferAllocator vectorAllocator = allocator.newChildAllocator("original vectors", 0,
             Integer.MAX_VALUE);
-        MapVector parent = MapVector.empty("parent", vectorAllocator)) {
+        NonNullableStructVector parent = NonNullableStructVector.empty("parent", vectorAllocator)) {
       ComplexWriter writer = new ComplexWriterImpl("root", parent);
-      MapWriter rootWriter = writer.rootAsMap();
+      StructWriter rootWriter = writer.rootAsStruct();
       Float8Writer floatWriter = rootWriter.float8("float");
       for (int i = 0; i < f.length; i++) {
         floatWriter.setPosition(i);
@@ -95,10 +93,10 @@ public class TestIntegration {
     try (
         BufferAllocator vectorAllocator = allocator.newChildAllocator("original vectors", 0,
             Integer.MAX_VALUE);
-        MapVector parent = MapVector.empty("parent", vectorAllocator)) {
+        NonNullableStructVector parent = NonNullableStructVector.empty("parent", vectorAllocator)) {
       writeData(count, parent);
       ComplexWriter writer = new ComplexWriterImpl("root", parent);
-      MapWriter rootWriter = writer.rootAsMap();
+      StructWriter rootWriter = writer.rootAsStruct();
       IntWriter intWriter = rootWriter.integer("int");
       BigIntWriter bigIntWriter = rootWriter.bigInt("bigInt");
       intWriter.setPosition(5);
@@ -174,7 +172,8 @@ public class TestIntegration {
 
     BufferedReader orig = readNormalized(testJSONFile);
     BufferedReader rt = readNormalized(testRoundTripJSONFile);
-    String i, o;
+    String i;
+    String o;
     int j = 0;
     while ((i = orig.readLine()) != null && (o = rt.readLine()) != null) {
       assertEquals("line: " + j, i, o);
@@ -204,7 +203,8 @@ public class TestIntegration {
 
     BufferedReader orig = readNormalized(testJSONFile);
     BufferedReader rt = readNormalized(testRoundTripJSONFile);
-    String i, o;
+    String i;
+    String o;
     int j = 0;
     while ((i = orig.readLine()) != null && (o = rt.readLine()) != null) {
       assertEquals("line: " + j, i, o);
@@ -219,7 +219,7 @@ public class TestIntegration {
   }
 
   /**
-   * the test should not be sensitive to small variations in float representation
+   * The test should not be sensitive to small variations in float representation.
    */
   @Test
   public void testFloat() throws Exception {

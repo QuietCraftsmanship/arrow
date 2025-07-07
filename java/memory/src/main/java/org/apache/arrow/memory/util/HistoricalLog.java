@@ -1,14 +1,13 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -51,14 +50,13 @@ public class HistoricalLog {
   /**
    * Constructor. The format string will be formatted and have its arguments
    * substituted at the time this is called.
-   * <p>
+   *
    * <p>This form supports the specification of a limit that will limit the
    * number of historical entries kept (which keeps down the amount of memory
    * used). With the limit, the first entry made is always kept (under the
    * assumption that this is the creation site of the object, which is usually
    * interesting), and then up to the limit number of entries are kept after that.
    * Each time a new entry is made, the oldest that is not the first is dropped.
-   * </p>
    *
    * @param limit          the maximum number of historical entries that will be kept, not including
    *                       the first entry made
@@ -97,7 +95,7 @@ public class HistoricalLog {
    * includes the identifying string provided at construction time, and all the recorded
    * events with their stack traces.
    *
-   * @param sb {@link StringBuilder} to write to
+   * @param sb                {@link StringBuilder} to write to
    * @param includeStackTrace whether to include the stacktrace of each event in the history
    */
   public void buildHistory(final StringBuilder sb, boolean includeStackTrace) {
@@ -105,9 +103,10 @@ public class HistoricalLog {
   }
 
   /**
-   * build the history and write it to sb
-   * @param sb output
-   * @param indent starting indent (usually "")
+   * Build the history and write it to sb.
+   *
+   * @param sb                output
+   * @param indent            starting indent (usually "")
    * @param includeStackTrace whether to include the stacktrace of each event.
    */
   public synchronized void buildHistory(

@@ -1,111 +1,145 @@
 #!/usr/bin/env bash
-
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License. See accompanying LICENSE file.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 set -e
 
 source $TRAVIS_BUILD_DIR/ci/travis_env_common.sh
 
+source $TRAVIS_BUILD_DIR/ci/travis_install_conda.sh
+
 export ARROW_HOME=$ARROW_CPP_INSTALL
+export PARQUET_HOME=$ARROW_CPP_INSTALL
+export LD_LIBRARY_PATH=$ARROW_HOME/lib:$LD_LIBRARY_PATH
+export PYARROW_CXXFLAGS="-Werror"
 
-pushd $ARROW_PYTHON_DIR
-export PARQUET_HOME=$TRAVIS_BUILD_DIR/parquet-env
+PYARROW_PYTEST_FLAGS=" -r sxX --durations=15 --parquet"
 
-build_parquet_cpp() {
-  export PARQUET_ARROW_VERSION=$(git rev-parse HEAD)
-  conda create -y -q -p $PARQUET_HOME python=3.6 cmake curl
-  source activate $PARQUET_HOME
+PYTHON_VERSION=$1
+CONDA_ENV_DIR=$TRAVIS_BUILD_DIR/pyarrow-test-$PYTHON_VERSION
 
-  # In case some package wants to download the MKL
-  conda install -y -q nomkl
+# We should use zlib in the target Python directory to avoid loading
+# the wrong libpython on macOS at run-time. Another zlib might sit in a
+# directory with a different libpython3.6m.dylib, and that libpython3.6m.dylib
+# may not have NumPy (which is required for python-test)
+export ZLIB_HOME=$CONDA_ENV_DIR
 
-  conda install -y -q thrift-cpp snappy zlib brotli boost
+CONDA_FILES=""
+CONDA_PACKAGES=""
 
-  export BOOST_ROOT=$PARQUET_HOME
-  export SNAPPY_HOME=$PARQUET_HOME
-  export THRIFT_HOME=$PARQUET_HOME
-  export ZLIB_HOME=$PARQUET_HOME
-  export BROTLI_HOME=$PARQUET_HOME
+if [ "$ARROW_TRAVIS_PYTHON_GANDIVA" == "1" ]; then
+    CONDA_FILES="$CONDA_FILES --file=$TRAVIS_BUILD_DIR/ci/conda_env_gandiva.yml"
+fi
 
-  PARQUET_DIR=$TRAVIS_BUILD_DIR/parquet
-  mkdir -p $PARQUET_DIR
+if [ "$ARROW_TRAVIS_PYTHON_JVM" == "1" ]; then
+    JPYPE_VERSION=0.6.3
+    CONDA_PACKAGES="$CONDA_PACKAGES jpype1=$JPYPE_VERSION"
+fi
 
-  git clone https://github.com/apache/parquet-cpp.git $PARQUET_DIR
+conda create -y -q -p $CONDA_ENV_DIR \
+      --file $TRAVIS_BUILD_DIR/ci/conda_env_cpp.yml \
+      --file $TRAVIS_BUILD_DIR/ci/conda_env_unix.yml \
+      --file $TRAVIS_BUILD_DIR/ci/conda_env_python.yml \
+      ${CONDA_FILES} \
+      nomkl \
+      pip \
+      numpy=1.14 \
+      'libgfortran<4' \
+      python=${PYTHON_VERSION} \
+      compilers \
+      ${CONDA_PACKAGES}
 
-  pushd $PARQUET_DIR
-  mkdir build-dir
-  cd build-dir
+conda activate $CONDA_ENV_DIR
 
-  cmake \
-      -DCMAKE_BUILD_TYPE=debug \
-      -DCMAKE_INSTALL_PREFIX=$PARQUET_HOME \
-      -DPARQUET_BUILD_BENCHMARKS=off \
-      -DPARQUET_BUILD_EXECUTABLES=off \
-      -DPARQUET_ZLIB_VENDORED=off \
-      -DPARQUET_BUILD_TESTS=off \
-      ..
+python --version
+which python
 
-  make -j${CPU_COUNT}
-  make install
+if [ "$ARROW_TRAVIS_PYTHON_DOCS" == "1" ]; then
+  # Install documentation dependencies
+  conda install -y --file ci/conda_env_sphinx.yml
+fi
 
-  popd
-}
+# ARROW-2093: PyTorch increases the size of our conda dependency stack
+# significantly, and so we have disabled these tests in Travis CI for now
 
-build_parquet_cpp
+# if [ "$PYTHON_VERSION" != "2.7" ] || [ $TRAVIS_OS_NAME != "osx" ]; then
+#   # Install pytorch for torch tensor conversion tests
+#   # PyTorch seems to be broken on Python 2.7 on macOS so we skip it
+#   conda install -y -q pytorch torchvision -c soumith
+# fi
 
-function build_arrow_libraries() {
-  CPP_BUILD_DIR=$1
-  CPP_DIR=$TRAVIS_BUILD_DIR/cpp
+if [ $TRAVIS_OS_NAME != "osx" ]; then
+  conda install -y tensorflow
+  PYARROW_PYTEST_FLAGS="$PYARROW_PYTEST_FLAGS --tensorflow"
+fi
 
-  mkdir $CPP_BUILD_DIR
-  pushd $CPP_BUILD_DIR
+# Re-build C++ libraries with the right Python setup
 
-  cmake -DARROW_BUILD_TESTS=off \
-        -DARROW_PYTHON=on \
-        -DCMAKE_INSTALL_PREFIX=$2 \
-        $CPP_DIR
+# Clear out prior build files
+rm -rf $ARROW_CPP_BUILD_DIR
+mkdir -p $ARROW_CPP_BUILD_DIR
+pushd $ARROW_CPP_BUILD_DIR
 
-  make -j4
-  make install
 
-  popd
-}
+# XXX Can we simply reuse CMAKE_COMMON_FLAGS from travis_before_script_cpp.sh?
+CMAKE_COMMON_FLAGS="-DARROW_EXTRA_ERROR_CONTEXT=ON"
 
-python_version_tests() {
-  PYTHON_VERSION=$1
-  CONDA_ENV_DIR=$TRAVIS_BUILD_DIR/pyarrow-test-$PYTHON_VERSION
+PYTHON_CPP_BUILD_TARGETS="arrow_python-all plasma parquet"
 
-  export ARROW_HOME=$TRAVIS_BUILD_DIR/arrow-install-$PYTHON_VERSION
-  export LD_LIBRARY_PATH=$ARROW_HOME/lib:$PARQUET_HOME/lib
+if [ "$ARROW_TRAVIS_FLIGHT" == "1" ]; then
+  CMAKE_COMMON_FLAGS="$CMAKE_COMMON_FLAGS -DARROW_FLIGHT=ON"
+fi
 
-  conda create -y -q -p $CONDA_ENV_DIR python=$PYTHON_VERSION cmake curl
-  source activate $CONDA_ENV_DIR
+if [ "$ARROW_TRAVIS_COVERAGE" == "1" ]; then
+  CMAKE_COMMON_FLAGS="$CMAKE_COMMON_FLAGS -DARROW_GENERATE_COVERAGE=ON"
+fi
 
-  python --version
-  which python
+if [ "$ARROW_TRAVIS_PYTHON_GANDIVA" == "1" ]; then
+  CMAKE_COMMON_FLAGS="$CMAKE_COMMON_FLAGS -DARROW_GANDIVA=ON"
+  PYTHON_CPP_BUILD_TARGETS="$PYTHON_CPP_BUILD_TARGETS gandiva"
+fi
 
-  # faster builds, please
-  conda install -y -q nomkl
+if [ "$ARROW_TRAVIS_VERBOSE" == "1" ]; then
+  CMAKE_COMMON_FLAGS="$CMAKE_COMMON_FLAGS -DARROW_VERBOSE_THIRDPARTY_BUILD=ON"
+fi
 
-  # Expensive dependencies install from Continuum package repo
-  conda install -y -q pip numpy pandas cython
+if [ $TRAVIS_OS_NAME == "osx" ]; then
+  source $TRAVIS_BUILD_DIR/ci/travis_install_osx_sdk.sh
+fi
 
-  # Build C++ libraries
-  build_arrow_libraries arrow-build-$PYTHON_VERSION $ARROW_HOME
+# conda-forge sets the build flags by default to -02, skip this to speed up the build
+export CFLAGS=${CFLAGS//-O2}
+export CXXFLAGS=${CXXFLAGS//-O2}
 
-  # Other stuff pip install
-  pip install -r requirements.txt
+cmake -GNinja \
+      $CMAKE_COMMON_FLAGS \
+      -DARROW_BUILD_TESTS=ON \
+      -DARROW_BUILD_UTILITIES=OFF \
+      -DARROW_OPTIONAL_INSTALL=ON \
+      -DARROW_PARQUET=on \
+      -DARROW_PLASMA=on \
+      -DARROW_TENSORFLOW=on \
+      -DARROW_PYTHON=on \
+      -DARROW_ORC=on \
+      -DCMAKE_BUILD_TYPE=$ARROW_BUILD_TYPE \
+      -DCMAKE_INSTALL_PREFIX=$ARROW_HOME \
+      $ARROW_CPP_DIR
 
+<<<<<<< HEAD
   python setup.py build_ext --inplace --with-parquet --with-jemalloc
 
   python -c "import pyarrow.parquet"
@@ -124,5 +158,117 @@ python_version_tests() {
 # run tests for python 2.7 and 3.6
 python_version_tests 2.7
 python_version_tests 3.6
+=======
+ninja $PYTHON_CPP_BUILD_TARGETS
+ninja install
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 popd
+
+# python-test isn't run by travis_script_cpp.sh, exercise it here
+$ARROW_CPP_BUILD_DIR/$ARROW_BUILD_TYPE/arrow-python-test
+
+pushd $ARROW_PYTHON_DIR
+
+pip install -q pickle5
+if [ "$ARROW_TRAVIS_COVERAGE" == "1" ]; then
+    export PYARROW_GENERATE_COVERAGE=1
+    pip install -q coverage
+fi
+
+echo "=== pip list ==="
+pip list
+
+export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$ARROW_CPP_INSTALL/lib/pkgconfig
+
+export PYARROW_BUILD_TYPE=$ARROW_BUILD_TYPE
+export PYARROW_WITH_PARQUET=1
+export PYARROW_WITH_PLASMA=1
+export PYARROW_WITH_ORC=1
+if [ "$ARROW_TRAVIS_FLIGHT" == "1" ]; then
+  export PYARROW_WITH_FLIGHT=1
+fi
+if [ "$ARROW_TRAVIS_PYTHON_GANDIVA" == "1" ]; then
+  export PYARROW_WITH_GANDIVA=1
+fi
+
+python setup.py develop
+
+# Basic sanity checks
+python -c "import pyarrow.parquet"
+python -c "import pyarrow.plasma"
+python -c "import pyarrow.orc"
+
+# Ensure we do eagerly import pandas (or other expensive imports)
+python < scripts/test_imports.py
+
+echo "PLASMA_VALGRIND: $PLASMA_VALGRIND"
+
+# Set up huge pages for plasma test
+if [ $TRAVIS_OS_NAME == "linux" ]; then
+    sudo sysctl -w vm.nr_hugepages=2048
+    sudo mkdir -p /mnt/hugepages
+    sudo mount -t hugetlbfs -o uid=`id -u` -o gid=`id -g` none /mnt/hugepages
+    sudo bash -c "echo `id -g` > /proc/sys/vm/hugetlb_shm_group"
+    sudo bash -c "echo 2048 > /proc/sys/vm/nr_hugepages"
+fi
+
+# Need to run tests from the source tree for Cython coverage and conftest.py
+if [ "$ARROW_TRAVIS_COVERAGE" == "1" ]; then
+    # Output Python coverage data in a persistent place
+    export COVERAGE_FILE=$ARROW_PYTHON_COVERAGE_FILE
+    coverage run --append -m pytest $PYARROW_PYTEST_FLAGS pyarrow/tests
+else
+    python -m pytest $PYARROW_PYTEST_FLAGS pyarrow/tests
+fi
+
+if [ "$ARROW_TRAVIS_COVERAGE" == "1" ]; then
+    # Check Cython coverage was correctly captured in $COVERAGE_FILE
+    coverage report -i --include="*/lib.pyx"
+    coverage report -i --include="*/memory.pxi"
+    coverage report -i --include="*/_parquet.pyx"
+    # Generate XML file for CodeCov
+    coverage xml -i -o $TRAVIS_BUILD_DIR/coverage.xml
+    # Capture C++ coverage info
+    pushd $TRAVIS_BUILD_DIR
+    lcov --directory . --capture --no-external --output-file coverage-python-tests.info \
+        2>&1 | grep -v "ignoring data for external file"
+    lcov --add-tracefile coverage-python-tests.info \
+        --output-file $ARROW_CPP_COVERAGE_FILE
+    rm coverage-python-tests.info
+    popd   # $TRAVIS_BUILD_DIR
+fi
+
+if [ "$ARROW_TRAVIS_PYTHON_DOCS" == "1" ]; then
+  pushd ../cpp/apidoc
+  doxygen
+  popd
+  cd ../docs
+  sphinx-build -q -b html -d _build/doctrees -W source _build/html
+fi
+
+popd  # $ARROW_PYTHON_DIR
+
+if [ "$ARROW_TRAVIS_PYTHON_BENCHMARKS" == "1" ]; then
+  # Check the ASV benchmarking setup.
+  # Unfortunately this won't ensure that all benchmarks succeed
+  # (see https://github.com/airspeed-velocity/asv/issues/449)
+  source deactivate
+  conda create -y -q -n pyarrow_asv python=$PYTHON_VERSION
+  conda activate pyarrow_asv
+  pip install -q git+https://github.com/pitrou/asv.git@customize_commands
+
+  export PYARROW_WITH_PARQUET=1
+  export PYARROW_WITH_PLASMA=1
+  export PYARROW_WITH_ORC=0
+  export PYARROW_WITH_GANDIVA=0
+
+  pushd $ARROW_PYTHON_DIR
+  # Workaround for https://github.com/airspeed-velocity/asv/issues/631
+  git fetch --depth=100 origin master:master
+  # Generate machine information (mandatory)
+  asv machine --yes
+  # Run benchmarks on the changeset being tested
+  asv run --no-pull --show-stderr --quick HEAD^!
+  popd  # $ARROW_PYTHON_DIR
+fi

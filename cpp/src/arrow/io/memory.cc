@@ -18,17 +18,14 @@
 #include "arrow/io/memory.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <sstream>
-#include <string>
+#include <mutex>
 
 #include "arrow/buffer.h"
-#include "arrow/io/interfaces.h"
 #include "arrow/status.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/macros.h"
 #include "arrow/util/memory.h"
 
 namespace arrow {
@@ -39,50 +36,75 @@ namespace io {
 
 static constexpr int64_t kBufferMinimumSize = 256;
 
+BufferOutputStream::BufferOutputStream()
+    : is_open_(false), capacity_(0), position_(0), mutable_data_(nullptr) {}
+
 BufferOutputStream::BufferOutputStream(const std::shared_ptr<ResizableBuffer>& buffer)
     : buffer_(buffer),
+      is_open_(true),
       capacity_(buffer->size()),
       position_(0),
       mutable_data_(buffer->mutable_data()) {}
 
 Status BufferOutputStream::Create(int64_t initial_capacity, MemoryPool* pool,
-    std::shared_ptr<BufferOutputStream>* out) {
-  std::shared_ptr<ResizableBuffer> buffer;
-  RETURN_NOT_OK(AllocateResizableBuffer(pool, initial_capacity, &buffer));
-  *out = std::make_shared<BufferOutputStream>(buffer);
+                                  std::shared_ptr<BufferOutputStream>* out) {
+  // ctor is private, so cannot use make_shared
+  *out = std::shared_ptr<BufferOutputStream>(new BufferOutputStream);
+  return (*out)->Reset(initial_capacity, pool);
+}
+
+Status BufferOutputStream::Reset(int64_t initial_capacity, MemoryPool* pool) {
+  RETURN_NOT_OK(AllocateResizableBuffer(pool, initial_capacity, &buffer_));
+  is_open_ = true;
+  capacity_ = initial_capacity;
+  position_ = 0;
+  mutable_data_ = buffer_->mutable_data();
   return Status::OK();
 }
 
 BufferOutputStream::~BufferOutputStream() {
   // This can fail, better to explicitly call close
-  if (buffer_) { Close(); }
-}
-
-Status BufferOutputStream::Close() {
-  if (position_ < capacity_) {
-    return buffer_->Resize(position_);
-  } else {
-    return Status::OK();
+  if (buffer_) {
+    ARROW_CHECK_OK(Close());
   }
 }
 
-Status BufferOutputStream::Finish(std::shared_ptr<Buffer>* result) {
-  RETURN_NOT_OK(Close());
-  *result = buffer_;
-  buffer_ = nullptr;
+Status BufferOutputStream::Close() {
+  if (is_open_) {
+    is_open_ = false;
+    if (position_ < capacity_) {
+      RETURN_NOT_OK(buffer_->Resize(position_, false));
+    }
+  }
   return Status::OK();
 }
 
-Status BufferOutputStream::Tell(int64_t* position) {
+bool BufferOutputStream::closed() const { return !is_open_; }
+
+Status BufferOutputStream::Finish(std::shared_ptr<Buffer>* result) {
+  RETURN_NOT_OK(Close());
+  buffer_->ZeroPadding();
+  *result = buffer_;
+  buffer_ = nullptr;
+  is_open_ = false;
+  return Status::OK();
+}
+
+Status BufferOutputStream::Tell(int64_t* position) const {
   *position = position_;
   return Status::OK();
 }
 
-Status BufferOutputStream::Write(const uint8_t* data, int64_t nbytes) {
+Status BufferOutputStream::Write(const void* data, int64_t nbytes) {
+  if (ARROW_PREDICT_FALSE(!is_open_)) {
+    return Status::IOError("OutputStream is closed");
+  }
   DCHECK(buffer_);
-  RETURN_NOT_OK(Reserve(nbytes));
-  memcpy(mutable_data_ + position_, data, nbytes);
-  position_ += nbytes;
+  if (ARROW_PREDICT_TRUE(nbytes > 0)) {
+    RETURN_NOT_OK(Reserve(nbytes));
+    memcpy(mutable_data_ + position_, data, nbytes);
+    position_ += nbytes;
+  }
   return Status::OK();
 }
 
@@ -100,127 +122,252 @@ Status BufferOutputStream::Reserve(int64_t nbytes) {
 }
 
 // ----------------------------------------------------------------------
+// OutputStream that doesn't write anything
+
+Status MockOutputStream::Close() {
+  is_open_ = false;
+  return Status::OK();
+}
+
+bool MockOutputStream::closed() const { return !is_open_; }
+
+Status MockOutputStream::Tell(int64_t* position) const {
+  *position = extent_bytes_written_;
+  return Status::OK();
+}
+
+Status MockOutputStream::Write(const void* data, int64_t nbytes) {
+  extent_bytes_written_ += nbytes;
+  return Status::OK();
+}
+
+// ----------------------------------------------------------------------
 // In-memory buffer writer
 
 static constexpr int kMemcopyDefaultNumThreads = 1;
 static constexpr int64_t kMemcopyDefaultBlocksize = 64;
 static constexpr int64_t kMemcopyDefaultThreshold = 1024 * 1024;
 
-/// Input buffer must be mutable, will abort if not
+class FixedSizeBufferWriter::FixedSizeBufferWriterImpl {
+ public:
+  /// Input buffer must be mutable, will abort if not
+
+  /// Input buffer must be mutable, will abort if not
+  explicit FixedSizeBufferWriterImpl(const std::shared_ptr<Buffer>& buffer)
+      : is_open_(true),
+        memcopy_num_threads_(kMemcopyDefaultNumThreads),
+        memcopy_blocksize_(kMemcopyDefaultBlocksize),
+        memcopy_threshold_(kMemcopyDefaultThreshold) {
+    buffer_ = buffer;
+    ARROW_CHECK(buffer->is_mutable()) << "Must pass mutable buffer";
+    mutable_data_ = buffer->mutable_data();
+    size_ = buffer->size();
+    position_ = 0;
+  }
+
+  Status Close() {
+    is_open_ = false;
+    return Status::OK();
+  }
+
+  bool closed() const { return !is_open_; }
+
+  Status Seek(int64_t position) {
+    if (position < 0 || position > size_) {
+      return Status::IOError("Seek out of bounds");
+    }
+    position_ = position;
+    return Status::OK();
+  }
+
+  Status Tell(int64_t* position) {
+    *position = position_;
+    return Status::OK();
+  }
+
+  Status Write(const void* data, int64_t nbytes) {
+    if (position_ + nbytes > size_) {
+      return Status::IOError("Write out of bounds");
+    }
+    if (nbytes > memcopy_threshold_ && memcopy_num_threads_ > 1) {
+      internal::parallel_memcopy(mutable_data_ + position_,
+                                 reinterpret_cast<const uint8_t*>(data), nbytes,
+                                 memcopy_blocksize_, memcopy_num_threads_);
+    } else {
+      memcpy(mutable_data_ + position_, data, nbytes);
+    }
+    position_ += nbytes;
+    return Status::OK();
+  }
+
+  Status WriteAt(int64_t position, const void* data, int64_t nbytes) {
+    std::lock_guard<std::mutex> guard(lock_);
+    RETURN_NOT_OK(Seek(position));
+    return Write(data, nbytes);
+  }
+
+  void set_memcopy_threads(int num_threads) { memcopy_num_threads_ = num_threads; }
+
+  void set_memcopy_blocksize(int64_t blocksize) { memcopy_blocksize_ = blocksize; }
+
+  void set_memcopy_threshold(int64_t threshold) { memcopy_threshold_ = threshold; }
+
+ private:
+  std::mutex lock_;
+  std::shared_ptr<Buffer> buffer_;
+  uint8_t* mutable_data_;
+  int64_t size_;
+  int64_t position_;
+  bool is_open_;
+
+  int memcopy_num_threads_;
+  int64_t memcopy_blocksize_;
+  int64_t memcopy_threshold_;
+};
+
 FixedSizeBufferWriter::FixedSizeBufferWriter(const std::shared_ptr<Buffer>& buffer)
-    : memcopy_num_threads_(kMemcopyDefaultNumThreads),
-      memcopy_blocksize_(kMemcopyDefaultBlocksize),
-      memcopy_threshold_(kMemcopyDefaultThreshold) {
-  buffer_ = buffer;
-  DCHECK(buffer->is_mutable()) << "Must pass mutable buffer";
-  mutable_data_ = buffer->mutable_data();
-  size_ = buffer->size();
-  position_ = 0;
+    : impl_(new FixedSizeBufferWriterImpl(buffer)) {}
+
+FixedSizeBufferWriter::~FixedSizeBufferWriter() = default;
+
+Status FixedSizeBufferWriter::Close() { return impl_->Close(); }
+
+bool FixedSizeBufferWriter::closed() const { return impl_->closed(); }
+
+Status FixedSizeBufferWriter::Seek(int64_t position) { return impl_->Seek(position); }
+
+Status FixedSizeBufferWriter::Tell(int64_t* position) const {
+  return impl_->Tell(position);
 }
 
-FixedSizeBufferWriter::~FixedSizeBufferWriter() {}
-
-Status FixedSizeBufferWriter::Close() {
-  // No-op
-  return Status::OK();
+Status FixedSizeBufferWriter::Write(const void* data, int64_t nbytes) {
+  return impl_->Write(data, nbytes);
 }
 
-Status FixedSizeBufferWriter::Seek(int64_t position) {
-  if (position < 0 || position >= size_) {
-    return Status::IOError("position out of bounds");
-  }
-  position_ = position;
-  return Status::OK();
-}
-
-Status FixedSizeBufferWriter::Tell(int64_t* position) {
-  *position = position_;
-  return Status::OK();
-}
-
-Status FixedSizeBufferWriter::Write(const uint8_t* data, int64_t nbytes) {
-  if (nbytes > memcopy_threshold_ && memcopy_num_threads_ > 1) {
-    parallel_memcopy(mutable_data_ + position_, data, nbytes, memcopy_blocksize_,
-        memcopy_num_threads_);
-  } else {
-    memcpy(mutable_data_ + position_, data, nbytes);
-  }
-  position_ += nbytes;
-  return Status::OK();
-}
-
-Status FixedSizeBufferWriter::WriteAt(
-    int64_t position, const uint8_t* data, int64_t nbytes) {
-  std::lock_guard<std::mutex> guard(lock_);
-  RETURN_NOT_OK(Seek(position));
-  return Write(data, nbytes);
+Status FixedSizeBufferWriter::WriteAt(int64_t position, const void* data,
+                                      int64_t nbytes) {
+  return impl_->WriteAt(position, data, nbytes);
 }
 
 void FixedSizeBufferWriter::set_memcopy_threads(int num_threads) {
-  memcopy_num_threads_ = num_threads;
+  impl_->set_memcopy_threads(num_threads);
 }
 
 void FixedSizeBufferWriter::set_memcopy_blocksize(int64_t blocksize) {
-  memcopy_blocksize_ = blocksize;
+  impl_->set_memcopy_blocksize(blocksize);
 }
 
 void FixedSizeBufferWriter::set_memcopy_threshold(int64_t threshold) {
-  memcopy_threshold_ = threshold;
+  impl_->set_memcopy_threshold(threshold);
 }
 
 // ----------------------------------------------------------------------
 // In-memory buffer reader
 
 BufferReader::BufferReader(const std::shared_ptr<Buffer>& buffer)
-    : buffer_(buffer), data_(buffer->data()), size_(buffer->size()), position_(0) {}
+    : buffer_(buffer),
+      data_(buffer->data()),
+      size_(buffer->size()),
+      position_(0),
+      is_open_(true) {}
 
 BufferReader::BufferReader(const uint8_t* data, int64_t size)
-    : buffer_(nullptr), data_(data), size_(size), position_(0) {}
+    : buffer_(nullptr), data_(data), size_(size), position_(0), is_open_(true) {}
 
-BufferReader::~BufferReader() {}
+BufferReader::BufferReader(const Buffer& buffer)
+    : BufferReader(buffer.data(), buffer.size()) {}
+
+BufferReader::BufferReader(const util::string_view& data)
+    : BufferReader(reinterpret_cast<const uint8_t*>(data.data()),
+                   static_cast<int64_t>(data.size())) {}
 
 Status BufferReader::Close() {
-  // no-op
+  is_open_ = false;
   return Status::OK();
 }
 
-Status BufferReader::Tell(int64_t* position) {
+bool BufferReader::closed() const { return !is_open_; }
+
+Status BufferReader::CheckClosed() const {
+  if (!is_open_) {
+    return Status::Invalid("Operation forbidden on closed BufferReader");
+  }
+  return Status::OK();
+}
+
+Status BufferReader::Tell(int64_t* position) const {
+  RETURN_NOT_OK(CheckClosed());
   *position = position_;
   return Status::OK();
 }
 
-bool BufferReader::supports_zero_copy() const {
-  return true;
+Status BufferReader::Peek(int64_t nbytes, util::string_view* out) {
+  RETURN_NOT_OK(CheckClosed());
+
+  const int64_t bytes_available = std::min(nbytes, size_ - position_);
+  *out = util::string_view(reinterpret_cast<const char*>(data_) + position_,
+                           static_cast<size_t>(bytes_available));
+  return Status::OK();
 }
 
-Status BufferReader::Read(int64_t nbytes, int64_t* bytes_read, uint8_t* buffer) {
-  memcpy(buffer, data_ + position_, nbytes);
-  *bytes_read = std::min(nbytes, size_ - position_);
+bool BufferReader::supports_zero_copy() const { return true; }
+
+Status BufferReader::ReadAt(int64_t position, int64_t nbytes, int64_t* bytes_read,
+                            void* buffer) {
+  RETURN_NOT_OK(CheckClosed());
+
+  if (nbytes < 0) {
+    return Status::IOError("Cannot read a negative number of bytes from BufferReader.");
+  }
+  *bytes_read = std::min(nbytes, size_ - position);
+  if (*bytes_read) {
+    memcpy(buffer, data_ + position, *bytes_read);
+  }
+  return Status::OK();
+}
+
+Status BufferReader::ReadAt(int64_t position, int64_t nbytes,
+                            std::shared_ptr<Buffer>* out) {
+  RETURN_NOT_OK(CheckClosed());
+
+  if (nbytes < 0) {
+    return Status::IOError("Cannot read a negative number of bytes from BufferReader.");
+  }
+  int64_t size = std::min(nbytes, size_ - position);
+
+  if (size > 0 && buffer_ != nullptr) {
+    *out = SliceBuffer(buffer_, position, size);
+  } else {
+    *out = std::make_shared<Buffer>(data_ + position, size);
+  }
+  return Status::OK();
+}
+
+Status BufferReader::Read(int64_t nbytes, int64_t* bytes_read, void* buffer) {
+  RETURN_NOT_OK(CheckClosed());
+  RETURN_NOT_OK(ReadAt(position_, nbytes, bytes_read, buffer));
   position_ += *bytes_read;
   return Status::OK();
 }
 
 Status BufferReader::Read(int64_t nbytes, std::shared_ptr<Buffer>* out) {
-  int64_t size = std::min(nbytes, size_ - position_);
-
-  if (size > 0 && buffer_ != nullptr) {
-    *out = SliceBuffer(buffer_, position_, size);
-  } else {
-    *out = std::make_shared<Buffer>(data_ + position_, size);
-  }
-
-  position_ += size;
+  RETURN_NOT_OK(CheckClosed());
+  RETURN_NOT_OK(ReadAt(position_, nbytes, out));
+  position_ += (*out)->size();
   return Status::OK();
 }
 
 Status BufferReader::GetSize(int64_t* size) {
+  RETURN_NOT_OK(CheckClosed());
   *size = size_;
   return Status::OK();
 }
 
 Status BufferReader::Seek(int64_t position) {
-  if (position < 0 || position >= size_) {
-    return Status::IOError("position out of bounds");
+  RETURN_NOT_OK(CheckClosed());
+
+  if (position < 0 || position > size_) {
+    return Status::IOError("Seek out of bounds");
   }
 
   position_ = position;

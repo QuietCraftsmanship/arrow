@@ -22,20 +22,29 @@
 #include <string>
 
 #include "arrow/status.h"
+#include "arrow/util/string_view.h"
 
 namespace arrow {
 
 static const char* kAsciiTable = "0123456789ABCDEF";
 
-static inline std::string HexEncode(const char* data, int32_t length) {
+static inline std::string HexEncode(const uint8_t* data, size_t length) {
   std::string hex_string;
   hex_string.reserve(length * 2);
-  for (int32_t j = 0; j < length; ++j) {
+  for (size_t j = 0; j < length; ++j) {
     // Convert to 2 base16 digits
     hex_string.push_back(kAsciiTable[data[j] >> 4]);
     hex_string.push_back(kAsciiTable[data[j] & 15]);
   }
   return hex_string;
+}
+
+static inline std::string HexEncode(const char* data, size_t length) {
+  return HexEncode(reinterpret_cast<const uint8_t*>(data), length);
+}
+
+static inline std::string HexEncode(util::string_view str) {
+  return HexEncode(str.data(), str.size());
 }
 
 static inline Status ParseHexValue(const char* data, uint8_t* out) {
@@ -46,7 +55,9 @@ static inline Status ParseHexValue(const char* data, uint8_t* out) {
   const char* pos2 = std::lower_bound(kAsciiTable, kAsciiTable + 16, c2);
 
   // Error checking
-  if (*pos1 != c1 || *pos2 != c2) { return Status::Invalid("Encountered non-hex digit"); }
+  if (*pos1 != c1 || *pos2 != c2) {
+    return Status::Invalid("Encountered non-hex digit");
+  }
 
   *out = static_cast<uint8_t>((pos1 - kAsciiTable) << 4 | (pos2 - kAsciiTable));
   return Status::OK();

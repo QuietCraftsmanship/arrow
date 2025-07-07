@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,17 +14,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.arrow.vector;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.complex.ListVector;
-import org.apache.arrow.vector.complex.NullableMapVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.junit.After;
@@ -51,73 +52,48 @@ public class TestVectorReAlloc {
   @Test
   public void testFixedType() {
     try (final UInt4Vector vector = new UInt4Vector("", allocator)) {
-      final UInt4Vector.Mutator m = vector.getMutator();
       vector.setInitialCapacity(512);
       vector.allocateNew();
 
-      assertEquals(512, vector.getValueCapacity());
+      assertTrue(vector.getValueCapacity() >= 512);
+      int initialCapacity = vector.getValueCapacity();
 
       try {
-        m.set(512, 0);
+        vector.set(initialCapacity, 0);
         Assert.fail("Expected out of bounds exception");
       } catch (Exception e) {
         // ok
       }
 
       vector.reAlloc();
-      assertEquals(1024, vector.getValueCapacity());
+      assertTrue(vector.getValueCapacity() >= 2 * initialCapacity);
 
-      m.set(512, 100);
-      assertEquals(100, vector.getAccessor().get(512));
-    }
-  }
-
-  @Test
-  public void testVariableLengthType() {
-    try (final VarCharVector vector = new VarCharVector("", allocator)) {
-      final VarCharVector.Mutator m = vector.getMutator();
-      // note: capacity ends up being - 1 due to offsets vector
-      vector.setInitialCapacity(511);
-      vector.allocateNew();
-
-      assertEquals(511, vector.getValueCapacity());
-
-      try {
-        m.set(512, "foo".getBytes(StandardCharsets.UTF_8));
-        Assert.fail("Expected out of bounds exception");
-      } catch (Exception e) {
-        // ok
-      }
-
-      vector.reAlloc();
-      assertEquals(1023, vector.getValueCapacity());
-
-      m.set(512, "foo".getBytes(StandardCharsets.UTF_8));
-      assertEquals("foo", new String(vector.getAccessor().get(512), StandardCharsets.UTF_8));
+      vector.set(initialCapacity, 100);
+      assertEquals(100, vector.get(initialCapacity));
     }
   }
 
   @Test
   public void testNullableType() {
-    try (final NullableVarCharVector vector = new NullableVarCharVector("", allocator)) {
-      final NullableVarCharVector.Mutator m = vector.getMutator();
+    try (final VarCharVector vector = new VarCharVector("", allocator)) {
       vector.setInitialCapacity(512);
       vector.allocateNew();
 
-      assertEquals(512, vector.getValueCapacity());
+      assertTrue(vector.getValueCapacity() >= 512);
+      int initialCapacity = vector.getValueCapacity();
 
       try {
-        m.set(512, "foo".getBytes(StandardCharsets.UTF_8));
+        vector.set(initialCapacity, "foo".getBytes(StandardCharsets.UTF_8));
         Assert.fail("Expected out of bounds exception");
       } catch (Exception e) {
         // ok
       }
 
       vector.reAlloc();
-      assertEquals(1024, vector.getValueCapacity());
+      assertTrue(vector.getValueCapacity() >= 2 * initialCapacity);
 
-      m.set(512, "foo".getBytes(StandardCharsets.UTF_8));
-      assertEquals("foo", new String(vector.getAccessor().get(512), StandardCharsets.UTF_8));
+      vector.set(initialCapacity, "foo".getBytes(StandardCharsets.UTF_8));
+      assertEquals("foo", new String(vector.get(initialCapacity), StandardCharsets.UTF_8));
     }
   }
 
@@ -129,33 +105,10 @@ public class TestVectorReAlloc {
       vector.setInitialCapacity(512);
       vector.allocateNew();
 
-      assertEquals(1023, vector.getValueCapacity()); // TODO this doubles for some reason...
-
-      try {
-        vector.getOffsetVector().getAccessor().get(2014);
-        Assert.fail("Expected out of bounds exception");
-      } catch (Exception e) {
-        // ok
-      }
-
-      vector.reAlloc();
-      assertEquals(2047, vector.getValueCapacity()); // note: size - 1
-      assertEquals(0, vector.getOffsetVector().getAccessor().get(2014));
-    }
-  }
-
-  @Test
-  public void testMapType() {
-    try (final NullableMapVector vector = NullableMapVector.empty("", allocator)) {
-      vector.addOrGet("", FieldType.nullable(MinorType.INT.getType()), NullableIntVector.class);
-
-      vector.setInitialCapacity(512);
-      vector.allocateNew();
-
       assertEquals(512, vector.getValueCapacity());
 
       try {
-        vector.getAccessor().getObject(513);
+        vector.getInnerValueCountAt(2014);
         Assert.fail("Expected out of bounds exception");
       } catch (Exception e) {
         // ok
@@ -163,7 +116,115 @@ public class TestVectorReAlloc {
 
       vector.reAlloc();
       assertEquals(1024, vector.getValueCapacity());
-      assertNull(vector.getAccessor().getObject(513));
+      assertEquals(0, vector.getOffsetBuffer().getInt(2014 * ListVector.OFFSET_WIDTH));
+    }
+  }
+
+  @Test
+  public void testStructType() {
+    try (final StructVector vector = StructVector.empty("", allocator)) {
+      vector.addOrGet("", FieldType.nullable(MinorType.INT.getType()), IntVector.class);
+
+      vector.setInitialCapacity(512);
+      vector.allocateNew();
+
+      assertEquals(512, vector.getValueCapacity());
+
+      try {
+        vector.getObject(513);
+        Assert.fail("Expected out of bounds exception");
+      } catch (Exception e) {
+        // ok
+      }
+
+      vector.reAlloc();
+      assertEquals(1024, vector.getValueCapacity());
+      assertNull(vector.getObject(513));
+    }
+  }
+
+  @Test
+  public void testFixedAllocateAfterReAlloc() throws Exception {
+    try (final IntVector vector = new IntVector("", allocator)) {
+      /*
+       * Allocate the default size, and then, reAlloc. This should double the allocation.
+       */
+      vector.allocateNewSafe(); // Initial allocation
+      vector.reAlloc(); // Double the allocation size.
+      int savedValueCapacity = vector.getValueCapacity();
+
+      /*
+       * Clear and allocate again.
+       */
+      vector.clear();
+      vector.allocateNewSafe();
+
+      /*
+       * Verify that the buffer sizes haven't changed.
+       */
+      Assert.assertEquals(vector.getValueCapacity(), savedValueCapacity);
+    }
+  }
+
+  @Test
+  public void testVariableAllocateAfterReAlloc() throws Exception {
+    try (final VarCharVector vector = new VarCharVector("", allocator)) {
+      /*
+       * Allocate the default size, and then, reAlloc. This should double the allocation.
+       */
+      vector.allocateNewSafe(); // Initial allocation
+      vector.reAlloc(); // Double the allocation size.
+      int savedValueCapacity = vector.getValueCapacity();
+      int savedValueBufferSize = vector.valueBuffer.capacity();
+
+      /*
+       * Clear and allocate again.
+       */
+      vector.clear();
+      vector.allocateNewSafe();
+
+      /*
+       * Verify that the buffer sizes haven't changed.
+       */
+      Assert.assertEquals(vector.getValueCapacity(), savedValueCapacity);
+      Assert.assertEquals(vector.valueBuffer.capacity(), savedValueBufferSize);
+    }
+  }
+
+  @Test
+  public void testFixedRepeatedClearAndSet() throws Exception {
+    try (final IntVector vector = new IntVector("", allocator)) {
+      vector.allocateNewSafe(); // Initial allocation
+      vector.clear(); // clear vector.
+      vector.setSafe(0, 10);
+      int savedValueCapacity = vector.getValueCapacity();
+
+      for (int i = 0; i < 1024; ++i) {
+        vector.clear(); // clear vector.
+        vector.setSafe(0, 10);
+      }
+
+      // should be deterministic, and not cause a run-away increase in capacity.
+      Assert.assertEquals(vector.getValueCapacity(), savedValueCapacity);
+    }
+  }
+
+  @Test
+  public void testVariableRepeatedClearAndSet() throws Exception {
+    try (final VarCharVector vector = new VarCharVector("", allocator)) {
+      vector.allocateNewSafe(); // Initial allocation
+
+      vector.clear(); // clear vector.
+      vector.setSafe(0, "hello world".getBytes());
+      int savedValueCapacity = vector.getValueCapacity();
+
+      for (int i = 0; i < 1024; ++i) {
+        vector.clear(); // clear vector.
+        vector.setSafe(0, "hello world".getBytes());
+      }
+
+      // should be deterministic, and not cause a run-away increase in capacity.
+      Assert.assertEquals(vector.getValueCapacity(), savedValueCapacity);
     }
   }
 }

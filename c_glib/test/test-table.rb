@@ -17,21 +17,19 @@
 
 class TestTable < Test::Unit::TestCase
   include Helper::Buildable
+  include Helper::Omittable
 
   sub_test_case(".new") do
-    def test_columns
-      fields = [
+    def setup
+      @fields = [
         Arrow::Field.new("visible", Arrow::BooleanDataType.new),
         Arrow::Field.new("valid", Arrow::BooleanDataType.new),
       ]
-      schema = Arrow::Schema.new(fields)
-      columns = [
-        Arrow::Column.new(fields[0], build_boolean_array([true])),
-        Arrow::Column.new(fields[1], build_boolean_array([false])),
-      ]
-      table = Arrow::Table.new(schema, columns)
+      @schema = Arrow::Schema.new(@fields)
+    end
 
-      data = table.n_columns.times.collect do |i|
+    def dump_table(table)
+      table.n_columns.times.collect do |i|
         column = table.get_column(i)
         values = []
         column.data.chunks.each do |chunk|
@@ -44,11 +42,54 @@ class TestTable < Test::Unit::TestCase
           values,
         ]
       end
+    end
+
+    def test_columns
+      columns = [
+        Arrow::Column.new(@fields[0], build_boolean_array([true])),
+        Arrow::Column.new(@fields[1], build_boolean_array([false])),
+      ]
+      table = Arrow::Table.new(@schema, columns)
       assert_equal([
                      ["visible", [true]],
                      ["valid", [false]],
                    ],
-                   data)
+                   dump_table(table))
+    end
+
+    def test_arrays
+      require_gi_bindings(3, 3, 1)
+      arrays = [
+        build_boolean_array([true]),
+        build_boolean_array([false]),
+      ]
+      table = Arrow::Table.new(@schema, arrays)
+      assert_equal([
+                     ["visible", [true]],
+                     ["valid", [false]],
+                   ],
+                   dump_table(table))
+    end
+
+    def test_record_batches
+      require_gi_bindings(3, 3, 1)
+      record_batches = [
+        build_record_batch({
+                             "visible" => build_boolean_array([true]),
+                             "valid" => build_boolean_array([false])
+                           }),
+        build_record_batch({
+                             "visible" => build_boolean_array([false]),
+                             "valid" => build_boolean_array([true])
+                           }),
+      ]
+      table = Arrow::Table.new(@schema, record_batches)
+
+      assert_equal([
+                     ["visible", [true, false]],
+                     ["valid", [false, true]],
+                   ],
+                   dump_table(table))
     end
   end
 
@@ -109,6 +150,54 @@ class TestTable < Test::Unit::TestCase
       new_table = @table.remove_column(0)
       assert_equal(["valid"],
                    new_table.schema.fields.collect(&:name))
+    end
+
+    def test_replace_column
+      field = Arrow::Field.new("added", Arrow::BooleanDataType.new)
+      column = Arrow::Column.new(field, build_boolean_array([true]))
+      new_table = @table.replace_column(0, column)
+      assert_equal(["added", "valid"],
+                   new_table.schema.fields.collect(&:name))
+    end
+
+    def test_to_s
+      table = build_table("valid" => build_boolean_array([true, false, true]))
+      assert_equal(<<-TABLE, table.to_s)
+valid: bool
+----
+valid:
+  [
+    [
+      true,
+      false,
+      true
+    ]
+  ]
+      TABLE
+    end
+
+    def test_concatenate
+      table = build_table("visible" => build_boolean_array([true, false, true, false]))
+      table1 = build_table("visible" => build_boolean_array([true]))
+      table2 = build_table("visible" => build_boolean_array([false, true]))
+      table3 = build_table("visible" => build_boolean_array([false]))
+      assert_equal(table, table1.concatenate([table2, table3]))
+    end
+
+    sub_test_case("#slice") do
+      test("offset: positive") do
+        visibles = [true, false, true]
+        table = build_table("visible" => build_boolean_array(visibles))
+        assert_equal(build_table("visible" => build_boolean_array([false, true])),
+                     table.slice(1, 2))
+      end
+
+      test("offset: negative") do
+        visibles = [true, false, true]
+        table = build_table("visible" => build_boolean_array(visibles))
+        assert_equal(build_table("visible" => build_boolean_array([false, true])),
+                     table.slice(-2, 2))
+      end
     end
   end
 end

@@ -15,12 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "gtest/gtest.h"
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <new>
+
+#include <gtest/gtest.h>
 
 #include "arrow/allocator.h"
-#include "arrow/test-util.h"
+#include "arrow/memory_pool.h"
+#include "arrow/testing/gtest_util.h"
 
 namespace arrow {
+
+TEST(STLMemoryPool, Base) {
+  std::allocator<uint8_t> allocator;
+  STLMemoryPool<std::allocator<uint8_t>> pool(allocator);
+
+  uint8_t* data = nullptr;
+  ASSERT_OK(pool.Allocate(100, &data));
+  ASSERT_EQ(pool.max_memory(), 100);
+  ASSERT_EQ(pool.bytes_allocated(), 100);
+  ASSERT_NE(data, nullptr);
+
+  ASSERT_OK(pool.Reallocate(100, 150, &data));
+  ASSERT_EQ(pool.max_memory(), 150);
+  ASSERT_EQ(pool.bytes_allocated(), 150);
+
+  pool.Free(data, 150);
+
+  ASSERT_EQ(pool.max_memory(), 150);
+  ASSERT_EQ(pool.bytes_allocated(), 0);
+}
 
 TEST(stl_allocator, MemoryTracking) {
   auto pool = default_memory_pool();
@@ -33,39 +59,25 @@ TEST(stl_allocator, MemoryTracking) {
   ASSERT_EQ(0, pool->bytes_allocated());
 }
 
-#if !(defined(ARROW_VALGRIND) || defined(ADDRESS_SANITIZER))
+#if !(defined(ARROW_VALGRIND) || defined(ADDRESS_SANITIZER) || defined(ARROW_JEMALLOC))
 
 TEST(stl_allocator, TestOOM) {
   stl_allocator<uint64_t> alloc;
-  uint64_t to_alloc = std::numeric_limits<uint64_t>::max();
+  uint64_t to_alloc = std::numeric_limits<uint64_t>::max() / 2;
   ASSERT_THROW(alloc.allocate(to_alloc), std::bad_alloc);
 }
 
-TEST(stl_allocator, FreeLargeMemory) {
-  stl_allocator<uint8_t> alloc;
-
-  uint8_t* data = alloc.allocate(100);
-
-#ifndef NDEBUG
-  EXPECT_EXIT(alloc.deallocate(data, 120), ::testing::ExitedWithCode(1),
-      ".*Check failed: \\(bytes_allocated_\\) >= \\(size\\)");
-#endif
-
-  alloc.deallocate(data, 100);
-}
-
 TEST(stl_allocator, MaxMemory) {
-  DefaultMemoryPool pool;
+  auto pool = default_memory_pool();
 
-  ASSERT_EQ(0, pool.max_memory());
-  stl_allocator<uint8_t> alloc(&pool);
-  uint8_t* data = alloc.allocate(100);
-  uint8_t* data2 = alloc.allocate(100);
+  stl_allocator<uint8_t> alloc(pool);
+  uint8_t* data = alloc.allocate(1000);
+  uint8_t* data2 = alloc.allocate(1000);
 
-  alloc.deallocate(data, 100);
-  alloc.deallocate(data2, 100);
+  alloc.deallocate(data, 1000);
+  alloc.deallocate(data2, 1000);
 
-  ASSERT_EQ(200, pool.max_memory());
+  ASSERT_EQ(2000, pool->max_memory());
 }
 
 #endif  // ARROW_VALGRIND

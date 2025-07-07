@@ -18,9 +18,9 @@
 #ifndef PYARROW_NUMPY_INTEROP_H
 #define PYARROW_NUMPY_INTEROP_H
 
-#include "arrow/python/platform.h"
+#include "arrow/python/platform.h"  // IWYU pragma: export
 
-#include <numpy/numpyconfig.h>
+#include <numpy/numpyconfig.h>  // IWYU pragma: export
 
 // Don't use the deprecated Numpy functions
 #ifdef NPY_1_7_API_VERSION
@@ -39,8 +39,34 @@
 #define NO_IMPORT_ARRAY
 #endif
 
-#include <numpy/arrayobject.h>
-#include <numpy/ufuncobject.h>
+#include <numpy/arrayobject.h>   // IWYU pragma: export
+#include <numpy/arrayscalars.h>  // IWYU pragma: export
+#include <numpy/ufuncobject.h>   // IWYU pragma: export
+
+// A bit subtle. Numpy has 5 canonical integer types:
+// (or, rather, type pairs: signed and unsigned)
+//   NPY_BYTE, NPY_SHORT, NPY_INT, NPY_LONG, NPY_LONGLONG
+// It also has 4 fixed-width integer aliases.
+// When mapping Arrow integer types to these 4 fixed-width aliases,
+// we always miss one of the canonical types (even though it may
+// have the same width as one of the aliases).
+// Which one depends on the platform...
+// On a LP64 system, NPY_INT64 maps to NPY_LONG and
+// NPY_LONGLONG needs to be handled separately.
+// On a LLP64 system, NPY_INT32 maps to NPY_LONG and
+// NPY_INT needs to be handled separately.
+
+#if NPY_BITSOF_LONG == 32 && NPY_BITSOF_LONGLONG == 64
+#define NPY_INT64_IS_LONG_LONG 1
+#else
+#define NPY_INT64_IS_LONG_LONG 0
+#endif
+
+#if NPY_BITSOF_INT == 32 && NPY_BITSOF_LONG == 64
+#define NPY_INT32_IS_INT 1
+#else
+#define NPY_INT32_IS_INT 0
+#endif
 
 namespace arrow {
 namespace py {
@@ -52,6 +78,19 @@ inline int import_numpy() {
 #endif
 
   return 0;
+}
+
+// See above about the missing Numpy integer type numbers
+inline int fix_numpy_type_num(int type_num) {
+#if !NPY_INT32_IS_INT && NPY_BITSOF_INT == 32
+  if (type_num == NPY_INT) return NPY_INT32;
+  if (type_num == NPY_UINT) return NPY_UINT32;
+#endif
+#if !NPY_INT64_IS_LONG_LONG && NPY_BITSOF_LONGLONG == 64
+  if (type_num == NPY_LONGLONG) return NPY_INT64;
+  if (type_num == NPY_ULONGLONG) return NPY_UINT64;
+#endif
+  return type_num;
 }
 
 }  // namespace py

@@ -18,20 +18,24 @@
 #ifndef ARROW_IO_HDFS_INTERNAL
 #define ARROW_IO_HDFS_INTERNAL
 
-#ifndef _WIN32
-#include <dlfcn.h>
-#endif
+#include <cstddef>
+#include <cstdint>
 
 #include <hdfs.h>
 
-#include "arrow/io/windows_compatibility.h"
 #include "arrow/util/visibility.h"
+#include "arrow/util/windows_compatibility.h"  // IWYU pragma: keep
+
+using std::size_t;
+
+struct hdfsBuilder;
 
 namespace arrow {
 
 class Status;
 
 namespace io {
+namespace internal {
 
 // NOTE(wesm): cpplint does not like use of short and other imprecise C types
 struct LibHdfsShim {
@@ -45,22 +49,24 @@ struct LibHdfsShim {
   void (*hdfsBuilderSetNameNode)(hdfsBuilder* bld, const char* nn);
   void (*hdfsBuilderSetNameNodePort)(hdfsBuilder* bld, tPort port);
   void (*hdfsBuilderSetUserName)(hdfsBuilder* bld, const char* userName);
-  void (*hdfsBuilderSetKerbTicketCachePath)(
-      hdfsBuilder* bld, const char* kerbTicketCachePath);
+  void (*hdfsBuilderSetKerbTicketCachePath)(hdfsBuilder* bld,
+                                            const char* kerbTicketCachePath);
+  void (*hdfsBuilderSetForceNewInstance)(hdfsBuilder* bld);
   hdfsFS (*hdfsBuilderConnect)(hdfsBuilder* bld);
+  int (*hdfsBuilderConfSetStr)(hdfsBuilder* bld, const char* key, const char* val);
 
   int (*hdfsDisconnect)(hdfsFS fs);
 
   hdfsFile (*hdfsOpenFile)(hdfsFS fs, const char* path, int flags, int bufferSize,
-      short replication, tSize blocksize);  // NOLINT
+                           short replication, tSize blocksize);  // NOLINT
 
   int (*hdfsCloseFile)(hdfsFS fs, hdfsFile file);
   int (*hdfsExists)(hdfsFS fs, const char* path);
   int (*hdfsSeek)(hdfsFS fs, hdfsFile file, tOffset desiredPos);
   tOffset (*hdfsTell)(hdfsFS fs, hdfsFile file);
   tSize (*hdfsRead)(hdfsFS fs, hdfsFile file, void* buffer, tSize length);
-  tSize (*hdfsPread)(
-      hdfsFS fs, hdfsFile file, tOffset position, void* buffer, tSize length);
+  tSize (*hdfsPread)(hdfsFS fs, hdfsFile file, tOffset position, void* buffer,
+                     tSize length);
   tSize (*hdfsWrite)(hdfsFS fs, hdfsFile file, const void* buffer, tSize length);
   int (*hdfsFlush)(hdfsFS fs, hdfsFile file);
   int (*hdfsAvailable)(hdfsFS fs, hdfsFile file);
@@ -91,6 +97,8 @@ struct LibHdfsShim {
     this->hdfsBuilderSetNameNodePort = nullptr;
     this->hdfsBuilderSetUserName = nullptr;
     this->hdfsBuilderSetKerbTicketCachePath = nullptr;
+    this->hdfsBuilderSetForceNewInstance = nullptr;
+    this->hdfsBuilderConfSetStr = nullptr;
     this->hdfsBuilderConnect = nullptr;
     this->hdfsDisconnect = nullptr;
     this->hdfsOpenFile = nullptr;
@@ -134,12 +142,16 @@ struct LibHdfsShim {
 
   void BuilderSetKerbTicketCachePath(hdfsBuilder* bld, const char* kerbTicketCachePath);
 
+  void BuilderSetForceNewInstance(hdfsBuilder* bld);
+
+  int BuilderConfSetStr(hdfsBuilder* bld, const char* key, const char* val);
+
   hdfsFS BuilderConnect(hdfsBuilder* bld);
 
   int Disconnect(hdfsFS fs);
 
   hdfsFile OpenFile(hdfsFS fs, const char* path, int flags, int bufferSize,
-      short replication, tSize blocksize);  // NOLINT
+                    short replication, tSize blocksize);  // NOLINT
 
   int CloseFile(hdfsFS fs, hdfsFile file);
 
@@ -205,6 +217,7 @@ struct LibHdfsShim {
 Status ARROW_EXPORT ConnectLibHdfs(LibHdfsShim** driver);
 Status ARROW_EXPORT ConnectLibHdfs3(LibHdfsShim** driver);
 
+}  // namespace internal
 }  // namespace io
 }  // namespace arrow
 

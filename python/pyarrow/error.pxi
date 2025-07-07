@@ -48,12 +48,39 @@ class ArrowNotImplementedError(NotImplementedError, ArrowException):
     pass
 
 
+class ArrowCapacityError(ArrowException):
+    pass
+
+
+class ArrowIndexError(IndexError, ArrowException):
+    pass
+
+
+class PlasmaObjectExists(ArrowException):
+    pass
+
+
+class PlasmaObjectNonexistent(ArrowException):
+    pass
+
+
+class PlasmaStoreFull(ArrowException):
+    pass
+
+
+class ArrowSerializationError(ArrowException):
+    pass
+
+
 cdef int check_status(const CStatus& status) nogil except -1:
     if status.ok():
         return 0
 
+    if status.IsPythonError():
+        return -1
+
     with gil:
-        message = frombytes(status.ToString())
+        message = frombytes(status.message())
         if status.IsInvalid():
             raise ArrowInvalid(message)
         elif status.IsIOError():
@@ -66,5 +93,24 @@ cdef int check_status(const CStatus& status) nogil except -1:
             raise ArrowNotImplementedError(message)
         elif status.IsTypeError():
             raise ArrowTypeError(message)
+        elif status.IsCapacityError():
+            raise ArrowCapacityError(message)
+        elif status.IsIndexError():
+            raise ArrowIndexError(message)
+        elif status.IsPlasmaObjectExists():
+            raise PlasmaObjectExists(message)
+        elif status.IsPlasmaObjectNonexistent():
+            raise PlasmaObjectNonexistent(message)
+        elif status.IsPlasmaStoreFull():
+            raise PlasmaStoreFull(message)
+        elif status.IsSerializationError():
+            raise ArrowSerializationError(message)
         else:
+            message = frombytes(status.ToString())
             raise ArrowException(message)
+
+
+# This is an API function for C++ PyArrow
+cdef api int pyarrow_internal_check_status(const CStatus& status) \
+        nogil except -1:
+    return check_status(status)

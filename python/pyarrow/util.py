@@ -17,9 +17,111 @@
 
 # Miscellaneous utility code
 
+from __future__ import absolute_import
+
+import functools
+import six
+import warnings
+
+
+try:
+    from textwrap import indent
+except ImportError:
+    def indent(text, prefix):
+        return ''.join(prefix + line for line in text.splitlines(True))
+
+try:
+    # pathlib might not be available
+    try:
+        import pathlib
+    except ImportError:
+        import pathlib2 as pathlib  # python 2 backport
+    _has_pathlib = True
+except ImportError:
+    _has_pathlib = False
+
 
 def implements(f):
     def decorator(g):
         g.__doc__ = f.__doc__
         return g
     return decorator
+
+
+def _deprecate_api(old_name, new_name, api, next_version):
+    msg = ('pyarrow.{0} is deprecated as of {1}, please use {2} instead'
+           .format(old_name, next_version, new_name))
+
+    def wrapper(*args, **kwargs):
+        warnings.warn(msg, FutureWarning)
+        return api(*args)
+    return wrapper
+
+
+def _is_path_like(path):
+    # PEP519 filesystem path protocol is available from python 3.6, so pathlib
+    # doesn't implement __fspath__ for earlier versions
+    return (isinstance(path, six.string_types) or
+            hasattr(path, '__fspath__') or
+            (_has_pathlib and isinstance(path, pathlib.Path)))
+
+
+def _stringify_path(path):
+    """
+    Convert *path* to a string or unicode path if possible.
+    """
+    if isinstance(path, six.string_types):
+        return path
+
+    # checking whether path implements the filesystem protocol
+    try:
+        return path.__fspath__()  # new in python 3.6
+    except AttributeError:
+        # fallback pathlib ckeck for earlier python versions than 3.6
+        if _has_pathlib and isinstance(path, pathlib.Path):
+            return str(path)
+
+    raise TypeError("not a path-like object")
+
+
+def product(seq):
+    """
+    Return a product of sequence items.
+    """
+    return functools.reduce(lambda a, b: a*b, seq, 1)
+
+
+def get_contiguous_span(shape, strides, itemsize):
+    """
+    Return a contiguous span of N-D array data.
+
+    Parameters
+    ----------
+    shape : tuple
+    strides : tuple
+    itemsize : int
+      Specify array shape data
+
+    Returns
+    -------
+    start, end : int
+      The span end points.
+    """
+    if not strides:
+        start = 0
+        end = itemsize * product(shape)
+    else:
+        start = 0
+        end = itemsize
+        for i, dim in enumerate(shape):
+            if dim == 0:
+                start = end = 0
+                break
+            stride = strides[i]
+            if stride > 0:
+                end += stride * (dim - 1)
+            elif stride < 0:
+                start += stride * (dim - 1)
+        if end - start != itemsize * product(shape):
+            raise ValueError('array data is non-contiguous')
+    return start, end

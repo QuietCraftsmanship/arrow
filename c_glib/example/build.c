@@ -33,13 +33,13 @@ main(int argc, char **argv)
 
     builder = garrow_int32_array_builder_new();
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 29, &error);
+      success = garrow_int32_array_builder_append_value(builder, 29, &error);
     }
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 2929, &error);
+      success = garrow_int32_array_builder_append_value(builder, 2929, &error);
     }
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 292929, &error);
+      success = garrow_int32_array_builder_append_value(builder, 292929, &error);
     }
     if (!success) {
       g_print("failed to append: %s\n", error->message);
@@ -47,7 +47,13 @@ main(int argc, char **argv)
       g_object_unref(builder);
       return EXIT_FAILURE;
     }
-    array = garrow_array_builder_finish(GARROW_ARRAY_BUILDER(builder));
+    array = garrow_array_builder_finish(GARROW_ARRAY_BUILDER(builder), &error);
+    if (!array) {
+      g_print("failed to finish: %s\n", error->message);
+      g_error_free(error);
+      g_object_unref(builder);
+      return EXIT_FAILURE;
+    }
     g_object_unref(builder);
   }
 

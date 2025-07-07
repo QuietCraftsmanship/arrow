@@ -23,6 +23,9 @@
 
 #include <arrow-glib/error.hpp>
 
+#include <iostream>
+#include <sstream>
+
 G_BEGIN_DECLS
 
 /**
@@ -52,10 +55,32 @@ garrow_error_code(const arrow::Status &status)
     return GARROW_ERROR_INVALID;
   case arrow::StatusCode::IOError:
     return GARROW_ERROR_IO;
+  case arrow::StatusCode::CapacityError:
+    return GARROW_ERROR_CAPACITY;
+  case arrow::StatusCode::IndexError:
+    return GARROW_ERROR_INDEX;
   case arrow::StatusCode::UnknownError:
     return GARROW_ERROR_UNKNOWN;
   case arrow::StatusCode::NotImplemented:
     return GARROW_ERROR_NOT_IMPLEMENTED;
+  case arrow::StatusCode::SerializationError:
+    return GARROW_ERROR_SERIALIZATION;
+  case arrow::StatusCode::PythonError:
+    return GARROW_ERROR_PYTHON;
+  case arrow::StatusCode::PlasmaObjectExists:
+    return GARROW_ERROR_PLASMA_OBJECT_EXISTS;
+  case arrow::StatusCode::PlasmaObjectNonexistent:
+    return GARROW_ERROR_PLASMA_OBJECT_NONEXISTENT;
+  case arrow::StatusCode::PlasmaStoreFull:
+    return GARROW_ERROR_PLASMA_STORE_FULL;
+  case arrow::StatusCode::PlasmaObjectAlreadySealed:
+    return GARROW_ERROR_PLASMA_OBJECT_ALREADY_SEALED;
+  case arrow::StatusCode::CodeGenError:
+    return GARROW_ERROR_CODE_GENERATION;
+  case arrow::StatusCode::ExpressionValidationError:
+    return GARROW_ERROR_EXPRESSION_VALIDATION;
+  case arrow::StatusCode::ExecutionError:
+    return GARROW_ERROR_EXECUTION;
   default:
     return GARROW_ERROR_UNKNOWN;
   }
@@ -79,4 +104,17 @@ garrow_error_check(GError **error,
                 status.ToString().c_str());
     return FALSE;
   }
+}
+
+arrow::Status
+garrow_error_to_status(GError *error,
+                       arrow::StatusCode code,
+                       const char *context)
+{
+  std::stringstream message;
+  message << context << ": " << g_quark_to_string(error->domain);
+  message << "(" << error->code << "): ";
+  message << error->message;
+  g_error_free(error);
+  return arrow::Status(code, message.str());
 }

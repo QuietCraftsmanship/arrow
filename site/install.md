@@ -20,123 +20,230 @@ limitations under the License.
 {% endcomment %}
 -->
 
-## Current Version: 0.4.0
+## Current Version: {{site.data.versions['current'].number}}
 
-### Released: 22 May 2017
+### Released: {{site.data.versions['current'].date}}
 
-See the [release notes][10] and [blog post][11] for more about what's new.
+See the [release notes][10] for more about what's new.
 
-### Source release
+### Source Release
 
-* **Source Release**: [apache-arrow-0.4.0.tar.gz][6]
-* **Verification**: [md5][3], [asc][7]
-* [Git tag a8f8ba0][2]
+* **Source Release**: [{{site.data.versions['current'].tarball_name}}][6]
+* **Verification**: [asc signature][13], [sha256 checksum][14], [sha512 checksum][15], ([verification instructions][12])
+* [Git tag {{site.data.versions['current'].git-tag}}][2]
+* [GPG keys for release signatures][11]
 
 ### Java Packages
 
 [Java Artifacts on Maven Central][4]
 
-### C++ and Python Conda Packages (Unofficial)
+### Python Wheels
 
-We have provided binary conda packages on [conda-forge][5] for the following
-platforms:
-
-* Linux and OS X (Python 2.7, 3.5, and 3.6)
-* Windows (Python 3.5 and 3.6)
-
-Install them with:
-
+We have provided official binary wheels on PyPI for Linux, macOS, and Windows:
 
 ```shell
-conda install arrow-cpp -c conda-forge
-conda install pyarrow -c conda-forge
+pip install pyarrow=={{site.data.versions['current'].pinned_number}}
 ```
 
-### Python Wheels on PyPI (Unofficial)
-
-We have provided Linux binary wheels on PyPI, which can be installed with pip.
-
-```shell
-pip install pyarrow
-```
+We recommend pinning `{{site.data.versions['current'].pinned_number}}`
+in `requirements.txt` to install the latest patch release.
 
 These include the Apache Arrow and Apache Parquet C++ binary libraries bundled
 with the wheel.
 
-### C++ and GLib (C) Packages for Debian GNU/Linux, Ubuntu and CentOS (Unofficial)
+## Other Binary Installers
+
+For convenience, we also provide binaries through several package managers, built from the source release. As the Apache Arrow PMC has not explicitly voted on these packages, they are technically considered unofficial releases.
+
+### C++ and Python Conda Packages
+
+Binary conda packages are on [conda-forge][5] for the following
+platforms:
+
+* Linux and macOS (Python 2.7, 3.6 and 3.7)
+* Windows (Python 3.6 and 3.7)
+
+Install them with:
+
+```shell
+conda install arrow-cpp={{site.data.versions['current'].pinned_number}} -c conda-forge
+conda install pyarrow={{site.data.versions['current'].pinned_number}} -c conda-forge
+```
+
+### C++ and GLib (C) Packages on Homebrew
+
+On macOS, you can install the C++ library using
+[Homebrew][17]:
+
+```shell
+brew install apache-arrow
+```
+
+and GLib (C) package with:
+
+```shell
+brew install apache-arrow-glib
+```
+
+### C++ and GLib (C) Packages for Debian GNU/Linux, Ubuntu and CentOS
 
 We have provided APT and Yum repositories for Apache Arrow C++ and
 Apache Arrow GLib (C). Here are supported platforms:
 
-* Debian GNU/Linux Jessie
+* Debian GNU/Linux stretch
+* Debian GNU/Linux buster
 * Ubuntu 16.04 LTS
-* Ubuntu 16.10
-* Ubuntu 17.04
+* Ubuntu 18.04 LTS
+* Ubuntu 18.10
+* Ubuntu 19.04
+* CentOS 6
 * CentOS 7
 
-Debian GNU/Linux Jessie:
+Debian GNU/Linux buster:
 
 ```shell
 sudo apt update
-sudo apt install -y -V apt-transport-https
-cat <<APT_LINE | sudo tee /etc/apt/sources.list.d/groonga.list
-deb https://packages.groonga.org/debian/ jessie main
-deb-src https://packages.groonga.org/debian/ jessie main
+sudo apt install -y -V apt-transport-https curl gnupg lsb-release
+sudo curl --output /usr/share/keyrings/apache-arrow-keyring.gpg https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-keyring.gpg
+sudo tee /etc/apt/sources.list.d/apache-arrow.list <<APT_LINE
+deb [arch=amd64 signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+deb-src [signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
 APT_LINE
 sudo apt update
-sudo apt install -y -V --allow-unauthenticated groonga-keyring
-sudo apt update
 sudo apt install -y -V libarrow-dev # For C++
 sudo apt install -y -V libarrow-glib-dev # For GLib (C)
+sudo apt install -y -V libarrow-flight-dev # For Flight C++
+sudo apt install -y -V libplasma-dev # For Plasma C++
+sudo apt install -y -V libplasma-glib-dev # For Plasma GLib (C)
+sudo apt install -y -V libgandiva-dev # For Gandiva C++
+sudo apt install -y -V libgandiva-glib-dev # For Gandiva GLib (C)
+sudo apt install -y -V libparquet-dev # For Apache Parquet C++
+sudo apt install -y -V libparquet-glib-dev # For Apache Parquet GLib (C)
 ```
 
-Ubuntu:
+Debian GNU/Linux stretch:
 
 ```shell
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:groonga/ppa
+sudo apt update
+sudo apt install -y -V apt-transport-https curl gnupg lsb-release
+sudo tee /etc/apt/sources.list.d/backports.list <<APT_LINE
+deb http://deb.debian.org/debian $(lsb_release --codename --short)-backports main
+APT_LINE
+sudo curl --output /usr/share/keyrings/apache-arrow-keyring.gpg https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-keyring.gpg
+sudo tee /etc/apt/sources.list.d/apache-arrow.list <<APT_LINE
+deb [arch=amd64 signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+deb-src [signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+APT_LINE
+curl https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+sudo tee /etc/apt/sources.list.d/llvm.list <<APT_LINE
+deb http://apt.llvm.org/$(lsb_release --codename --short)/ llvm-toolchain-$(lsb_release --codename --short)-7 main
+deb-src http://apt.llvm.org/$(lsb_release --codename --short)/ llvm-toolchain-$(lsb_release --codename --short)-7 main
+APT_LINE
 sudo apt update
 sudo apt install -y -V libarrow-dev # For C++
 sudo apt install -y -V libarrow-glib-dev # For GLib (C)
+sudo apt install -y -V libarrow-flight-dev # For Flight C++
+sudo apt install -y -V libplasma-dev # For Plasma C++
+sudo apt install -y -V libplasma-glib-dev # For Plasma GLib (C)
+sudo apt install -y -V libgandiva-dev # For Gandiva C++
+sudo apt install -y -V libgandiva-glib-dev # For Gandiva GLib (C)
+sudo apt install -y -V libparquet-dev # For Apache Parquet C++
+sudo apt install -y -V libparquet-glib-dev # For Apache Parquet GLib (C)
+```
+
+Ubuntu 18.04 LTS or later:
+
+```shell
+sudo apt update
+sudo apt install -y -V apt-transport-https gnupg lsb-release wget
+sudo wget -O /usr/share/keyrings/apache-arrow-keyring.gpg https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-keyring.gpg
+sudo tee /etc/apt/sources.list.d/apache-arrow.list <<APT_LINE
+deb [arch=amd64 signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+deb-src [signed-by=/usr/share/keyrings/apache-arrow-keyring.gpg] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+APT_LINE
+sudo apt update
+sudo apt install -y -V libarrow-dev # For C++
+sudo apt install -y -V libarrow-glib-dev # For GLib (C)
+sudo apt install -y -V libarrow-flight-dev # For Flight C++
+sudo apt install -y -V libplasma-dev # For Plasma C++
+sudo apt install -y -V libplasma-glib-dev # For Plasma GLib (C)
+sudo apt install -y -V libgandiva-dev # For Gandiva C++
+sudo apt install -y -V libgandiva-glib-dev # For Gandiva GLib (C)
+sudo apt install -y -V libparquet-dev # For Apache Parquet C++
+sudo apt install -y -V libparquet-glib-dev # For Apache Parquet GLib (C)
+```
+
+Ubuntu 16.04 LTS:
+
+```shell
+sudo apt update
+sudo apt install -y -V apt-transport-https curl gnupg lsb-release
+curl https://dist.apache.org/repos/dist/dev/arrow/KEYS | sudo apt-key add -
+sudo tee /etc/apt/sources.list.d/apache-arrow.list <<APT_LINE
+deb [arch=amd64] https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+deb-src https://dl.bintray.com/apache/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/ $(lsb_release --codename --short) main
+APT_LINE
+curl https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+sudo tee /etc/apt/sources.list.d/llvm.list <<APT_LINE
+deb http://apt.llvm.org/$(lsb_release --codename --short)/ llvm-toolchain-$(lsb_release --codename --short)-7 main
+deb-src http://apt.llvm.org/$(lsb_release --codename --short)/ llvm-toolchain-$(lsb_release --codename --short)-7 main
+APT_LINE
+sudo apt update
+sudo apt install -y -V libarrow-dev # For C++
+sudo apt install -y -V libarrow-glib-dev # For GLib (C)
+sudo apt install -y -V libplasma-dev # For Plasma C++
+sudo apt install -y -V libplasma-glib-dev # For Plasma GLib (C)
+sudo apt install -y -V libgandiva-dev # For Gandiva C++
+sudo apt install -y -V libgandiva-glib-dev # For Gandiva GLib (C)
+sudo apt install -y -V libparquet-dev # For Apache Parquet C++
+sudo apt install -y -V libparquet-glib-dev # For Apache Parquet GLib (C)
 ```
 
 CentOS:
 
 ```shell
-sudo yum install -y https://packages.groonga.org/centos/groonga-release-1.3.0-1.noarch.rpm
+sudo tee /etc/yum.repos.d/Apache-Arrow.repo <<REPO
+[apache-arrow]
+name=Apache Arrow
+baseurl=https://dl.bintray.com/apache/arrow/centos/\$releasever/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://dl.bintray.com/apache/arrow/centos/RPM-GPG-KEY-apache-arrow
+REPO
+sudo yum install -y epel-release
 sudo yum install -y --enablerepo=epel arrow-devel # For C++
 sudo yum install -y --enablerepo=epel arrow-glib-devel # For GLib (C)
-```
-
-These repositories also provide Apache Parquet C++ and
-[Parquet GLib][8]. You can install them by the followings:
-
-Debian GNU/Linux and Ubuntu:
-
-```shell
-sudo apt install -y -V libparquet-dev # For Apache Parquet C++
-sudo apt install -y -V libparquet-glib-dev # For Parquet GLib (C)
-```
-
-CentOS:
-
-```shell
 sudo yum install -y --enablerepo=epel parquet-devel # For Apache Parquet C++
 sudo yum install -y --enablerepo=epel parquet-glib-devel # For Parquet GLib (C)
 ```
 
-These repositories are managed at
-[red-data-tools/arrow-packages][9]. If you have any feedback, please
-send it to the project instead of Apache Arrow project.
+### C++ and GLib (C) Packages for MSYS2
 
-[1]: https://www-us.apache.org/dist/arrow/arrow-0.4.0/
-[2]: https://github.com/apache/arrow/releases/tag/apache-arrow-0.4.0
-[3]: https://www-us.apache.org/dist/arrow/arrow-0.4.0/apache-arrow-0.4.0.tar.gz.md5
-[4]: http://search.maven.org/#search%7Cga%7C1%7Cg%3A%22org.apache.arrow%22%20AND%20v%3A%220.4.0%22
-[5]: http://conda-forge.github.io
-[6]: https://www-us.apache.org/dist/arrow/arrow-0.4.0/apache-arrow-0.4.0.tar.gz
-[7]: https://www-us.apache.org/dist/arrow/arrow-0.4.0/apache-arrow-0.4.0.tar.gz.asc
-[8]: https://github.com/red-data-tools/parquet-glib
-[9]: https://github.com/red-data-tools/arrow-packages
-[10]: http://arrow.apache.org/release/0.4.0.html
-[11]: http://arrow.apache.org/blog/2017/05/23/0.4.0-release/
+The MSYS2 packages include [Apache Arrow C++ and GLib (C)
+package][16]. You can install the package by `pacman`.
+
+64bit version:
+
+```shell
+pacman -S --noconfirm mingw-w64-x86_64-arrow
+```
+
+32bit version:
+
+```shell
+pacman -S --noconfirm mingw-w64-i686-arrow
+```
+
+[1]: {{site.data.versions['current'].mirrors}}
+[2]: {{site.data.versions['current'].github-tag-link}}
+[4]: {{site.data.versions['current'].java-artifacts}}
+[5]: https://conda-forge.github.io
+[6]: {{site.data.versions['current'].mirrors-tar}}
+[10]: {{site.data.versions['current'].release-notes}}
+[11]: https://www.apache.org/dist/arrow/KEYS
+[12]: https://www.apache.org/dyn/closer.cgi#verify
+[13]: {{site.data.versions['current'].asc}}
+[14]: {{site.data.versions['current'].sha256}}
+[15]: {{site.data.versions['current'].sha512}}
+[16]: https://github.com/msys2/MINGW-packages/tree/master/mingw-w64-arrow
+[17]: https://brew.sh/

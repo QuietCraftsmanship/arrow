@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -47,6 +46,7 @@ public class ComplexCopier {
       switch (mt) {
 
       case LIST:
+      case MAP:
         if (reader.isSet()) {
           writer.startList();
           while (reader.next()) {
@@ -57,13 +57,13 @@ public class ComplexCopier {
         break;
       case FIXED_SIZE_LIST:
         throw new UnsupportedOperationException("Copy fixed size list");
-      case MAP:
+      case STRUCT:
         if (reader.isSet()) {
           writer.start();
           for(String name : reader){
             FieldReader childReader = reader.reader(name);
             if(childReader.isSet()){
-              writeValue(childReader, getMapWriterForReader(childReader, writer, name));
+              writeValue(childReader, getStructWriterForReader(childReader, writer, name));
             }
           }
           writer.end();
@@ -90,7 +90,7 @@ public class ComplexCopier {
       }
  }
 
-  private static FieldWriter getMapWriterForReader(FieldReader reader, MapWriter writer, String name) {
+  private static FieldWriter getStructWriterForReader(FieldReader reader, StructWriter writer, String name) {
     switch (reader.getMinorType()) {
     <#list vv.types as type><#list type.minor as minor><#assign name = minor.class?cap_first />
     <#assign fields = minor.fields!type.fields />
@@ -100,8 +100,8 @@ public class ComplexCopier {
       return (FieldWriter) writer.<#if name == "Int">integer<#else>${uncappedName}</#if>(name);
     </#if>
     </#list></#list>
-    case MAP:
-      return (FieldWriter) writer.map(name);
+    case STRUCT:
+      return (FieldWriter) writer.struct(name);
     case LIST:
       return (FieldWriter) writer.list(name);
     default:
@@ -119,8 +119,8 @@ public class ComplexCopier {
     return (FieldWriter) writer.<#if name == "Int">integer<#else>${uncappedName}</#if>();
     </#if>
     </#list></#list>
-    case MAP:
-      return (FieldWriter) writer.map();
+    case STRUCT:
+      return (FieldWriter) writer.struct();
     case LIST:
       return (FieldWriter) writer.list();
     default:

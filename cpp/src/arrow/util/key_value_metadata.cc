@@ -16,9 +16,19 @@
 // under the License.
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
+
+using std::size_t;
 
 namespace arrow {
 
@@ -46,12 +56,14 @@ KeyValueMetadata::KeyValueMetadata() : keys_(), values_() {}
 
 KeyValueMetadata::KeyValueMetadata(
     const std::unordered_map<std::string, std::string>& map)
-    : keys_(UnorderedMapKeys(map)), values_(UnorderedMapValues(map)) {}
+    : keys_(UnorderedMapKeys(map)), values_(UnorderedMapValues(map)) {
+  ARROW_CHECK_EQ(keys_.size(), values_.size());
+}
 
-KeyValueMetadata::KeyValueMetadata(
-    const std::vector<std::string>& keys, const std::vector<std::string>& values)
+KeyValueMetadata::KeyValueMetadata(const std::vector<std::string>& keys,
+                                   const std::vector<std::string>& values)
     : keys_(keys), values_(values) {
-  DCHECK_EQ(keys.size(), values.size());
+  ARROW_CHECK_EQ(keys.size(), values.size());
 }
 
 void KeyValueMetadata::ToUnorderedMap(
@@ -81,14 +93,25 @@ int64_t KeyValueMetadata::size() const {
   return static_cast<int64_t>(keys_.size());
 }
 
-std::string KeyValueMetadata::key(int64_t i) const {
+const std::string& KeyValueMetadata::key(int64_t i) const {
   DCHECK_GE(i, 0);
-  return keys_[static_cast<size_t>(i)];
+  DCHECK_LT(static_cast<size_t>(i), keys_.size());
+  return keys_[i];
 }
 
-std::string KeyValueMetadata::value(int64_t i) const {
+const std::string& KeyValueMetadata::value(int64_t i) const {
   DCHECK_GE(i, 0);
-  return values_[static_cast<size_t>(i)];
+  DCHECK_LT(static_cast<size_t>(i), values_.size());
+  return values_[i];
+}
+
+int KeyValueMetadata::FindKey(const std::string& key) const {
+  for (size_t i = 0; i < keys_.size(); ++i) {
+    if (keys_[i] == key) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
 }
 
 std::shared_ptr<KeyValueMetadata> KeyValueMetadata::Copy() const {
@@ -100,4 +123,26 @@ bool KeyValueMetadata::Equals(const KeyValueMetadata& other) const {
          std::equal(keys_.cbegin(), keys_.cend(), other.keys_.cbegin()) &&
          std::equal(values_.cbegin(), values_.cend(), other.values_.cbegin());
 }
+
+std::string KeyValueMetadata::ToString() const {
+  std::stringstream buffer;
+
+  buffer << "\n-- metadata --";
+  for (int64_t i = 0; i < size(); ++i) {
+    buffer << "\n" << keys_[i] << ": " << values_[i];
+  }
+
+  return buffer.str();
+}
+
+std::shared_ptr<KeyValueMetadata> key_value_metadata(
+    const std::unordered_map<std::string, std::string>& pairs) {
+  return std::make_shared<KeyValueMetadata>(pairs);
+}
+
+std::shared_ptr<KeyValueMetadata> key_value_metadata(
+    const std::vector<std::string>& keys, const std::vector<std::string>& values) {
+  return std::make_shared<KeyValueMetadata>(keys, values);
+}
+
 }  // namespace arrow

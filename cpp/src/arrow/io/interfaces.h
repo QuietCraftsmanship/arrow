@@ -20,16 +20,16 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
+#include <vector>
 
 #include "arrow/util/macros.h"
+#include "arrow/util/string_view.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
 
 class Buffer;
-class MemoryPool;
 class Status;
 
 namespace io {
@@ -42,38 +42,59 @@ struct ObjectType {
   enum type { FILE, DIRECTORY };
 };
 
-class ARROW_EXPORT FileSystemClient {
+struct ARROW_EXPORT FileStatistics {
+  /// Size of file, -1 if finding length is unsupported
+  int64_t size;
+  ObjectType::type kind;
+};
+
+class ARROW_EXPORT FileSystem {
  public:
-  virtual ~FileSystemClient() {}
+  virtual ~FileSystem() = default;
+
+  virtual Status MakeDirectory(const std::string& path) = 0;
+
+  virtual Status DeleteDirectory(const std::string& path) = 0;
+
+  virtual Status GetChildren(const std::string& path,
+                             std::vector<std::string>* listing) = 0;
+
+  virtual Status Rename(const std::string& src, const std::string& dst) = 0;
+
+  virtual Status Stat(const std::string& path, FileStatistics* stat) = 0;
 };
 
 class ARROW_EXPORT FileInterface {
  public:
   virtual ~FileInterface() = 0;
   virtual Status Close() = 0;
-  virtual Status Tell(int64_t* position) = 0;
+  virtual Status Tell(int64_t* position) const = 0;
+  virtual bool closed() const = 0;
 
   FileMode::type mode() const { return mode_; }
 
  protected:
-  FileInterface() {}
+  FileInterface() : mode_(FileMode::READ) {}
   FileMode::type mode_;
   void set_mode(FileMode::type mode) { mode_ = mode; }
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(FileInterface);
+  ARROW_DISALLOW_COPY_AND_ASSIGN(FileInterface);
 };
 
 class ARROW_EXPORT Seekable {
  public:
+  virtual ~Seekable() = default;
   virtual Status Seek(int64_t position) = 0;
 };
 
-class ARROW_EXPORT Writeable {
+class ARROW_EXPORT Writable {
  public:
-  virtual Status Write(const uint8_t* data, int64_t nbytes) = 0;
+  virtual ~Writable() = default;
 
-  // Default implementation is a no-op
+  virtual Status Write(const void* data, int64_t nbytes) = 0;
+
+  /// \brief Flush buffered bytes, if any
   virtual Status Flush();
 
   Status Write(const std::string& data);
@@ -81,61 +102,103 @@ class ARROW_EXPORT Writeable {
 
 class ARROW_EXPORT Readable {
  public:
-  virtual Status Read(int64_t nbytes, int64_t* bytes_read, uint8_t* out) = 0;
+  virtual ~Readable() = default;
+
+  virtual Status Read(int64_t nbytes, int64_t* bytes_read, void* out) = 0;
 
   // Does not copy if not necessary
   virtual Status Read(int64_t nbytes, std::shared_ptr<Buffer>* out) = 0;
 };
 
-class ARROW_EXPORT OutputStream : virtual public FileInterface, public Writeable {
+class ARROW_EXPORT OutputStream : virtual public FileInterface, public Writable {
  protected:
-  OutputStream() {}
+  OutputStream() = default;
 };
 
-class ARROW_EXPORT InputStream : virtual public FileInterface, public Readable {
+class ARROW_EXPORT InputStream : virtual public FileInterface, virtual public Readable {
+ public:
+  /// \brief Advance or skip stream indicated number of bytes
+  /// \param[in] nbytes the number to move forward
+  /// \return Status
+  Status Advance(int64_t nbytes);
+
+  /// \brief Return zero-copy string_view to upcoming bytes in the
+  /// stream but do not modify stream position. View becomes invalid
+  /// after any operation on file. If the InputStream is unbuffered,
+  /// returns 0-length string_view. May trigger buffering if the
+  /// requested size is larger than the number of buffered bytes
+  /// \param[in] nbytes the maximum number of bytes to see
+  /// \param[out] out the returned arrow::util::string_view
+  /// \return Status
+  virtual Status Peek(int64_t nbytes, util::string_view* out);
+
+  /// \brief Return true if InputStream is capable of zero copy Buffer reads
+  virtual bool supports_zero_copy() const;
+
  protected:
-  InputStream() {}
+  InputStream() = default;
 };
 
 class ARROW_EXPORT RandomAccessFile : public InputStream, public Seekable {
  public:
+  /// Necessary because we hold a std::unique_ptr
+  ~RandomAccessFile() override;
+
   virtual Status GetSize(int64_t* size) = 0;
 
-  virtual bool supports_zero_copy() const = 0;
-
-  /// Read at position, provide default implementations using Read(...), but can
-  /// be overridden
+  /// \brief Read nbytes at position, provide default implementations using
+  /// Read(...), but can be overridden. The default implementation is
+  /// thread-safe. It is unspecified whether this method updates the file
+  /// position or not.
   ///
-  /// Default implementation is thread-safe
-  virtual Status ReadAt(
-      int64_t position, int64_t nbytes, int64_t* bytes_read, uint8_t* out);
+  /// \param[in] position Where to read bytes from
+  /// \param[in] nbytes The number of bytes to read
+  /// \param[out] bytes_read The number of bytes read
+  /// \param[out] out The buffer to read bytes into
+  /// \return Status
+  virtual Status ReadAt(int64_t position, int64_t nbytes, int64_t* bytes_read, void* out);
 
-  /// Default implementation is thread-safe
+  /// \brief Read nbytes at position, provide default implementations using
+  /// Read(...), but can be overridden. The default implementation is
+  /// thread-safe. It is unspecified whether this method updates the file
+  /// position or not.
+  ///
+  /// \param[in] position Where to read bytes from
+  /// \param[in] nbytes The number of bytes to read
+  /// \param[out] out The buffer to read bytes into. The number of bytes read can be
+  /// retrieved by calling Buffer::size().
   virtual Status ReadAt(int64_t position, int64_t nbytes, std::shared_ptr<Buffer>* out);
 
-  std::mutex& lock() { return lock_; }
-
  protected:
-  std::mutex lock_;
-
   RandomAccessFile();
+
+ private:
+  struct ARROW_NO_EXPORT RandomAccessFileImpl;
+  std::unique_ptr<RandomAccessFileImpl> interface_impl_;
 };
 
-class ARROW_EXPORT WriteableFile : public OutputStream, public Seekable {
+class ARROW_EXPORT WritableFile : public OutputStream, public Seekable {
  public:
-  virtual Status WriteAt(int64_t position, const uint8_t* data, int64_t nbytes) = 0;
+  virtual Status WriteAt(int64_t position, const void* data, int64_t nbytes) = 0;
 
  protected:
-  WriteableFile() { set_mode(FileMode::READ); }
+  WritableFile() = default;
 };
 
-class ARROW_EXPORT ReadWriteFileInterface : public RandomAccessFile,
-                                            public WriteableFile {
+class ARROW_EXPORT ReadWriteFileInterface : public RandomAccessFile, public WritableFile {
  protected:
   ReadWriteFileInterface() { RandomAccessFile::set_mode(FileMode::READWRITE); }
 };
 
+// TODO(kszucs): remove this after 0.13
+#ifndef _MSC_VER
+using WriteableFile ARROW_DEPRECATED("Use WritableFile") = WritableFile;
+using ReadableFileInterface ARROW_DEPRECATED("Use RandomAccessFile") = RandomAccessFile;
+#else
+// MSVC does not like using ARROW_DEPRECATED with using declarations
+using WriteableFile = WritableFile;
 using ReadableFileInterface = RandomAccessFile;
+#endif
 
 }  // namespace io
 }  // namespace arrow

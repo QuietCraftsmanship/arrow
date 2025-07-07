@@ -15,24 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <cstdint>
 #include <memory>
-#include <random>
 #include <sstream>
 #include <string>
-#include <vector>
 
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 
+#include "arrow/array.h"
 #include "arrow/io/memory.h"
 #include "arrow/ipc/feather-internal.h"
-#include "arrow/ipc/feather.h"
+#include "arrow/ipc/feather_generated.h"
 #include "arrow/ipc/test-common.h"
-#include "arrow/loader.h"
+#include "arrow/memory_pool.h"
 #include "arrow/pretty_print.h"
-#include "arrow/test-util.h"
+#include "arrow/record_batch.h"
+#include "arrow/status.h"
+#include "arrow/table.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/type.h"
+#include "arrow/util/checked_cast.h"
 
 namespace arrow {
+
+class Buffer;
+
+using internal::checked_cast;
+
 namespace ipc {
 namespace feather {
 
@@ -50,7 +58,7 @@ class TestTableBuilder : public ::testing::Test {
   void SetUp() { tb_.reset(new TableBuilder(1000)); }
 
   virtual void Finish() {
-    tb_->Finish();
+    ASSERT_OK(tb_->Finish());
 
     table_.reset(new TableMetadata());
     ASSERT_OK(table_->Open(tb_->GetBuffer()));
@@ -107,7 +115,7 @@ TEST_F(TestTableBuilder, AddPrimitiveColumn) {
   std::string user_meta = "as you wish";
   cb->SetUserMetadata(user_meta);
 
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   cb = tb_->AddColumn("f1");
 
@@ -118,7 +126,7 @@ TEST_F(TestTableBuilder, AddPrimitiveColumn) {
   values2.total_bytes = 10000;
 
   cb->SetValues(values2);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   Finish();
 
@@ -148,12 +156,12 @@ TEST_F(TestTableBuilder, AddCategoryColumn) {
   std::unique_ptr<ColumnBuilder> cb = tb_->AddColumn("c0");
   cb->SetValues(values1);
   cb->SetCategory(levels);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   cb = tb_->AddColumn("c1");
   cb->SetValues(values1);
   cb->SetCategory(levels, true);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   Finish();
 
@@ -182,7 +190,7 @@ TEST_F(TestTableBuilder, AddTimestampColumn) {
   std::unique_ptr<ColumnBuilder> cb = tb_->AddColumn("c0");
   cb->SetValues(values1);
   cb->SetTimestamp(TimeUnit::MILLI);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   cb = tb_->AddColumn("c1");
 
@@ -190,7 +198,7 @@ TEST_F(TestTableBuilder, AddTimestampColumn) {
 
   cb->SetValues(values1);
   cb->SetTimestamp(TimeUnit::SECOND, tz);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   Finish();
 
@@ -216,7 +224,7 @@ TEST_F(TestTableBuilder, AddDateColumn) {
   std::unique_ptr<ColumnBuilder> cb = tb_->AddColumn("d0");
   cb->SetValues(values1);
   cb->SetDate();
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
 
   Finish();
 
@@ -233,7 +241,7 @@ TEST_F(TestTableBuilder, AddTimeColumn) {
   std::unique_ptr<ColumnBuilder> cb = tb_->AddColumn("c0");
   cb->SetValues(values1);
   cb->SetTime(TimeUnit::SECOND);
-  cb->Finish();
+  ASSERT_OK(cb->Finish());
   Finish();
 
   auto col = table_->column(0);
@@ -252,10 +260,96 @@ void CheckArrays(const Array& expected, const Array& result) {
     std::stringstream pp_result;
     std::stringstream pp_expected;
 
-    EXPECT_OK(PrettyPrint(result, 0, &pp_result));
-    EXPECT_OK(PrettyPrint(expected, 0, &pp_expected));
+    ARROW_EXPECT_OK(PrettyPrint(result, 0, &pp_result));
+    ARROW_EXPECT_OK(PrettyPrint(expected, 0, &pp_expected));
     FAIL() << "Got: " << pp_result.str() << "\nExpected: " << pp_expected.str();
   }
+}
+
+void CheckBatches(const RecordBatch& expected, const RecordBatch& result) {
+  if (!result.Equals(expected)) {
+    std::stringstream pp_result;
+    std::stringstream pp_expected;
+
+    ARROW_EXPECT_OK(PrettyPrint(result, 0, &pp_result));
+    ARROW_EXPECT_OK(PrettyPrint(expected, 0, &pp_expected));
+    FAIL() << "Got: " << pp_result.str() << "\nExpected: " << pp_expected.str();
+  }
+}
+
+class TestTableReader : public ::testing::Test {
+ public:
+  void SetUp() {
+    ASSERT_OK(io::BufferOutputStream::Create(1024, default_memory_pool(), &stream_));
+    ASSERT_OK(TableWriter::Open(stream_, &writer_));
+  }
+
+  void Finish() {
+    // Write table footer
+    ASSERT_OK(writer_->Finalize());
+
+    ASSERT_OK(stream_->Finish(&output_));
+
+    auto buffer = std::make_shared<io::BufferReader>(output_);
+    ASSERT_OK(TableReader::Open(buffer, &reader_));
+  }
+
+ protected:
+  std::shared_ptr<io::BufferOutputStream> stream_;
+  std::unique_ptr<TableWriter> writer_;
+  std::unique_ptr<TableReader> reader_;
+
+  std::shared_ptr<Buffer> output_;
+};
+
+TEST_F(TestTableReader, ReadIndices) {
+  std::shared_ptr<RecordBatch> batch1;
+  ASSERT_OK(ipc::test::MakeIntRecordBatch(&batch1));
+  std::shared_ptr<RecordBatch> batch2;
+  ASSERT_OK(ipc::test::MakeIntRecordBatch(&batch2));
+
+  ASSERT_OK(writer_->Append("f0", *batch1->column(0)));
+  ASSERT_OK(writer_->Append("f1", *batch1->column(1)));
+  ASSERT_OK(writer_->Append("f2", *batch2->column(0)));
+  ASSERT_OK(writer_->Append("f3", *batch2->column(1)));
+  Finish();
+
+  std::vector<int> indices({3, 0, 5});
+  std::shared_ptr<Table> result;
+  ASSERT_OK(reader_->Read(indices, &result));
+  std::vector<std::shared_ptr<Field>> fields;
+  std::vector<std::shared_ptr<Array>> arrays;
+  fields.push_back(std::make_shared<Field>("f0", int32()));
+  arrays.push_back(batch1->column(0));
+  fields.push_back(std::make_shared<Field>("f3", int32()));
+  arrays.push_back(batch2->column(1));
+  auto expected = Table::Make(std::make_shared<Schema>(fields), arrays);
+  AssertTablesEqual(*expected, *result);
+}
+
+TEST_F(TestTableReader, ReadNames) {
+  std::shared_ptr<RecordBatch> batch1;
+  ASSERT_OK(ipc::test::MakeIntRecordBatch(&batch1));
+  std::shared_ptr<RecordBatch> batch2;
+  ASSERT_OK(ipc::test::MakeIntRecordBatch(&batch2));
+
+  ASSERT_OK(writer_->Append("f0", *batch1->column(0)));
+  ASSERT_OK(writer_->Append("f1", *batch1->column(1)));
+  ASSERT_OK(writer_->Append("f2", *batch2->column(0)));
+  ASSERT_OK(writer_->Append("f3", *batch2->column(1)));
+  Finish();
+
+  std::vector<std::string> names({"f3", "f0", "f5"});
+  std::shared_ptr<Table> result;
+  ASSERT_OK(reader_->Read(names, &result));
+  std::vector<std::shared_ptr<Field>> fields;
+  std::vector<std::shared_ptr<Array>> arrays;
+  fields.push_back(std::make_shared<Field>("f0", int32()));
+  arrays.push_back(batch1->column(0));
+  fields.push_back(std::make_shared<Field>("f3", int32()));
+  arrays.push_back(batch2->column(1));
+  auto expected = Table::Make(std::make_shared<Schema>(fields), arrays);
+  AssertTablesEqual(*expected, *result);
 }
 
 class TestTableWriter : public ::testing::Test {
@@ -271,22 +365,20 @@ class TestTableWriter : public ::testing::Test {
 
     ASSERT_OK(stream_->Finish(&output_));
 
-    std::shared_ptr<io::BufferReader> buffer(new io::BufferReader(output_));
+    auto buffer = std::make_shared<io::BufferReader>(output_);
     ASSERT_OK(TableReader::Open(buffer, &reader_));
   }
 
-  void CheckBatch(const RecordBatch& batch) {
-    for (int i = 0; i < batch.num_columns(); ++i) {
-      ASSERT_OK(writer_->Append(batch.column_name(i), *batch.column(i)));
-    }
+  void CheckBatch(std::shared_ptr<RecordBatch> batch) {
+    std::shared_ptr<Table> table;
+    std::vector<std::shared_ptr<RecordBatch>> batches = {batch};
+    ASSERT_OK(Table::FromRecordBatches(batches, &table));
+    ASSERT_OK(writer_->Write(*table));
     Finish();
 
-    std::shared_ptr<Column> col;
-    for (int i = 0; i < batch.num_columns(); ++i) {
-      ASSERT_OK(reader_->GetColumn(i, &col));
-      ASSERT_EQ(batch.column_name(i), col->name());
-      CheckArrays(*batch.column(i), *col->data()->chunk(0));
-    }
+    std::shared_ptr<Table> read_table;
+    ASSERT_OK(reader_->Read(&read_table));
+    AssertTablesEqual(*table, *read_table);
   }
 
  protected:
@@ -327,7 +419,7 @@ TEST_F(TestTableWriter, SetDescription) {
 
 TEST_F(TestTableWriter, PrimitiveRoundTrip) {
   std::shared_ptr<RecordBatch> batch;
-  ASSERT_OK(MakeIntRecordBatch(&batch));
+  ASSERT_OK(ipc::test::MakeIntRecordBatch(&batch));
 
   ASSERT_OK(writer_->Append("f0", *batch->column(0)));
   ASSERT_OK(writer_->Append("f1", *batch->column(1)));
@@ -345,8 +437,8 @@ TEST_F(TestTableWriter, PrimitiveRoundTrip) {
 
 TEST_F(TestTableWriter, CategoryRoundtrip) {
   std::shared_ptr<RecordBatch> batch;
-  ASSERT_OK(MakeDictionaryFlat(&batch));
-  CheckBatch(*batch);
+  ASSERT_OK(ipc::test::MakeDictionaryFlat(&batch));
+  CheckBatch(batch);
 }
 
 TEST_F(TestTableWriter, TimeTypes) {
@@ -355,43 +447,122 @@ TEST_F(TestTableWriter, TimeTypes) {
   auto f1 = field("f1", time32(TimeUnit::MILLI));
   auto f2 = field("f2", timestamp(TimeUnit::NANO));
   auto f3 = field("f3", timestamp(TimeUnit::SECOND, "US/Los_Angeles"));
-  std::shared_ptr<Schema> schema(new Schema({f0, f1, f2, f3}));
+  auto schema = ::arrow::schema({f0, f1, f2, f3});
 
-  std::vector<int64_t> values_vec = {0, 1, 2, 3, 4, 5, 6};
-  std::shared_ptr<Array> values;
-  ArrayFromVector<Int64Type, int64_t>(is_valid, values_vec, &values);
+  std::vector<int64_t> values64_vec = {0, 1, 2, 3, 4, 5, 6};
+  std::shared_ptr<Array> values64;
+  ArrayFromVector<Int64Type, int64_t>(is_valid, values64_vec, &values64);
 
-  std::vector<int32_t> date_values_vec = {0, 1, 2, 3, 4, 5, 6};
+  std::vector<int32_t> values32_vec = {10, 11, 12, 13, 14, 15, 16};
+  std::shared_ptr<Array> values32;
+  ArrayFromVector<Int32Type, int32_t>(is_valid, values32_vec, &values32);
+
+  std::vector<int32_t> date_values_vec = {20, 21, 22, 23, 24, 25, 26};
   std::shared_ptr<Array> date_array;
   ArrayFromVector<Date32Type, int32_t>(is_valid, date_values_vec, &date_array);
 
-  std::vector<FieldMetadata> fields(1);
-  fields[0].length = values->length();
-  fields[0].null_count = values->null_count();
-  fields[0].offset = 0;
+  const auto& prim_values64 = checked_cast<const PrimitiveArray&>(*values64);
+  BufferVector buffers64 = {prim_values64.null_bitmap(), prim_values64.values()};
 
-  const auto& prim_values = static_cast<const PrimitiveArray&>(*values);
-  std::vector<std::shared_ptr<Buffer>> buffers = {
-      prim_values.null_bitmap(), prim_values.data()};
+  const auto& prim_values32 = checked_cast<const PrimitiveArray&>(*values32);
+  BufferVector buffers32 = {prim_values32.null_bitmap(), prim_values32.values()};
 
-  std::vector<std::shared_ptr<Array>> arrays;
-  arrays.push_back(date_array);
+  // Push date32 ArrayData
+  std::vector<std::shared_ptr<ArrayData>> arrays;
+  arrays.push_back(date_array->data());
 
-  for (int i = 1; i < schema->num_fields(); ++i) {
-    std::shared_ptr<Array> arr;
-    LoadArray(schema->field(i)->type(), fields, buffers, &arr);
-    arrays.push_back(arr);
+  // Create time32 ArrayData
+  arrays.emplace_back(ArrayData::Make(schema->field(1)->type(), values32->length(),
+                                      BufferVector(buffers32), values32->null_count(),
+                                      0));
+
+  // Create timestamp ArrayData
+  for (int i = 2; i < schema->num_fields(); ++i) {
+    arrays.emplace_back(ArrayData::Make(schema->field(i)->type(), values64->length(),
+                                        BufferVector(buffers64), values64->null_count(),
+                                        0));
   }
 
-  RecordBatch batch(schema, values->length(), arrays);
+  auto batch = RecordBatch::Make(schema, 7, std::move(arrays));
   CheckBatch(batch);
 }
 
 TEST_F(TestTableWriter, VLenPrimitiveRoundTrip) {
   std::shared_ptr<RecordBatch> batch;
-  ASSERT_OK(MakeStringTypesRecordBatch(&batch));
-  CheckBatch(*batch);
+  ASSERT_OK(ipc::test::MakeStringTypesRecordBatch(&batch));
+  CheckBatch(batch);
 }
+
+TEST_F(TestTableWriter, PrimitiveNullRoundTrip) {
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeNullRecordBatch(&batch));
+
+  for (int i = 0; i < batch->num_columns(); ++i) {
+    ASSERT_OK(writer_->Append(batch->column_name(i), *batch->column(i)));
+  }
+  Finish();
+
+  std::shared_ptr<Column> col;
+  for (int i = 0; i < batch->num_columns(); ++i) {
+    ASSERT_OK(reader_->GetColumn(i, &col));
+    ASSERT_EQ(batch->column_name(i), col->name());
+    StringArray str_values(batch->column(i)->length(), nullptr, nullptr,
+                           batch->column(i)->null_bitmap(),
+                           batch->column(i)->null_count());
+    CheckArrays(str_values, *col->data()->chunk(0));
+  }
+}
+
+class TestTableWriterSlice : public TestTableWriter,
+                             public ::testing::WithParamInterface<std::tuple<int, int>> {
+ public:
+  void CheckSlice(std::shared_ptr<RecordBatch> batch) {
+    auto p = GetParam();
+    auto start = std::get<0>(p);
+    auto size = std::get<1>(p);
+
+    batch = batch->Slice(start, size);
+
+    ASSERT_OK(writer_->Append("f0", *batch->column(0)));
+    ASSERT_OK(writer_->Append("f1", *batch->column(1)));
+    Finish();
+
+    std::shared_ptr<Column> col;
+    ASSERT_OK(reader_->GetColumn(0, &col));
+    ASSERT_TRUE(col->data()->chunk(0)->Equals(batch->column(0)));
+    ASSERT_EQ("f0", col->name());
+
+    ASSERT_OK(reader_->GetColumn(1, &col));
+    ASSERT_TRUE(col->data()->chunk(0)->Equals(batch->column(1)));
+    ASSERT_EQ("f1", col->name());
+  }
+};
+
+TEST_P(TestTableWriterSlice, SliceRoundTrip) {
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeIntBatchSized(600, &batch));
+  CheckSlice(batch);
+}
+
+TEST_P(TestTableWriterSlice, SliceStringsRoundTrip) {
+  auto p = GetParam();
+  auto start = std::get<0>(p);
+  auto with_nulls = start % 2 == 0;
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeStringTypesRecordBatch(&batch, with_nulls));
+  CheckSlice(batch);
+}
+
+TEST_P(TestTableWriterSlice, SliceBooleanRoundTrip) {
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeBooleanBatchSized(600, &batch));
+  CheckSlice(batch);
+}
+
+INSTANTIATE_TEST_CASE_P(TestTableWriterSliceOffsets, TestTableWriterSlice,
+                        ::testing::Combine(::testing::Values(0, 1, 300, 301, 302, 303,
+                                                             304, 305, 306, 307),
+                                           ::testing::Values(0, 1, 7, 8, 30, 32, 100)));
 
 }  // namespace feather
 }  // namespace ipc

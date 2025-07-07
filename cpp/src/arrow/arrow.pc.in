@@ -15,15 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-prefix=@CMAKE_INSTALL_PREFIX@
-libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
-includedir=${prefix}/include
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
 
 so_version=@ARROW_SO_VERSION@
-abi_version=@ARROW_ABI_VERSION@
+abi_version=@ARROW_SO_VERSION@
+full_so_version=@ARROW_FULL_SO_VERSION@
 
 Name: Apache Arrow
 Description: Arrow is a set of technologies that enable big-data systems to process and move data fast.
 Version: @ARROW_VERSION@
 Libs: -L${libdir} -larrow
-Cflags: -I${includedir}
+Cflags: -I${includedir} @ARROW_DEFINITION_FLAGS@

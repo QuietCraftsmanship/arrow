@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "gtest/gtest.h"
+#include <sstream>
+
+#include <gtest/gtest.h>
 
 #include "arrow/status.h"
-#include "arrow/test-util.h"
 
 namespace arrow {
 
@@ -33,6 +34,47 @@ TEST(StatusTest, TestCodeAndMessage) {
 TEST(StatusTest, TestToString) {
   Status file_error = Status::IOError("file error");
   ASSERT_EQ("IOError: file error", file_error.ToString());
+
+  std::stringstream ss;
+  ss << file_error;
+  ASSERT_EQ(file_error.ToString(), ss.str());
+}
+
+TEST(StatusTest, AndStatus) {
+  Status a = Status::OK();
+  Status b = Status::OK();
+  Status c = Status::Invalid("invalid value");
+  Status d = Status::IOError("file error");
+
+  Status res;
+  res = a & b;
+  ASSERT_TRUE(res.ok());
+  res = a & c;
+  ASSERT_TRUE(res.IsInvalid());
+  res = d & c;
+  ASSERT_TRUE(res.IsIOError());
+
+  res = Status::OK();
+  res &= c;
+  ASSERT_TRUE(res.IsInvalid());
+  res &= d;
+  ASSERT_TRUE(res.IsInvalid());
+
+  // With rvalues
+  res = Status::OK() & Status::Invalid("foo");
+  ASSERT_TRUE(res.IsInvalid());
+  res = Status::Invalid("foo") & Status::OK();
+  ASSERT_TRUE(res.IsInvalid());
+  res = Status::Invalid("foo") & Status::IOError("bar");
+  ASSERT_TRUE(res.IsInvalid());
+
+  res = Status::OK();
+  res &= Status::OK();
+  ASSERT_TRUE(res.ok());
+  res &= Status::Invalid("foo");
+  ASSERT_TRUE(res.IsInvalid());
+  res &= Status::IOError("bar");
+  ASSERT_TRUE(res.IsInvalid());
 }
 
 }  // namespace arrow

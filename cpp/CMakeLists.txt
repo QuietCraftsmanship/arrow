@@ -15,26 +15,54 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 2.7)
-project(arrow)
+cmake_minimum_required(VERSION 3.2)
+message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
 
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../java/pom.xml" POM_XML)
-string(REGEX MATCHALL
-  "\n  <version>[^<]+</version>" ARROW_VERSION_TAG "${POM_XML}")
-string(REGEX REPLACE
-  "(\n  <version>|</version>)" "" ARROW_VERSION "${ARROW_VERSION_TAG}")
+set(ARROW_VERSION "0.14.0-SNAPSHOT")
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" ARROW_BASE_VERSION "${ARROW_VERSION}")
+
+project(arrow VERSION "${ARROW_BASE_VERSION}")
+
+# if no build build type is specified, default to release builds
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif(NOT CMAKE_BUILD_TYPE)
+
+set(ARROW_VERSION_MAJOR "${arrow_VERSION_MAJOR}")
+set(ARROW_VERSION_MINOR "${arrow_VERSION_MINOR}")
+set(ARROW_VERSION_PATCH "${arrow_VERSION_PATCH}")
+if(ARROW_VERSION_MAJOR STREQUAL ""
+   OR ARROW_VERSION_MINOR STREQUAL ""
+   OR ARROW_VERSION_PATCH STREQUAL "")
+  message(FATAL_ERROR "Failed to determine Arrow version from '${ARROW_VERSION}'")
+endif()
+
+# The SO version is also the ABI version
+if(arrow_VERSION_MAJOR STREQUAL "0")
+  # Arrow 0.x.y => SO version is "x", full SO version is "x.y.0"
+  set(ARROW_SO_VERSION "${ARROW_VERSION_MINOR}")
+  set(ARROW_FULL_SO_VERSION "${ARROW_SO_VERSION}.${ARROW_VERSION_PATCH}.0")
+else()
+  message(FATAL_ERROR "Need to implement SO version generation for Arrow 1.0+")
+endif()
+
+message(STATUS "Arrow version: "
+               "${ARROW_VERSION_MAJOR}.${ARROW_VERSION_MINOR}.${ARROW_VERSION_PATCH} "
+               "(full: '${ARROW_VERSION}')")
+
+set(ARROW_SOURCE_DIR ${PROJECT_SOURCE_DIR})
+set(ARROW_BINARY_DIR ${PROJECT_BINARY_DIR})
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules")
 
 include(CMakeParseArguments)
 include(ExternalProject)
+include(FindPkgConfig)
 
-if(CMAKE_MAJOR_VERSION LESS 3)
-  set(CMAKE_INSTALL_INCLUDEDIR "include")
-  set(CMAKE_INSTALL_LIBDIR "lib")
-else()
-  include(GNUInstallDirs)
-endif()
+include(GNUInstallDirs)
+
+cmake_policy(SET CMP0025 NEW)
 
 # Compatibility with CMake 3.1
 if(POLICY CMP0054)
@@ -42,186 +70,305 @@ if(POLICY CMP0054)
   cmake_policy(SET CMP0054 NEW)
 endif()
 
-set(ARROW_SO_VERSION "0")
-set(ARROW_ABI_VERSION "${ARROW_SO_VERSION}.0.0")
+if(POLICY CMP0068)
+  # https://cmake.org/cmake/help/v3.9/policy/CMP0068.html
+  cmake_policy(SET CMP0068 NEW)
+endif()
+
+# don't ignore <PackageName>_ROOT variables in find_package
+if(POLICY CMP0074)
+  # https://cmake.org/cmake/help/v3.12/policy/CMP0074.html
+  cmake_policy(SET CMP0074 NEW)
+endif()
 
 set(BUILD_SUPPORT_DIR "${CMAKE_SOURCE_DIR}/build-support")
 
+set(ARROW_LLVM_VERSION "7.0")
+# TODO: Remove this when we drop LLVM 7 support.
+set(ARROW_LLVM_VERSION_FALLBACK "7.1")
+string(
+  REGEX
+  REPLACE "^([0-9]+)\\.[0-9]+" "\\1" ARROW_LLVM_MAJOR_VERSION "${ARROW_LLVM_VERSION}")
+string(
+  REGEX
+  REPLACE "^[0-9]+\\.([0-9]+)" "\\1" ARROW_LLVM_MINOR_VERSION "${ARROW_LLVM_VERSION}")
+
+if(APPLE)
+  find_program(BREW_BIN brew)
+  if(BREW_BIN)
+    execute_process(COMMAND ${BREW_BIN} --prefix "llvm@${ARROW_LLVM_MAJOR_VERSION}"
+                    OUTPUT_VARIABLE LLVM_BREW_PREFIX
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT LLVM_BREW_PREFIX)
+      execute_process(COMMAND ${BREW_BIN} --prefix llvm
+                      OUTPUT_VARIABLE LLVM_BREW_PREFIX
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+  endif()
+endif()
+
 find_package(ClangTools)
-if ("$ENV{CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "1" OR CLANG_TIDY_FOUND)
+if("$ENV{CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "1" OR CLANG_TIDY_FOUND)
   # Generate a Clang compile_commands.json "compilation database" file for use
   # with various development tools, such as Vim's YouCompleteMe plugin.
   # See http://clang.llvm.org/docs/JSONCompilationDatabase.html
   set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
 endif()
 
-find_program(CCACHE_FOUND ccache)
-if(CCACHE_FOUND)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
-endif(CCACHE_FOUND)
+find_package(InferTools)
+if("$ENV{CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "1" OR INFER_FOUND)
+  # Generate a Clang compile_commands.json "compilation database" file for use
+  # with various development tools, such as Vim's YouCompleteMe plugin.
+  # See http://clang.llvm.org/docs/JSONCompilationDatabase.html
+  set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
+endif()
 
 # ----------------------------------------------------------------------
 # cmake options
+include(DefineOptions)
 
-# Top level cmake dir
-if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
-  set(ARROW_CXXFLAGS "" CACHE STRING
-    "Compiler flags to append when compiling Arrow")
+# Needed for linting targets, etc.
+find_package(PythonInterp)
 
-  option(ARROW_BUILD_STATIC
-    "Build the libarrow static libraries"
-    ON)
+if(ARROW_USE_CCACHE)
+  find_program(CCACHE_FOUND ccache)
+  if(CCACHE_FOUND)
+    message(STATUS "Using ccache: ${CCACHE_FOUND}")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE_FOUND})
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE_FOUND})
+    # ARROW-3985: let ccache preserve C++ comments, because some of them may be
+    # meaningful to the compiler
+    set(ENV{CCACHE_COMMENTS} "1")
+  endif(CCACHE_FOUND)
+endif()
 
-  option(ARROW_BUILD_SHARED
-    "Build the libarrow shared libraries"
-    ON)
+if(ARROW_OPTIONAL_INSTALL)
+  # Don't make the "install" target depend on the "all" target
+  set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY true)
 
-  option(ARROW_TEST_MEMCHECK
-    "Run the test suite using valgrind --tool=memcheck"
-    OFF)
+  set(INSTALL_IS_OPTIONAL OPTIONAL)
+endif()
 
-  option(ARROW_BUILD_TESTS
-    "Build the Arrow googletest unit tests"
-    ON)
+#
+# "make lint" target
+#
+if(NOT ARROW_VERBOSE_LINT)
+  set(ARROW_LINT_QUIET "--quiet")
+endif()
 
-  option(ARROW_BUILD_BENCHMARKS
-    "Build the Arrow micro benchmarks"
-    OFF)
+if(NOT LINT_EXCLUSIONS_FILE)
+  # source files matching a glob from a line in this file
+  # will be excluded from linting (cpplint, clang-tidy, clang-format)
+  set(LINT_EXCLUSIONS_FILE ${BUILD_SUPPORT_DIR}/lint_exclusions.txt)
+endif()
 
-  option(ARROW_NO_DEPRECATED_API
-    "Exclude deprecated APIs from build"
-    OFF)
+find_program(CPPLINT_BIN NAMES cpplint cpplint.py HINTS ${BUILD_SUPPORT_DIR})
+message(STATUS "Found cpplint executable at ${CPPLINT_BIN}")
 
-  option(ARROW_IPC
-    "Build the Arrow IPC extensions"
-    ON)
+add_custom_target(lint
+                  ${PYTHON_EXECUTABLE}
+                  ${BUILD_SUPPORT_DIR}/run_cpplint.py
+                  --cpplint_binary
+                  ${CPPLINT_BIN}
+                  --exclude_globs
+                  ${LINT_EXCLUSIONS_FILE}
+                  --source_dir
+                  ${CMAKE_CURRENT_SOURCE_DIR}/src
+                  ${ARROW_LINT_QUIET})
 
-  option(ARROW_JEMALLOC
-    "Build the Arrow jemalloc-based allocator"
-    ON)
+#
+# "make format" and "make check-format" targets
+#
+if(${CLANG_FORMAT_FOUND})
+  # runs clang format and updates files in place.
+  add_custom_target(format
+                    ${PYTHON_EXECUTABLE}
+                    ${BUILD_SUPPORT_DIR}/run_clang_format.py
+                    --clang_format_binary
+                    ${CLANG_FORMAT_BIN}
+                    --exclude_globs
+                    ${LINT_EXCLUSIONS_FILE}
+                    --source_dir
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    --fix
+                    ${ARROW_LINT_QUIET})
 
-  option(ARROW_JEMALLOC_USE_SHARED
-    "Rely on jemalloc shared libraries where relevant"
-    ON)
+  # runs clang format and exits with a non-zero exit code if any files need to be reformatted
+  add_custom_target(check-format
+                    ${PYTHON_EXECUTABLE}
+                    ${BUILD_SUPPORT_DIR}/run_clang_format.py
+                    --clang_format_binary
+                    ${CLANG_FORMAT_BIN}
+                    --exclude_globs
+                    ${LINT_EXCLUSIONS_FILE}
+                    --source_dir
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    ${ARROW_LINT_QUIET})
+endif()
 
-  option(ARROW_HDFS
-    "Build the Arrow HDFS bridge"
-    ON)
+#
+# "make clang-tidy" and "make check-clang-tidy" targets
+#
+if(${CLANG_TIDY_FOUND})
+  # TODO check to make sure .clang-tidy is being respected
 
-  option(ARROW_BOOST_USE_SHARED
-    "Rely on boost shared libraries where relevant"
-    ON)
+  # runs clang-tidy and attempts to fix any warning automatically
+  add_custom_target(clang-tidy
+                    ${PYTHON_EXECUTABLE}
+                    ${BUILD_SUPPORT_DIR}/run_clang_tidy.py
+                    --clang_tidy_binary
+                    ${CLANG_TIDY_BIN}
+                    --exclude_globs
+                    ${LINT_EXCLUSIONS_FILE}
+                    --compile_commands
+                    ${CMAKE_BINARY_DIR}/compile_commands.json
+                    --source_dir
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    --fix
+                    ${ARROW_LINT_QUIET})
 
-  option(ARROW_PYTHON
-    "Build the Arrow CPython extensions"
-    OFF)
+  # runs clang-tidy and exits with a non-zero exit code if any errors are found.
+  add_custom_target(check-clang-tidy
+                    ${PYTHON_EXECUTABLE}
+                    ${BUILD_SUPPORT_DIR}/run_clang_tidy.py
+                    --clang_tidy_binary
+                    ${CLANG_TIDY_BIN}
+                    --exclude_globs
+                    ${LINT_EXCLUSIONS_FILE}
+                    --compile_commands
+                    ${CMAKE_BINARY_DIR}/compile_commands.json
+                    --source_dir
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    ${ARROW_LINT_QUIET})
+endif()
 
-  option(ARROW_SSE3
-    "Build Arrow with SSE3"
-    ON)
+if(ARROW_ONLY_LINT)
+  return()
+endif()
 
-  option(ARROW_ALTIVEC
-    "Build Arrow with Altivec"
-    ON)
+#
+# Set up various options
+#
 
-  option(ARROW_BUILD_UTILITIES
-    "Build Arrow commandline utilities"
-    ON)
-
-  option(ARROW_RPATH_ORIGIN
-    "Build Arrow libraries with RATH set to \$ORIGIN"
-    OFF)
+if(ARROW_BUILD_TESTS OR ARROW_BUILD_BENCHMARKS)
+  # Currently the compression tests require at least these libraries; bz2 and
+  # zstd are optional. See ARROW-3984
+  set(ARROW_WITH_BROTLI ON)
+  set(ARROW_WITH_LZ4 ON)
+  set(ARROW_WITH_SNAPPY ON)
+  set(ARROW_WITH_ZLIB ON)
 endif()
 
 if(ARROW_BUILD_TESTS)
+  # JSON parsing of arrays is required for Arrow unit tests
+  set(ARROW_IPC ON)
+endif()
+
+if(PARQUET_BUILD_EXAMPLES OR PARQUET_BUILD_EXECUTABLES)
+  set(ARROW_PARQUET ON)
   set(ARROW_BUILD_STATIC ON)
-else()
+endif()
+
+if(MSVC)
+  # ORC doesn't build on windows
+  set(ARROW_ORC OFF)
+  # Plasma using glog is not fully tested on windows.
+  set(ARROW_USE_GLOG OFF)
+endif()
+
+if(ARROW_JNI)
+  set(ARROW_BUILD_STATIC ON)
+endif()
+
+if(ARROW_ORC)
+  set(ARROW_WITH_LZ4 ON)
+  set(ARROW_WITH_SNAPPY ON)
+  set(ARROW_WITH_ZLIB ON)
+endif()
+
+if(NOT ARROW_BUILD_TESTS)
   set(NO_TESTS 1)
+else()
+  add_custom_target(all-tests)
+  add_custom_target(unittest
+                    ctest
+                    -j4
+                    -L
+                    unittest
+                    --output-on-failure)
+  add_dependencies(unittest all-tests)
 endif()
 
 if(NOT ARROW_BUILD_BENCHMARKS)
   set(NO_BENCHMARKS 1)
-endif()
-
-if(ARROW_HDFS)
-  set(ARROW_BOOST_HEADER_ONLY 0)
 else()
-  set(ARROW_BOOST_HEADER_ONLY 1)
+  add_custom_target(all-benchmarks)
+  add_custom_target(benchmark ctest -L benchmark)
+  add_dependencies(benchmark all-benchmarks)
+  if(ARROW_BUILD_BENCHMARKS_REFERENCE)
+    add_definitions(-DARROW_WITH_BENCHMARKS_REFERENCE)
+  endif()
 endif()
 
-include(BuildUtils)
+if(NOT ARROW_BUILD_EXAMPLES)
+  set(NO_EXAMPLES 1)
+endif()
 
-############################################################
+if(NOT ARROW_FUZZING)
+  set(NO_FUZZING 1)
+endif()
+
+if(MSVC
+   AND ARROW_USE_CLCACHE
+   AND (("${CMAKE_GENERATOR}" STREQUAL "NMake Makefiles")
+        OR ("${CMAKE_GENERATOR}" STREQUAL "Ninja")))
+  find_program(CLCACHE_FOUND clcache)
+  if(CLCACHE_FOUND)
+    set(CMAKE_CXX_COMPILER ${CLCACHE_FOUND})
+  endif(CLCACHE_FOUND)
+endif()
+
+#
 # Compiler flags
-############################################################
-
-include(SetupCxxFlags)
-
-if (ARROW_NO_DEPRECATED_API)
-  add_definitions(-DARROW_NO_DEPRECATED_API)
-endif()
-
-# Add common flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_COMMON_FLAGS}")
-set(EP_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ARROW_CXXFLAGS}")
-
-message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+#
 
 # Determine compiler version
 include(CompilerInfo)
 
-if ("${COMPILER_FAMILY}" STREQUAL "clang")
-  # Using Clang with ccache causes a bunch of spurious warnings that are
-  # purportedly fixed in the next version of ccache. See the following for details:
-  #
-  #   http://petereisentraut.blogspot.com/2011/05/ccache-and-clang.html
-  #   http://petereisentraut.blogspot.com/2011/09/ccache-and-clang-part-2.html
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Qunused-arguments")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CLANG_OPTIONS}")
+if(ARROW_NO_DEPRECATED_API)
+  add_definitions(-DARROW_NO_DEPRECATED_API)
 endif()
 
-# ASAN / TSAN / UBSAN
-include(san-config)
-
-# For any C code, use the same flags.
-set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS}")
-
-# Code coverage
-if ("${ARROW_GENERATE_COVERAGE}")
-  if("${CMAKE_CXX_COMPILER}" MATCHES ".*clang.*")
-    # There appears to be some bugs in clang 3.3 which cause code coverage
-    # to have link errors, not locating the llvm_gcda_* symbols.
-    # This should be fixed in llvm 3.4 with http://llvm.org/viewvc/llvm-project?view=revision&revision=184666
-    message(SEND_ERROR "Cannot currently generate coverage with clang")
-  endif()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -DCOVERAGE_BUILD")
-
-  # For coverage to work properly, we need to use static linkage. Otherwise,
-  # __gcov_flush() doesn't properly flush coverage from every module.
-  # See http://stackoverflow.com/questions/28164543/using-gcov-flush-within-a-library-doesnt-force-the-other-modules-to-yield-gc
-  if(NOT ARROW_BUILD_STATIC)
-    message(SEND_ERROR "Coverage requires the static lib to be built")
-  endif()
+if(ARROW_EXTRA_ERROR_CONTEXT)
+  add_definitions(-DARROW_EXTRA_ERROR_CONTEXT)
 endif()
+
+include(SetupCxxFlags)
+
+#
+# Build output directory
+#
 
 # set compile output directory
-string (TOLOWER ${CMAKE_BUILD_TYPE} BUILD_SUBDIR_NAME)
+string(TOLOWER ${CMAKE_BUILD_TYPE} BUILD_SUBDIR_NAME)
 
 # If build in-source, create the latest symlink. If build out-of-source, which is
 # preferred, simply output the binaries in the build folder
-if (${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_BINARY_DIR})
-  set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/build/${BUILD_SUBDIR_NAME}/")
+if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_BINARY_DIR})
+  set(BUILD_OUTPUT_ROOT_DIRECTORY
+      "${CMAKE_CURRENT_BINARY_DIR}/build/${BUILD_SUBDIR_NAME}/")
   # Link build/latest to the current build directory, to avoid developers
   # accidentally running the latest debug build when in fact they're building
   # release builds.
-  FILE(MAKE_DIRECTORY ${BUILD_OUTPUT_ROOT_DIRECTORY})
-  if (NOT APPLE)
+  file(MAKE_DIRECTORY ${BUILD_OUTPUT_ROOT_DIRECTORY})
+  if(NOT APPLE)
     set(MORE_ARGS "-T")
   endif()
-EXECUTE_PROCESS(COMMAND ln ${MORE_ARGS} -sf ${BUILD_OUTPUT_ROOT_DIRECTORY}
-  ${CMAKE_CURRENT_BINARY_DIR}/build/latest)
+  execute_process(COMMAND ln
+                          ${MORE_ARGS}
+                          -sf
+                          ${BUILD_OUTPUT_ROOT_DIRECTORY}
+                          ${CMAKE_CURRENT_BINARY_DIR}/build/latest)
 else()
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${BUILD_SUBDIR_NAME}/")
 endif()
@@ -236,797 +383,416 @@ set(LIBRARY_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}")
 
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}")
+
+#
+# Dependencies
+#
+
+include(BuildUtils)
+enable_testing()
+
+include(ThirdpartyToolchain)
+
+# Add common flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_COMMON_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ARROW_CXXFLAGS}")
+
+# For any C code, use the same flags. These flags don't contain
+# C++ specific flags.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${ARROW_CXX_FLAGS} ${CXX_COMMON_FLAGS}")
+
+# Remove --std=c++11 to avoid errors from C compilers
+string(REPLACE "-std=c++11" "" CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
+
+# Add C++-only flags, like -std=c++11
+set(CMAKE_CXX_FLAGS "${CXX_ONLY_FLAGS} ${CMAKE_CXX_FLAGS}")
+
+# ASAN / TSAN / UBSAN
+if(ARROW_FUZZING)
+  set(ARROW_USE_COVERAGE ON)
+endif()
+include(san-config)
+
+# Code coverage
+if("${ARROW_GENERATE_COVERAGE}")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --coverage -DCOVERAGE_BUILD")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -DCOVERAGE_BUILD")
+endif()
+
+# CMAKE_CXX_FLAGS now fully assembled
+message(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
+message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/src)
 include_directories(src)
 
-############################################################
+#
 # Visibility
-############################################################
+#
 # For generate_export_header() and add_compiler_export_flags().
 include(GenerateExportHeader)
 
-# Sets -fvisibility=hidden for gcc
-add_compiler_export_flags()
-
-############################################################
-# Benchmarking
-############################################################
-# Add a new micro benchmark, with or without an executable that should be built.
-# If benchmarks are enabled then they will be run along side unit tests with ctest.
-# 'make runbenchmark' and 'make unittest' to build/run only benchmark or unittests,
-# respectively.
+# Adapted from Apache Kudu: https://github.com/apache/kudu/commit/bd549e13743a51013585
+# Honor visibility properties for all target types. See
+# "cmake --help-policy CMP0063" for details.
 #
-# REL_BENCHMARK_NAME is the name of the benchmark app. It may be a single component
-# (e.g. monotime-benchmark) or contain additional components (e.g.
-# net/net_util-benchmark). Either way, the last component must be a globally
-# unique name.
+# This policy was only added to cmake in version 3.3, so until the cmake in
+# thirdparty is updated, we must check if the policy exists before setting it.
+if(POLICY CMP0063)
+  cmake_policy(SET CMP0063 NEW)
+endif()
 
-# The benchmark will registered as unit test with ctest with a label
-# of 'benchmark'.
+if(PARQUET_BUILD_SHARED)
+  if(POLICY CMP0063)
+    set_target_properties(arrow_shared
+                          PROPERTIES C_VISIBILITY_PRESET
+                                     hidden
+                                     CXX_VISIBILITY_PRESET
+                                     hidden
+                                     VISIBILITY_INLINES_HIDDEN
+                                     1)
+  else()
+    # Sets -fvisibility=hidden for gcc
+    add_compiler_export_flags()
+  endif()
+endif()
+
 #
-# Arguments after the test name will be passed to set_tests_properties().
-function(ADD_ARROW_BENCHMARK REL_BENCHMARK_NAME)
-  if(NO_BENCHMARKS)
-    return()
-  endif()
-  get_filename_component(BENCHMARK_NAME ${REL_BENCHMARK_NAME} NAME_WE)
-
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${REL_BENCHMARK_NAME}.cc)
-    # This benchmark has a corresponding .cc file, set it up as an executable.
-    set(BENCHMARK_PATH "${EXECUTABLE_OUTPUT_PATH}/${BENCHMARK_NAME}")
-    add_executable(${BENCHMARK_NAME} "${REL_BENCHMARK_NAME}.cc")
-    target_link_libraries(${BENCHMARK_NAME} ${ARROW_BENCHMARK_LINK_LIBS})
-    add_dependencies(runbenchmark ${BENCHMARK_NAME})
-    set(NO_COLOR "--color_print=false")
-  else()
-    # No executable, just invoke the benchmark (probably a script) directly.
-    set(BENCHMARK_PATH ${CMAKE_CURRENT_SOURCE_DIR}/${REL_BENCHMARK_NAME})
-    set(NO_COLOR "")
-  endif()
-
-  add_test(${BENCHMARK_NAME}
-    ${BUILD_SUPPORT_DIR}/run-test.sh ${CMAKE_BINARY_DIR} benchmark ${BENCHMARK_PATH} ${NO_COLOR})
-  set_tests_properties(${BENCHMARK_NAME} PROPERTIES LABELS "benchmark")
-  if(ARGN)
-    set_tests_properties(${BENCHMARK_NAME} PROPERTIES ${ARGN})
-  endif()
-endfunction()
-
-# A wrapper for add_dependencies() that is compatible with NO_BENCHMARKS.
-function(ADD_ARROW_BENCHMARK_DEPENDENCIES REL_BENCHMARK_NAME)
-  if(NO_BENCHMARKS)
-    return()
-  endif()
-  get_filename_component(BENCMARK_NAME ${REL_BENCHMARK_NAME} NAME_WE)
-
-  add_dependencies(${BENCHMARK_NAME} ${ARGN})
-endfunction()
-
-# A wrapper for target_link_libraries() that is compatible with NO_BENCHMARKS.
-function(ARROW_BENCHMARK_LINK_LIBRARIES REL_BENCHMARK_NAME)
-    if(NO_BENCHMARKS)
-    return()
-  endif()
-  get_filename_component(BENCHMARK_NAME ${REL_BENCHMARK_NAME} NAME_WE)
-
-  target_link_libraries(${BENCHMARK_NAME} ${ARGN})
-endfunction()
-
-
-############################################################
-# Testing
-############################################################
-# Add a new test case, with or without an executable that should be built.
+# "make ctags" target
 #
-# REL_TEST_NAME is the name of the test. It may be a single component
-# (e.g. monotime-test) or contain additional components (e.g.
-# net/net_util-test). Either way, the last component must be a globally
-# unique name.
+if(UNIX)
+  add_custom_target(ctags ctags -R --languages=c++,c)
+endif(UNIX)
+
 #
-# The unit test is added with a label of "unittest" to support filtering with
-# ctest.
+# "make etags" target
 #
-# Arguments after the test name will be passed to set_tests_properties().
-function(ADD_ARROW_TEST REL_TEST_NAME)
-  set(options)
-  set(single_value_args)
-  set(multi_value_args STATIC_LINK_LIBS)
-  cmake_parse_arguments(ARG "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
-  if(ARG_UNPARSED_ARGUMENTS)
-    message(SEND_ERROR "Error: unrecognized arguments: ${ARG_UNPARSED_ARGUMENTS}")
-  endif()
+if(UNIX)
+  add_custom_target(tags
+                    etags
+                    --members
+                    --declarations
+                    `find
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    -name
+                    \\*.cc
+                    -or
+                    -name
+                    \\*.hh
+                    -or
+                    -name
+                    \\*.cpp
+                    -or
+                    -name
+                    \\*.h
+                    -or
+                    -name
+                    \\*.c
+                    -or
+                    -name
+                    \\*.f`)
+  add_custom_target(etags DEPENDS tags)
+endif(UNIX)
 
-  if(NO_TESTS OR NOT ARROW_BUILD_STATIC)
-    return()
-  endif()
-  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
+#
+# "make cscope" target
+#
+if(UNIX)
+  add_custom_target(cscope find ${CMAKE_CURRENT_SOURCE_DIR}
+                    (-name
+                     \\*.cc
+                     -or
+                     -name
+                     \\*.hh
+                     -or
+                     -name
+                     \\*.cpp
+                     -or
+                     -name
+                     \\*.h
+                     -or
+                     -name
+                     \\*.c
+                     -or
+                     -name
+                     \\*.f)
+                    -exec
+                    echo
+                    \"{}\"
+                    \;
+                    >
+                    cscope.files
+                    &&
+                    cscope
+                    -q
+                    -b
+                    VERBATIM)
+endif(UNIX)
 
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME}.cc)
-    # This test has a corresponding .cc file, set it up as an executable.
-    set(TEST_PATH "${EXECUTABLE_OUTPUT_PATH}/${TEST_NAME}")
-    add_executable(${TEST_NAME} "${REL_TEST_NAME}.cc")
+#
+# "make infer" target
+#
 
-    if (ARG_STATIC_LINK_LIBS)
-      # Customize link libraries
-      target_link_libraries(${TEST_NAME} ${ARG_STATIC_LINK_LIBS})
-    else()
-      target_link_libraries(${TEST_NAME} ${ARROW_TEST_LINK_LIBS})
-    endif()
-    add_dependencies(unittest ${TEST_NAME})
-  else()
-    # No executable, just invoke the test (probably a script) directly.
-    set(TEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME})
-  endif()
-
-  if (ARROW_TEST_MEMCHECK)
-    SET_PROPERTY(TARGET ${TEST_NAME}
-      APPEND_STRING PROPERTY
-      COMPILE_FLAGS " -DARROW_VALGRIND")
-    add_test(${TEST_NAME}
-      valgrind --tool=memcheck --leak-check=full --error-exitcode=1 ${TEST_PATH})
-  elseif(MSVC)
-    add_test(${TEST_NAME} ${TEST_PATH})
-  else()
-    add_test(${TEST_NAME}
-      ${BUILD_SUPPORT_DIR}/run-test.sh ${CMAKE_BINARY_DIR} test ${TEST_PATH})
-  endif()
-  set_tests_properties(${TEST_NAME} PROPERTIES LABELS "unittest")
-endfunction()
-
-# A wrapper for add_dependencies() that is compatible with NO_TESTS.
-function(ADD_ARROW_TEST_DEPENDENCIES REL_TEST_NAME)
-  if(NO_TESTS)
-    return()
-  endif()
-  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
-
-  add_dependencies(${TEST_NAME} ${ARGN})
-endfunction()
-
-# A wrapper for target_link_libraries() that is compatible with NO_TESTS.
-function(ARROW_TEST_LINK_LIBRARIES REL_TEST_NAME)
-  if(NO_TESTS)
-    return()
-  endif()
-  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
-
-  target_link_libraries(${TEST_NAME} ${ARGN})
-endfunction()
-
-enable_testing()
-
-############################################################
-# Dependencies
-############################################################
-
-# ----------------------------------------------------------------------
-# Thirdparty toolchain
-
-set(THIRDPARTY_DIR "${CMAKE_SOURCE_DIR}/thirdparty")
-set(GFLAGS_VERSION "2.1.2")
-set(GTEST_VERSION "1.8.0")
-set(GBENCHMARK_VERSION "1.1.0")
-set(FLATBUFFERS_VERSION "1.6.0")
-set(JEMALLOC_VERSION "4.4.0")
-
-if (NOT "$ENV{ARROW_BUILD_TOOLCHAIN}" STREQUAL "")
-  set(FLATBUFFERS_HOME "$ENV{ARROW_BUILD_TOOLCHAIN}")
-  set(RAPIDJSON_HOME "$ENV{ARROW_BUILD_TOOLCHAIN}")
-  set(JEMALLOC_HOME "$ENV{ARROW_BUILD_TOOLCHAIN}")
-
-  if (NOT DEFINED ENV{BOOST_ROOT})
-    # Since we have to set this in the environment, we check whether
-    # $BOOST_ROOT is defined inside here
-    set(ENV{BOOST_ROOT} "$ENV{ARROW_BUILD_TOOLCHAIN}")
-  endif()
+if(${INFER_FOUND})
+  # runs infer capture
+  add_custom_target(infer
+                    ${BUILD_SUPPORT_DIR}/run-infer.sh
+                    ${INFER_BIN}
+                    ${CMAKE_BINARY_DIR}/compile_commands.json
+                    1)
+  # runs infer analyze
+  add_custom_target(infer-analyze
+                    ${BUILD_SUPPORT_DIR}/run-infer.sh
+                    ${INFER_BIN}
+                    ${CMAKE_BINARY_DIR}/compile_commands.json
+                    2)
+  # runs infer report
+  add_custom_target(infer-report
+                    ${BUILD_SUPPORT_DIR}/run-infer.sh
+                    ${INFER_BIN}
+                    ${CMAKE_BINARY_DIR}/compile_commands.json
+                    3)
 endif()
 
-if (DEFINED ENV{FLATBUFFERS_HOME})
-  set(FLATBUFFERS_HOME "$ENV{FLATBUFFERS_HOME}")
+#
+# "make iwyu" target
+#
+if(UNIX)
+  add_custom_target(iwyu ${BUILD_SUPPORT_DIR}/iwyu/iwyu.sh)
+endif(UNIX)
+
+#
+# Linker and Dependencies
+#
+
+# TODO: Also rework how these libs work
+set(ARROW_LINK_LIBS)
+set(ARROW_SHARED_INSTALL_INTERFACE_LIBS)
+set(ARROW_STATIC_INSTALL_INTERFACE_LIBS)
+
+# Libraries to link statically with libarrow.so
+set(ARROW_LINK_LIBS ${double-conversion_LIBRARIES})
+set(ARROW_STATIC_LINK_LIBS ${double-conversion_LIBRARIES})
+set(ARROW_STATIC_INSTALL_INTERFACE_LIBS ${double-conversion_LIBRARIES})
+
+if(ARROW_WITH_URIPARSER)
+  list(APPEND ARROW_STATIC_LINK_LIBS uriparser::uriparser)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS uriparser::uriparser)
 endif()
 
-if (DEFINED ENV{RAPIDJSON_HOME})
-  set(RAPIDJSON_HOME "$ENV{RAPIDJSON_HOME}")
+if(ARROW_USE_OPENSSL)
+  set(ARROW_OPENSSL_LIBS OpenSSL::Crypto OpenSSL::SSL)
+  list(APPEND ARROW_LINK_LIBS ${ARROW_OPENSSL_LIBS})
+  list(APPEND ARROW_STATIC_LINK_LIBS ${ARROW_OPENSSL_LIBS})
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS ${ARROW_OPENSSL_LIBS})
 endif()
 
-if (DEFINED ENV{JEMALLOC_HOME})
-  set(JEMALLOC_HOME "$ENV{JEMALLOC_HOME}")
+if(ARROW_WITH_BROTLI)
+  # Order is important for static linking
+  set(ARROW_BROTLI_LIBS Brotli::brotlienc Brotli::brotlidec Brotli::brotlicommon)
+  list(APPEND ARROW_LINK_LIBS ${ARROW_BROTLI_LIBS})
+  list(APPEND ARROW_STATIC_LINK_LIBS ${ARROW_BROTLI_LIBS})
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS ${ARROW_BROTLI_LIBS})
 endif()
 
-# ----------------------------------------------------------------------
-# Add Boost dependencies (code adapted from Apache Kudu (incubating))
-
-set(Boost_DEBUG TRUE)
-set(Boost_USE_MULTITHREADED ON)
-set(Boost_ADDITIONAL_VERSIONS
-  "1.63.0" "1.63"
-  "1.62.0" "1.61"
-  "1.61.0" "1.62"
-  "1.60.0" "1.60")
-
-if (ARROW_BOOST_USE_SHARED)
-  # Find shared Boost libraries.
-  set(Boost_USE_STATIC_LIBS OFF)
-
-  if(MSVC)
-    # disable autolinking in boost
-    add_definitions(-DBOOST_ALL_NO_LIB)
-
-    # force all boost libraries to dynamic link
-    add_definitions(-DBOOST_ALL_DYN_LINK)
-  endif()
-
-  if (ARROW_BOOST_HEADER_ONLY)
-    find_package(Boost)
-  else()
-    find_package(Boost COMPONENTS system filesystem REQUIRED)
-    if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
-      set(BOOST_SHARED_SYSTEM_LIBRARY ${Boost_SYSTEM_LIBRARY_DEBUG})
-      set(BOOST_SHARED_FILESYSTEM_LIBRARY ${Boost_FILESYSTEM_LIBRARY_DEBUG})
-    else()
-      set(BOOST_SHARED_SYSTEM_LIBRARY ${Boost_SYSTEM_LIBRARY_RELEASE})
-      set(BOOST_SHARED_FILESYSTEM_LIBRARY ${Boost_FILESYSTEM_LIBRARY_RELEASE})
-    endif()
-    set(BOOST_SYSTEM_LIBRARY boost_system_shared)
-    set(BOOST_FILESYSTEM_LIBRARY boost_filesystem_shared)
-  endif()
-else()
-  # Find static boost headers and libs
-  # TODO Differentiate here between release and debug builds
-  set(Boost_USE_STATIC_LIBS ON)
-  if (ARROW_BOOST_HEADER_ONLY)
-    find_package(Boost)
-  else()
-    find_package(Boost COMPONENTS system filesystem regex REQUIRED)
-    if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
-      set(BOOST_STATIC_SYSTEM_LIBRARY ${Boost_SYSTEM_LIBRARY_DEBUG})
-      set(BOOST_STATIC_FILESYSTEM_LIBRARY ${Boost_FILESYSTEM_LIBRARY_DEBUG})
-    else()
-      set(BOOST_STATIC_SYSTEM_LIBRARY ${Boost_SYSTEM_LIBRARY_RELEASE})
-      set(BOOST_STATIC_FILESYSTEM_LIBRARY ${Boost_FILESYSTEM_LIBRARY_RELEASE})
-    endif()
-    set(BOOST_SYSTEM_LIBRARY boost_system_static)
-    set(BOOST_FILESYSTEM_LIBRARY boost_filesystem_static)
-  endif()
+if(ARROW_WITH_BZ2)
+  list(APPEND ARROW_STATIC_LINK_LIBS BZip2::BZip2)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS BZip2::BZip2)
 endif()
 
-message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIRS})
-message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
-
-if (NOT ARROW_BOOST_HEADER_ONLY)
-  ADD_THIRDPARTY_LIB(boost_system
-      STATIC_LIB "${BOOST_STATIC_SYSTEM_LIBRARY}"
-      SHARED_LIB "${BOOST_SHARED_SYSTEM_LIBRARY}")
-
-  ADD_THIRDPARTY_LIB(boost_filesystem
-      STATIC_LIB "${BOOST_STATIC_FILESYSTEM_LIBRARY}"
-      SHARED_LIB "${BOOST_SHARED_FILESYSTEM_LIBRARY}")
-
-  SET(ARROW_BOOST_LIBS boost_system boost_filesystem)
+if(ARROW_WITH_LZ4)
+  list(APPEND ARROW_STATIC_LINK_LIBS LZ4::lz4)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS LZ4::lz4)
 endif()
 
-include_directories(SYSTEM ${Boost_INCLUDE_DIR})
+if(ARROW_WITH_SNAPPY)
+  list(APPEND ARROW_STATIC_LINK_LIBS Snappy::snappy)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS Snappy::snappy)
+endif()
 
-if(ARROW_BUILD_TESTS OR ARROW_BUILD_BENCHMARKS)
-  add_custom_target(unittest ctest -L unittest)
+if(ARROW_WITH_ZLIB)
+  list(APPEND ARROW_STATIC_LINK_LIBS ZLIB::ZLIB)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS ZLIB::ZLIB)
+endif()
 
-  if("$ENV{GTEST_HOME}" STREQUAL "")
-    if(APPLE)
-      set(GTEST_CMAKE_CXX_FLAGS "-fPIC -DGTEST_USE_OWN_TR1_TUPLE=1 -Wno-unused-value -Wno-ignored-attributes")
-    elseif(NOT MSVC)
-      set(GTEST_CMAKE_CXX_FLAGS "-fPIC")
-    endif()
-    string(TOUPPER ${CMAKE_BUILD_TYPE} UPPERCASE_BUILD_TYPE)
-    set(GTEST_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}} ${GTEST_CMAKE_CXX_FLAGS}")
+if(ARROW_WITH_ZSTD)
+  list(APPEND ARROW_STATIC_LINK_LIBS ZSTD::zstd)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS ZSTD::zstd)
+endif()
 
-    set(GTEST_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/googletest_ep-prefix/src/googletest_ep")
-    set(GTEST_INCLUDE_DIR "${GTEST_PREFIX}/include")
-    set(GTEST_STATIC_LIB
-      "${GTEST_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}gtest${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    set(GTEST_MAIN_STATIC_LIB
-      "${GTEST_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}gtest_main${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    set(GTEST_VENDORED 1)
-    set(GTEST_CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-                         -DCMAKE_INSTALL_PREFIX=${GTEST_PREFIX}
-                         -Dgtest_force_shared_crt=ON
-                         -DCMAKE_CXX_FLAGS=${GTEST_CMAKE_CXX_FLAGS})
+if(ARROW_ORC)
+  list(APPEND ARROW_LINK_LIBS protobuf::libprotobuf orc::liborc)
+  list(APPEND ARROW_STATIC_LINK_LIBS protobuf::libprotobuf orc::liborc)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS protobuf::libprotobuf orc::liborc)
+endif()
 
-    if (CMAKE_VERSION VERSION_GREATER "3.2")
-      # BUILD_BYPRODUCTS is a 3.2+ feature
-      ExternalProject_Add(googletest_ep
-        URL "https://github.com/google/googletest/archive/release-${GTEST_VERSION}.tar.gz"
-        BUILD_BYPRODUCTS ${GTEST_STATIC_LIB} ${GTEST_MAIN_STATIC_LIB}
-        CMAKE_ARGS ${GTEST_CMAKE_ARGS})
-    else()
-      ExternalProject_Add(googletest_ep
-        URL "https://github.com/google/googletest/archive/release-${GTEST_VERSION}.tar.gz"
-        CMAKE_ARGS ${GTEST_CMAKE_ARGS})
-    endif()
-  else()
-    find_package(GTest REQUIRED)
-    set(GTEST_VENDORED 0)
-  endif()
+if(ARROW_USE_GLOG)
+  list(APPEND ARROW_LINK_LIBS GLOG::glog)
+  list(APPEND ARROW_STATIC_LINK_LIBS GLOG::glog)
+  list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS GLOG::glog)
+  add_definitions("-DARROW_USE_GLOG")
+endif()
 
-  message(STATUS "GTest include dir: ${GTEST_INCLUDE_DIR}")
-  message(STATUS "GTest static library: ${GTEST_STATIC_LIB}")
-  include_directories(SYSTEM ${GTEST_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(gtest
-    STATIC_LIB ${GTEST_STATIC_LIB})
-  ADD_THIRDPARTY_LIB(gtest_main
-    STATIC_LIB ${GTEST_MAIN_STATIC_LIB})
+add_custom_target(arrow_dependencies)
+add_custom_target(arrow_benchmark_dependencies)
+add_custom_target(arrow_test_dependencies)
 
-  if(GTEST_VENDORED)
-    add_dependencies(gtest googletest_ep)
-    add_dependencies(gtest_main googletest_ep)
-  endif()
+# ARROW-4581: CMake can be finicky about invoking the ExternalProject builds
+# for some of the library dependencies, so we "nuke it from orbit" by making
+# the toolchain dependency explicit using these "dependencies" targets
+add_dependencies(arrow_dependencies toolchain)
+add_dependencies(arrow_test_dependencies toolchain-tests)
 
-  # gflags (formerly Googleflags) command line parsing
-  if("$ENV{GFLAGS_HOME}" STREQUAL "")
-    set(GFLAGS_CMAKE_CXX_FLAGS ${EP_CXX_FLAGS})
+if(ARROW_STATIC_LINK_LIBS)
+  add_dependencies(arrow_dependencies ${ARROW_STATIC_LINK_LIBS})
+endif()
 
-    set(GFLAGS_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/gflags_ep-prefix/src/gflags_ep")
-    set(GFLAGS_HOME "${GFLAGS_PREFIX}")
-    set(GFLAGS_INCLUDE_DIR "${GFLAGS_PREFIX}/include")
-    if(MSVC)
-      set(GFLAGS_STATIC_LIB "${GFLAGS_PREFIX}/lib/gflags_static.lib")
-    else()
-      set(GFLAGS_STATIC_LIB "${GFLAGS_PREFIX}/lib/libgflags.a")
-    endif()
-    set(GFLAGS_VENDORED 1)
-    set(GFLAGS_CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-                          -DCMAKE_INSTALL_PREFIX=${GFLAGS_PREFIX}
-                          -DBUILD_SHARED_LIBS=OFF
-                          -DBUILD_STATIC_LIBS=ON
-                          -DBUILD_PACKAGING=OFF
-                          -DBUILD_TESTING=OFF
-                          -BUILD_CONFIG_TESTS=OFF
-                          -DINSTALL_HEADERS=ON
-                          -DCMAKE_CXX_FLAGS=${GFLAGS_CMAKE_CXX_FLAGS})
-    if (CMAKE_VERSION VERSION_GREATER "3.2")
-      # BUILD_BYPRODUCTS is a 3.2+ feature
-      ExternalProject_Add(gflags_ep
-        GIT_REPOSITORY https://github.com/gflags/gflags.git
-        GIT_TAG cce68f0c9c5d054017425e6e6fd54f696d36e8ee
-        BUILD_IN_SOURCE 1
-        BUILD_BYPRODUCTS "${GFLAGS_STATIC_LIB}"
-        CMAKE_ARGS ${GFLAGS_CMAKE_ARGS})
-    else()
-      ExternalProject_Add(gflags_ep
-        GIT_REPOSITORY https://github.com/gflags/gflags.git
-        GIT_TAG cce68f0c9c5d054017425e6e6fd54f696d36e8ee
-        BUILD_IN_SOURCE 1
-        CMAKE_ARGS ${GFLAGS_CMAKE_ARGS})
-    endif()
-  else()
-    set(GFLAGS_VENDORED 0)
-    find_package(GFlags REQUIRED)
-  endif()
+set(ARROW_SHARED_PRIVATE_LINK_LIBS ${ARROW_STATIC_LINK_LIBS} ${BOOST_SYSTEM_LIBRARY}
+                                   ${BOOST_FILESYSTEM_LIBRARY} ${BOOST_REGEX_LIBRARY})
 
-  message(STATUS "GFlags include dir: ${GFLAGS_INCLUDE_DIR}")
-  message(STATUS "GFlags static library: ${GFLAGS_STATIC_LIB}")
-  include_directories(SYSTEM ${GFLAGS_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(gflags
-    STATIC_LIB ${GFLAGS_STATIC_LIB})
-  if(MSVC)
-    set_target_properties(gflags
-      PROPERTIES
-      IMPORTED_LINK_INTERFACE_LIBRARIES "shlwapi.lib")
-  endif()
+list(APPEND ARROW_STATIC_LINK_LIBS ${BOOST_SYSTEM_LIBRARY} ${BOOST_FILESYSTEM_LIBRARY}
+            ${BOOST_REGEX_LIBRARY})
 
-  if(GFLAGS_VENDORED)
-    add_dependencies(gflags gflags_ep)
-  endif()
+list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS boost_system boost_filesystem boost_regex)
+
+if(NOT MSVC)
+  list(APPEND ARROW_LINK_LIBS ${CMAKE_DL_LIBS})
+  list(APPEND ARROW_SHARED_INSTALL_INTERFACE_LIBS ${CMAKE_DL_LIBS})
+endif()
+
+set(ARROW_TEST_LINK_TOOLCHAIN GTest::Main GTest::GTest GTest::GMock)
+
+if(ARROW_BUILD_TESTS)
+  add_dependencies(arrow_test_dependencies ${ARROW_TEST_LINK_TOOLCHAIN})
 endif()
 
 if(ARROW_BUILD_BENCHMARKS)
-  add_custom_target(runbenchmark ctest -L benchmark)
-
-  if("$ENV{GBENCHMARK_HOME}" STREQUAL "")
-    if(APPLE)
-      set(GBENCHMARK_CMAKE_CXX_FLAGS "-fPIC -std=c++11 -stdlib=libc++")
-    elseif(NOT MSVC)
-      set(GBENCHMARK_CMAKE_CXX_FLAGS "-fPIC --std=c++11")
-    endif()
-
-    set(GBENCHMARK_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/gbenchmark_ep/src/gbenchmark_ep-install")
-    set(GBENCHMARK_INCLUDE_DIR "${GBENCHMARK_PREFIX}/include")
-    set(GBENCHMARK_STATIC_LIB "${GBENCHMARK_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}benchmark${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    set(GBENCHMARK_VENDORED 1)
-    set(GBENCHMARK_CMAKE_ARGS
-          "-DCMAKE_BUILD_TYPE=Release"
-          "-DCMAKE_INSTALL_PREFIX:PATH=${GBENCHMARK_PREFIX}"
-          "-DBENCHMARK_ENABLE_TESTING=OFF"
-          "-DCMAKE_CXX_FLAGS=${GBENCHMARK_CMAKE_CXX_FLAGS}")
-    if (APPLE)
-      set(GBENCHMARK_CMAKE_ARGS ${GBENCHMARK_CMAKE_ARGS} "-DBENCHMARK_USE_LIBCXX=ON")
-    endif()
-    if (CMAKE_VERSION VERSION_GREATER "3.2")
-      # BUILD_BYPRODUCTS is a 3.2+ feature
-      ExternalProject_Add(gbenchmark_ep
-        URL "https://github.com/google/benchmark/archive/v${GBENCHMARK_VERSION}.tar.gz"
-        BUILD_BYPRODUCTS "${GBENCHMARK_STATIC_LIB}"
-        CMAKE_ARGS ${GBENCHMARK_CMAKE_ARGS})
-    else()
-      ExternalProject_Add(gbenchmark_ep
-        URL "https://github.com/google/benchmark/archive/v${GBENCHMARK_VERSION}.tar.gz"
-        CMAKE_ARGS ${GBENCHMARK_CMAKE_ARGS})
-    endif()
-  else()
-    find_package(GBenchmark REQUIRED)
-    set(GBENCHMARK_VENDORED 0)
-  endif()
-
-  message(STATUS "GBenchmark include dir: ${GBENCHMARK_INCLUDE_DIR}")
-  message(STATUS "GBenchmark static library: ${GBENCHMARK_STATIC_LIB}")
-  include_directories(SYSTEM ${GBENCHMARK_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(benchmark
-    STATIC_LIB ${GBENCHMARK_STATIC_LIB})
-
-  if(GBENCHMARK_VENDORED)
-    add_dependencies(benchmark gbenchmark_ep)
-  endif()
+  # Some benchmarks use gtest
+  add_dependencies(arrow_benchmark_dependencies arrow_test_dependencies
+                   toolchain-benchmarks)
 endif()
 
-if (ARROW_IPC)
-  # RapidJSON, header only dependency
-  if("${RAPIDJSON_HOME}" STREQUAL "")
-    ExternalProject_Add(rapidjson_ep
-      PREFIX "${CMAKE_BINARY_DIR}"
-      URL "https://github.com/miloyip/rapidjson/archive/v1.1.0.tar.gz"
-      URL_MD5 "badd12c511e081fec6c89c43a7027bce"
-      CONFIGURE_COMMAND ""
-      BUILD_COMMAND ""
-      BUILD_IN_SOURCE 1
-      INSTALL_COMMAND "")
+set(ARROW_TEST_STATIC_LINK_LIBS arrow_testing_static arrow_static ${ARROW_LINK_LIBS}
+                                ${ARROW_TEST_LINK_TOOLCHAIN})
 
-    ExternalProject_Get_Property(rapidjson_ep SOURCE_DIR)
-    set(RAPIDJSON_INCLUDE_DIR "${SOURCE_DIR}/include")
-    set(RAPIDJSON_VENDORED 1)
-  else()
-    set(RAPIDJSON_INCLUDE_DIR "${RAPIDJSON_HOME}/include")
-    set(RAPIDJSON_VENDORED 0)
-  endif()
-  message(STATUS "RapidJSON include dir: ${RAPIDJSON_INCLUDE_DIR}")
-  include_directories(SYSTEM ${RAPIDJSON_INCLUDE_DIR})
-
-  ## Flatbuffers
-  if("${FLATBUFFERS_HOME}" STREQUAL "")
-    set(FLATBUFFERS_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/flatbuffers_ep-prefix/src/flatbuffers_ep-install")
-    ExternalProject_Add(flatbuffers_ep
-      URL "https://github.com/google/flatbuffers/archive/v${FLATBUFFERS_VERSION}.tar.gz"
-      CMAKE_ARGS
-      "-DCMAKE_INSTALL_PREFIX:PATH=${FLATBUFFERS_PREFIX}"
-      "-DFLATBUFFERS_BUILD_TESTS=OFF")
-
-    set(FLATBUFFERS_INCLUDE_DIR "${FLATBUFFERS_PREFIX}/include")
-    set(FLATBUFFERS_COMPILER "${FLATBUFFERS_PREFIX}/bin/flatc")
-    set(FLATBUFFERS_VENDORED 1)
-  else()
-    find_package(Flatbuffers REQUIRED)
-    set(FLATBUFFERS_VENDORED 0)
-  endif()
-
-  message(STATUS "Flatbuffers include dir: ${FLATBUFFERS_INCLUDE_DIR}")
-  message(STATUS "Flatbuffers compiler: ${FLATBUFFERS_COMPILER}")
-  include_directories(SYSTEM ${FLATBUFFERS_INCLUDE_DIR})
-endif()
-#----------------------------------------------------------------------
-
-if (MSVC)
-  # jemalloc is not supported on Windows
-  set(ARROW_JEMALLOC off)
-endif()
-
-if (ARROW_JEMALLOC)
-  find_package(jemalloc)
-
-  if(NOT JEMALLOC_FOUND)
-    set(ARROW_JEMALLOC_USE_SHARED OFF)
-    set(JEMALLOC_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/jemalloc_ep-prefix/src/jemalloc_ep/dist/")
-    set(JEMALLOC_HOME "${JEMALLOC_PREFIX}")
-    set(JEMALLOC_INCLUDE_DIR "${JEMALLOC_PREFIX}/include")
-    set(JEMALLOC_SHARED_LIB "${JEMALLOC_PREFIX}/lib/libjemalloc${CMAKE_SHARED_LIBRARY_SUFFIX}")
-    set(JEMALLOC_STATIC_LIB "${JEMALLOC_PREFIX}/lib/libjemalloc_pic${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    set(JEMALLOC_VENDORED 1)
-    if (CMAKE_VERSION VERSION_GREATER "3.2")
-      # BUILD_BYPRODUCTS is a 3.2+ feature
-      ExternalProject_Add(jemalloc_ep
-        URL https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2
-        CONFIGURE_COMMAND ./configure "--prefix=${JEMALLOC_PREFIX}" "--with-jemalloc-prefix="
-        BUILD_IN_SOURCE 1
-        BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
-        BUILD_BYPRODUCTS "${JEMALLOC_STATIC_LIB}" "${JEMALLOC_SHARED_LIB}"
-        INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} -j1 install)
-    else()
-      ExternalProject_Add(jemalloc_ep
-        URL https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2
-        CONFIGURE_COMMAND ./configure "--prefix=${JEMALLOC_PREFIX}" "--with-jemalloc-prefix="
-        BUILD_IN_SOURCE 1
-        BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
-        INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} -j1 install)
-    endif()
-  else()
-    set(JEMALLOC_VENDORED 0)
-  endif()
-
-  include_directories(SYSTEM ${JEMALLOC_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(jemalloc
-    STATIC_LIB ${JEMALLOC_STATIC_LIB}
-    SHARED_LIB ${JEMALLOC_SHARED_LIB})
-endif()
-
-## Google PerfTools
-##
-## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see comment
-## near definition of ARROW_USING_GOLD).
-# find_package(GPerf REQUIRED)
-# if (NOT "${ARROW_USE_ASAN}" AND
-#     NOT "${ARROW_USE_TSAN}" AND
-#     NOT ("${ARROW_USING_GOLD}" AND "${ARROW_LINK}" STREQUAL "d"))
-#   ADD_THIRDPARTY_LIB(tcmalloc
-#     STATIC_LIB "${TCMALLOC_STATIC_LIB}"
-#     SHARED_LIB "${TCMALLOC_SHARED_LIB}")
-#   ADD_THIRDPARTY_LIB(profiler
-#     STATIC_LIB "${PROFILER_STATIC_LIB}"
-#     SHARED_LIB "${PROFILER_SHARED_LIB}")
-#   list(APPEND ARROW_BASE_LIBS tcmalloc profiler)
-#   add_definitions("-DTCMALLOC_ENABLED")
-#   set(ARROW_TCMALLOC_AVAILABLE 1)
-# endif()
-
-########################################################################
-# HDFS thirdparty setup
-
-if (DEFINED ENV{HADOOP_HOME})
-  set(HADOOP_HOME $ENV{HADOOP_HOME})
-  if (NOT EXISTS "${HADOOP_HOME}/include/hdfs.h")
-    message(STATUS "Did not find hdfs.h in expected location, using vendored one")
-    set(HADOOP_HOME "${THIRDPARTY_DIR}/hadoop")
-  endif()
-else()
-  set(HADOOP_HOME "${THIRDPARTY_DIR}/hadoop")
-endif()
-
-set(HDFS_H_PATH "${HADOOP_HOME}/include/hdfs.h")
-if (NOT EXISTS ${HDFS_H_PATH})
-  message(FATAL_ERROR "Did not find hdfs.h at ${HDFS_H_PATH}")
-endif()
-message(STATUS "Found hdfs.h at: " ${HDFS_H_PATH})
-
-include_directories(SYSTEM "${HADOOP_HOME}/include")
-
-############################################################
-# Linker setup
-############################################################
-set(ARROW_MIN_TEST_LIBS
-  arrow_static
-  gtest
-  gtest_main
-  ${ARROW_BASE_LIBS})
-
-if (APPLE)
-  set(ARROW_MIN_TEST_LIBS
-    ${ARROW_MIN_TEST_LIBS}
-    ${CMAKE_DL_LIBS})
-elseif(NOT MSVC)
-  set(ARROW_MIN_TEST_LIBS
-    ${ARROW_MIN_TEST_LIBS}
-    pthread
-    ${CMAKE_DL_LIBS})
-endif()
-
-set(ARROW_TEST_LINK_LIBS ${ARROW_MIN_TEST_LIBS})
-
-set(ARROW_BENCHMARK_LINK_LIBS
-  arrow_static
-  arrow_benchmark_main
-  ${ARROW_BASE_LIBS})
-
-############################################################
-# "make ctags" target
-############################################################
-if (UNIX)
-  add_custom_target(ctags ctags -R --languages=c++,c)
-endif (UNIX)
-
-############################################################
-# "make etags" target
-############################################################
-if (UNIX)
-  add_custom_target(tags etags --members --declarations
-  `find ${CMAKE_CURRENT_SOURCE_DIR}/src
-   -name \\*.cc -or -name \\*.hh -or -name \\*.cpp -or -name \\*.h -or -name \\*.c -or
-   -name \\*.f`)
-  add_custom_target(etags DEPENDS tags)
-endif (UNIX)
-
-############################################################
-# "make cscope" target
-############################################################
-if (UNIX)
-  add_custom_target(cscope find ${CMAKE_CURRENT_SOURCE_DIR}
-  ( -name \\*.cc -or -name \\*.hh -or -name \\*.cpp -or
-    -name \\*.h -or -name \\*.c -or -name \\*.f )
-  -exec echo \"{}\" \; > cscope.files && cscope -q -b VERBATIM)
-endif (UNIX)
-
-############################################################
-# "make lint" target
-############################################################
-if (UNIX)
-
-  file(GLOB_RECURSE LINT_FILES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
-    )
-
-  FOREACH(item ${LINT_FILES})
-    IF(NOT ((item MATCHES "_generated.h") OR
-            (item MATCHES "pyarrow_api.h")))
-      LIST(APPEND FILTERED_LINT_FILES ${item})
-    ENDIF()
-  ENDFOREACH(item ${LINT_FILES})
-
-  find_program(CPPLINT_BIN NAMES cpplint cpplint.py HINTS ${BUILD_SUPPORT_DIR})
-  message(STATUS "Found cpplint executable at ${CPPLINT_BIN}")
-
-  # Full lint
-  add_custom_target(lint ${CPPLINT_BIN}
-  --verbose=2
-  --linelength=90
-  --filter=-whitespace/comments,-readability/todo,-build/header_guard,-build/c++11,-runtime/references,-build/include_order
-  ${FILTERED_LINT_FILES})
-endif (UNIX)
-
-
-############################################################
-# "make format" and "make check-format" targets
-############################################################
-if (${CLANG_FORMAT_FOUND})
-  # runs clang format and updates files in place.
-  add_custom_target(format ${BUILD_SUPPORT_DIR}/run-clang-format.sh ${CMAKE_CURRENT_SOURCE_DIR} ${CLANG_FORMAT_BIN} 1
-    `find ${CMAKE_CURRENT_SOURCE_DIR}/src -name \\*.cc -or -name \\*.h |
-    sed -e '/_generated/g' |
-    sed -e '/windows_compatibility.h/g' |
-    sed -e '/pyarrow_api.h/g' |
-    sed -e '/config.h/g' |   # python/config.h
-    sed -e '/platform.h/g'`  # python/platform.h
-    )
-
-  # runs clang format and exits with a non-zero exit code if any files need to be reformatted
-  add_custom_target(check-format ${BUILD_SUPPORT_DIR}/run-clang-format.sh ${CMAKE_CURRENT_SOURCE_DIR} ${CLANG_FORMAT_BIN} 0
-  `find ${CMAKE_CURRENT_SOURCE_DIR}/src -name \\*.cc -or -name \\*.h | sed -e '/_generated/g'`)
-endif()
-
-
-############################################################
-# "make clang-tidy" and "make check-clang-tidy" targets
-############################################################
-if (${CLANG_TIDY_FOUND})
-  # runs clang-tidy and attempts to fix any warning automatically
-  add_custom_target(clang-tidy ${BUILD_SUPPORT_DIR}/run-clang-tidy.sh ${CLANG_TIDY_BIN} ${CMAKE_BINARY_DIR}/compile_commands.json 1
-  `find ${CMAKE_CURRENT_SOURCE_DIR}/src -name \\*.cc | sed -e '/_generated/g'`)
-  # runs clang-tidy and exits with a non-zero exit code if any errors are found.
-  add_custom_target(check-clang-tidy ${BUILD_SUPPORT_DIR}/run-clang-tidy.sh ${CLANG_TIDY_BIN} ${CMAKE_BINARY_DIR}/compile_commands.json
-  0 `find ${CMAKE_CURRENT_SOURCE_DIR}/src -name \\*.cc |grep -v -F -f ${CMAKE_CURRENT_SOURCE_DIR}/src/.clang-tidy-ignore | sed -e '/_generated/g'`)
-
-endif()
-
-
-
-############################################################
-# Subdirectories
-############################################################
-
-set(ARROW_LINK_LIBS
-    )
-
-set(ARROW_STATIC_LINK_LIBS)
-
-set(ARROW_SHARED_PRIVATE_LINK_LIBS
-  ${BOOST_SYSTEM_LIBRARY}
-  ${BOOST_FILESYSTEM_LIBRARY})
-
-set(ARROW_STATIC_PRIVATE_LINK_LIBS
-  ${BOOST_SYSTEM_LIBRARY}
-  ${BOOST_FILESYSTEM_LIBRARY})
-
-if (NOT MSVC)
-  set(ARROW_LINK_LIBS
+set(ARROW_TEST_SHARED_LINK_LIBS
+    arrow_testing_shared
+    arrow_shared
     ${ARROW_LINK_LIBS}
-    ${CMAKE_DL_LIBS}
-    pthread)
+    ${double-conversion_LIBRARIES}
+    ${BOOST_SYSTEM_LIBRARY}
+    ${BOOST_FILESYSTEM_LIBRARY}
+    ${BOOST_REGEX_LIBRARY}
+    ${ARROW_TEST_LINK_TOOLCHAIN})
+
+if(NOT MSVC)
+  set(ARROW_TEST_SHARED_LINK_LIBS ${ARROW_TEST_SHARED_LINK_LIBS} ${CMAKE_DL_LIBS})
 endif()
 
-if(RAPIDJSON_VENDORED)
-  set(ARROW_DEPENDENCIES ${ARROW_DEPENDENCIES} rapidjson_ep)
+if("${ARROW_TEST_LINKAGE}" STREQUAL "shared")
+  if(ARROW_BUILD_TESTS AND NOT ARROW_BUILD_SHARED)
+    message(FATAL_ERROR "If using shared linkage for unit tests, must also \
+pass ARROW_BUILD_SHARED=on")
+  endif()
+  # Use shared linking for unit tests if it's available
+  set(ARROW_TEST_LINK_LIBS ${ARROW_TEST_SHARED_LINK_LIBS})
+  set(ARROW_EXAMPLE_LINK_LIBS arrow_shared)
+else()
+  if(ARROW_BUILD_TESTS AND NOT ARROW_BUILD_STATIC)
+    message(FATAL_ERROR "If using static linkage for unit tests, must also \
+pass ARROW_BUILD_STATIC=on")
+  endif()
+  set(ARROW_TEST_LINK_LIBS ${ARROW_TEST_STATIC_LINK_LIBS})
+  set(ARROW_EXAMPLE_LINK_LIBS arrow_static)
 endif()
 
-if(FLATBUFFERS_VENDORED)
-  set(ARROW_DEPENDENCIES ${ARROW_DEPENDENCIES} flatbuffers_ep)
+if(ARROW_BUILD_BENCHMARKS)
+  # In the case that benchmark::benchmark_main is not available,
+  # we need to provide our own version. This only happens for older versions
+  # of benchmark.
+  if(NOT TARGET benchmark::benchmark_main)
+    add_library(arrow_benchmark_main STATIC src/arrow/util/benchmark_main.cc)
+    add_library(benchmark::benchmark_main ALIAS arrow_benchmark_main)
+  endif()
+
+  set(ARROW_BENCHMARK_LINK_LIBS benchmark::benchmark_main benchmark::benchmark
+                                ${ARROW_TEST_LINK_LIBS})
+  if(WIN32)
+    set(ARROW_BENCHMARK_LINK_LIBS Shlwapi.dll ${ARROW_BENCHMARK_LINK_LIBS})
+  endif()
+endif()
+
+set(ARROW_SYSTEM_LINK_LIBS)
+
+if(ARROW_JEMALLOC)
+  add_definitions(-DARROW_JEMALLOC)
+  add_definitions(-DARROW_JEMALLOC_INCLUDE_DIR=${JEMALLOC_INCLUDE_DIR})
+  list(APPEND ARROW_SYSTEM_LINK_LIBS jemalloc::jemalloc)
+endif(ARROW_JEMALLOC)
+
+if(THREADS_FOUND)
+  list(APPEND ARROW_SYSTEM_LINK_LIBS Threads::Threads)
+endif()
+
+if(NOT WIN32 AND NOT APPLE)
+  # Pass -lrt on Linux only
+  list(APPEND ARROW_SYSTEM_LINK_LIBS rt)
+endif()
+
+list(APPEND ARROW_LINK_LIBS ${ARROW_SYSTEM_LINK_LIBS})
+list(APPEND ARROW_STATIC_LINK_LIBS ${ARROW_SYSTEM_LINK_LIBS})
+list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS ${ARROW_SYSTEM_LINK_LIBS})
+
+#
+# Subdirectories
+#
+
+if(NOT WIN32 AND ARROW_PLASMA)
+  add_subdirectory(src/plasma)
 endif()
 
 add_subdirectory(src/arrow)
-add_subdirectory(src/arrow/io)
-if (ARROW_IPC)
-  add_subdirectory(src/arrow/ipc)
-  set(ARROW_DEPENDENCIES ${ARROW_DEPENDENCIES} metadata_fbs)
+
+if(ARROW_PARQUET)
+  add_subdirectory(src/parquet)
+  add_subdirectory(tools/parquet)
+  if(PARQUET_BUILD_EXAMPLES)
+    add_subdirectory(examples/parquet)
+  endif()
 endif()
 
-set(ARROW_SRCS
-  src/arrow/array.cc
-  src/arrow/buffer.cc
-  src/arrow/builder.cc
-  src/arrow/compare.cc
-  src/arrow/loader.cc
-  src/arrow/memory_pool.cc
-  src/arrow/pretty_print.cc
-  src/arrow/status.cc
-  src/arrow/table.cc
-  src/arrow/tensor.cc
-  src/arrow/type.cc
-  src/arrow/visitor.cc
-
-  src/arrow/io/file.cc
-  src/arrow/io/interfaces.cc
-  src/arrow/io/memory.cc
-
-  src/arrow/util/bit-util.cc
-  src/arrow/util/decimal.cc
-  src/arrow/util/key_value_metadata.cc
-)
-
-if (NOT ARROW_BOOST_HEADER_ONLY)
-  set(ARROW_SRCS ${ARROW_SRCS}
-    src/arrow/io/hdfs.cc
-    src/arrow/io/hdfs-internal.cc
-  )
+if(ARROW_JNI)
+  add_subdirectory(src/jni)
 endif()
 
-if (ARROW_IPC)
-  set(ARROW_SRCS ${ARROW_SRCS}
-    src/arrow/ipc/feather.cc
-    src/arrow/ipc/json.cc
-    src/arrow/ipc/json-internal.cc
-    src/arrow/ipc/metadata.cc
-    src/arrow/ipc/reader.cc
-    src/arrow/ipc/writer.cc
-  )
+if(ARROW_GANDIVA)
+  add_subdirectory(src/gandiva)
 endif()
 
-
-if(NOT APPLE AND NOT MSVC)
-  # Localize thirdparty symbols using a linker version script. This hides them
-  # from the client application. The OS X linker does not support the
-  # version-script option.
-  set(ARROW_SHARED_LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/arrow/symbols.map")
+if(ARROW_BUILD_EXAMPLES)
+  add_custom_target(runexample ctest -L example)
+  add_subdirectory(examples/arrow)
 endif()
 
-set(ARROW_ALL_SRCS
-  ${ARROW_SRCS})
+include(CMakePackageConfigHelpers)
 
-ADD_ARROW_LIB(arrow
-  SOURCES ${ARROW_ALL_SRCS}
-  DEPENDENCIES ${ARROW_DEPENDENCIES}
-  SHARED_LINK_FLAGS ${ARROW_SHARED_LINK_FLAGS}
-  SHARED_LINK_LIBS ${ARROW_LINK_LIBS}
-  SHARED_PRIVATE_LINK_LIBS ${ARROW_SHARED_PRIVATE_LINK_LIBS}
-  STATIC_LINK_LIBS ${ARROW_STATIC_LINK_LIBS}
-  STATIC_PRIVATE_LINK_LIBS ${ARROW_STATIC_PRIVATE_LINK_LIBS}
-)
+# Makes the project importable from the build directory
+export(EXPORT ${PROJECT_NAME}-targets
+       FILE "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Targets.cmake")
+configure_package_config_file(${PROJECT_NAME}Config.cmake.in
+                              "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
+                              INSTALL_DESTINATION
+                              "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake
+  VERSION ${${PROJECT_NAME}_VERSION}
+  COMPATIBILITY AnyNewerVersion)
 
-add_subdirectory(src/arrow/util)
+install(EXPORT ${PROJECT_NAME}-targets
+        FILE ${PROJECT_NAME}Targets.cmake
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
 
-if(ARROW_JEMALLOC)
-  add_subdirectory(src/arrow/jemalloc)
-endif()
-
-if(ARROW_PYTHON)
-  find_package(PythonLibsNew REQUIRED)
-  find_package(NumPy REQUIRED)
-
-  include_directories(SYSTEM
-    ${NUMPY_INCLUDE_DIRS}
-    ${PYTHON_INCLUDE_DIRS})
-
-  add_subdirectory(src/arrow/python)
-endif()
+config_summary()

@@ -18,15 +18,18 @@
 #ifndef ARROW_ALLOCATOR_H
 #define ARROW_ALLOCATOR_H
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <utility>
 
 #include "arrow/memory_pool.h"
 #include "arrow/status.h"
+#include "arrow/util/macros.h"
 
 namespace arrow {
 
+/// \brief A STL allocator delegating allocations to a Arrow MemoryPool
 template <class T>
 class stl_allocator {
  public:
@@ -43,19 +46,21 @@ class stl_allocator {
     using other = stl_allocator<U>;
   };
 
+  /// \brief Construct an allocator from the default MemoryPool
   stl_allocator() noexcept : pool_(default_memory_pool()) {}
+  /// \brief Construct an allocator from the given MemoryPool
   explicit stl_allocator(MemoryPool* pool) noexcept : pool_(pool) {}
 
   template <class U>
   stl_allocator(const stl_allocator<U>& rhs) noexcept : pool_(rhs.pool_) {}
 
-  ~stl_allocator() { pool_ = nullptr; }
+  ~stl_allocator() { pool_ = NULLPTR; }
 
   pointer address(reference r) const noexcept { return std::addressof(r); }
 
   const_pointer address(const_reference r) const noexcept { return std::addressof(r); }
 
-  pointer allocate(size_type n, const void* /*hint*/ = nullptr) {
+  pointer allocate(size_type n, const void* /*hint*/ = NULLPTR) {
     uint8_t* data;
     Status s = pool_->Allocate(n * sizeof(T), &data);
     if (!s.ok()) throw std::bad_alloc();
@@ -82,6 +87,53 @@ class stl_allocator {
 
  private:
   MemoryPool* pool_;
+};
+
+/// \brief A MemoryPool implementation delegating allocations to a STL allocator
+///
+/// Note that STL allocators don't provide a resizing operation, and therefore
+/// any buffer resizes will do a full reallocation and copy.
+template <typename Allocator = std::allocator<uint8_t>>
+class STLMemoryPool : public MemoryPool {
+ public:
+  /// \brief Construct a memory pool from the given allocator
+  explicit STLMemoryPool(const Allocator& alloc) : alloc_(alloc) {}
+
+  Status Allocate(int64_t size, uint8_t** out) override {
+    try {
+      *out = alloc_.allocate(size);
+    } catch (std::bad_alloc& e) {
+      return Status::OutOfMemory(e.what());
+    }
+    stats_.UpdateAllocatedBytes(size);
+    return Status::OK();
+  }
+
+  Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override {
+    uint8_t* old_ptr = *ptr;
+    try {
+      *ptr = alloc_.allocate(new_size);
+    } catch (std::bad_alloc& e) {
+      return Status::OutOfMemory(e.what());
+    }
+    memcpy(*ptr, old_ptr, std::min(old_size, new_size));
+    alloc_.deallocate(old_ptr, old_size);
+    stats_.UpdateAllocatedBytes(new_size - old_size);
+    return Status::OK();
+  }
+
+  void Free(uint8_t* buffer, int64_t size) override {
+    alloc_.deallocate(buffer, size);
+    stats_.UpdateAllocatedBytes(-size);
+  }
+
+  int64_t bytes_allocated() const override { return stats_.bytes_allocated(); }
+
+  int64_t max_memory() const override { return stats_.max_memory(); }
+
+ private:
+  Allocator alloc_;
+  internal::MemoryPoolStats stats_;
 };
 
 template <class T1, class T2>

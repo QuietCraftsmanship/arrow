@@ -30,8 +30,8 @@ def test_tensor_attrs():
 
     assert tensor.ndim == 2
     assert tensor.size == 40
-    assert tensor.shape == list(data.shape)
-    assert tensor.strides == list(data.strides)
+    assert tensor.shape == data.shape
+    assert tensor.strides == data.strides
 
     assert tensor.is_contiguous
     assert tensor.is_mutable
@@ -101,16 +101,94 @@ def test_tensor_ipc_roundtrip(tmpdir):
 
 
 def test_tensor_ipc_strided(tmpdir):
-    data = np.random.randn(10, 4)
-    tensor = pa.Tensor.from_numpy(data[::2])
+    data1 = np.random.randn(10, 4)
+    tensor1 = pa.Tensor.from_numpy(data1[::2])
+
+    data2 = np.random.randn(10, 6, 4)
+    tensor2 = pa.Tensor.from_numpy(data2[::, ::2, ::])
 
     path = os.path.join(str(tmpdir), 'pyarrow-tensor-ipc-strided')
-    with pytest.raises(ValueError):
-        mmap = pa.create_memory_map(path, 1024)
+    mmap = pa.create_memory_map(path, 2048)
+
+    for tensor in [tensor1, tensor2]:
+        mmap.seek(0)
         pa.write_tensor(tensor, mmap)
+
+        mmap.seek(0)
+        result = pa.read_tensor(mmap)
+
+        assert result.equals(tensor)
+
+
+def test_tensor_equals():
+    def eq(a, b):
+        assert a.equals(b)
+        assert a == b
+        assert not (a != b)
+
+    def ne(a, b):
+        assert not a.equals(b)
+        assert not (a == b)
+        assert a != b
+
+    data = np.random.randn(10, 6, 4)[::, ::2, ::]
+    tensor1 = pa.Tensor.from_numpy(data)
+    tensor2 = pa.Tensor.from_numpy(np.ascontiguousarray(data))
+    eq(tensor1, tensor2)
+    data = data.copy()
+    data[9, 0, 0] = 1.0
+    tensor2 = pa.Tensor.from_numpy(np.ascontiguousarray(data))
+    ne(tensor1, tensor2)
+
+
+def test_tensor_hashing():
+    # Tensors are unhashable
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(pa.Tensor.from_numpy(np.arange(10)))
 
 
 def test_tensor_size():
     data = np.random.randn(10, 4)
     tensor = pa.Tensor.from_numpy(data)
     assert pa.get_tensor_size(tensor) > (data.size * 8)
+
+
+def test_read_tensor(tmpdir):
+    # Create and write tensor tensor
+    data = np.random.randn(10, 4)
+    tensor = pa.Tensor.from_numpy(data)
+    data_size = pa.get_tensor_size(tensor)
+    path = os.path.join(str(tmpdir), 'pyarrow-tensor-ipc-read-tensor')
+    write_mmap = pa.create_memory_map(path, data_size)
+    pa.write_tensor(tensor, write_mmap)
+    # Try to read tensor
+    read_mmap = pa.memory_map(path, mode='r')
+    array = pa.read_tensor(read_mmap).to_numpy()
+    np.testing.assert_equal(data, array)
+
+
+@pytest.mark.skipif(sys.version_info < (3,),
+                    reason="requires Python 3+")
+def test_tensor_memoryview():
+    # Tensors support the PEP 3118 buffer protocol
+    for dtype, expected_format in [(np.int8, '=b'),
+                                   (np.int64, '=q'),
+                                   (np.uint64, '=Q'),
+                                   (np.float16, 'e'),
+                                   (np.float64, 'd'),
+                                   ]:
+        data = np.arange(10, dtype=dtype)
+        dtype = data.dtype
+        lst = data.tolist()
+        tensor = pa.Tensor.from_numpy(data)
+        m = memoryview(tensor)
+        assert m.format == expected_format
+        assert m.shape == data.shape
+        assert m.strides == data.strides
+        assert m.ndim == 1
+        assert m.nbytes == data.nbytes
+        assert m.itemsize == data.itemsize
+        assert m.itemsize * 8 == tensor.type.bit_width
+        assert np.frombuffer(m, dtype).tolist() == lst
+        del tensor, data
+        assert np.frombuffer(m, dtype).tolist() == lst

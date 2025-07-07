@@ -17,13 +17,39 @@
 # specific language governing permissions and limitations
 # under the License.
 
-base_dir="$(cd .; pwd)"
-lib_dir="${base_dir}/arrow-glib/.libs"
+test_dir="$(cd $(dirname $0); pwd)"
+build_dir="$(cd .; pwd)"
 
-LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH}"
+modules="arrow-glib arrow-cuda-glib gandiva-glib parquet-glib plasma-glib"
+
+for module in ${modules}; do
+  module_build_dir="${build_dir}/${module}"
+  libtool_dir="${module_build_dir}/.libs"
+  if [ -d "${libtool_dir}" ]; then
+    LD_LIBRARY_PATH="${libtool_dir}:${LD_LIBRARY_PATH}"
+  else
+    if [ -d "${module_build_dir}" ]; then
+      LD_LIBRARY_PATH="${module_build_dir}:${LD_LIBRARY_PATH}"
+    fi
+  fi
+done
+export LD_LIBRARY_PATH
 
 if [ -f "Makefile" -a "${NO_MAKE}" != "yes" ]; then
   make -j8 > /dev/null || exit $?
 fi
 
-${GDB} ruby ${base_dir}/test/run-test.rb "$@"
+for module in ${modules}; do
+  MODULE_TYPELIB_DIR_VAR_NAME="$(echo ${module} | tr a-z- A-Z_)_TYPELIB_DIR"
+  module_typelib_dir=$(eval "echo \${${MODULE_TYPELIB_DIR_VAR_NAME}}")
+  if [ -z "${module_typelib_dir}" ]; then
+    module_typelib_dir="${build_dir}/${module}"
+  fi
+
+  if [ -d "${module_typelib_dir}" ]; then
+    GI_TYPELIB_PATH="${module_typelib_dir}:${GI_TYPELIB_PATH}"
+  fi
+done
+export GI_TYPELIB_PATH
+
+${GDB} ruby ${test_dir}/run-test.rb "$@"

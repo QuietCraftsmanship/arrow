@@ -17,37 +17,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-var fs = require('fs')
-var process = require('process');
-var arrow = require('../lib/arrow.js');
-var program = require('commander');
+const Path = require(`path`);
+const here = Path.resolve(__dirname, '../');
+const tsnode = require.resolve(`ts-node/register`);
+const arrow2csv = Path.join(here, `src/bin/arrow2csv.ts`);
+const env = { ...process.env, TS_NODE_TRANSPILE_ONLY: `true` };
 
-function list (val) {
-    return val.split(',');
-}
-
-program
-  .version('0.1.0')
-  .usage('[options] <file>')
-  .option('-s --schema <list>', 'A comma-separated list of column names', list)
-  .parse(process.argv);
-
-if (!program.schema) {
-    program.outputHelp();
-    process.exit(1);
-}
-
-var buf = fs.readFileSync(process.argv[process.argv.length - 1]);
-var reader = arrow.getReader(buf);
-var nrecords
-
-nrecords = reader.loadNextBatch();
-while (nrecords > 0) {
-  for (var i = 0; i < nrecords; i += 1|0) {
-    console.log(program.schema.map(function (field) {
-      return '' + reader.getVector(field).get(i);
-    }).join(','));
-  }
-  nrecords = reader.loadNextBatch();
-  if (nrecords > 0) console.log('---');
-}
+require('child_process').spawn(`node`, [
+    `-r`, tsnode, arrow2csv, ...process.argv.slice(2)
+], { cwd: here, env, stdio: `inherit` });

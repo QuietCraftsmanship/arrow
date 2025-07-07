@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "gtest/gtest.h"
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 #include "arrow/util/key_value_metadata.h"
-
-#include "arrow/test-util.h"
 
 namespace arrow {
 
@@ -81,6 +84,16 @@ TEST(KeyValueMetadataTest, Copy) {
   ASSERT_TRUE(metadata.Equals(*metadata2));
 }
 
+TEST(KeyValueMetadataTest, FindKey) {
+  std::vector<std::string> keys = {"foo", "bar"};
+  std::vector<std::string> values = {"bizz", "buzz"};
+  KeyValueMetadata metadata(keys, values);
+
+  ASSERT_EQ(0, metadata.FindKey("foo"));
+  ASSERT_EQ(1, metadata.FindKey("bar"));
+  ASSERT_EQ(-1, metadata.FindKey("baz"));
+}
+
 TEST(KeyValueMetadataTest, Equals) {
   std::vector<std::string> keys = {"foo", "bar"};
   std::vector<std::string> values = {"bizz", "buzz"};
@@ -91,6 +104,21 @@ TEST(KeyValueMetadataTest, Equals) {
 
   ASSERT_TRUE(metadata.Equals(metadata2));
   ASSERT_FALSE(metadata.Equals(metadata3));
+}
+
+TEST(KeyValueMetadataTest, ToString) {
+  std::vector<std::string> keys = {"foo", "bar"};
+  std::vector<std::string> values = {"bizz", "buzz"};
+
+  KeyValueMetadata metadata(keys, values);
+
+  std::string result = metadata.ToString();
+  std::string expected = R"(
+-- metadata --
+foo: bizz
+bar: buzz)";
+
+  ASSERT_EQ(expected, result);
 }
 
 }  // namespace arrow

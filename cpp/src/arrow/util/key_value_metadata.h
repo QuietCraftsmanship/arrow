@@ -29,12 +29,14 @@
 
 namespace arrow {
 
+/// \brief A container for key-value pair type metadata. Not thread-safe
 class ARROW_EXPORT KeyValueMetadata {
  public:
   KeyValueMetadata();
-  KeyValueMetadata(
-      const std::vector<std::string>& keys, const std::vector<std::string>& values);
+  KeyValueMetadata(const std::vector<std::string>& keys,
+                   const std::vector<std::string>& values);
   explicit KeyValueMetadata(const std::unordered_map<std::string, std::string>& map);
+  virtual ~KeyValueMetadata() = default;
 
   void ToUnorderedMap(std::unordered_map<std::string, std::string>* out) const;
 
@@ -43,19 +45,36 @@ class ARROW_EXPORT KeyValueMetadata {
   void reserve(int64_t n);
   int64_t size() const;
 
-  std::string key(int64_t i) const;
-  std::string value(int64_t i) const;
+  const std::string& key(int64_t i) const;
+  const std::string& value(int64_t i) const;
+
+  /// \brief Perform linear search for key, returning -1 if not found
+  int FindKey(const std::string& key) const;
 
   std::shared_ptr<KeyValueMetadata> Copy() const;
 
   bool Equals(const KeyValueMetadata& other) const;
+  std::string ToString() const;
 
  private:
   std::vector<std::string> keys_;
   std::vector<std::string> values_;
 
-  DISALLOW_COPY_AND_ASSIGN(KeyValueMetadata);
+  ARROW_DISALLOW_COPY_AND_ASSIGN(KeyValueMetadata);
 };
+
+/// \brief Create a KeyValueMetadata instance
+///
+/// \param pairs key-value mapping
+std::shared_ptr<KeyValueMetadata> ARROW_EXPORT
+key_value_metadata(const std::unordered_map<std::string, std::string>& pairs);
+
+/// \brief Create a KeyValueMetadata instance
+///
+/// \param keys sequence of metadata keys
+/// \param values sequence of corresponding metadata values
+std::shared_ptr<KeyValueMetadata> ARROW_EXPORT key_value_metadata(
+    const std::vector<std::string>& keys, const std::vector<std::string>& values);
 
 }  // namespace arrow
 

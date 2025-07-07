@@ -12,31 +12,35 @@
 
 #include "arrow/status.h"
 
-#include <assert.h>
+#include <cassert>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+
+#include "arrow/util/logging.h"
 
 namespace arrow {
 
-Status::Status(StatusCode code, const std::string& msg, int16_t posix_code) {
-  assert(code != StatusCode::OK);
-  const uint32_t size = static_cast<uint32_t>(msg.size());
-  char* result = new char[size + 7];
-  memcpy(result, &size, sizeof(size));
-  result[4] = static_cast<char>(code);
-  memcpy(result + 5, &posix_code, sizeof(posix_code));
-  memcpy(result + 7, msg.c_str(), msg.size());
-  state_ = result;
+Status::Status(StatusCode code, const std::string& msg) {
+  ARROW_CHECK_NE(code, StatusCode::OK) << "Cannot construct ok status with message";
+  state_ = new State;
+  state_->code = code;
+  state_->msg = msg;
 }
 
-const char* Status::CopyState(const char* state) {
-  uint32_t size;
-  memcpy(&size, state, sizeof(size));
-  char* result = new char[size + 7];
-  memcpy(result, state, size + 7);
-  return result;
+void Status::CopyFrom(const Status& s) {
+  delete state_;
+  if (s.state_ == nullptr) {
+    state_ = nullptr;
+  } else {
+    state_ = new State(*s.state_);
+  }
 }
 
 std::string Status::CodeAsString() const {
-  if (state_ == NULL) { return "OK"; }
+  if (state_ == nullptr) {
+    return "OK";
+  }
 
   const char* type;
   switch (code()) {
@@ -58,11 +62,44 @@ std::string Status::CodeAsString() const {
     case StatusCode::IOError:
       type = "IOError";
       break;
+    case StatusCode::CapacityError:
+      type = "Capacity error";
+      break;
+    case StatusCode::IndexError:
+      type = "Index error";
+      break;
     case StatusCode::UnknownError:
       type = "Unknown error";
       break;
     case StatusCode::NotImplemented:
       type = "NotImplemented";
+      break;
+    case StatusCode::SerializationError:
+      type = "Serialization error";
+      break;
+    case StatusCode::PythonError:
+      type = "Python error";
+      break;
+    case StatusCode::PlasmaObjectExists:
+      type = "Plasma object exists";
+      break;
+    case StatusCode::PlasmaObjectNonexistent:
+      type = "Plasma object is nonexistent";
+      break;
+    case StatusCode::PlasmaStoreFull:
+      type = "Plasma store is full";
+      break;
+    case StatusCode::PlasmaObjectAlreadySealed:
+      type = "Plasma object is already sealed";
+      break;
+    case StatusCode::CodeGenError:
+      type = "CodeGenError in Gandiva";
+      break;
+    case StatusCode::ExpressionValidationError:
+      type = "ExpressionValidationError";
+      break;
+    case StatusCode::ExecutionError:
+      type = "ExecutionError in Gandiva";
       break;
     default:
       type = "Unknown";
@@ -73,14 +110,32 @@ std::string Status::CodeAsString() const {
 
 std::string Status::ToString() const {
   std::string result(CodeAsString());
-  if (state_ == NULL) { return result; }
-
-  result.append(": ");
-
-  uint32_t length;
-  memcpy(&length, state_, sizeof(length));
-  result.append(reinterpret_cast<const char*>(state_ + 7), length);
+  if (state_ == NULL) {
+    return result;
+  }
+  result += ": ";
+  result += state_->msg;
   return result;
 }
+
+void Status::Abort() const { Abort(std::string()); }
+
+void Status::Abort(const std::string& message) const {
+  std::cerr << "-- Arrow Fatal Error --\n";
+  if (!message.empty()) {
+    std::cerr << message << "\n";
+  }
+  std::cerr << ToString() << std::endl;
+  std::abort();
+}
+
+#ifdef ARROW_EXTRA_ERROR_CONTEXT
+void Status::AddContextLine(const char* filename, int line, const char* expr) {
+  ARROW_CHECK(!ok()) << "Cannot add context line to ok status";
+  std::stringstream ss;
+  ss << "\nIn " << filename << ", line " << line << ", code: " << expr;
+  state_->msg += ss.str();
+}
+#endif
 
 }  // namespace arrow

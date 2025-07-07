@@ -25,8 +25,26 @@
 #include <arrow-glib/error.hpp>
 #include <arrow-glib/record-batch.hpp>
 #include <arrow-glib/schema.hpp>
+#include <arrow-glib/field.hpp>
 
 #include <sstream>
+
+static inline bool
+garrow_record_batch_adjust_index(const std::shared_ptr<arrow::RecordBatch> arrow_record_batch,
+                                 gint &i)
+{
+  auto n_columns = arrow_record_batch->num_columns();
+  if (i < 0) {
+    i += n_columns;
+    if (i < 0) {
+      return false;
+    }
+  }
+  if (i >= n_columns) {
+    return false;
+  }
+  return true;
+}
 
 G_BEGIN_DECLS
 
@@ -54,10 +72,10 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowRecordBatch,
                            garrow_record_batch,
                            G_TYPE_OBJECT)
 
-#define GARROW_RECORD_BATCH_GET_PRIVATE(obj)               \
-  (G_TYPE_INSTANCE_GET_PRIVATE((obj),               \
-                               GARROW_TYPE_RECORD_BATCH,   \
-                               GArrowRecordBatchPrivate))
+#define GARROW_RECORD_BATCH_GET_PRIVATE(obj)         \
+  static_cast<GArrowRecordBatchPrivate *>(           \
+     garrow_record_batch_get_instance_private(       \
+       GARROW_RECORD_BATCH(obj)))
 
 static void
 garrow_record_batch_finalize(GObject *object)
@@ -135,13 +153,15 @@ garrow_record_batch_class_init(GArrowRecordBatchClass *klass)
  * @schema: The schema of the record batch.
  * @n_rows: The number of the rows in the record batch.
  * @columns: (element-type GArrowArray): The columns in the record batch.
+ * @error: (nullable): Return location for a #GError or %NULL.
  *
- * Returns: A newly created #GArrowRecordBatch.
+ * Returns: (nullable): A newly created #GArrowRecordBatch or %NULL on error.
  */
 GArrowRecordBatch *
 garrow_record_batch_new(GArrowSchema *schema,
                         guint32 n_rows,
-                        GList *columns)
+                        GList *columns,
+                        GError **error)
 {
   std::vector<std::shared_ptr<arrow::Array>> arrow_columns;
   for (GList *node = columns; node; node = node->next) {
@@ -150,10 +170,14 @@ garrow_record_batch_new(GArrowSchema *schema,
   }
 
   auto arrow_record_batch =
-    std::make_shared<arrow::RecordBatch>(garrow_schema_get_raw(schema),
-                                         n_rows,
-                                         arrow_columns);
-  return garrow_record_batch_new_raw(&arrow_record_batch);
+    arrow::RecordBatch::Make(garrow_schema_get_raw(schema),
+                             n_rows, arrow_columns);
+  auto status = arrow_record_batch->Validate();
+  if (garrow_error_check(error, status, "[record-batch][new]")) {
+    return garrow_record_batch_new_raw(&arrow_record_batch);
+  } else {
+    return NULL;
+  }
 }
 
 /**
@@ -193,15 +217,21 @@ garrow_record_batch_get_schema(GArrowRecordBatch *record_batch)
 /**
  * garrow_record_batch_get_column:
  * @record_batch: A #GArrowRecordBatch.
- * @i: The index of the target column.
+ * @i: The index of the target column. If it's negative, index is
+ *   counted backward from the end of the columns. `-1` means the last
+ *   column.
  *
- * Returns: (transfer full): The i-th column in the record batch.
+ * Returns: (transfer full) (nullable): The i-th column in the record batch
+ *   on success, %NULL on out of index.
  */
 GArrowArray *
 garrow_record_batch_get_column(GArrowRecordBatch *record_batch,
-                               guint i)
+                               gint i)
 {
   const auto arrow_record_batch = garrow_record_batch_get_raw(record_batch);
+  if (!garrow_record_batch_adjust_index(arrow_record_batch, i)) {
+    return NULL;
+  }
   auto arrow_column = arrow_record_batch->column(i);
   return garrow_array_new_raw(&arrow_column);
 }
@@ -219,7 +249,8 @@ garrow_record_batch_get_columns(GArrowRecordBatch *record_batch)
   const auto arrow_record_batch = garrow_record_batch_get_raw(record_batch);
 
   GList *columns = NULL;
-  for (auto arrow_column : arrow_record_batch->columns()) {
+  for (int i = 0; i < arrow_record_batch->num_columns(); ++i) {
+    auto arrow_column = arrow_record_batch->column(i);
     GArrowArray *column = garrow_array_new_raw(&arrow_column);
     columns = g_list_prepend(columns, column);
   }
@@ -230,15 +261,21 @@ garrow_record_batch_get_columns(GArrowRecordBatch *record_batch)
 /**
  * garrow_record_batch_get_column_name:
  * @record_batch: A #GArrowRecordBatch.
- * @i: The index of the target column.
+ * @i: The index of the target column. If it's negative, index is
+ *   counted backward from the end of the columns. `-1` means the last
+ *   column.
  *
- * Returns: The name of the i-th column in the record batch.
+ * Returns: (nullable): The name of the i-th column in the record batch
+ *   on success, %NULL on out of index
  */
 const gchar *
 garrow_record_batch_get_column_name(GArrowRecordBatch *record_batch,
-                                    guint i)
+                                    gint i)
 {
   const auto arrow_record_batch = garrow_record_batch_get_raw(record_batch);
+  if (!garrow_record_batch_adjust_index(arrow_record_batch, i)) {
+    return NULL;
+  }
   return arrow_record_batch->column_name(i).c_str();
 }
 
@@ -294,7 +331,8 @@ garrow_record_batch_slice(GArrowRecordBatch *record_batch,
  * @record_batch: A #GArrowRecordBatch.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
- * Returns: (nullable): The formatted record batch content or %NULL on error.
+ * Returns: (nullable) (transfer full):
+ *   The formatted record batch content or %NULL on error.
  *
  *   The returned string should be freed when with g_free() when no
  *   longer needed.
@@ -314,6 +352,63 @@ garrow_record_batch_to_string(GArrowRecordBatch *record_batch, GError **error)
   }
 }
 
+/**
+ * garrow_record_batch_add_column:
+ * @record_batch: A #GArrowRecordBatch.
+ * @i: The index of the new column.
+ * @field: The field to be added.
+ * @column: The column to be added.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ *   #GArrowRecordBatch that has a new column or %NULL on error.
+ *
+ * Since: 0.9.0
+ */
+GArrowRecordBatch *
+garrow_record_batch_add_column(GArrowRecordBatch *record_batch,
+                               guint i,
+                               GArrowField *field,
+                               GArrowArray *column,
+                               GError **error)
+{
+  const auto arrow_record_batch = garrow_record_batch_get_raw(record_batch);
+  const auto arrow_field = garrow_field_get_raw(field);
+  const auto arrow_column = garrow_array_get_raw(column);
+  std::shared_ptr<arrow::RecordBatch> arrow_new_record_batch;
+  auto status = arrow_record_batch->AddColumn(i, arrow_field, arrow_column, &arrow_new_record_batch);
+  if (garrow_error_check(error, status, "[record-batch][add-column]")) {
+    return garrow_record_batch_new_raw(&arrow_new_record_batch);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_record_batch_remove_column:
+ * @record_batch: A #GArrowRecordBatch.
+ * @i: The index of the new column.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ *   #GArrowRecordBatch that doesn't have the column or %NULL on error.
+ *
+ * Since: 0.9.0
+ */
+GArrowRecordBatch *
+garrow_record_batch_remove_column(GArrowRecordBatch *record_batch,
+                                  guint i,
+                                  GError **error)
+{
+  const auto arrow_record_batch = garrow_record_batch_get_raw(record_batch);
+  std::shared_ptr<arrow::RecordBatch> arrow_new_record_batch;
+  auto status = arrow_record_batch->RemoveColumn(i, &arrow_new_record_batch);
+  if (garrow_error_check(error, status, "[record-batch][remove-column]")) {
+    return garrow_record_batch_new_raw(&arrow_new_record_batch);
+  } else {
+    return NULL;
+  }
+}
 
 G_END_DECLS
 

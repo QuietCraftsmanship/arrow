@@ -21,6 +21,8 @@
 #  include <config.h>
 #endif
 
+#include <arrow-glib/basic-data-type.hpp>
+#include <arrow-glib/error.hpp>
 #include <arrow-glib/field.hpp>
 #include <arrow-glib/schema.hpp>
 
@@ -47,10 +49,10 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowSchema,
                            garrow_schema,
                            G_TYPE_OBJECT)
 
-#define GARROW_SCHEMA_GET_PRIVATE(obj)                  \
-  (G_TYPE_INSTANCE_GET_PRIVATE((obj),                   \
-                               GARROW_TYPE_SCHEMA,      \
-                               GArrowSchemaPrivate))
+#define GARROW_SCHEMA_GET_PRIVATE(obj)         \
+  static_cast<GArrowSchemaPrivate *>(          \
+     garrow_schema_get_instance_private(       \
+       GARROW_SCHEMA(obj)))
 
 static void
 garrow_schema_finalize(GObject *object)
@@ -172,7 +174,7 @@ garrow_schema_get_field(GArrowSchema *schema, guint i)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
   auto arrow_field = arrow_schema->field(i);
-  return garrow_field_new_raw(&arrow_field);
+  return garrow_field_new_raw(&arrow_field, nullptr);
 }
 
 /**
@@ -191,7 +193,8 @@ garrow_schema_get_field_by_name(GArrowSchema *schema,
   if (arrow_field == nullptr) {
     return NULL;
   } else {
-    return garrow_field_new_raw(&arrow_field);
+    auto arrow_data_type = arrow_field->type();
+    return garrow_field_new_raw(&arrow_field, nullptr);
   }
 }
 
@@ -222,7 +225,7 @@ garrow_schema_get_fields(GArrowSchema *schema)
 
   GList *fields = NULL;
   for (auto arrow_field : arrow_schema->fields()) {
-    GArrowField *field = garrow_field_new_raw(&arrow_field);
+    auto field = garrow_field_new_raw(&arrow_field, nullptr);
     fields = g_list_prepend(fields, field);
   }
 
@@ -240,6 +243,90 @@ garrow_schema_to_string(GArrowSchema *schema)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
   return g_strdup(arrow_schema->ToString().c_str());
+}
+
+/**
+ * garrow_schema_add_field:
+ * @schema: A #GArrowSchema.
+ * @i: The index of the new field.
+ * @field: The field to be added.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ * #GArrowSchema that has a new field or %NULL on error.
+ *
+ * Since: 0.10.0
+ */
+GArrowSchema *
+garrow_schema_add_field(GArrowSchema *schema,
+                        guint i,
+                        GArrowField *field,
+                        GError **error)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  const auto arrow_field = garrow_field_get_raw(field);
+  std::shared_ptr<arrow::Schema> arrow_new_schema;
+  auto status = arrow_schema->AddField(i, arrow_field, &arrow_new_schema);
+  if (garrow_error_check(error, status, "[schema][add-field]")) {
+    return garrow_schema_new_raw(&arrow_new_schema);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_schema_remove_field:
+ * @schema: A #GArrowSchema.
+ * @i: The index of the field to be removed.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ * #GArrowSchema that doesn't have the field or %NULL on error.
+ *
+ * Since: 0.10.0
+ */
+GArrowSchema *
+garrow_schema_remove_field(GArrowSchema *schema,
+                           guint i,
+                           GError **error)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  std::shared_ptr<arrow::Schema> arrow_new_schema;
+  auto status = arrow_schema->RemoveField(i, &arrow_new_schema);
+  if (garrow_error_check(error, status, "[schema][remove-field]")) {
+    return garrow_schema_new_raw(&arrow_new_schema);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_schema_replace_field:
+ * @schema: A #GArrowSchema.
+ * @i: The index of the field to be replaced.
+ * @field: The newly added #GArrowField.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ * #GArrowSchema that has @field as the @i-th field or %NULL on error.
+ *
+ * Since: 0.10.0
+ */
+GArrowSchema *
+garrow_schema_replace_field(GArrowSchema *schema,
+                            guint i,
+                            GArrowField *field,
+                            GError **error)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  const auto arrow_field = garrow_field_get_raw(field);
+  std::shared_ptr<arrow::Schema> arrow_new_schema;
+  auto status = arrow_schema->SetField(i, arrow_field, &arrow_new_schema);
+  if (garrow_error_check(error, status, "[schema][replace-field]")) {
+    return garrow_schema_new_raw(&arrow_new_schema);
+  } else {
+    return NULL;
+  }
 }
 
 G_END_DECLS

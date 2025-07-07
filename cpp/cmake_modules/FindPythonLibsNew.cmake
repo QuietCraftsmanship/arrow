@@ -9,6 +9,8 @@
 #  PYTHON_INCLUDE_DIRS        - path to where Python.h is found
 #  PYTHON_SITE_PACKAGES       - path to installation site-packages
 #  PYTHON_IS_DEBUG            - whether the Python interpreter is a debug build
+#  PYTHON_OTHER_LIBS          - third-party libraries (as link flags) needed
+#                               for linking with Python
 #
 #  PYTHON_INCLUDE_PATH        - path to where Python.h is found (deprecated)
 #
@@ -87,11 +89,11 @@ print(hasattr(sys, 'gettotalrefcount')+0);
 print(struct.calcsize('@P'));
 print(s.get_config_var('LDVERSION') or s.get_config_var('VERSION'));
 print(s.get_config_var('LIBPL'));
+print(s.get_config_var('LIBS') or '');
 "
     RESULT_VARIABLE _PYTHON_SUCCESS
     OUTPUT_VARIABLE _PYTHON_VALUES
-    ERROR_VARIABLE _PYTHON_ERROR_VALUE
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    ERROR_VARIABLE _PYTHON_ERROR_VALUE)
 
 if(NOT _PYTHON_SUCCESS MATCHES 0)
     if(PythonLibsNew_FIND_REQUIRED)
@@ -114,6 +116,7 @@ list(GET _PYTHON_VALUES 5 PYTHON_IS_DEBUG)
 list(GET _PYTHON_VALUES 6 PYTHON_SIZEOF_VOID_P)
 list(GET _PYTHON_VALUES 7 PYTHON_LIBRARY_SUFFIX)
 list(GET _PYTHON_VALUES 8 PYTHON_LIBRARY_PATH)
+list(GET _PYTHON_VALUES 9 PYTHON_OTHER_LIBS)
 
 # Make sure the Python has the same pointer-size as the chosen compiler
 # Skip the check on OS X, it doesn't consistently have CMAKE_SIZEOF_VOID_P defined
@@ -146,22 +149,27 @@ if(CMAKE_HOST_WIN32)
     set(PYTHON_LIBRARY
       "${PYTHON_PREFIX}/libs/Python${PYTHON_LIBRARY_SUFFIX}.lib")
   else()
-    set(PYTHON_LIBRARY "${PYTHON_PREFIX}/libs/libpython${PYTHON_LIBRARY_SUFFIX}.a")
+    find_library(PYTHON_LIBRARY
+        NAMES "python${PYTHON_LIBRARY_SUFFIX}"
+        PATHS "${PYTHON_PREFIX}" NO_DEFAULT_PATH
+        PATH_SUFFIXES "lib" "libs")
   endif()
 elseif(APPLE)
-  # In some cases libpythonX.X.dylib is not part of the PYTHON_PREFIX and we
-  # need to call `python-config --prefix` to determine the correct location.
 
-  find_program(PYTHON_CONFIG python-config
-      NO_CMAKE_SYSTEM_PATH)
-  if (PYTHON_CONFIG)
-    execute_process(
-        COMMAND "${PYTHON_CONFIG}" "--prefix"
-        OUTPUT_VARIABLE PYTHON_CONFIG_PREFIX
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    set(PYTHON_LIBRARY "${PYTHON_CONFIG_PREFIX}/lib/libpython${PYTHON_LIBRARY_SUFFIX}.dylib")
-  else()
-    set(PYTHON_LIBRARY "${PYTHON_PREFIX}/lib/libpython${PYTHON_LIBRARY_SUFFIX}.dylib")
+  set(PYTHON_LIBRARY "${PYTHON_PREFIX}/lib/libpython${PYTHON_LIBRARY_SUFFIX}.dylib")
+
+  if (NOT EXISTS ${PYTHON_LIBRARY})
+    # In some cases libpythonX.X.dylib is not part of the PYTHON_PREFIX and we
+    # need to call `python-config --prefix` to determine the correct location.
+    find_program(PYTHON_CONFIG python-config
+        NO_CMAKE_SYSTEM_PATH)
+    if (PYTHON_CONFIG)
+      execute_process(
+          COMMAND "${PYTHON_CONFIG}" "--prefix"
+          OUTPUT_VARIABLE PYTHON_CONFIG_PREFIX
+          OUTPUT_STRIP_TRAILING_WHITESPACE)
+      set(PYTHON_LIBRARY "${PYTHON_CONFIG_PREFIX}/lib/libpython${PYTHON_LIBRARY_SUFFIX}.dylib")
+    endif()
   endif()
 else()
     if(${PYTHON_SIZEOF_VOID_P} MATCHES 8)

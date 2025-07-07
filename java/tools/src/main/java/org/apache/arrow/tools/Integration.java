@@ -1,32 +1,41 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package org.apache.arrow.tools;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.file.ArrowBlock;
-import org.apache.arrow.vector.file.ArrowFileReader;
-import org.apache.arrow.vector.file.ArrowFileWriter;
-import org.apache.arrow.vector.file.json.JsonFileReader;
-import org.apache.arrow.vector.file.json.JsonFileWriter;
+import org.apache.arrow.vector.ipc.ArrowFileReader;
+import org.apache.arrow.vector.ipc.ArrowFileWriter;
+import org.apache.arrow.vector.ipc.JsonFileReader;
+import org.apache.arrow.vector.ipc.JsonFileWriter;
+import org.apache.arrow.vector.ipc.message.ArrowBlock;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Validator;
 import org.apache.commons.cli.CommandLine;
@@ -37,14 +46,9 @@ import org.apache.commons.cli.PosixParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-
+/**
+ * Application for cross language integration testing.
+ */
 public class Integration {
   private static final Logger LOGGER = LoggerFactory.getLogger(Integration.class);
   private final Options options;
@@ -57,6 +61,9 @@ public class Integration {
         .values()));
   }
 
+  /**
+   *  Main method.
+   */
   public static void main(String[] args) {
     try {
       new Integration().run(args);
@@ -90,10 +97,20 @@ public class Integration {
     return f;
   }
 
+  static void extractDictionaryEncodings(List<Field> fields, List<DictionaryEncoding> encodings) {
+    for (Field field : fields) {
+      DictionaryEncoding encoding = field.getDictionary();
+      if (encoding != null) {
+        encodings.add(encoding);
+      }
+
+      extractDictionaryEncodings(field.getChildren(), encodings);
+    }
+  }
+
   void run(String[] args) throws ParseException, IOException {
     CommandLineParser parser = new PosixParser();
     CommandLine cmd = parser.parse(options, args, false);
-
 
     Command command = toCommand(cmd.getOptionValue("command"));
     File arrowFile = validateFile("arrow", cmd.getOptionValue("arrow"), command.arrowExists);
@@ -105,11 +122,14 @@ public class Integration {
     try {
       return Command.valueOf(commandName);
     } catch (IllegalArgumentException e) {
-      throw new IllegalArgumentException("Unknown command: " + commandName + " expected one of "
-          + Arrays.toString(Command.values()));
+      throw new IllegalArgumentException("Unknown command: " + commandName + " expected one of " +
+          Arrays.toString(Command.values()));
     }
   }
 
+  /**
+   * Commands (actions) the application can perform.
+   */
   enum Command {
     ARROW_TO_JSON(true, false) {
       @Override
@@ -124,7 +144,7 @@ public class Integration {
           LOGGER.debug("Found schema: " + schema);
           try (JsonFileWriter writer = new JsonFileWriter(jsonFile, JsonFileWriter.config()
               .pretty(true))) {
-            writer.start(schema);
+            writer.start(schema, arrowReader);
             for (ArrowBlock rbBlock : arrowReader.getRecordBlocks()) {
               if (!arrowReader.loadRecordBatch(rbBlock)) {
                 throw new IOException("Expected to load record batch");
@@ -147,7 +167,7 @@ public class Integration {
           try (FileOutputStream fileOutputStream = new FileOutputStream(arrowFile);
                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
                // TODO json dictionaries
-               ArrowFileWriter arrowWriter = new ArrowFileWriter(root, null, fileOutputStream
+               ArrowFileWriter arrowWriter = new ArrowFileWriter(root, reader, fileOutputStream
                    .getChannel())) {
             arrowWriter.start();
             while (reader.read(root)) {
@@ -189,12 +209,20 @@ public class Integration {
             jsonRoot.close();
             totalBatches++;
           }
+
+          // Validate Dictionaries after ArrowFileReader has read batches
+          List<DictionaryEncoding> encodingsJson = new ArrayList<>();
+          extractDictionaryEncodings(jsonSchema.getFields(), encodingsJson);
+          List<DictionaryEncoding> encodingsArrow = new ArrayList<>();
+          extractDictionaryEncodings(arrowSchema.getFields(), encodingsArrow);
+          Validator.compareDictionaries(encodingsJson, encodingsArrow, jsonReader, arrowReader);
+
           boolean hasMoreJSON = jsonRoot != null;
           boolean hasMoreArrow = iterator.hasNext();
           if (hasMoreJSON || hasMoreArrow) {
-            throw new IllegalArgumentException("Unexpected RecordBatches. Total: " + totalBatches
-                                               + " J:" + hasMoreJSON + " "
-                + "A:" + hasMoreArrow);
+            throw new IllegalArgumentException("Unexpected RecordBatches. Total: " + totalBatches +
+                " J:" + hasMoreJSON + " " +
+                "A:" + hasMoreArrow);
           }
         }
       }
@@ -208,7 +236,7 @@ public class Integration {
       this.jsonExists = jsonExists;
     }
 
-    abstract public void execute(File arrowFile, File jsonFile) throws IOException;
+    public abstract void execute(File arrowFile, File jsonFile) throws IOException;
 
   }
 

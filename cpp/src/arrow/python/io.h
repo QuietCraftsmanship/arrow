@@ -18,9 +18,11 @@
 #ifndef PYARROW_IO_H
 #define PYARROW_IO_H
 
+#include <memory>
+
 #include "arrow/io/interfaces.h"
 #include "arrow/io/memory.h"
-#include "arrow/util/visibility.h"
+#include "arrow/python/visibility.h"
 
 #include "arrow/python/config.h"
 
@@ -32,67 +34,73 @@ class MemoryPool;
 
 namespace py {
 
-// A common interface to a Python file-like object. Must acquire GIL before
-// calling any methods
-class ARROW_EXPORT PythonFile {
- public:
-  explicit PythonFile(PyObject* file);
-  ~PythonFile();
+class ARROW_NO_EXPORT PythonFile;
 
-  Status Close();
-  Status Seek(int64_t position, int whence);
-  Status Read(int64_t nbytes, PyObject** out);
-  Status Tell(int64_t* position);
-  Status Write(const uint8_t* data, int64_t nbytes);
-
- private:
-  PyObject* file_;
-};
-
-class ARROW_EXPORT PyReadableFile : public io::RandomAccessFile {
+class ARROW_PYTHON_EXPORT PyReadableFile : public io::RandomAccessFile {
  public:
   explicit PyReadableFile(PyObject* file);
-  virtual ~PyReadableFile();
+  ~PyReadableFile() override;
 
   Status Close() override;
+  bool closed() const override;
 
-  Status Read(int64_t nbytes, int64_t* bytes_read, uint8_t* out) override;
+  Status Read(int64_t nbytes, int64_t* bytes_read, void* out) override;
   Status Read(int64_t nbytes, std::shared_ptr<Buffer>* out) override;
+
+  // Thread-safe version
+  Status ReadAt(int64_t position, int64_t nbytes, int64_t* bytes_read,
+                void* out) override;
+
+  // Thread-safe version
+  Status ReadAt(int64_t position, int64_t nbytes, std::shared_ptr<Buffer>* out) override;
 
   Status GetSize(int64_t* size) override;
 
   Status Seek(int64_t position) override;
 
-  Status Tell(int64_t* position) override;
-
-  bool supports_zero_copy() const override;
+  Status Tell(int64_t* position) const override;
 
  private:
   std::unique_ptr<PythonFile> file_;
 };
 
-class ARROW_EXPORT PyOutputStream : public io::OutputStream {
+class ARROW_PYTHON_EXPORT PyOutputStream : public io::OutputStream {
  public:
   explicit PyOutputStream(PyObject* file);
-  virtual ~PyOutputStream();
+  ~PyOutputStream() override;
 
   Status Close() override;
-  Status Tell(int64_t* position) override;
-  Status Write(const uint8_t* data, int64_t nbytes) override;
+  bool closed() const override;
+  Status Tell(int64_t* position) const override;
+  Status Write(const void* data, int64_t nbytes) override;
 
  private:
   std::unique_ptr<PythonFile> file_;
   int64_t position_;
 };
 
-// A zero-copy reader backed by a PyBuffer object
-class ARROW_EXPORT PyBytesReader : public io::BufferReader {
- public:
-  explicit PyBytesReader(PyObject* obj);
-  virtual ~PyBytesReader();
-};
-
 // TODO(wesm): seekable output files
+
+// A Buffer subclass that keeps a PyObject reference throughout its
+// lifetime, such that the Python object is kept alive as long as the
+// C++ buffer is still needed.
+// Keeping the reference in a Python wrapper would be incorrect as
+// the Python wrapper can get destroyed even though the wrapped C++
+// buffer is still alive (ARROW-2270).
+class ARROW_PYTHON_EXPORT PyForeignBuffer : public Buffer {
+ public:
+  static Status Make(const uint8_t* data, int64_t size, PyObject* base,
+                     std::shared_ptr<Buffer>* out);
+
+ private:
+  PyForeignBuffer(const uint8_t* data, int64_t size, PyObject* base)
+      : Buffer(data, size) {
+    Py_INCREF(base);
+    base_.reset(base);
+  }
+
+  OwnedRefNoGIL base_;
+};
 
 }  // namespace py
 }  // namespace arrow

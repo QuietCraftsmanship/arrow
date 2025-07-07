@@ -20,21 +20,55 @@
 require "pathname"
 require "test-unit"
 
-base_dir = Pathname(__dir__).parent
-typelib_dir = base_dir + "arrow-glib"
-test_dir = base_dir + "test"
+(ENV["ARROW_DLL_PATH"] || "").split(File::PATH_SEPARATOR).each do |path|
+  RubyInstaller::Runtime.add_dll_directory(path)
+end
 
-ENV["GI_TYPELIB_PATH"] = [
-  typelib_dir.to_s,
-  ENV["GI_TYPELIB_PATH"],
-].compact.join(File::PATH_SEPARATOR)
+base_dir = Pathname(__dir__).parent
+test_dir = base_dir + "test"
 
 require "gi"
 
+Gio = GI.load("Gio")
 Arrow = GI.load("Arrow")
+module Arrow
+  class Buffer
+    alias_method :initialize_raw, :initialize
+    def initialize(data)
+      initialize_raw(data)
+      @data = data
+    end
+  end
+end
 
+begin
+  ArrowCUDA = GI.load("ArrowCUDA")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  Gandiva = GI.load("Gandiva")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  Parquet = GI.load("Parquet")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  Plasma = GI.load("Plasma")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+require "fileutils"
+require "rbconfig"
 require "tempfile"
+require "zlib"
 require_relative "helper/buildable"
+require_relative "helper/data-type"
+require_relative "helper/fixture"
 require_relative "helper/omittable"
+require_relative "helper/plasma-store"
 
 exit(Test::Unit::AutoRunner.run(true, test_dir.to_s))

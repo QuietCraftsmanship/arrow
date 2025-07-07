@@ -19,26 +19,30 @@
 
 #include "arrow/array.h"
 #include "arrow/memory_pool.h"
-#include "arrow/test-util.h"
+#include "arrow/table.h"
+#include "arrow/testing/gtest_util.h"
 
 namespace arrow {
 namespace {
 template <typename ArrayType>
-std::shared_ptr<Array> MakePrimitive(int64_t length, int64_t null_count = 0) {
-  auto pool = default_memory_pool();
-  auto data = std::make_shared<PoolBuffer>(pool);
-  auto null_bitmap = std::make_shared<PoolBuffer>(pool);
-  data->Resize(length * sizeof(typename ArrayType::value_type));
-  null_bitmap->Resize(BitUtil::BytesForBits(length));
-  return std::make_shared<ArrayType>(length, data, null_bitmap, 10);
+Status MakePrimitive(int64_t length, int64_t null_count, std::shared_ptr<Array>* out) {
+  std::shared_ptr<Buffer> data, null_bitmap;
+
+  RETURN_NOT_OK(AllocateBuffer(length * sizeof(typename ArrayType::value_type), &data));
+  RETURN_NOT_OK(AllocateBuffer(BitUtil::BytesForBits(length), &null_bitmap));
+
+  *out = std::make_shared<ArrayType>(length, data, null_bitmap, null_count);
+  return Status::OK();
 }
 }  // anonymous namespace
 
-static void BM_BuildInt32ColumnByChunk(
+static void BuildInt32ColumnByChunk(
     benchmark::State& state) {  // NOLINT non-const reference
   ArrayVector arrays;
   for (int chunk_n = 0; chunk_n < state.range(0); ++chunk_n) {
-    arrays.push_back(MakePrimitive<Int32Array>(100, 10));
+    std::shared_ptr<Array> array;
+    ABORT_NOT_OK(MakePrimitive<Int32Array>(100, 10, &array));
+    arrays.push_back(array);
   }
   const auto INT32 = std::make_shared<Int32Type>();
   const auto field = std::make_shared<Field>("c0", INT32);
@@ -48,6 +52,6 @@ static void BM_BuildInt32ColumnByChunk(
   }
 }
 
-BENCHMARK(BM_BuildInt32ColumnByChunk)->Range(5, 50000);
+BENCHMARK(BuildInt32ColumnByChunk)->Range(5, 50000);
 
 }  // namespace arrow

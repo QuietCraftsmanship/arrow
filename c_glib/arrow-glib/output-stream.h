@@ -19,59 +19,28 @@
 
 #pragma once
 
-#include <glib-object.h>
+#include <gio/gio.h>
 
 #include <arrow-glib/buffer.h>
+#include <arrow-glib/codec.h>
 #include <arrow-glib/tensor.h>
 
 G_BEGIN_DECLS
 
-#define GARROW_TYPE_OUTPUT_STREAM               \
-  (garrow_output_stream_get_type())
-#define GARROW_OUTPUT_STREAM(obj)                               \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),                            \
-                              GARROW_TYPE_OUTPUT_STREAM,        \
-                              GArrowOutputStream))
-#define GARROW_OUTPUT_STREAM_CLASS(klass)               \
-  (G_TYPE_CHECK_CLASS_CAST((klass),                     \
-                           GARROW_TYPE_OUTPUT_STREAM,   \
-                           GArrowOutputStreamClass))
-#define GARROW_IS_OUTPUT_STREAM(obj)                            \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                            \
-                              GARROW_TYPE_OUTPUT_STREAM))
-#define GARROW_IS_OUTPUT_STREAM_CLASS(klass)            \
-  (G_TYPE_CHECK_CLASS_TYPE((klass),                     \
-                           GARROW_TYPE_OUTPUT_STREAM))
-#define GARROW_OUTPUT_STREAM_GET_CLASS(obj)             \
-  (G_TYPE_INSTANCE_GET_CLASS((obj),                     \
-                             GARROW_TYPE_OUTPUT_STREAM, \
-                             GArrowOutputStreamClass))
-
-typedef struct _GArrowOutputStream          GArrowOutputStream;
-#ifndef __GTK_DOC_IGNORE__
-typedef struct _GArrowOutputStreamClass     GArrowOutputStreamClass;
-#endif
-
-/**
- * GArrowOutputStream:
- *
- * It wraps `arrow::io::OutputStream`.
- */
-struct _GArrowOutputStream
-{
-  /*< private >*/
-  GObject parent_instance;
-};
-
-#ifndef __GTK_DOC_IGNORE__
+#define GARROW_TYPE_OUTPUT_STREAM (garrow_output_stream_get_type())
+G_DECLARE_DERIVABLE_TYPE(GArrowOutputStream,
+                         garrow_output_stream,
+                         GARROW,
+                         OUTPUT_STREAM,
+                         GObject)
 struct _GArrowOutputStreamClass
 {
   GObjectClass parent_class;
 };
-#endif
 
-GType garrow_output_stream_get_type(void) G_GNUC_CONST;
-
+gboolean garrow_output_stream_align(GArrowOutputStream *stream,
+                                    gint32 alignment,
+                                    GError **error);
 gint64 garrow_output_stream_write_tensor(GArrowOutputStream *stream,
                                          GArrowTensor *tensor,
                                          GError **error);
@@ -175,5 +144,76 @@ struct _GArrowBufferOutputStreamClass
 GType garrow_buffer_output_stream_get_type(void) G_GNUC_CONST;
 
 GArrowBufferOutputStream *garrow_buffer_output_stream_new(GArrowResizableBuffer *buffer);
+
+
+#define GARROW_TYPE_GIO_OUTPUT_STREAM           \
+  (garrow_gio_output_stream_get_type())
+#define GARROW_GIO_OUTPUT_STREAM(obj)                           \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj),                            \
+                              GARROW_TYPE_GIO_OUTPUT_STREAM,    \
+                              GArrowGIOOutputStream))
+#define GARROW_GIO_OUTPUT_STREAM_CLASS(klass)                   \
+  (G_TYPE_CHECK_CLASS_CAST((klass),                             \
+                           GARROW_TYPE_GIO_OUTPUT_STREAM,       \
+                           GArrowGIOOutputStreamClass))
+#define GARROW_IS_GIO_OUTPUT_STREAM(obj)                        \
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                            \
+                              GARROW_TYPE_GIO_OUTPUT_STREAM))
+#define GARROW_IS_GIO_OUTPUT_STREAM_CLASS(klass)                \
+  (G_TYPE_CHECK_CLASS_TYPE((klass),                             \
+                           GARROW_TYPE_GIO_OUTPUT_STREAM))
+#define GARROW_GIO_OUTPUT_STREAM_GET_CLASS(obj)                 \
+  (G_TYPE_INSTANCE_GET_CLASS((obj),                             \
+                             GARROW_TYPE_GIO_OUTPUT_STREAM,     \
+                             GArrowGIOOutputStreamClass))
+
+typedef struct _GArrowGIOOutputStream         GArrowGIOOutputStream;
+#ifndef __GTK_DOC_IGNORE__
+typedef struct _GArrowGIOOutputStreamClass    GArrowGIOOutputStreamClass;
+#endif
+
+/**
+ * GArrowGIOOutputStream:
+ *
+ * It's an output stream for `GOutputStream`.
+ */
+struct _GArrowGIOOutputStream
+{
+  /*< private >*/
+  GArrowOutputStream parent_instance;
+};
+
+#ifndef __GTK_DOC_IGNORE__
+struct _GArrowGIOOutputStreamClass
+{
+  GArrowOutputStreamClass parent_class;
+};
+#endif
+
+GType garrow_gio_output_stream_get_type(void) G_GNUC_CONST;
+
+GArrowGIOOutputStream *garrow_gio_output_stream_new(GOutputStream *gio_output_stream);
+#ifndef GARROW_DISABLE_DEPRECATED
+G_GNUC_DEPRECATED
+GOutputStream *
+garrow_gio_output_stream_get_raw(GArrowGIOOutputStream *output_stream);
+#endif
+
+#define GARROW_TYPE_COMPRESSED_OUTPUT_STREAM    \
+  (garrow_compressed_output_stream_get_type())
+G_DECLARE_DERIVABLE_TYPE(GArrowCompressedOutputStream,
+                         garrow_compressed_output_stream,
+                         GARROW,
+                         COMPRESSED_OUTPUT_STREAM,
+                         GArrowOutputStream)
+struct _GArrowCompressedOutputStreamClass
+{
+  GArrowOutputStreamClass parent_class;
+};
+
+GArrowCompressedOutputStream *
+garrow_compressed_output_stream_new(GArrowCodec *codec,
+                                    GArrowOutputStream *raw,
+                                    GError **error);
 
 G_END_DECLS
