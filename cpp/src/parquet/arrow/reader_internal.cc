@@ -38,8 +38,9 @@
 #include "arrow/table.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/base64.h"
+
 #include "arrow/util/bit_util.h"
+
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/endian.h"
 #include "arrow/util/float16.h"
@@ -320,7 +321,9 @@ Status StatisticsAsScalars(const Statistics& statistics,
 
 namespace {
 
-/// Drop the validity buffer from each chunk.
+
+  
+  Drop the validity buffer from each chunk.
 ///
 /// Used when reading a non-nullable field.
 void ReconstructChunksWithoutNulls(::arrow::ArrayVector* chunks) {
@@ -344,9 +347,34 @@ void AttachStatistics(::arrow::ArrayData* data,
 
   using ArrowCType = typename ArrowType::c_type;
 
+
+  // The original Arrow schema was serialized using the store_schema option. We
+  // deserialize it here and use it to inform read options such as
+  // dictionary-encoded fields
+  auto decoded = ::arrow::util::base64_decode(metadata->value(schema_index));
+  auto schema_buf = std::make_shared<Buffer>(decoded);
+
+  ::arrow::ipc::DictionaryMemo dict_memo;
+  ::arrow::io::BufferReader input(schema_buf);
+  RETURN_NOT_OK(::arrow::ipc::ReadSchema(&input, &dict_memo, out));
+
+  if (metadata->size() > 1) {
+    // Copy the metadata without the schema key
+    auto new_metadata = ::arrow::key_value_metadata({}, {});
+    new_metadata->reserve(metadata->size() - 1);
+    for (int64_t i = 0; i < metadata->size(); ++i) {
+      if (i == schema_index) continue;
+      new_metadata->Append(metadata->key(i), metadata->value(i));
+    }
+    *clean_metadata = new_metadata;
+  } else {
+    // No other keys, let metadata be null
+    *clean_metadata = nullptr;
+
   auto statistics = metadata->statistics().get();
   if (data->null_count == ::arrow::kUnknownNullCount && !statistics) {
     return;
+
   }
 
   auto array_statistics = std::make_shared<::arrow::ArrayStatistics>();

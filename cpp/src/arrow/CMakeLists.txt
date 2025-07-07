@@ -543,7 +543,12 @@ set(ARROW_UTIL_SRCS
     util/unreachable.cc
     util/uri.cc
     util/utf8.cc
+
+    vendored/base64.cpp
+    vendored/datetime/tz.cpp)
+
     util/value_parsing.cc)
+
 
 append_runtime_avx2_src(ARROW_UTIL_SRCS util/bpacking_avx2.cc)
 append_runtime_avx512_src(ARROW_UTIL_SRCS util/bpacking_avx512.cc)
