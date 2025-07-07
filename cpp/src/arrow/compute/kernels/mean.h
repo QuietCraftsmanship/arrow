@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+<<<<<<<< HEAD:cpp/src/arrow/compute/kernels/cast.h
+#ifndef ARROW_COMPUTE_KERNELS_CAST_H
+#define ARROW_COMPUTE_KERNELS_CAST_H
+========
 #pragma once
+>>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/compute/kernels/mean.h
 
 #include <memory>
 #include <type_traits>
@@ -28,7 +33,10 @@
 namespace arrow {
 
 class Array;
+class ChunkedArray;
+class Column;
 class DataType;
+class Datum;
 
 namespace compute {
 
@@ -62,5 +70,16 @@ Status Mean(FunctionContext* context, const Datum& value, Datum* mean);
 ARROW_EXPORT
 Status Mean(FunctionContext* context, const Array& array, Datum* mean);
 
+ARROW_EXPORT
+Status Cast(FunctionContext* context, const Datum& value,
+            const std::shared_ptr<DataType>& to_type, const CastOptions& options,
+            Datum* out);
+
 }  // namespace compute
+<<<<<<<< HEAD:cpp/src/arrow/compute/kernels/cast.h
+}  // namespace arrow
+
+#endif  // ARROW_COMPUTE_KERNELS_CAST_H
+========
 };  // namespace arrow
+>>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/compute/kernels/mean.h

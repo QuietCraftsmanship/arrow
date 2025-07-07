@@ -1678,10 +1678,505 @@ TEST_F(TestAdaptiveUIntBuilder, TestAppendValues) {
   ASSERT_TRUE(expected_->Equals(result_));
 }
 
-TEST_F(TestAdaptiveUIntBuilder, TestAssertZeroPadded) {
-  std::vector<uint64_t> values(
-      {0, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1});
-  ASSERT_OK(builder_->AppendValues(values.data(), values.size()));
+// ----------------------------------------------------------------------
+// Dictionary tests
+
+template <typename Type>
+class TestDictionaryBuilder : public TestBuilder {};
+
+typedef ::testing::Types<Int8Type, UInt8Type, Int16Type, UInt16Type, Int32Type,
+                         UInt32Type, Int64Type, UInt64Type, FloatType, DoubleType>
+    PrimitiveDictionaries;
+
+TYPED_TEST_CASE(TestDictionaryBuilder, PrimitiveDictionaries);
+
+TYPED_TEST(TestDictionaryBuilder, Basic) {
+  DictionaryBuilder<TypeParam> builder(default_memory_pool());
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(1)));
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(2)));
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(1)));
+
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Build expected data
+  NumericBuilder<TypeParam> dict_builder;
+  ASSERT_OK(dict_builder.Append(static_cast<typename TypeParam::c_type>(1)));
+  ASSERT_OK(dict_builder.Append(static_cast<typename TypeParam::c_type>(2)));
+  std::shared_ptr<Array> dict_array;
+  ASSERT_OK(dict_builder.Finish(&dict_array));
+  auto dtype = std::make_shared<DictionaryType>(int8(), dict_array);
+
+  Int8Builder int_builder;
+  ASSERT_OK(int_builder.Append(0));
+  ASSERT_OK(int_builder.Append(1));
+  ASSERT_OK(int_builder.Append(0));
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TYPED_TEST(TestDictionaryBuilder, ArrayConversion) {
+  NumericBuilder<TypeParam> builder;
+  // DictionaryBuilder<TypeParam> builder;
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(1)));
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(2)));
+  ASSERT_OK(builder.Append(static_cast<typename TypeParam::c_type>(1)));
+
+  std::shared_ptr<Array> intermediate_result;
+  ASSERT_OK(builder.Finish(&intermediate_result));
+  DictionaryBuilder<TypeParam> dictionary_builder(default_memory_pool());
+  ASSERT_OK(dictionary_builder.AppendArray(*intermediate_result));
+  std::shared_ptr<Array> result;
+  ASSERT_OK(dictionary_builder.Finish(&result));
+
+  // Build expected data
+  NumericBuilder<TypeParam> dict_builder;
+  ASSERT_OK(dict_builder.Append(static_cast<typename TypeParam::c_type>(1)));
+  ASSERT_OK(dict_builder.Append(static_cast<typename TypeParam::c_type>(2)));
+  std::shared_ptr<Array> dict_array;
+  ASSERT_OK(dict_builder.Finish(&dict_array));
+  auto dtype = std::make_shared<DictionaryType>(int8(), dict_array);
+
+  Int8Builder int_builder;
+  ASSERT_OK(int_builder.Append(0));
+  ASSERT_OK(int_builder.Append(1));
+  ASSERT_OK(int_builder.Append(0));
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TYPED_TEST(TestDictionaryBuilder, DoubleTableSize) {
+  using Scalar = typename TypeParam::c_type;
+  // Skip this test for (u)int8
+  if (sizeof(Scalar) > 1) {
+    // Build the dictionary Array
+    DictionaryBuilder<TypeParam> builder(default_memory_pool());
+    // Build expected data
+    NumericBuilder<TypeParam> dict_builder;
+    Int16Builder int_builder;
+
+    // Fill with 1024 different values
+    for (int64_t i = 0; i < 1024; i++) {
+      ASSERT_OK(builder.Append(static_cast<Scalar>(i)));
+      ASSERT_OK(dict_builder.Append(static_cast<Scalar>(i)));
+      ASSERT_OK(int_builder.Append(static_cast<uint16_t>(i)));
+    }
+    // Fill with an already existing value
+    for (int64_t i = 0; i < 1024; i++) {
+      ASSERT_OK(builder.Append(static_cast<Scalar>(1)));
+      ASSERT_OK(int_builder.Append(1));
+    }
+
+    // Finalize result
+    std::shared_ptr<Array> result;
+    ASSERT_OK(builder.Finish(&result));
+
+    // Finalize expected data
+    std::shared_ptr<Array> dict_array;
+    ASSERT_OK(dict_builder.Finish(&dict_array));
+    auto dtype = std::make_shared<DictionaryType>(int16(), dict_array);
+    std::shared_ptr<Array> int_array;
+    ASSERT_OK(int_builder.Finish(&int_array));
+
+    DictionaryArray expected(dtype, int_array);
+    ASSERT_TRUE(expected.Equals(result));
+  }
+}
+
+TEST(TestStringDictionaryBuilder, Basic) {
+  // Build the dictionary Array
+  StringDictionaryBuilder builder(default_memory_pool());
+  ASSERT_OK(builder.Append("test"));
+  ASSERT_OK(builder.Append("test2"));
+  ASSERT_OK(builder.Append("test"));
+
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Build expected data
+  StringBuilder str_builder;
+  ASSERT_OK(str_builder.Append("test"));
+  ASSERT_OK(str_builder.Append("test2"));
+  std::shared_ptr<Array> str_array;
+  ASSERT_OK(str_builder.Finish(&str_array));
+  auto dtype = std::make_shared<DictionaryType>(int8(), str_array);
+
+  Int8Builder int_builder;
+  ASSERT_OK(int_builder.Append(0));
+  ASSERT_OK(int_builder.Append(1));
+  ASSERT_OK(int_builder.Append(0));
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestStringDictionaryBuilder, DoubleTableSize) {
+  // Build the dictionary Array
+  StringDictionaryBuilder builder(default_memory_pool());
+  // Build expected data
+  StringBuilder str_builder;
+  Int16Builder int_builder;
+
+  // Fill with 1024 different values
+  for (int64_t i = 0; i < 1024; i++) {
+    std::stringstream ss;
+    ss << "test" << i;
+    ASSERT_OK(builder.Append(ss.str()));
+    ASSERT_OK(str_builder.Append(ss.str()));
+    ASSERT_OK(int_builder.Append(static_cast<uint16_t>(i)));
+  }
+  // Fill with an already existing value
+  for (int64_t i = 0; i < 1024; i++) {
+    ASSERT_OK(builder.Append("test1"));
+    ASSERT_OK(int_builder.Append(1));
+  }
+
+  // Finalize result
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Finalize expected data
+  std::shared_ptr<Array> str_array;
+  ASSERT_OK(str_builder.Finish(&str_array));
+  auto dtype = std::make_shared<DictionaryType>(int16(), str_array);
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestFixedSizeBinaryDictionaryBuilder, Basic) {
+  // Build the dictionary Array
+  DictionaryBuilder<FixedSizeBinaryType> builder(arrow::fixed_size_binary(4),
+                                                 default_memory_pool());
+  std::vector<uint8_t> test{12, 12, 11, 12};
+  std::vector<uint8_t> test2{12, 12, 11, 11};
+  ASSERT_OK(builder.Append(test.data()));
+  ASSERT_OK(builder.Append(test2.data()));
+  ASSERT_OK(builder.Append(test.data()));
+
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Build expected data
+  FixedSizeBinaryBuilder fsb_builder(arrow::fixed_size_binary(4));
+  ASSERT_OK(fsb_builder.Append(test.data()));
+  ASSERT_OK(fsb_builder.Append(test2.data()));
+  std::shared_ptr<Array> fsb_array;
+  ASSERT_OK(fsb_builder.Finish(&fsb_array));
+  auto dtype = std::make_shared<DictionaryType>(int8(), fsb_array);
+
+  Int8Builder int_builder;
+  ASSERT_OK(int_builder.Append(0));
+  ASSERT_OK(int_builder.Append(1));
+  ASSERT_OK(int_builder.Append(0));
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestFixedSizeBinaryDictionaryBuilder, DoubleTableSize) {
+  // Build the dictionary Array
+  DictionaryBuilder<FixedSizeBinaryType> builder(arrow::fixed_size_binary(4),
+                                                 default_memory_pool());
+  // Build expected data
+  FixedSizeBinaryBuilder fsb_builder(arrow::fixed_size_binary(4));
+  Int16Builder int_builder;
+
+  // Fill with 1024 different values
+  for (int64_t i = 0; i < 1024; i++) {
+    std::vector<uint8_t> value{12, 12, static_cast<uint8_t>(i / 128),
+                               static_cast<uint8_t>(i % 128)};
+    ASSERT_OK(builder.Append(value.data()));
+    ASSERT_OK(fsb_builder.Append(value.data()));
+    ASSERT_OK(int_builder.Append(static_cast<uint16_t>(i)));
+  }
+  // Fill with an already existing value
+  std::vector<uint8_t> known_value{12, 12, 0, 1};
+  for (int64_t i = 0; i < 1024; i++) {
+    ASSERT_OK(builder.Append(known_value.data()));
+    ASSERT_OK(int_builder.Append(1));
+  }
+
+  // Finalize result
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Finalize expected data
+  std::shared_ptr<Array> fsb_array;
+  ASSERT_OK(fsb_builder.Finish(&fsb_array));
+  auto dtype = std::make_shared<DictionaryType>(int16(), fsb_array);
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestFixedSizeBinaryDictionaryBuilder, InvalidTypeAppend) {
+  // Build the dictionary Array
+  DictionaryBuilder<FixedSizeBinaryType> builder(arrow::fixed_size_binary(4),
+                                                 default_memory_pool());
+  // Build an array with different byte width
+  FixedSizeBinaryBuilder fsb_builder(arrow::fixed_size_binary(5));
+  std::vector<uint8_t> value{100, 1, 1, 1, 1};
+  ASSERT_OK(fsb_builder.Append(value.data()));
+  std::shared_ptr<Array> fsb_array;
+  ASSERT_OK(fsb_builder.Finish(&fsb_array));
+
+  ASSERT_RAISES(Invalid, builder.AppendArray(*fsb_array));
+}
+
+TEST(TestDecimalDictionaryBuilder, Basic) {
+  // Build the dictionary Array
+  const auto& decimal_type = arrow::decimal(2, 0);
+  DictionaryBuilder<FixedSizeBinaryType> builder(decimal_type, default_memory_pool());
+
+  // Test data
+  std::vector<Decimal128> test{12, 12, 11, 12};
+  for (const auto& value : test) {
+    ASSERT_OK(builder.Append(value.ToBytes().data()));
+  }
+
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Build expected data
+  FixedSizeBinaryBuilder decimal_builder(decimal_type);
+  ASSERT_OK(decimal_builder.Append(Decimal128(12).ToBytes()));
+  ASSERT_OK(decimal_builder.Append(Decimal128(11).ToBytes()));
+
+  std::shared_ptr<Array> decimal_array;
+  ASSERT_OK(decimal_builder.Finish(&decimal_array));
+  auto dtype = arrow::dictionary(int8(), decimal_array);
+
+  Int8Builder int_builder;
+  ASSERT_OK(int_builder.Append({0, 0, 1, 0}));
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestDecimalDictionaryBuilder, DoubleTableSize) {
+  const auto& decimal_type = arrow::decimal(21, 0);
+
+  // Build the dictionary Array
+  DictionaryBuilder<FixedSizeBinaryType> builder(decimal_type, default_memory_pool());
+
+  // Build expected data
+  FixedSizeBinaryBuilder fsb_builder(decimal_type);
+  Int16Builder int_builder;
+
+  // Fill with 1024 different values
+  for (int64_t i = 0; i < 1024; i++) {
+    const uint8_t bytes[] = {0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             12,
+                             12,
+                             static_cast<uint8_t>(i / 128),
+                             static_cast<uint8_t>(i % 128)};
+    ASSERT_OK(builder.Append(bytes));
+    ASSERT_OK(fsb_builder.Append(bytes));
+    ASSERT_OK(int_builder.Append(static_cast<uint16_t>(i)));
+  }
+  // Fill with an already existing value
+  const uint8_t known_value[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 12, 0, 1};
+  for (int64_t i = 0; i < 1024; i++) {
+    ASSERT_OK(builder.Append(known_value));
+    ASSERT_OK(int_builder.Append(1));
+  }
+
+  // Finalize result
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+
+  // Finalize expected data
+  std::shared_ptr<Array> fsb_array;
+  ASSERT_OK(fsb_builder.Finish(&fsb_array));
+
+  auto dtype = std::make_shared<DictionaryType>(int16(), fsb_array);
+  std::shared_ptr<Array> int_array;
+  ASSERT_OK(int_builder.Finish(&int_array));
+
+  DictionaryArray expected(dtype, int_array);
+  ASSERT_TRUE(expected.Equals(result));
+}
+
+// ----------------------------------------------------------------------
+// List tests
+
+class TestListArray : public TestBuilder {
+ public:
+  void SetUp() {
+    TestBuilder::SetUp();
+
+    value_type_ = int32();
+    type_ = list(value_type_);
+
+    std::unique_ptr<ArrayBuilder> tmp;
+    ASSERT_OK(MakeBuilder(pool_, type_, &tmp));
+    builder_.reset(static_cast<ListBuilder*>(tmp.release()));
+  }
+
+  void Done() {
+    std::shared_ptr<Array> out;
+    EXPECT_OK(builder_->Finish(&out));
+    result_ = std::dynamic_pointer_cast<ListArray>(out);
+  }
+
+ protected:
+  std::shared_ptr<DataType> value_type_;
+  std::shared_ptr<DataType> type_;
+
+  std::shared_ptr<ListBuilder> builder_;
+  std::shared_ptr<ListArray> result_;
+};
+
+TEST_F(TestListArray, Equality) {
+  Int32Builder* vb = static_cast<Int32Builder*>(builder_->value_builder());
+
+  std::shared_ptr<Array> array, equal_array, unequal_array;
+  vector<int32_t> equal_offsets = {0, 1, 2, 5, 6, 7, 8, 10};
+  vector<int32_t> equal_values = {1, 2, 3, 4, 5, 2, 2, 2, 5, 6};
+  vector<int32_t> unequal_offsets = {0, 1, 4, 7};
+  vector<int32_t> unequal_values = {1, 2, 2, 2, 3, 4, 5};
+
+  // setup two equal arrays
+  ASSERT_OK(builder_->Append(equal_offsets.data(), equal_offsets.size()));
+  ASSERT_OK(vb->Append(equal_values.data(), equal_values.size()));
+
+  ASSERT_OK(builder_->Finish(&array));
+  ASSERT_OK(builder_->Append(equal_offsets.data(), equal_offsets.size()));
+  ASSERT_OK(vb->Append(equal_values.data(), equal_values.size()));
+
+  ASSERT_OK(builder_->Finish(&equal_array));
+  // now an unequal one
+  ASSERT_OK(builder_->Append(unequal_offsets.data(), unequal_offsets.size()));
+  ASSERT_OK(vb->Append(unequal_values.data(), unequal_values.size()));
+
+  ASSERT_OK(builder_->Finish(&unequal_array));
+
+  // Test array equality
+  EXPECT_TRUE(array->Equals(array));
+  EXPECT_TRUE(array->Equals(equal_array));
+  EXPECT_TRUE(equal_array->Equals(array));
+  EXPECT_FALSE(equal_array->Equals(unequal_array));
+  EXPECT_FALSE(unequal_array->Equals(equal_array));
+
+  // Test range equality
+  EXPECT_TRUE(array->RangeEquals(0, 1, 0, unequal_array));
+  EXPECT_FALSE(array->RangeEquals(0, 2, 0, unequal_array));
+  EXPECT_FALSE(array->RangeEquals(1, 2, 1, unequal_array));
+  EXPECT_TRUE(array->RangeEquals(2, 3, 2, unequal_array));
+
+  // Check with slices, ARROW-33
+  std::shared_ptr<Array> slice, slice2;
+
+  slice = array->Slice(2);
+  slice2 = array->Slice(2);
+  ASSERT_EQ(array->length() - 2, slice->length());
+
+  ASSERT_TRUE(slice->Equals(slice2));
+  ASSERT_TRUE(array->RangeEquals(2, slice->length(), 0, slice));
+
+  // Chained slices
+  slice2 = array->Slice(1)->Slice(1);
+  ASSERT_TRUE(slice->Equals(slice2));
+
+  slice = array->Slice(1, 4);
+  slice2 = array->Slice(1, 4);
+  ASSERT_EQ(4, slice->length());
+
+  ASSERT_TRUE(slice->Equals(slice2));
+  ASSERT_TRUE(array->RangeEquals(1, 5, 0, slice));
+}
+
+TEST_F(TestListArray, TestResize) {}
+
+TEST_F(TestListArray, TestFromArrays) {
+  std::shared_ptr<Array> offsets1, offsets2, offsets3, offsets4, values;
+
+  std::vector<bool> offsets_is_valid3 = {true, false, true, true};
+  std::vector<bool> offsets_is_valid4 = {true, true, false, true};
+
+  std::vector<bool> values_is_valid = {true, false, true, true, true, true};
+
+  std::vector<int32_t> offset1_values = {0, 2, 2, 6};
+  std::vector<int32_t> offset2_values = {0, 2, 6, 6};
+
+  std::vector<int8_t> values_values = {0, 1, 2, 3, 4, 5};
+  const int length = 3;
+
+  ArrayFromVector<Int32Type, int32_t>(offset1_values, &offsets1);
+  ArrayFromVector<Int32Type, int32_t>(offset2_values, &offsets2);
+
+  ArrayFromVector<Int32Type, int32_t>(offsets_is_valid3, offset1_values, &offsets3);
+  ArrayFromVector<Int32Type, int32_t>(offsets_is_valid4, offset2_values, &offsets4);
+
+  ArrayFromVector<Int8Type, int8_t>(values_is_valid, values_values, &values);
+
+  auto list_type = list(int8());
+
+  std::shared_ptr<Array> list1, list3, list4;
+  ASSERT_OK(ListArray::FromArrays(*offsets1, *values, pool_, &list1));
+  ASSERT_OK(ListArray::FromArrays(*offsets3, *values, pool_, &list3));
+  ASSERT_OK(ListArray::FromArrays(*offsets4, *values, pool_, &list4));
+
+  ListArray expected1(list_type, length, offsets1->data()->buffers[1], values,
+                      offsets1->data()->buffers[0], 0);
+  AssertArraysEqual(expected1, *list1);
+
+  // Use null bitmap from offsets3, but clean offsets from non-null version
+  ListArray expected3(list_type, length, offsets1->data()->buffers[1], values,
+                      offsets3->data()->buffers[0], 1);
+  AssertArraysEqual(expected3, *list3);
+
+  // Check that the last offset bit is zero
+  ASSERT_TRUE(BitUtil::BitNotSet(list3->null_bitmap()->data(), length + 1));
+
+  ListArray expected4(list_type, length, offsets2->data()->buffers[1], values,
+                      offsets4->data()->buffers[0], 1);
+  AssertArraysEqual(expected4, *list4);
+
+  // Test failure modes
+
+  std::shared_ptr<Array> tmp;
+
+  // Zero-length offsets
+  ASSERT_RAISES(Invalid,
+                ListArray::FromArrays(*offsets1->Slice(0, 0), *values, pool_, &tmp));
+
+  // Offsets not int32
+  ASSERT_RAISES(Invalid, ListArray::FromArrays(*values, *offsets1, pool_, &tmp));
+}
+
+TEST_F(TestListArray, TestAppendNull) {
+  ASSERT_OK(builder_->AppendNull());
+  ASSERT_OK(builder_->AppendNull());
+
   Done();
 }
 
