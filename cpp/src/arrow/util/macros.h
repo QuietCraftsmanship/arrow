@@ -67,8 +67,30 @@
 // [5] J. Doerfert et al. 2019. "Performance Exploration Through Optimistic Static
 //     Program Annotations". https://github.com/jdoerfert/PETOSPA/blob/master/ISC19.pdf
 #define ARROW_UNUSED(x) (void)(x)
+<<<<<<< HEAD
+#define ARROW_ARG_UNUSED(x)
+//
+// GCC can be told that a certain branch is not likely to be taken (for
+// instance, a CHECK failure), and use that information in static analysis.
+// Giving it this information can help it optimize for the common case in
+// the absence of better information (ie. -fprofile-arcs).
+//
+#if defined(__GNUC__)
+#define ARROW_PREDICT_FALSE(x) (__builtin_expect(!!(x), 0))
+#define ARROW_PREDICT_TRUE(x) (__builtin_expect(!!(x), 1))
+#define ARROW_NORETURN __attribute__((noreturn))
+#define ARROW_NOINLINE __attribute__((noinline))
+#define ARROW_PREFETCH(addr) __builtin_prefetch(addr)
+#elif defined(_MSC_VER)
+#define ARROW_NORETURN __declspec(noreturn)
+#define ARROW_NOINLINE __declspec(noinline)
+#define ARROW_PREDICT_FALSE(x) (x)
+#define ARROW_PREDICT_TRUE(x) (x)
+#define ARROW_PREFETCH(addr)
+=======
 #ifdef ARROW_WARN_DOCUMENTATION
 #  define ARROW_ARG_UNUSED(x) x
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #else
 #  define ARROW_ARG_UNUSED(x)
 #endif

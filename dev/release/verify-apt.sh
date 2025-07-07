@@ -165,13 +165,25 @@ popd
 echo "::endgroup::"
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+if [ "${have_plasma}" = "yes" ]; then
+  apt install -y -V libplasma-glib-dev=${deb_version}
+  apt install -y -V libplasma-glib-doc=${deb_version}
+  apt install -y -V plasma-store-server=${deb_version}
+fi
+=======
 
 echo "::group::Test Apache Arrow GLib"
 export G_DEBUG=fatal-warnings
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 =======
 apt install -y -V libplasma-glib-dev=${deb_version}
 # apt install -y -V libplasma-glib-doc=${deb_version}
 apt install -y -V plasma-store-server=${deb_version}
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 if [ "${have_gandiva}" = "yes" ]; then
   apt install -y -V libgandiva-glib-dev=${deb_version}

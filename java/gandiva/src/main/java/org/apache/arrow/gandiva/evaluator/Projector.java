@@ -236,6 +236,14 @@ public class Projector {
       bufSizes[idx++] = bufLayout.getSize();
     }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+    boolean hasVariableWidthColumns = false;
+    BaseVariableWidthVector[] resizableVectors = new BaseVariableWidthVector[outColumns.size()];
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     long[] outAddrs = new long[3 * outColumns.size()];
     long[] outSizes = new long[3 * outColumns.size()];
     idx = 0;
@@ -243,7 +251,16 @@ public class Projector {
       boolean isFixedWith = valueVector instanceof FixedWidthVector;
       boolean isVarWidth = valueVector instanceof VariableWidthVector;
       if (!isFixedWith && !isVarWidth) {
+<<<<<<< HEAD
+<<<<<<< HEAD
+        throw new UnsupportedTypeException(
+            "Unsupported value vector type " + valueVector.getField().getFieldType());
+=======
         throw new UnsupportedTypeException("Unsupported value vector type " + valueVector.getField().getFieldType());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        throw new UnsupportedTypeException("Unsupported value vector type " + valueVector.getField().getFieldType());
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       }
 
       outAddrs[idx] = valueVector.getValidityBuffer().memoryAddress();
@@ -251,6 +268,16 @@ public class Projector {
       if (isVarWidth) {
         outAddrs[idx] = valueVector.getOffsetBuffer().memoryAddress();
         outSizes[idx++] = valueVector.getOffsetBuffer().capacity();
+<<<<<<< HEAD
+<<<<<<< HEAD
+        hasVariableWidthColumns = true;
+
+        // save vector to allow for resizing.
+        resizableVectors[outColumnIdx] = (BaseVariableWidthVector) valueVector;
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       }
       outAddrs[idx] = valueVector.getDataBuffer().memoryAddress();
       outSizes[idx++] = valueVector.getDataBuffer().capacity();

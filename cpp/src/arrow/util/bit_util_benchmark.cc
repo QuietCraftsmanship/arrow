@@ -29,11 +29,16 @@
 #include "arrow/array/array_primitive.h"
 #include "arrow/buffer.h"
 #include "arrow/result.h"
+<<<<<<< HEAD
+#include "arrow/testing/random.h"
+#include "arrow/testing/util.h"
+=======
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/bit_run_reader.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap.h"
 #include "arrow/util/bitmap_generate.h"
@@ -42,9 +47,14 @@
 #include "arrow/util/bitmap_visit.h"
 #include "arrow/util/bitmap_writer.h"
 
+<<<<<<< HEAD
+namespace arrow {
+namespace BitUtil {
+=======
 namespace arrow::bit_util::benchmarks {
 
 constexpr int64_t kBufferSize = 1024 * 8;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
 

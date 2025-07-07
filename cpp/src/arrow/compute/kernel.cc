@@ -350,6 +350,44 @@ std::shared_ptr<TypeMatcher> RunEndEncoded(
                                                 std::move(value_type_matcher));
 }
 
+class IntegerMatcher : public TypeMatcher {
+ public:
+  IntegerMatcher() {}
+
+  bool Matches(const DataType& type) const override { return is_integer(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const IntegerMatcher*>(&other);
+    return casted != nullptr;
+  }
+
+  std::string ToString() const override { return "integer"; }
+};
+
+std::shared_ptr<TypeMatcher> Integer() { return std::make_shared<IntegerMatcher>(); }
+
+class PrimitiveMatcher : public TypeMatcher {
+ public:
+  PrimitiveMatcher() {}
+
+  bool Matches(const DataType& type) const override { return is_primitive(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const PrimitiveMatcher*>(&other);
+    return casted != nullptr;
+  }
+
+  std::string ToString() const override { return "primitive"; }
+};
+
+std::shared_ptr<TypeMatcher> Primitive() { return std::make_shared<PrimitiveMatcher>(); }
+
 }  // namespace match
 
 // ----------------------------------------------------------------------

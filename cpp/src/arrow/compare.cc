@@ -239,6 +239,15 @@ class RangeDataEqualsImpl {
 =======
     const auto& left_type = checked_cast<const UnionType&>(*left.type());
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+    const std::vector<int>& child_ids = left_type.child_ids();
+
+    const int8_t* left_codes = left.raw_type_codes();
+    const int8_t* right_codes = right.raw_type_codes();
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     // Define a mapping from the type id to child number
     const std::vector<uint8_t>& type_codes = left_type.type_codes();
     std::vector<uint8_t> type_id_to_child_num(left.union_type()->max_type_code() + 1, 0);
@@ -247,6 +256,11 @@ class RangeDataEqualsImpl {
     }
 >>>>>>> 5588-Better-support-for-building-UnionArrays
 
+<<<<<<< HEAD
+    const uint8_t* left_ids = left.raw_type_ids();
+    const uint8_t* right_ids = right.raw_type_ids();
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
   template <typename TypeClass>
   enable_if_primitive_ctype<TypeClass, Status> Visit(const TypeClass& type) {
     return ComparePrimitive(type);
@@ -257,6 +271,7 @@ class RangeDataEqualsImpl {
   enable_if_t<is_temporal_type<TypeClass>::value, Status> Visit(const TypeClass& type) {
     return ComparePrimitive(type);
   }
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   Status Visit(const BooleanType&) {
     const uint8_t* left_bits = left_.GetValues<uint8_t>(1, 0);
@@ -280,7 +295,15 @@ class RangeDataEqualsImpl {
         return false;
       }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+      auto child_num = child_ids[left_codes[i]];
+=======
       auto child_num = type_id_to_child_num[left_ids[i]];
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+      auto child_num = type_id_to_child_num[left_ids[i]];
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
       // TODO(wesm): really we should be comparing stretches of non-null data
       // rather than looking at one value at a time.

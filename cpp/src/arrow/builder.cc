@@ -1325,13 +1325,28 @@ Status MakeBuilderExactIndex(MemoryPool* pool, const std::shared_ptr<DataType>& 
     }
 
     case Type::STRUCT: {
+<<<<<<< HEAD
+<<<<<<< HEAD
+      const std::vector<std::shared_ptr<Field>>& fields = type->fields();
+=======
       const std::vector<std::shared_ptr<Field>>& fields = type->children();
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+      const std::vector<std::shared_ptr<Field>>& fields = type->children();
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
 
       for (auto it : fields) {
         std::unique_ptr<ArrayBuilder> builder;
         RETURN_NOT_OK(MakeBuilder(pool, it->type(), &builder));
         field_builders.emplace_back(std::move(builder));
+<<<<<<< HEAD
+<<<<<<< HEAD
+      }
+      out->reset(new StructBuilder(type, pool, std::move(field_builders)));
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       }
       out->reset(new StructBuilder(type, pool, std::move(field_builders)));
       return Status::OK();
@@ -1359,6 +1374,10 @@ Status MakeBuilderExactIndex(MemoryPool* pool, const std::shared_ptr<DataType>& 
       } else {
         out->reset(new SparseUnionBuilder(pool, std::move(field_builders), type));
       }
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       return Status::OK();
     }
 

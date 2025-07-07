@@ -161,6 +161,9 @@ int32_t gdv_fn_populate_varlen_vector(int64_t context_ptr, int8_t* data_ptr,
   offsets[slot + 1] = offset + entry_len;
   return 0;
 }
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
 
 #define CRC_FUNCTION(TYPE)                                                          \
   GANDIVA_EXPORT                                                                    \
@@ -175,6 +178,7 @@ int32_t gdv_fn_populate_varlen_vector(int64_t context_ptr, int8_t* data_ptr,
   }
 CRC_FUNCTION(utf8)
 CRC_FUNCTION(binary)
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 int32_t gdv_fn_dec_from_string(int64_t context, const char* in, int32_t in_length,
                                int32_t* precision_from_str, int32_t* scale_from_str,
@@ -205,6 +209,10 @@ char* gdv_fn_dec_to_string(int64_t context, int64_t x_high, uint64_t x_low,
   memcpy(ret, dec_str.data(), *dec_str_len);
   return ret;
 }
+<<<<<<< HEAD
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
 
 GANDIVA_EXPORT
 const char* gdv_fn_base64_encode_binary(int64_t context, const char* in, int32_t in_len,
@@ -868,6 +876,7 @@ int32_t gdv_fn_populate_varlen_vector(int64_t context_ptr, int8_t* data_ptr,
   offsets[slot + 1] = offset + entry_len;
   return 0;
 }
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 namespace gandiva {
@@ -970,6 +979,21 @@ arrow::Status ExportedStubFunctions::AddMappings(Engine* engine) const {
   engine->AddGlobalMappingForFunc("gdv_fn_populate_varlen_vector",
                                   types->i32_type() /*return_type*/, args,
                                   reinterpret_cast<void*>(gdv_fn_populate_varlen_vector));
+<<<<<<< HEAD
+<<<<<<< HEAD
+
+  // gdv_fn_random
+  args = {types->i64_type()};
+  engine->AddGlobalMappingForFunc("gdv_fn_random", types->double_type(), args,
+                                  reinterpret_cast<void*>(gdv_fn_random));
+
+  args = {types->i64_type(), types->i32_type(), types->i1_type()};
+  engine->AddGlobalMappingForFunc("gdv_fn_random_with_seed", types->double_type(), args,
+                                  reinterpret_cast<void*>(gdv_fn_random_with_seed));
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 >>>>>>> 5588-Better-support-for-building-UnionArrays
 

@@ -352,6 +352,16 @@ Result<Datum> Filter(const Datum& values, const Datum& filter,
                      const FilterOptions& options = FilterOptions::Defaults(),
                      ExecContext* ctx = NULLPTR);
 
+<<<<<<< HEAD
+struct ARROW_EXPORT TakeOptions : public FunctionOptions {
+  explicit TakeOptions(bool boundscheck = true) : boundscheck(boundscheck) {}
+
+  bool boundscheck = true;
+  static TakeOptions Boundscheck() { return TakeOptions(true); }
+  static TakeOptions NoBoundscheck() { return TakeOptions(false); }
+  static TakeOptions Defaults() { return Boundscheck(); }
+};
+=======
 namespace internal {
 
 // These internal functions are implemented in kernels/vector_selection.cc
@@ -420,6 +430,7 @@ Result<Datum> FillNullForward(const Datum& values, ExecContext* ctx = NULLPTR);
 /// \return the resulting datum
 ARROW_EXPORT
 Result<Datum> FillNullBackward(const Datum& values, ExecContext* ctx = NULLPTR);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 /// \brief Take from an array of values at indices in another array
 ///

@@ -39,11 +39,16 @@
 #include "arrow/status.h"
 #include "arrow/testing/gtest_compat.h"
 #include "arrow/testing/gtest_util.h"
+<<<<<<< HEAD
+#include "arrow/util/bit_stream_utils.h"
+#include "arrow/util/bit_util.h"
+=======
 #include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/bit_run_reader.h"
 #include "arrow/util/bit_stream_utils_internal.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/util/bitmap.h"
 #include "arrow/util/bitmap_generate.h"
 #include "arrow/util/bitmap_ops.h"
@@ -2306,6 +2311,8 @@ TEST(Bitmap, VisitWordsAnd) {
   }
 }
 
+<<<<<<< HEAD
+=======
 void DoBitmapVisitAndWrite(int64_t part, bool with_offset) {
   int64_t bits = part * 4;
 
@@ -2372,5 +2379,6 @@ TEST_P(TestBitmapVisitAndWrite, NoOffset) { DoBitmapVisitAndWrite(GetParam(), fa
 
 TEST_P(TestBitmapVisitAndWrite, WithOffset) { DoBitmapVisitAndWrite(GetParam(), true); }
 
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }  // namespace internal
 }  // namespace arrow

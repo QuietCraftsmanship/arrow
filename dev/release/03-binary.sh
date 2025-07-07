@@ -70,6 +70,13 @@ if ! jq --help > /dev/null 2>&1; then
   exit 1
 fi
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+if [ -n "${SOURCE_BINTRAY_REPOSITORY_CUSTOM}" ]; then
+  SOURCE_BINTRAY_REPOSITORY=${SOURCE_BINTRAY_REPOSITORY_CUSTOM}
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 : ${BINTRAY_REPOSITORY:=apache/arrow}
 : ${SOURCE_BINTRAY_REPOSITORY:=${BINTRAY_REPOSITORY}}
 
@@ -123,6 +130,10 @@ docker_run_gpg_ready() {
 if [ \$(id -u) -ne ${docker_uid} ]; then
   usermod --uid ${docker_uid} arrow
   chown -R arrow: ~arrow
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 fi
 /usr/sbin/sshd -D
 "
@@ -138,6 +149,12 @@ fi
   rm -rf ${container_id_dir}
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+. binary-common.sh
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 bintray() {
   local command=$1
   shift
@@ -524,6 +541,10 @@ upload_python() {
 docker build -t ${docker_image_name} ${SOURCE_DIR}/binary
 
 chmod go-rwx "${docker_ssh_key}"
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 # By default upload all artifacts.
 # To deactivate one category, deactivate the category and all of its dependents.

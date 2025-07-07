@@ -41,9 +41,46 @@ const MICROSECONDS: i64 = 1_000_000;
 const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Trait for dealing with different types of array at runtime when the type of the
+<<<<<<< HEAD
+<<<<<<< HEAD
+/// array is not known in advance.
+pub trait Array: fmt::Debug + Send + Sync + ArrayEqual + JsonEqual {
+    /// Returns the array as [`Any`](std::any::Any) so that it can be
+    /// downcasted to a specific implementation.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::Int32Array;
+    /// use arrow::datatypes::{Schema, Field, DataType};
+    /// use arrow::record_batch::RecordBatch;
+    ///
+    /// # fn main() -> arrow::error::Result<()> {
+    /// let id = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    /// let batch = RecordBatch::try_new(
+    ///     Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+    ///     vec![Arc::new(id)]
+    /// )?;
+    ///
+    /// let int32array = batch
+    ///     .column(0)
+    ///     .as_any()
+    ///     .downcast_ref::<Int32Array>()
+    ///     .expect("Failed to downcast");
+    /// # Ok(())
+    /// # }
+    /// ```
+=======
 /// array is not known in advance
 pub trait Array: Send + Sync + ArrayEqual {
     /// Returns the array as `Any` so that it can be downcast to a specific implementation
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+/// array is not known in advance
+pub trait Array: Send + Sync + ArrayEqual {
+    /// Returns the array as `Any` so that it can be downcast to a specific implementation
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     fn as_any(&self) -> &Any;
 
     /// Returns a reference-counted pointer to the data of this array
@@ -690,7 +727,16 @@ impl<T: ArrowPrimitiveType> From<ArrayDataRef> for PrimitiveArray<T> {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+/// Common operations for List types, currently `ListArray`, `FixedSizeListArray`, `BinaryArray`
+/// `StringArray` and `DictionaryArray`
+=======
 /// Common operations for List types, currently `ListArray` and `BinaryArray`.
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+/// Common operations for List types, currently `ListArray` and `BinaryArray`.
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 pub trait ListArrayOps {
     fn value_offset_at(&self, i: usize) -> i32;
 }
@@ -701,12 +747,42 @@ impl ListArrayOps for ListArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl ListArrayOps for FixedSizeListArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl ListArrayOps for BinaryArray {
     fn value_offset_at(&self, i: usize) -> i32 {
         self.value_offset_at(i)
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl ListArrayOps for StringArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+impl ListArrayOps for FixedSizeBinaryArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type.
 pub struct ListArray {
@@ -917,6 +993,19 @@ impl From<Vec<&[u8]>> for BinaryArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl<'a> TryFrom<Vec<Option<&'a str>>> for StringArray {
+    type Error = ArrowError;
+
+    fn try_from(v: Vec<Option<&'a str>>) -> Result<Self> {
+        let mut builder = StringBuilder::new(v.len());
+        for val in v {
+            if let Some(s) = val {
+                builder.append_value(s)?;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl<'a> TryFrom<Vec<Option<&'a str>>> for BinaryArray {
     type Error = ArrowError;
 
@@ -925,6 +1014,10 @@ impl<'a> TryFrom<Vec<Option<&'a str>>> for BinaryArray {
         for val in v {
             if let Some(s) = val {
                 builder.append_string(s)?;
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             } else {
                 builder.append(false)?;
             }
@@ -994,6 +1087,41 @@ impl StructArray {
     pub fn num_columns(&self) -> usize {
         self.boxed_fields.len()
     }
+<<<<<<< HEAD
+<<<<<<< HEAD
+
+    /// Returns the fields of the struct array
+    pub fn columns(&self) -> Vec<&ArrayRef> {
+        self.boxed_fields.iter().collect()
+    }
+
+    /// Returns child array refs of the struct array
+    pub fn columns_ref(&self) -> Vec<ArrayRef> {
+        self.boxed_fields.clone()
+    }
+
+    /// Return field names in this struct array
+    pub fn column_names(&self) -> Vec<&str> {
+        match self.data.data_type() {
+            Struct(fields) => fields
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<&str>>(),
+            _ => unreachable!("Struct array's data type is not struct!"),
+        }
+    }
+
+    /// Return child array whose field name equals to column_name
+    pub fn column_by_name(&self, column_name: &str) -> Option<&ArrayRef> {
+        self.column_names()
+            .iter()
+            .position(|c| c == &column_name)
+            .map(|pos| self.column(pos))
+    }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 impl From<ArrayDataRef> for StructArray {

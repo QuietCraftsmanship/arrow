@@ -20,10 +20,39 @@ package org.apache.arrow.vector;
 /**
  * Interface for all int type vectors.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
+public interface BaseIntVector extends FieldVector {
+
+  /**
+   * Sets the value at index, note this value may need to be need truncated.
+   * Note this is safe version (i.e. call setSafe method in vector)
+   */
+  void setWithPossibleTruncate(int index, long value);
+
+  /**
+   * Sets the value at index, note this value may need to be need truncated.
+   * Note this is unsafe version (i.e. call set method in vector)
+   */
+  void setUnsafeWithPossibleTruncate(int index, long value);
+
+  /**
+   * Gets the value at index.
+   * This value may have been extended to long and will throw {@link NullPointerException}
+   * if the value is null. Note null check could be turned off via {@link NullCheckingForGet}.
+   */
+  long getValueAsLong(int index);
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 public interface BaseIntVector extends ValueVector {
 
   /**
    * set the encoded value from a {@link org.apache.arrow.vector.dictionary.Dictionary}.
    */
   void setEncodedValue(int index, int value);
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }

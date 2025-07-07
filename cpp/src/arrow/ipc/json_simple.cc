@@ -768,7 +768,15 @@ class StructConverter final : public ConcreteConverter<StructConverter> {
 };
 
 // ------------------------------------------------------------------------
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
 // Converter for union arrays
+=======
+// Converter for struct arrays
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
+// Converter for union arrays
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 class UnionConverter final : public ConcreteConverter<UnionConverter> {
  public:
@@ -784,7 +792,15 @@ class UnionConverter final : public ConcreteConverter<UnionConverter> {
       type_id_to_child_num_[type_id] = child_i++;
     }
     std::vector<std::shared_ptr<ArrayBuilder>> child_builders;
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
     for (const auto& field : type_->fields()) {
+=======
+    for (const auto& field : type_->children()) {
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
+    for (const auto& field : type_->fields()) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       std::shared_ptr<Converter> child_converter;
       RETURN_NOT_OK(GetConverter(field->type(), &child_converter));
       child_converters_.push_back(child_converter);
@@ -800,8 +816,33 @@ class UnionConverter final : public ConcreteConverter<UnionConverter> {
     return Status::OK();
   }
 
+<<<<<<< HEAD
+  Status AppendNull() override {
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
+    if (mode_ == UnionMode::SPARSE) {
+      for (auto& converter : child_converters_) {
+        RETURN_NOT_OK(converter->AppendNull());
+      }
+=======
+    for (auto& converter : child_converters_) {
+      RETURN_NOT_OK(converter->AppendNull());
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+    }
+    return builder_->AppendNull();
+  }
+
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
   // Append a JSON value that must be a 2-long array, containing the type_id
   // and value of the UnionArray's slot.
+=======
+  // Append a JSON value that is either an array of N elements in order
+  // or an object mapping struct names to values (omitted struct members
+  // are mapped to null).
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
+  // Append a JSON value that must be a 2-long array, containing the type_id
+  // and value of the UnionArray's slot.
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   Status AppendValue(const rj::Value& json_obj) override {
     if (json_obj.IsNull()) {
       return this->AppendNull();
@@ -825,15 +866,33 @@ class UnionConverter final : public ConcreteConverter<UnionConverter> {
     }
 
     auto child_converter = child_converters_[child_num];
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
     if (mode_ == UnionMode::SPARSE) {
+=======
+    if (mode_ == UnionMode::DENSE) {
+      RETURN_NOT_OK(checked_cast<DenseUnionBuilder&>(*builder_).Append(id));
+    } else {
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
+    if (mode_ == UnionMode::SPARSE) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       RETURN_NOT_OK(checked_cast<SparseUnionBuilder&>(*builder_).Append(id));
       for (auto&& other_converter : child_converters_) {
         if (other_converter != child_converter) {
           RETURN_NOT_OK(other_converter->AppendNull());
         }
       }
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
     } else {
       RETURN_NOT_OK(checked_cast<DenseUnionBuilder&>(*builder_).Append(id));
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
+    } else {
+      RETURN_NOT_OK(checked_cast<DenseUnionBuilder&>(*builder_).Append(id));
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     }
     return child_converter->AppendValue(json_obj[1]);
   }
@@ -951,6 +1010,12 @@ Status GetConverter(const std::shared_ptr<DataType>& type,
     SIMPLE_CONVERTER_CASE(Type::BINARY, StringConverter<BinaryType>)
     SIMPLE_CONVERTER_CASE(Type::LARGE_STRING, StringConverter<LargeStringType>)
     SIMPLE_CONVERTER_CASE(Type::LARGE_BINARY, StringConverter<LargeBinaryType>)
+<<<<<<< HEAD
+    SIMPLE_CONVERTER_CASE(Type::FIXED_SIZE_BINARY, FixedSizeBinaryConverter)
+    SIMPLE_CONVERTER_CASE(Type::DECIMAL, DecimalConverter)
+    SIMPLE_CONVERTER_CASE(Type::UNION, UnionConverter)
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple.cc
+=======
     SIMPLE_CONVERTER_CASE(Type::STRING_VIEW, StringConverter<StringViewType>)
     SIMPLE_CONVERTER_CASE(Type::BINARY_VIEW, StringConverter<BinaryViewType>)
     SIMPLE_CONVERTER_CASE(Type::FIXED_SIZE_BINARY, FixedSizeBinaryConverter<>)
@@ -960,11 +1025,22 @@ Status GetConverter(const std::shared_ptr<DataType>& type,
     SIMPLE_CONVERTER_CASE(Type::DECIMAL256, Decimal256Converter<>)
     SIMPLE_CONVERTER_CASE(Type::SPARSE_UNION, UnionConverter)
     SIMPLE_CONVERTER_CASE(Type::DENSE_UNION, UnionConverter)
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     SIMPLE_CONVERTER_CASE(Type::INTERVAL_MONTHS, IntegerConverter<MonthIntervalType>)
     SIMPLE_CONVERTER_CASE(Type::INTERVAL_DAY_TIME, DayTimeIntervalConverter)
     SIMPLE_CONVERTER_CASE(Type::INTERVAL_MONTH_DAY_NANO, MonthDayNanoIntervalConverter)
     default:
+<<<<<<< HEAD
+      return not_implemented();
+=======
+    default: {
+      return Status::NotImplemented("JSON conversion to ", type->ToString(),
+                                    " not implemented");
+    }
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple.cc
+=======
       return ConversionNotImplemented(type);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
 #undef SIMPLE_CONVERTER_CASE

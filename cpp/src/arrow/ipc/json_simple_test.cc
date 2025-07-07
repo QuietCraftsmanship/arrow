@@ -1186,9 +1186,15 @@ TEST(TestDenseUnion, Basics) {
   auto field_a = field("a", int8());
   auto field_b = field("b", boolean());
 
+<<<<<<< HEAD
+  auto type = union_({field_a, field_b}, {4, 8}, UnionMode::DENSE);
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  auto array = checked_pointer_cast<UnionArray>(
+=======
   auto type = dense_union({field_a, field_b}, {4, 8});
   ASSERT_OK_AND_ASSIGN(
       auto array_parsed,
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       ArrayFromJSON(type, "[null, [4, 122], [8, true], [4, null], null, [8, false]]"));
   auto array = checked_pointer_cast<DenseUnionArray>(array_parsed);
 
@@ -1208,6 +1214,24 @@ TEST(TestDenseUnion, Basics) {
   ASSERT_TRUE(array->value_offsets()->Equals(*expected_offsets->data()->buffers[1]));
   ASSERT_ARRAYS_EQUAL(*expected_a, *array->field(0));
   ASSERT_ARRAYS_EQUAL(*expected_b, *array->field(1));
+<<<<<<< HEAD
+=======
+  auto array = ArrayFromJSON(type, "[[4, 122], [8, true], [4, null], null, [8, false]]");
+
+  auto expected_types = ArrayFromJSON(int8(), "[4, 8, 4, null, 8]");
+  auto expected_offsets = ArrayFromJSON(int32(), "[0, 0, 1, 0, 1]");
+  auto expected_a = ArrayFromJSON(int8(), "[122, null]");
+  auto expected_b = ArrayFromJSON(boolean(), "[true, false]");
+
+  std::shared_ptr<Array> expected;
+  ASSERT_OK(UnionArray::MakeDense(*expected_types, *expected_offsets,
+                                  {expected_a, expected_b}, {"a", "b"}, {4, 8},
+                                  &expected));
+
+  ASSERT_ARRAYS_EQUAL(*expected, *array);
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 TEST(TestSparseUnion, Basics) {
@@ -1225,9 +1249,21 @@ TEST(TestSparseUnion, Basics) {
   ASSERT_OK_AND_ASSIGN(auto expected_b,
                        ArrayFromJSON(boolean(), "[null, true, null, null, false]"));
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ASSERT_OK_AND_ASSIGN(auto expected,
                        SparseUnionArray::Make(*expected_types, {expected_a, expected_b},
                                               {"a", "b"}, {4, 8}));
+<<<<<<< HEAD
+=======
+  std::shared_ptr<Array> expected;
+  ASSERT_OK(UnionArray::MakeSparse(*expected_types, {expected_a, expected_b}, {"a", "b"},
+                                   {4, 8}, &expected));
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   ASSERT_ARRAYS_EQUAL(*expected, *array);
 }
@@ -1237,18 +1273,39 @@ TEST(TestDenseUnion, ListOfUnion) {
   auto field_b = field("b", boolean());
   auto union_type = dense_union({field_a, field_b}, {4, 8});
   auto list_type = list(union_type);
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  auto array =
+      checked_pointer_cast<ListArray>(ArrayFromJSON(list_type,
+                                                    "["
+                                                    "[[4, 122], [8, true]],"
+                                                    "[[4, null], null, [8, false]]"
+                                                    "]"));
+=======
+  auto array = ArrayFromJSON(list_type,
+                             "["
+                             "[[4, 122], [8, true]],"
+                             "[[4, null], null, [8, false]]"
+                             "]");
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
   ASSERT_OK_AND_ASSIGN(auto parsed_array, ArrayFromJSON(list_type,
                                                         "["
                                                         "[[4, 122], [8, true]],"
                                                         "[[4, null], null, [8, false]]"
                                                         "]"));
   auto array = checked_pointer_cast<ListArray>(parsed_array);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   ASSERT_OK_AND_ASSIGN(auto expected_types, ArrayFromJSON(int8(), "[4, 8, 4, 4, 8]"));
   ASSERT_OK_AND_ASSIGN(auto expected_offsets, ArrayFromJSON(int32(), "[0, 0, 1, 2, 1]"));
   ASSERT_OK_AND_ASSIGN(auto expected_a, ArrayFromJSON(int8(), "[122, null, null]"));
   ASSERT_OK_AND_ASSIGN(auto expected_b, ArrayFromJSON(boolean(), "[true, false]"));
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ASSERT_OK_AND_ASSIGN(
       auto expected_values,
       DenseUnionArray::Make(*expected_types, *expected_offsets, {expected_a, expected_b},
@@ -1265,6 +1322,20 @@ TEST(TestDenseUnion, ListOfUnion) {
       *checked_pointer_cast<DenseUnionArray>(expected_values)->value_offsets()));
   ASSERT_ARRAYS_EQUAL(*expected_a, *array_values->field(0));
   ASSERT_ARRAYS_EQUAL(*expected_b, *array_values->field(1));
+<<<<<<< HEAD
+=======
+  std::shared_ptr<Array> expected_values, expected;
+  ASSERT_OK(UnionArray::MakeDense(*expected_types, *expected_offsets,
+                                  {expected_a, expected_b}, {"a", "b"}, {4, 8},
+                                  &expected_values));
+  auto expected_list_offsets = ArrayFromJSON(int32(), "[0, 2, 5]");
+  ASSERT_OK(ListArray::FromArrays(*expected_list_offsets, *expected_values,
+                                  default_memory_pool(), &expected));
+
+  ASSERT_ARRAYS_EQUAL(*expected, *array);
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 TEST(TestSparseUnion, ListOfUnion) {
@@ -1284,12 +1355,27 @@ TEST(TestSparseUnion, ListOfUnion) {
   ASSERT_OK_AND_ASSIGN(auto expected_b,
                        ArrayFromJSON(boolean(), "[null, true, null, null, false]"));
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ASSERT_OK_AND_ASSIGN(auto expected_values,
                        SparseUnionArray::Make(*expected_types, {expected_a, expected_b},
                                               {"a", "b"}, {4, 8}));
   ASSERT_OK_AND_ASSIGN(auto expected_list_offsets, ArrayFromJSON(int32(), "[0, 2, 5]"));
   ASSERT_OK_AND_ASSIGN(auto expected,
                        ListArray::FromArrays(*expected_list_offsets, *expected_values));
+<<<<<<< HEAD
+=======
+  std::shared_ptr<Array> expected_values, expected;
+  ASSERT_OK(UnionArray::MakeSparse(*expected_types, {expected_a, expected_b}, {"a", "b"},
+                                   {4, 8}, &expected_values));
+  auto expected_list_offsets = ArrayFromJSON(int32(), "[0, 2, 5]");
+  ASSERT_OK(ListArray::FromArrays(*expected_list_offsets, *expected_values,
+                                  default_memory_pool(), &expected));
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   ASSERT_ARRAYS_EQUAL(*expected, *array);
 }
@@ -1300,6 +1386,24 @@ TEST(TestDenseUnion, UnionOfStructs) {
       field("wtf", struct_({field("whiskey", int8()), field("tango", float64()),
                             field("foxtrot", list(int8()))})),
       field("q", struct_({field("quebec", utf8())}))};
+<<<<<<< HEAD
+  auto type = union_(fields, {0, 23, 47}, UnionMode::DENSE);
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  auto array = checked_pointer_cast<UnionArray>(ArrayFromJSON(type, R"([
+=======
+  auto array = ArrayFromJSON(type, R"([
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+    [0, {"alpha": 0.0, "bravo": "charlie"}],
+    [23, {"whiskey": 99}],
+    [0, {"bravo": "mike"}],
+    null,
+    [23, {"tango": 8.25, "foxtrot": [0, 2, 3]}]
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  ])"));
+=======
+  ])");
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
   auto type = dense_union(fields, {0, 23, 47});
   ASSERT_OK_AND_ASSIGN(auto array_parsed,
                        ArrayFromJSON(type, R"([[0, {"alpha": 0.0, "bravo": "charlie"}],
@@ -1309,6 +1413,7 @@ TEST(TestDenseUnion, UnionOfStructs) {
                                       [23, {"tango": 8.25, "foxtrot": [0, 2, 3]}]
                                       ])"));
   auto array = checked_pointer_cast<DenseUnionArray>(array_parsed);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   ASSERT_OK_AND_ASSIGN(auto expected_types, ArrayFromJSON(int8(), "[0, 23, 0, 0, 23]"));
   ASSERT_OK_AND_ASSIGN(auto expected_offsets, ArrayFromJSON(int32(), "[0, 0, 1, 2, 1]"));
@@ -1324,6 +1429,10 @@ TEST(TestDenseUnion, UnionOfStructs) {
   ASSERT_OK_AND_ASSIGN(auto expected_fields_2, ArrayFromJSON(fields[2]->type(), "[]"));
   ArrayVector expected_fields = {expected_fields_0, expected_fields_1, expected_fields_2};
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ASSERT_OK_AND_ASSIGN(
       auto expected,
       DenseUnionArray::Make(*expected_types, *expected_offsets, expected_fields,
@@ -1337,6 +1446,16 @@ TEST(TestDenseUnion, UnionOfStructs) {
     ASSERT_ARRAYS_EQUAL(*checked_cast<const UnionArray&>(*expected).field(i),
                         *array->field(i));
   }
+<<<<<<< HEAD
+=======
+  std::shared_ptr<Array> expected;
+  ASSERT_OK(UnionArray::MakeDense(*expected_types, *expected_offsets, expected_fields,
+                                  {"ab", "wtf", "q"}, {0, 23, 47}, &expected));
+
+  ASSERT_ARRAYS_EQUAL(*expected, *array);
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 TEST(TestSparseUnion, UnionOfStructs) {
@@ -1373,9 +1492,21 @@ TEST(TestSparseUnion, UnionOfStructs) {
                        ArrayFromJSON(fields[2]->type(), "[null, null, null, null, null]"))
   ArrayVector expected_fields = {expected_fields_0, expected_fields_1, expected_fields_2};
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ASSERT_OK_AND_ASSIGN(auto expected,
                        SparseUnionArray::Make(*expected_types, expected_fields,
                                               {"ab", "wtf", "q"}, {0, 23, 47}));
+<<<<<<< HEAD
+=======
+  std::shared_ptr<Array> expected;
+  ASSERT_OK(UnionArray::MakeSparse(*expected_types, expected_fields, {"ab", "wtf", "q"},
+                                   {0, 23, 47}, &expected));
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   ASSERT_ARRAYS_EQUAL(*expected, *array);
 }
@@ -1386,6 +1517,24 @@ TEST(TestDenseUnion, Errors) {
   std::shared_ptr<DataType> type = dense_union({field_a, field_b}, {4, 8});
   std::shared_ptr<Array> array;
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a valid type_id\"]", &array));
+  ASSERT_RAISES(Invalid,
+                ArrayFromJSON(type, "[[0, 99]]", &array));  // 0 is not one of {4, 8}
+  ASSERT_RAISES(Invalid,
+                ArrayFromJSON(type, "[[4, \"\"]]", &array));  // "" is not a valid int8()
+
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a pair\"]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0]]", &array));
+=======
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"\"]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0, 8]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[4, \"\"]]", &array));
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[8, true, 1]]", &array));
+=======
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a valid type_id\"]"));
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0, 99]]"));    // 0 is not one of {4, 8}
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[4, \"\"]]"));  // "" is not a valid int8()
@@ -1393,6 +1542,7 @@ TEST(TestDenseUnion, Errors) {
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a pair\"]"));
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0]]"));
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[8, true, 1]]"));
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 TEST(TestSparseUnion, Errors) {
@@ -1401,6 +1551,12 @@ TEST(TestSparseUnion, Errors) {
   std::shared_ptr<DataType> type = sparse_union({field_a, field_b}, {4, 8});
   std::shared_ptr<Array> array;
 
+<<<<<<< HEAD
+<<<<<<< HEAD:cpp/src/arrow/ipc/json_simple_test.cc
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a valid type_id\"]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0, 99]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[4, \"\"]]", &array));
+=======
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"not a valid type_id\"]"));
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0, 99]]"));
   ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[4, \"\"]]"));
@@ -1415,6 +1571,7 @@ TEST(TestNestedDictionary, ListOfDict) {
   auto value_type = utf8();
   auto dict_type = dictionary(index_type, value_type);
   auto type = list(dict_type);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   std::shared_ptr<Array> array, expected, indices, values, dicts, offsets;
 
@@ -1455,6 +1612,17 @@ TEST(TestDictArrayFromJSON, Errors) {
                                            &array));  // dict value isn't string
 }
 
+<<<<<<< HEAD
+=======
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[\"\"]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0, 8]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[0]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[4, \"\"]]", &array));
+  ASSERT_RAISES(Invalid, ArrayFromJSON(type, "[[8, true, 1]]", &array));
+}
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays:cpp/src/arrow/ipc/json-simple-test.cc
+=======
 TEST(TestChunkedArrayFromJSON, Basics) {
   auto type = int32();
   std::shared_ptr<ChunkedArray> chunked_array;
@@ -1535,6 +1703,7 @@ TEST(TestDictScalarFromJSON, Errors) {
                                             &scalar));  // dict value isn't string
 }
 
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }  // namespace json
 }  // namespace internal
 }  // namespace ipc

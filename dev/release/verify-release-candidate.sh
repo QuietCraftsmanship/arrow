@@ -199,6 +199,37 @@ check_verification_result_on_github() {
 
 test_apt() {
 <<<<<<< HEAD
+<<<<<<< HEAD
+  for target in "debian:stretch" \
+                "arm64v8/debian:stretch" \
+                "debian:buster" \
+                "arm64v8/debian:buster" \
+                "ubuntu:xenial" \
+                "arm64v8/ubuntu:xenial" \
+                "ubuntu:bionic" \
+                "arm64v8/ubuntu:bionic" \
+                "ubuntu:eoan" \
+                "arm64v8/ubuntu:eoan" \
+                "ubuntu:focal" \
+                "arm64v8/ubuntu:focal"; do \
+    # We can't build some arm64 binaries by Crossbow for now.
+    if [ "${target}" = "arm64v8/debian:stretch" ]; then continue; fi
+    if [ "${target}" = "arm64v8/debian:buster" ]; then continue; fi
+    if [ "${target}" = "arm64v8/ubuntu:xenial" ]; then continue; fi
+    if [ "${target}" = "arm64v8/ubuntu:bionic" ]; then continue; fi
+    if [ "${target}" = "arm64v8/ubuntu:eoan" ]; then continue; fi
+    if [ "${target}" = "arm64v8/ubuntu:focal" ]; then continue; fi
+    case "${target}" in
+      arm64v8/*)
+        if [ "$(arch)" = "aarch64" -o -e /usr/bin/qemu-aarch64-static ]; then
+          : # OK
+        else
+          continue
+        fi
+        ;;
+    esac
+    if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+=======
   show_header "Testing APT packages"
 
   if [ "${GITHUB_ACTIONS}" != "true" ]; then
@@ -246,6 +277,7 @@ test_apt() {
       done
       ;;
   esac
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 =======
   for target in debian-stretch \
                 debian-buster \
@@ -254,6 +286,10 @@ test_apt() {
                 ubuntu-cosmic \
                 ubuntu-disco; do
     if ! "${SOURCE_DIR}/../run_docker_compose.sh" \
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
            "${target}" \
            /arrow/dev/release/verify-apt.sh \
            "${VERSION}" \

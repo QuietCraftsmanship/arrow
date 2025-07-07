@@ -637,6 +637,21 @@ err_out:
 ///
 class JavaResizableBuffer : public arrow::ResizableBuffer {
  public:
+<<<<<<< HEAD
+<<<<<<< HEAD
+  JavaResizableBuffer(JNIEnv* env, jobject jexpander, int32_t vector_idx, uint8_t* buffer,
+                      int32_t len)
+      : ResizableBuffer(buffer, len),
+        env_(env),
+        jexpander_(jexpander),
+        vector_idx_(vector_idx) {
+    size_ = 0;
+  }
+
+  Status Resize(const int64_t new_size, bool shrink_to_fit) override;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   JavaResizableBuffer(uint8_t* buffer, int32_t len) : ResizableBuffer(buffer, len) {
     size_ = 0;
   }
@@ -652,12 +667,61 @@ class JavaResizableBuffer : public arrow::ResizableBuffer {
       return Status::NotImplemented("buffer expand not implemented");
     }
   }
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   Status Reserve(const int64_t new_capacity) override {
     return Status::NotImplemented("reserve not implemented");
   }
+<<<<<<< HEAD
+<<<<<<< HEAD
+
+ private:
+  JNIEnv* env_;
+  jobject jexpander_;
+  int32_t vector_idx_;
 };
 
+Status JavaResizableBuffer::Resize(const int64_t new_size, bool shrink_to_fit) {
+  if (shrink_to_fit == true) {
+    return Status::NotImplemented("shrink not implemented");
+  }
+
+  if (ARROW_PREDICT_TRUE(new_size < capacity())) {
+    // no need to expand.
+    size_ = new_size;
+    return Status::OK();
+  }
+
+  // callback into java to expand the buffer
+  jobject ret =
+      env_->CallObjectMethod(jexpander_, vector_expander_method_, vector_idx_, new_size);
+  if (env_->ExceptionCheck()) {
+    env_->ExceptionDescribe();
+    env_->ExceptionClear();
+    return Status::OutOfMemory("buffer expand failed in java");
+  }
+
+  jlong ret_address = env_->GetLongField(ret, vector_expander_ret_address_);
+  jlong ret_capacity = env_->GetLongField(ret, vector_expander_ret_capacity_);
+  DCHECK_GE(ret_capacity, new_size);
+
+  data_ = mutable_data_ = reinterpret_cast<uint8_t*>(ret_address);
+  size_ = new_size;
+  capacity_ = ret_capacity;
+  return Status::OK();
+}
+
+=======
+};
+
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+};
+
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #define CHECK_OUT_BUFFER_IDX_AND_BREAK(idx, len)                               \
   if (idx >= len) {                                                            \
     status = gandiva::Status::Invalid("insufficient number of out_buf_addrs"); \
@@ -755,7 +819,22 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
       uint8_t* value_buf = reinterpret_cast<uint8_t*>(out_bufs[buf_idx++]);
       jlong data_sz = out_sizes[sz_idx++];
       if (arrow::is_binary_like(field->type()->id())) {
+<<<<<<< HEAD
+<<<<<<< HEAD
+        if (jexpander == nullptr) {
+          status = Status::Invalid(
+              "expression has variable len output columns, but the expander object is "
+              "null");
+          break;
+        }
+        buffers.push_back(std::make_shared<JavaResizableBuffer>(
+            env, jexpander, output_vector_idx, value_buf, data_sz));
+=======
         buffers.push_back(std::make_shared<JavaResizableBuffer>(value_buf, data_sz));
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        buffers.push_back(std::make_shared<JavaResizableBuffer>(value_buf, data_sz));
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       } else {
         buffers.push_back(std::make_shared<arrow::MutableBuffer>(value_buf, data_sz));
       }

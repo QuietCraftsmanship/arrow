@@ -48,10 +48,15 @@ endif()
 add_arrow_test(utility-test
                SOURCES
                align_util_test.cc
+<<<<<<< HEAD
+               bit_block_counter_test.cc
+               bit_util_test.cc
+=======
                atfork_test.cc
                byte_size_test.cc
                byte_stream_split_test.cc
                cache_test.cc
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
                checked_cast_test.cc
                compression_test.cc
                decimal_test.cc
@@ -108,12 +113,15 @@ add_arrow_test(threading-utility-test
                test_common.cc
                thread_pool_test.cc)
 
+<<<<<<< HEAD
+=======
 add_arrow_test(crc32-test
                SOURCES
                crc32_test.cc
                EXTRA_LINK_LIBS
                Boost::headers)
 
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 add_arrow_benchmark(bit_block_counter_benchmark)
 add_arrow_benchmark(bit_util_benchmark)
 add_arrow_benchmark(bitmap_reader_benchmark)

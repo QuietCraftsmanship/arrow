@@ -21,12 +21,60 @@
 #include <cstdint>
 #include <type_traits>
 
+<<<<<<< HEAD
+#include "arrow/util/bit_util.h"
+#include "arrow/util/ubsan.h"
+=======
 #include "arrow/buffer.h"
 #include "arrow/util/bitmap_ops.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 namespace arrow {
 namespace internal {
 
+<<<<<<< HEAD
+BitBlockCount BitBlockCounter::NextWord() { return NextWordInline(); }
+
+BitBlockCount BitBlockCounter::NextFourWords() {
+  static constexpr int16_t kTargetBlockLength = 256;
+  auto load_word = [](const uint8_t* bytes) -> uint64_t {
+    return BitUtil::ToLittleEndian(util::SafeLoadAs<uint64_t>(bytes));
+  };
+  auto shift_word = [](uint64_t current, uint64_t next, int64_t shift) -> uint64_t {
+    return (current >> shift) | (next << (64 - shift));
+  };
+  int64_t total_popcount = 0;
+  if (offset_ == 0) {
+    if (bits_remaining_ < 256) {
+      return GetLastBlock();
+    }
+    total_popcount += BitUtil::PopCount(load_word(bitmap_));
+    total_popcount += BitUtil::PopCount(load_word(bitmap_ + 8));
+    total_popcount += BitUtil::PopCount(load_word(bitmap_ + 16));
+    total_popcount += BitUtil::PopCount(load_word(bitmap_ + 24));
+  } else {
+    // When the offset is > 0, we need there to be a word beyond the last
+    // aligned word in the bitmap for the bit shifting logic.
+    if (bits_remaining_ < 320 - offset_) {
+      return GetLastBlock();
+    }
+    auto current = load_word(bitmap_);
+    auto next = load_word(bitmap_ + 8);
+    total_popcount += BitUtil::PopCount(shift_word(current, next, offset_));
+    current = next;
+    next = load_word(bitmap_ + 16);
+    total_popcount += BitUtil::PopCount(shift_word(current, next, offset_));
+    current = next;
+    next = load_word(bitmap_ + 24);
+    total_popcount += BitUtil::PopCount(shift_word(current, next, offset_));
+    current = next;
+    next = load_word(bitmap_ + 32);
+    total_popcount += BitUtil::PopCount(shift_word(current, next, offset_));
+  }
+  bitmap_ += BitUtil::BytesForBits(kTargetBlockLength);
+  bits_remaining_ -= 256;
+  return {256, static_cast<int16_t>(total_popcount)};
+=======
 BitBlockCount BitBlockCounter::GetBlockSlow(int64_t block_size) noexcept {
   const int16_t run_length = static_cast<int16_t>(std::min(bits_remaining_, block_size));
   int16_t popcount = static_cast<int16_t>(CountSetBits(bitmap_, offset_, run_length));
@@ -35,20 +83,72 @@ BitBlockCount BitBlockCounter::GetBlockSlow(int64_t block_size) noexcept {
   // case, the first time the run length will be a multiple of 8 by construction
   bitmap_ += run_length / 8;
   return {run_length, popcount};
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(const uint8_t* validity_bitmap,
                                                  int64_t offset, int64_t length)
+<<<<<<< HEAD
+    : counter_(validity_bitmap, offset, length),
+      position_(0),
+      length_(length),
+      has_bitmap_(validity_bitmap != nullptr) {}
+=======
     : has_bitmap_(validity_bitmap != nullptr),
       position_(0),
       length_(length),
       counter_(util::MakeNonNull(validity_bitmap), offset, length) {}
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(
     const std::shared_ptr<Buffer>& validity_bitmap, int64_t offset, int64_t length)
     : OptionalBitBlockCounter(validity_bitmap ? validity_bitmap->data() : nullptr, offset,
                               length) {}
 
+<<<<<<< HEAD
+BitBlockCount BinaryBitBlockCounter::NextAndWord() {
+  auto load_word = [](const uint8_t* bytes) -> uint64_t {
+    return BitUtil::ToLittleEndian(util::SafeLoadAs<uint64_t>(bytes));
+  };
+  auto shift_word = [](uint64_t current, uint64_t next, int64_t shift) -> uint64_t {
+    if (shift == 0) return current;
+    return (current >> shift) | (next << (64 - shift));
+  };
+
+  // When the offset is > 0, we need there to be a word beyond the last aligned
+  // word in the bitmap for the bit shifting logic.
+  const int64_t bits_required_to_use_words =
+      std::max(left_offset_ == 0 ? 64 : 64 + (64 - left_offset_),
+               right_offset_ == 0 ? 64 : 64 + (64 - right_offset_));
+  if (bits_remaining_ < bits_required_to_use_words) {
+    const int16_t run_length = static_cast<int16_t>(bits_remaining_);
+    int16_t popcount = 0;
+    for (int64_t i = 0; i < run_length; ++i) {
+      if (BitUtil::GetBit(left_bitmap_, left_offset_ + i) &&
+          BitUtil::GetBit(right_bitmap_, right_offset_ + i)) {
+        ++popcount;
+      }
+    }
+    bits_remaining_ -= run_length;
+    return {run_length, popcount};
+  }
+
+  int64_t popcount = 0;
+  if (left_offset_ == 0 && right_offset_ == 0) {
+    popcount = BitUtil::PopCount(load_word(left_bitmap_) & load_word(right_bitmap_));
+  } else {
+    auto left_word =
+        shift_word(load_word(left_bitmap_), load_word(left_bitmap_ + 8), left_offset_);
+    auto right_word =
+        shift_word(load_word(right_bitmap_), load_word(right_bitmap_ + 8), right_offset_);
+    popcount = BitUtil::PopCount(left_word & right_word);
+  }
+  left_bitmap_ += 8;
+  right_bitmap_ += 8;
+  bits_remaining_ -= 64;
+  return {64, static_cast<int16_t>(popcount)};
+}
+=======
 OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(const uint8_t* left_bitmap,
                                                              int64_t left_offset,
                                                              const uint8_t* right_bitmap,
@@ -69,6 +169,7 @@ OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(
     : OptionalBinaryBitBlockCounter(
           left_bitmap ? left_bitmap->data() : nullptr, left_offset,
           right_bitmap ? right_bitmap->data() : nullptr, right_offset, length) {}
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 }  // namespace internal
 }  // namespace arrow

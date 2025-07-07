@@ -173,6 +173,13 @@ ARROW_EXPORT std::shared_ptr<TypeMatcher> RunEndEncoded(
     std::shared_ptr<TypeMatcher> run_end_type_matcher,
     std::shared_ptr<TypeMatcher> value_type_matcher);
 
+// \brief Match any integer type
+ARROW_EXPORT std::shared_ptr<TypeMatcher> Integer();
+
+// \brief Match any primitive type (boolean or any type representable as a C
+// Type)
+ARROW_EXPORT std::shared_ptr<TypeMatcher> Primitive();
+
 }  // namespace match
 
 /// \brief An object used for type-checking arguments to be passed to a kernel

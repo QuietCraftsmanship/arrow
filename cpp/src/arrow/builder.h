@@ -27,7 +27,10 @@
 #include "arrow/array/builder_dict.h"       // IWYU pragma: keep
 #include "arrow/array/builder_nested.h"     // IWYU pragma: keep
 #include "arrow/array/builder_primitive.h"  // IWYU pragma: keep
+<<<<<<< HEAD
+=======
 #include "arrow/array/builder_run_end.h"    // IWYU pragma: keep
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/array/builder_time.h"       // IWYU pragma: keep
 #include "arrow/array/builder_union.h"      // IWYU pragma: keep
 =======

@@ -23,6 +23,8 @@
 
 #pragma once
 
+<<<<<<< HEAD
+=======
 /// \defgroup numeric-arrays Concrete classes for numeric arrays
 /// @{
 /// @}
@@ -39,13 +41,17 @@
 /// @{
 /// @}
 
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/array/array_base.h"       // IWYU pragma: keep
 #include "arrow/array/array_binary.h"     // IWYU pragma: keep
 #include "arrow/array/array_decimal.h"    // IWYU pragma: keep
 #include "arrow/array/array_dict.h"       // IWYU pragma: keep
 #include "arrow/array/array_nested.h"     // IWYU pragma: keep
 #include "arrow/array/array_primitive.h"  // IWYU pragma: keep
+<<<<<<< HEAD
+=======
 #include "arrow/array/array_run_end.h"    // IWYU pragma: keep
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/array/data.h"             // IWYU pragma: keep
 #include "arrow/array/util.h"             // IWYU pragma: keep
 =======

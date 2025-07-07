@@ -17,10 +17,22 @@
 
 #![allow(bare_trait_objects)]
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+use arrow::util::pretty;
+use clap::{crate_version, App, Arg};
+use datafusion::error::Result;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 use arrow::array::*;
 use arrow::datatypes::{DataType, TimeUnit};
 use clap::{crate_version, App, Arg};
 use datafusion::error::{ExecutionError, Result};
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 use datafusion::execution::context::ExecutionContext;
 use datafusion::execution::relation::Relation;
 use prettytable::{Cell, Row, Table};

@@ -25,11 +25,18 @@
 #include "arrow/buffer.h"
 #include "arrow/memory_pool.h"
 #include "arrow/result.h"
+<<<<<<< HEAD
+#include "arrow/testing/gtest_common.h"
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
 #include "arrow/util/bit_block_counter.h"
 #include "arrow/util/bit_util.h"
+<<<<<<< HEAD
+=======
 #include "arrow/util/bitmap_ops.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 namespace arrow {
 namespace internal {
@@ -105,12 +112,38 @@ TEST_F(TestBitBlockCounter, OneWordWithOffsets) {
     ASSERT_EQ(block.popcount, 64);
 
     // Add a false value to the next word
+<<<<<<< HEAD
+    BitUtil::SetBitTo(buf_->mutable_data(), kWordSize + offset, false);
+=======
     bit_util::SetBitTo(buf_->mutable_data(), kWordSize + offset, false);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     block = counter_->NextWord();
     ASSERT_EQ(block.length, 64);
     ASSERT_EQ(block.popcount, 63);
 
     // Set the next word to all false
+<<<<<<< HEAD
+    BitUtil::SetBitsTo(buf_->mutable_data(), 2 * kWordSize + offset, kWordSize, false);
+
+    if (offset == 0) {
+      block = counter_->NextWord();
+      ASSERT_EQ(block.length, 64);
+      ASSERT_EQ(block.popcount, 0);
+
+      // Last block
+      block = counter_->NextWord();
+      ASSERT_EQ(block.length, kWordSize - 1);
+      ASSERT_EQ(block.length, block.popcount);
+    } else {
+      // In the last block, we are unable to do the required bit-shifting so
+      // more than 64 bits are returned.
+      block = counter_->NextWord();
+      ASSERT_EQ(block.length, 2 * kWordSize - offset - 1);
+
+      // The first 64 bits were zeroed
+      ASSERT_EQ(block.popcount, block.length - 64);
+    }
+=======
     bit_util::SetBitsTo(buf_->mutable_data(), 2 * kWordSize + offset, kWordSize, false);
 
     block = counter_->NextWord();
@@ -120,6 +153,7 @@ TEST_F(TestBitBlockCounter, OneWordWithOffsets) {
     block = counter_->NextWord();
     ASSERT_EQ(block.length, kWordSize - offset - 1);
     ASSERT_EQ(block.length, block.popcount);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
     // We can keep calling NextWord safely
     block = counter_->NextWord();
@@ -134,7 +168,11 @@ TEST_F(TestBitBlockCounter, OneWordWithOffsets) {
 
 TEST_F(TestBitBlockCounter, FourWordsWithOffsets) {
   auto CheckWithOffset = [&](int64_t offset) {
+<<<<<<< HEAD
+    const int64_t nwords = 15;
+=======
     const int64_t nwords = 17;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
     const int64_t total_bytes = nwords * 8 + 1;
     // Trim a bit from the end of the bitmap so we can check the remainder bits
@@ -145,6 +183,30 @@ TEST_F(TestBitBlockCounter, FourWordsWithOffsets) {
     std::memset(buf_->mutable_data(), 0xFF, total_bytes);
 
     BitBlockCount block = counter_->NextFourWords();
+<<<<<<< HEAD
+    ASSERT_EQ(4 * kWordSize, block.length);
+    ASSERT_EQ(block.popcount, 256);
+
+    // Add some false values to the next 3 shifted words
+    BitUtil::SetBitTo(buf_->mutable_data(), 4 * kWordSize + offset, false);
+    BitUtil::SetBitTo(buf_->mutable_data(), 5 * kWordSize + offset, false);
+    BitUtil::SetBitTo(buf_->mutable_data(), 6 * kWordSize + offset, false);
+    block = counter_->NextFourWords();
+
+    ASSERT_EQ(block.length, 256);
+    ASSERT_EQ(block.popcount, 253);
+
+    BitUtil::SetBitsTo(buf_->mutable_data(), 8 * kWordSize + offset, 2 * kWordSize,
+                       false);
+
+    block = counter_->NextFourWords();
+    ASSERT_EQ(block.length, 256);
+    ASSERT_EQ(block.popcount, 128);
+
+    // Last block
+    block = counter_->NextFourWords();
+    ASSERT_EQ(block.length, 3 * kWordSize - offset - 1);
+=======
     ASSERT_EQ(block.length, 4 * kWordSize);
     ASSERT_EQ(block.popcount, block.length);
 
@@ -174,6 +236,7 @@ TEST_F(TestBitBlockCounter, FourWordsWithOffsets) {
     // Partial block
     block = counter_->NextFourWords();
     ASSERT_EQ(block.length, kWordSize - offset - 1);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     ASSERT_EQ(block.length, block.popcount);
 
     // We can keep calling NextFourWords safely
@@ -205,8 +268,12 @@ TEST_F(TestBitBlockCounter, FourWordsRandomData) {
   }
 }
 
+<<<<<<< HEAD
+TEST(TestBinaryBitBlockCounter, NextAndWord) {
+=======
 template <class Op, typename NextWordFunc>
 void CheckBinaryBitBlockOp(NextWordFunc&& get_next_word) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   const int64_t nbytes = 1024;
   auto left = *AllocateBuffer(nbytes);
   auto right = *AllocateBuffer(nbytes);
@@ -218,6 +285,26 @@ void CheckBinaryBitBlockOp(NextWordFunc&& get_next_word) {
     BinaryBitBlockCounter counter(left->data(), left_offset, right->data(), right_offset,
                                   overlap_length);
     int64_t position = 0;
+<<<<<<< HEAD
+    while (true) {
+      BitBlockCount block = counter.NextAndWord();
+      if (block.length == 0) {
+        break;
+      }
+      int expected_popcount = 0;
+      for (int j = 0; j < block.length; ++j) {
+        expected_popcount +=
+            static_cast<int>(BitUtil::GetBit(left->data(), position + left_offset + j) &&
+                             BitUtil::GetBit(right->data(), position + right_offset + j));
+      }
+      ASSERT_EQ(block.popcount, expected_popcount);
+      position += block.length;
+    }
+    // We made it through all the data
+    ASSERT_EQ(position, overlap_length);
+
+    BitBlockCount block = counter.NextAndWord();
+=======
     do {
       BitBlockCount block = get_next_word(&counter);
       int expected_popcount = 0;
@@ -233,17 +320,25 @@ void CheckBinaryBitBlockOp(NextWordFunc&& get_next_word) {
     ASSERT_EQ(position, overlap_length);
 
     BitBlockCount block = get_next_word(&counter);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     ASSERT_EQ(block.length, 0);
     ASSERT_EQ(block.popcount, 0);
   };
 
+<<<<<<< HEAD
+  for (int left_i = 0; left_i < 7; ++left_i) {
+    for (int right_i = 0; right_i < 7; ++right_i) {
+=======
   for (int left_i = 0; left_i < 8; ++left_i) {
     for (int right_i = 0; right_i < 8; ++right_i) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       CheckWithOffsets(left_i, right_i);
     }
   }
 }
 
+<<<<<<< HEAD
+=======
 TEST(TestBinaryBitBlockCounter, NextAndWord) {
   CheckBinaryBitBlockOp<detail::BitBlockAnd>(
       [](BinaryBitBlockCounter* counter) { return counter->NextAndWord(); });
@@ -412,5 +507,6 @@ TEST_F(TestOptionalBinaryBitBlockCounter, NextBlockNoBitmap) {
   ASSERT_EQ(block.popcount, 0);
 }
 
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }  // namespace internal
 }  // namespace arrow

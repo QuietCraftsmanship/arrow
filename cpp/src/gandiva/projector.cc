@@ -197,7 +197,11 @@ Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
 
   // The output vector always has a null bitmap.
 <<<<<<< HEAD
+<<<<<<< HEAD
+  int64_t size = arrow::BitUtil::BytesForBits(num_records);
+=======
   int64_t size = arrow::bit_util::BytesForBits(num_records);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   ARROW_ASSIGN_OR_RAISE(auto bitmap_buffer, arrow::AllocateBuffer(size, pool));
   buffers.push_back(std::move(bitmap_buffer));
 =======
@@ -211,7 +215,11 @@ Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
   auto type_id = type->id();
   if (arrow::is_binary_like(type_id)) {
 <<<<<<< HEAD
+<<<<<<< HEAD
+    auto offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+=======
     auto offsets_len = arrow::bit_util::BytesForBits((num_records + 1) * 32);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
     ARROW_ASSIGN_OR_RAISE(auto offsets_buffer, arrow::AllocateBuffer(offsets_len, pool));
     buffers.push_back(std::move(offsets_buffer));
@@ -227,11 +235,17 @@ Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
   // The output vector always has a data array.
   int64_t data_len;
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+  std::shared_ptr<arrow::ResizableBuffer> data_buffer;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
   if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
     const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*type);
     data_len = arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
 =======
   std::shared_ptr<arrow::ResizableBuffer> data_buffer;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
     const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*type);
     data_len = arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());

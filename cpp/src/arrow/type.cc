@@ -1221,6 +1221,24 @@ std::string DurationType::ToString(bool show_metadata) const {
 constexpr int8_t UnionType::kMaxTypeCode;
 constexpr int UnionType::kInvalidChildId;
 
+<<<<<<< HEAD
+UnionType::UnionType(const std::vector<std::shared_ptr<Field>>& fields,
+<<<<<<< HEAD
+                     const std::vector<int8_t>& type_codes, UnionMode::type mode)
+    : NestedType(Type::UNION),
+      mode_(mode),
+      type_codes_(type_codes),
+      child_ids_(kMaxTypeCode + 1, kInvalidChildId) {
+  DCHECK_OK(ValidateParameters(fields, type_codes, mode));
+=======
+                     const std::vector<uint8_t>& type_codes, UnionMode::type mode)
+    : NestedType(Type::UNION), mode_(mode), type_codes_(type_codes) {
+  DCHECK_LE(fields.size(), type_codes.size()) << "union field with unknown type id";
+  DCHECK_GE(fields.size(), type_codes.size())
+      << "type id provided without corresponding union field";
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+  children_ = fields;
+=======
 UnionMode::type UnionType::mode() const {
   return id_ == Type::SPARSE_UNION ? UnionMode::SPARSE : UnionMode::DENSE;
 }
@@ -1231,6 +1249,7 @@ UnionType::UnionType(FieldVector fields, std::vector<int8_t> type_codes, Type::t
       child_ids_(kMaxTypeCode + 1, kInvalidChildId) {
   children_ = std::move(fields);
   DCHECK_OK(ValidateParameters(children_, type_codes_, mode()));
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   for (int child_id = 0; child_id < static_cast<int>(type_codes_.size()); ++child_id) {
     const auto type_code = type_codes_[child_id];
     child_ids_[type_code] = child_id;
