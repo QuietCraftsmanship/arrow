@@ -147,7 +147,7 @@ jobs:
           package_id=${GITHUB_REF_NAME%-rc*}
           echo "VERSION=${package_id#apache-arrow-}" >> ${GITHUB_ENV}
           echo "RC=${GITHUB_REF_NAME#*-rc}" >> ${GITHUB_ENV}
-      - uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+      - uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
       - name: Install System Dependencies
         run: |
           choco install --no-progress --yes boost-msvc-14.1
