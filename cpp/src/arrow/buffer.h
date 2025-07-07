@@ -547,15 +547,30 @@ Result<std::unique_ptr<Buffer>> AllocateBuffer(const int64_t size, int64_t align
 /// \param[in] size size of buffer to allocate
 /// \param[in] pool a memory pool
 ARROW_EXPORT
+<<<<<<< HEAD
 Result<std::unique_ptr<ResizableBuffer>> AllocateResizableBuffer(
     const int64_t size, MemoryPool* pool = NULLPTR);
 ARROW_EXPORT
 Result<std::unique_ptr<ResizableBuffer>> AllocateResizableBuffer(
     const int64_t size, const int64_t alignment, MemoryPool* pool = NULLPTR);
+=======
+Status AllocateResizableBuffer(MemoryPool* pool, const int64_t size,
+                               std::shared_ptr<ResizableBuffer>* out);
+
+#ifndef ARROW_NO_DEPRECATED_API
+
+/// \brief Create Buffer referencing std::string memory
+/// \note Deprecated since 0.8.0
+///
+/// \return Status message
+ARROW_EXPORT
+Status AllocateResizableBuffer(const int64_t size, std::unique_ptr<ResizableBuffer>* out);
+>>>>>>> 05d626fd13495f7877a6974f7e1100f028cb6fd8
 
 /// \brief Allocate a bitmap buffer from a memory pool
 /// no guarantee on values is provided.
 ///
+<<<<<<< HEAD
 /// \param[in] length size in bits of bitmap to allocate
 /// \param[in] pool memory pool to allocate memory from
 ARROW_EXPORT
@@ -583,5 +598,14 @@ Result<std::shared_ptr<Buffer>> ConcatenateBuffers(const BufferVector& buffers,
                                                    MemoryPool* pool = NULLPTR);
 
 /// @}
+=======
+/// \param str std::string instance
+/// \return std::shared_ptr<Buffer>
+static inline std::shared_ptr<Buffer> GetBufferFromString(const std::string& str) {
+  return std::make_shared<Buffer>(str);
+}
+
+#endif  // ARROW_NO_DEPRECATED_API
+>>>>>>> 05d626fd13495f7877a6974f7e1100f028cb6fd8
 
 }  // namespace arrow

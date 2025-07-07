@@ -32,6 +32,9 @@ from pyarrow import set_timezone_db_path
 from pyarrow.util import find_free_port
 
 
+<<<<<<< HEAD
+groups = ['hdfs', 'parquet']
+=======
 # setup hypothesis profiles
 h.settings.register_profile('ci', max_examples=1000)
 h.settings.register_profile('dev', max_examples=50)
@@ -43,6 +46,7 @@ h.settings.register_profile('debug', max_examples=10,
 # examples try:
 # pytest pyarrow -sv --enable-hypothesis --hypothesis-profile=debug
 h.settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
 # Set this at the beginning before the AWS SDK was loaded to avoid reading in
 # user configuration values.
