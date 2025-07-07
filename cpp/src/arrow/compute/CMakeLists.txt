@@ -15,26 +15,110 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Headers: top level
-install(FILES
-  api.h
-  context.h
-  kernel.h
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/compute")
+add_custom_target(arrow-compute-tests)
 
-# pkg-config support
-configure_file(arrow-compute.pc.in
-  "${CMAKE_CURRENT_BINARY_DIR}/arrow-compute.pc"
-  @ONLY)
-install(
-  FILES "${CMAKE_CURRENT_BINARY_DIR}/arrow-compute.pc"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig/")
+arrow_install_all_headers("arrow/compute")
 
-#######################################
+if(ARROW_COMPUTE)
+  # pkg-config support
+  arrow_add_pkg_config("arrow-compute")
+endif()
+
+#
 # Unit tests
-#######################################
+#
 
-ADD_ARROW_TEST(compute-test)
-ADD_ARROW_BENCHMARK(compute-benchmark)
+# Define arrow_compute_testing object library for common test files
+if(ARROW_TESTING)
+  add_library(arrow_compute_testing OBJECT test_util_internal.cc)
+  # Even though this is still just an object library we still need to "link" our
+  # dependencies so that include paths are configured correctly
+  target_link_libraries(arrow_compute_testing PUBLIC ${ARROW_GTEST_GMOCK})
+endif()
+
+set(ARROW_COMPUTE_TEST_PREFIX "arrow-compute")
+set(ARROW_COMPUTE_TEST_LABELS "arrow-compute-tests")
+set(ARROW_COMPUTE_TEST_ARGS PREFIX ${ARROW_COMPUTE_TEST_PREFIX} LABELS
+                            ${ARROW_COMPUTE_TEST_LABELS})
+
+# This will only add the test if ARROW_COMPUTE is enabled, meaning the full kernel registry is available.
+#
+# The following kernels are always present in default builds:
+#  - array_filter
+#  - array_take
+#  - cast
+#  - dictionary_encode
+#  - drop_null
+#  - filter
+#  - indices_nonzero
+#  - take
+#  - unique
+#  - value_counts
+#
+# Also see: GH-34388, GH-34615
+function(ADD_ARROW_COMPUTE_TEST REL_TEST_NAME)
+  if(NOT ARROW_COMPUTE)
+    return()
+  endif()
+
+  set(one_value_args PREFIX)
+  set(multi_value_args LABELS)
+  cmake_parse_arguments(ARG
+                        "${options}"
+                        "${one_value_args}"
+                        "${multi_value_args}"
+                        ${ARGN})
+
+  if(ARG_PREFIX)
+    set(PREFIX ${ARG_PREFIX})
+  else()
+    set(PREFIX ${ARROW_COMPUTE_TEST_PREFIX})
+  endif()
+
+  if(ARG_LABELS)
+    set(LABELS ${ARG_LABELS})
+  else()
+    set(LABELS ${ARROW_COMPUTE_TEST_LABELS})
+  endif()
+
+  add_arrow_test(${REL_TEST_NAME}
+                 PREFIX
+                 ${PREFIX}
+                 LABELS
+                 ${LABELS}
+                 ${ARG_UNPARSED_ARGUMENTS})
+endfunction()
+
+add_arrow_test(internals_test
+               ${ARROW_COMPUTE_TEST_ARGS}
+               SOURCES
+               function_test.cc
+               exec_test.cc
+               kernel_test.cc
+               registry_test.cc
+               EXTRA_LINK_LIBS
+               arrow_compute_testing)
+
+add_arrow_compute_test(expression_test
+                       SOURCES
+                       expression_test.cc
+                       EXTRA_LINK_LIBS
+                       arrow_compute_testing)
+
+add_arrow_compute_test(row_test
+                       SOURCES
+                       key_hash_test.cc
+                       light_array_test.cc
+                       row/compare_test.cc
+                       row/grouper_test.cc
+                       row/row_encoder_internal_test.cc
+                       row/row_test.cc
+                       util_internal_test.cc
+                       EXTRA_LINK_LIBS
+                       arrow_compute_testing)
+
+add_arrow_benchmark(function_benchmark PREFIX "arrow-compute")
 
 add_subdirectory(kernels)
+
+add_subdirectory(row)

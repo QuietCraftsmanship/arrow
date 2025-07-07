@@ -17,6 +17,8 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.complex.impl.BigIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
@@ -33,13 +35,22 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class BigIntVector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 8;
   private final FieldReader reader;
 
   /**
    * Instantiate a BigIntVector. This doesn't allocate any memory for
    * the data in vector.
+   *
    * @param name name of the vector
    * @param allocator allocator for memory management.
    */
@@ -50,6 +61,7 @@ public class BigIntVector extends BaseFixedWidthVector {
   /**
    * Instantiate a BigIntVector. This doesn't allocate any memory for
    * the data in vector.
+   *
    * @param name name of the vector
    * @param fieldType type of Field materialized by this vector
    * @param allocator allocator for memory management.
@@ -60,7 +72,8 @@ public class BigIntVector extends BaseFixedWidthVector {
   }
 
   /**
-   * Get a reader that supports reading values from this vector
+   * Get a reader that supports reading values from this vector.
+   *
    * @return Field Reader for this vector
    */
   @Override
@@ -79,11 +92,11 @@ public class BigIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *          vector value retrieval methods                        *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value retrieval methods                        |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
   /**
    * Get the element at the given index from the vector.
@@ -92,7 +105,7 @@ public class BigIntVector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public long get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getLong(index * TYPE_WIDTH);
@@ -130,7 +143,8 @@ public class BigIntVector extends BaseFixedWidthVector {
 
   /**
    * Copy a cell value from a particular index in source vector to a particular
-   * position in this vector
+   * position in this vector.
+   *
    * @param fromIndex position to copy from in source vector
    * @param thisIndex position to copy to in this vector
    * @param from source vector
@@ -145,6 +159,7 @@ public class BigIntVector extends BaseFixedWidthVector {
    * Same as {@link #copyFrom(int, int, BigIntVector)} except that
    * it handles the case when the capacity of the vector needs to be expanded
    * before copy.
+   *
    * @param fromIndex position to copy from in source vector
    * @param thisIndex position to copy to in this vector
    * @param from source vector
@@ -155,11 +170,11 @@ public class BigIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *          vector value setter methods                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value setter methods                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   private void setValue(int index, long value) {
@@ -290,7 +305,7 @@ public class BigIntVector extends BaseFixedWidthVector {
    * Given a data buffer, get the value stored at a particular position
    * in the vector.
    *
-   * This method should not be used externally.
+   * <p>This method should not be used externally.
    *
    * @param buffer data buffer
    * @param index position of the element.
@@ -301,16 +316,17 @@ public class BigIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *                      vector transfer                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |                      vector transfer                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   /**
    * Construct a TransferPair comprising of this and and a target vector of
    * the same type.
+   *
    * @param ref name of the target vector
    * @param allocator allocator for the target vector
    * @return {@link TransferPair}
@@ -322,6 +338,7 @@ public class BigIntVector extends BaseFixedWidthVector {
 
   /**
    * Construct a TransferPair with a desired target vector of the same type.
+   *
    * @param to target vector
    * @return {@link TransferPair}
    */
@@ -330,6 +347,34 @@ public class BigIntVector extends BaseFixedWidthVector {
     return new TransferImpl((BigIntVector) to);
   }
 
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+  }
+
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+  }
+
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private class TransferImpl implements TransferPair {
     BigIntVector to;
 

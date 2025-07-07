@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_LOCAL_BITMAPS_HOLDER_H
-#define GANDIVA_LOCAL_BITMAPS_HOLDER_H
+#pragma once
 
 #include <memory>
 #include <utility>
@@ -41,7 +40,7 @@ class LocalBitMapsHolder {
   uint8_t** GetLocalBitMapArray() const { return local_bitmaps_array_.get(); }
 
   uint8_t* GetLocalBitMap(int idx) const {
-    DCHECK(idx <= GetNumLocalBitMaps());
+    ARROW_DCHECK(idx <= GetNumLocalBitMaps());
     return local_bitmaps_array_.get()[idx];
   }
 
@@ -49,11 +48,11 @@ class LocalBitMapsHolder {
   /// number of records in the current batch.
   int64_t num_records_;
 
-  /// A container of 'local_bitmaps_', each sized to accomodate 'num_records'.
-  std::vector<std::unique_ptr<uint8_t>> local_bitmaps_vec_;
+  /// A container of 'local_bitmaps_', each sized to accommodate 'num_records'.
+  std::vector<std::unique_ptr<uint8_t[]>> local_bitmaps_vec_;
 
   /// An array of the local bitmaps.
-  std::unique_ptr<uint8_t*> local_bitmaps_array_;
+  std::unique_ptr<uint8_t*[]> local_bitmaps_array_;
 
   int64_t local_bitmap_size_;
 };
@@ -72,7 +71,7 @@ inline LocalBitMapsHolder::LocalBitMapsHolder(int64_t num_records, int num_local
   // Alloc 'num_local_bitmaps_' number of bitmaps, each of capacity 'num_records_'.
   for (int i = 0; i < num_local_bitmaps; ++i) {
     // TODO : round-up to a slab friendly multiple.
-    std::unique_ptr<uint8_t> bitmap(new uint8_t[local_bitmap_size_]);
+    std::unique_ptr<uint8_t[]> bitmap(new uint8_t[local_bitmap_size_]);
 
     // keep pointer to the bitmap in the array.
     (local_bitmaps_array_.get())[i] = bitmap.get();
@@ -84,5 +83,3 @@ inline LocalBitMapsHolder::LocalBitMapsHolder(int64_t num_records, int num_local
 }
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_LOCAL_BITMAPS_HOLDER_H

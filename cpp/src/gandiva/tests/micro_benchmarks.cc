@@ -14,11 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 #include <stdlib.h>
 
-#include <gtest/gtest.h>
 #include "arrow/memory_pool.h"
 #include "arrow/status.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/type_fwd.h"
+#include "benchmark/benchmark.h"
+#include "gandiva/decimal_type_util.h"
 #include "gandiva/projector.h"
 #include "gandiva/tests/test_util.h"
 #include "gandiva/tests/timed_evaluate.h"
@@ -31,24 +35,13 @@ using arrow::int32;
 using arrow::int64;
 using arrow::utf8;
 
-// TODO : the base numbers are from a mac. they need to be caliberated
-// for the hardware used by travis.
-float tolerance_ratio = 6.0;
-
-class TestBenchmarks : public ::testing::Test {
- public:
-  void SetUp() { pool_ = arrow::default_memory_pool(); }
-
- protected:
-  arrow::MemoryPool* pool_;
-};
-
-TEST_F(TestBenchmarks, TimedTestAdd3) {
+static void TimedTestAdd3(benchmark::State& state) {
   // schema for input fields
   auto field0 = field("f0", int64());
   auto field1 = field("f1", int64());
   auto field2 = field("f2", int64());
   auto schema = arrow::schema({field0, field1, field2});
+  auto pool_ = arrow::default_memory_pool();
 
   // output field
   auto field_sum = field("add", int64());
@@ -63,25 +56,21 @@ TEST_F(TestBenchmarks, TimedTestAdd3) {
   auto sum_expr = TreeExprBuilder::MakeExpression(sum, field_sum);
 
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {sum_expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {sum_expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   Int64DataGenerator data_generator;
   ProjectEvaluator evaluator(projector);
 
-  status = TimedEvaluate<arrow::Int64Type, int64_t>(schema, evaluator, data_generator,
-                                                    pool_, 1 * MILLION, 16 * THOUSAND,
-                                                    elapsed_millis);
-  ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for Add3 " << elapsed_millis << " ms\n";
-  EXPECT_LE(elapsed_millis, 2 * tolerance_ratio);
+  Status status = TimedEvaluate<arrow::Int64Type, int64_t>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state);
+  ASSERT_OK(status);
 }
 
-TEST_F(TestBenchmarks, TimedTestBigNested) {
+static void TimedTestBigNested(benchmark::State& state) {
   // schema for input fields
   auto fielda = field("a", int32());
   auto schema = arrow::schema({fielda});
+  auto pool_ = arrow::default_memory_pool();
 
   // output fields
   auto field_result = field("res", int32());
@@ -110,26 +99,21 @@ TEST_F(TestBenchmarks, TimedTestBigNested) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   BoundedInt32DataGenerator data_generator(250);
   ProjectEvaluator evaluator(projector);
 
-  status = TimedEvaluate<arrow::Int32Type, int32_t>(schema, evaluator, data_generator,
-                                                    pool_, 1 * MILLION, 16 * THOUSAND,
-                                                    elapsed_millis);
+  Status status = TimedEvaluate<arrow::Int32Type, int32_t>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state);
   ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for BigNestedIf " << elapsed_millis << " ms\n";
-
-  EXPECT_LE(elapsed_millis, 12 * tolerance_ratio);
 }
 
-TEST_F(TestBenchmarks, TimedTestExtractYear) {
+static void TimedTestExtractYear(benchmark::State& state) {
   // schema for input fields
   auto field0 = field("f0", arrow::date64());
   auto schema = arrow::schema({field0});
+  auto pool_ = arrow::default_memory_pool();
 
   // output field
   auto field_res = field("res", int64());
@@ -138,57 +122,48 @@ TEST_F(TestBenchmarks, TimedTestExtractYear) {
   auto expr = TreeExprBuilder::MakeExpression("extractYear", {field0}, field_res);
 
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   Int64DataGenerator data_generator;
   ProjectEvaluator evaluator(projector);
 
-  status = TimedEvaluate<arrow::Date64Type, int64_t>(schema, evaluator, data_generator,
-                                                     pool_, 1 * MILLION, 16 * THOUSAND,
-                                                     elapsed_millis);
+  Status status = TimedEvaluate<arrow::Date64Type, int64_t>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state);
   ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for extractYear " << elapsed_millis << " ms\n";
-
-  EXPECT_LE(elapsed_millis, 11 * tolerance_ratio);
 }
 
-TEST_F(TestBenchmarks, TimedTestFilterAdd2) {
+static void TimedTestFilterAdd2(benchmark::State& state) {
   // schema for input fields
   auto field0 = field("f0", int64());
   auto field1 = field("f1", int64());
   auto field2 = field("f2", int64());
   auto schema = arrow::schema({field0, field1, field2});
+  auto pool_ = arrow::default_memory_pool();
 
   // Build expression
   auto sum = TreeExprBuilder::MakeFunction(
-      "add", {TreeExprBuilder::MakeField(field1), TreeExprBuilder::MakeField(field2)},
+      "add", {TreeExprBuilder::MakeField(field1), TreeExprBuilder::MakeField(field0)},
       int64());
   auto less_than = TreeExprBuilder::MakeFunction(
       "less_than", {sum, TreeExprBuilder::MakeField(field2)}, boolean());
   auto condition = TreeExprBuilder::MakeCondition(less_than);
 
   std::shared_ptr<Filter> filter;
-  Status status = Filter::Make(schema, condition, &filter);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Filter::Make(schema, condition, TestConfiguration(), &filter));
 
-  int64_t elapsed_millis;
   Int64DataGenerator data_generator;
   FilterEvaluator evaluator(filter);
 
-  status = TimedEvaluate<arrow::Int64Type, int64_t>(
-      schema, evaluator, data_generator, pool_, MILLION, 16 * THOUSAND, elapsed_millis);
+  Status status = TimedEvaluate<arrow::Int64Type, int64_t>(
+      schema, evaluator, data_generator, pool_, MILLION, 16 * THOUSAND, state);
   ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for Filter with Add2 " << elapsed_millis << " ms\n";
-
-  EXPECT_LE(elapsed_millis, 2.5 * tolerance_ratio);
 }
 
-TEST_F(TestBenchmarks, TimedTestFilterLike) {
+static void TimedTestFilterLike(benchmark::State& state) {
   // schema for input fields
   auto fielda = field("a", utf8());
   auto schema = arrow::schema({fielda});
+  auto pool_ = arrow::default_memory_pool();
 
   // build expression.
   auto node_a = TreeExprBuilder::MakeField(fielda);
@@ -198,26 +173,65 @@ TEST_F(TestBenchmarks, TimedTestFilterLike) {
   auto condition = TreeExprBuilder::MakeCondition(like_yellow);
 
   std::shared_ptr<Filter> filter;
-  Status status = Filter::Make(schema, condition, &filter);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Filter::Make(schema, condition, TestConfiguration(), &filter));
 
-  int64_t elapsed_millis;
   FastUtf8DataGenerator data_generator(32);
   FilterEvaluator evaluator(filter);
 
-  status = TimedEvaluate<arrow::StringType, std::string>(
-      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND,
-      elapsed_millis);
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state);
   ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for Filter with like " << elapsed_millis << " ms\n";
-
-  EXPECT_LE(elapsed_millis, 600 * tolerance_ratio);
 }
 
-TEST_F(TestBenchmarks, TimedTestAllocs) {
+static void TimedTestCastFloatFromString(benchmark::State& state) {
+  auto field_a = field("a", utf8());
+  auto schema = arrow::schema({field_a});
+  auto pool = arrow::default_memory_pool();
+
+  auto field_result = field("res", arrow::float64());
+
+  auto node_a = TreeExprBuilder::MakeField(field_a);
+  auto fn = TreeExprBuilder::MakeFunction("castFLOAT8", {node_a}, arrow::float64());
+  auto expr = TreeExprBuilder::MakeExpression(fn, field_result);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
+
+  Utf8FloatDataGenerator data_generator;
+  ProjectEvaluator evaluator(projector);
+
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool, 1 * MILLION, 16 * THOUSAND, state);
+  ASSERT_TRUE(status.ok());
+}
+
+static void TimedTestCastIntFromString(benchmark::State& state) {
+  auto field_a = field("a", utf8());
+  auto schema = arrow::schema({field_a});
+  auto pool = arrow::default_memory_pool();
+
+  auto field_result = field("res", int32());
+
+  auto node_a = TreeExprBuilder::MakeField(field_a);
+  auto fn = TreeExprBuilder::MakeFunction("castINT", {node_a}, int32());
+  auto expr = TreeExprBuilder::MakeExpression(fn, field_result);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
+
+  Utf8IntDataGenerator data_generator;
+  ProjectEvaluator evaluator(projector);
+
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool, 1 * MILLION, 16 * THOUSAND, state);
+  ASSERT_TRUE(status.ok());
+}
+
+static void TimedTestAllocs(benchmark::State& state) {
   // schema for input fields
   auto field_a = field("a", arrow::utf8());
   auto schema = arrow::schema({field_a});
+  auto pool_ = arrow::default_memory_pool();
 
   // output field
   auto field_res = field("res", int32());
@@ -229,27 +243,47 @@ TEST_F(TestBenchmarks, TimedTestAllocs) {
   auto expr = TreeExprBuilder::MakeExpression(length, field_res);
 
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   FastUtf8DataGenerator data_generator(64);
   ProjectEvaluator evaluator(projector);
 
-  status = TimedEvaluate<arrow::StringType, std::string>(
-      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND,
-      elapsed_millis);
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state);
   ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for length(upper(utf8)) " << elapsed_millis << " ms\n";
 }
 
+static void TimedTestOutputStringAllocs(benchmark::State& state) {
+  // schema for input fields
+  auto field_a = field("abcdefghijklmnopqrstuvwxyz", arrow::utf8());
+  auto schema = arrow::schema({field_a});
+  auto pool_ = arrow::default_memory_pool();
+  // output field
+  auto field_res = field("res", utf8());
+
+  // Build expression
+  auto node_a = TreeExprBuilder::MakeField(field_a);
+  auto upper = TreeExprBuilder::MakeFunction("upper", {node_a}, utf8());
+  auto length = TreeExprBuilder::MakeFunction("octet_length", {upper}, int32());
+  auto expr = TreeExprBuilder::MakeExpression(upper, field_res);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
+
+  FastUtf8DataGenerator data_generator(64);
+  ProjectEvaluator evaluator(projector);
+
+  ASSERT_OK((TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool_, 1 * MILLION, 16 * THOUSAND, state)));
+}
 // following two tests are for benchmark optimization of
 // in expr. will be used in follow-up PRs to optimize in expr.
 
-TEST_F(TestBenchmarks, TimedTestMultiOr) {
+static void TimedTestMultiOr(benchmark::State& state) {
   // schema for input fields
   auto fielda = field("a", utf8());
   auto schema = arrow::schema({fielda});
+  auto pool_ = arrow::default_memory_pool();
 
   // output fields
   auto field_result = field("res", boolean());
@@ -271,23 +305,20 @@ TEST_F(TestBenchmarks, TimedTestMultiOr) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   FastUtf8DataGenerator data_generator(250);
   ProjectEvaluator evaluator(projector);
-  status = TimedEvaluate<arrow::StringType, std::string>(
-      schema, evaluator, data_generator, pool_, 100 * THOUSAND, 16 * THOUSAND,
-      elapsed_millis);
-  ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for BooleanOr (100K) " << elapsed_millis << " ms\n";
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool_, 100 * THOUSAND, 16 * THOUSAND, state);
+  ASSERT_OK(status);
 }
 
-TEST_F(TestBenchmarks, TimedTestInExpr) {
+static void TimedTestInExpr(benchmark::State& state) {
   // schema for input fields
   auto fielda = field("a", utf8());
   auto schema = arrow::schema({fielda});
+  auto pool_ = arrow::default_memory_pool();
 
   // output fields
   auto field_result = field("res", boolean());
@@ -306,19 +337,178 @@ TEST_F(TestBenchmarks, TimedTestInExpr) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
-  EXPECT_TRUE(status.ok());
+  ASSERT_OK(Projector::Make(schema, {expr}, TestConfiguration(), &projector));
 
-  int64_t elapsed_millis;
   FastUtf8DataGenerator data_generator(250);
   ProjectEvaluator evaluator(projector);
 
-  status = TimedEvaluate<arrow::StringType, std::string>(
-      schema, evaluator, data_generator, pool_, 100 * THOUSAND, 16 * THOUSAND,
-      elapsed_millis);
+  Status status = TimedEvaluate<arrow::StringType, std::string>(
+      schema, evaluator, data_generator, pool_, 100 * THOUSAND, 16 * THOUSAND, state);
 
-  ASSERT_TRUE(status.ok());
-  std::cout << "Time taken for BooleanIn (100K) " << elapsed_millis << " ms\n";
+  ASSERT_OK(status);
 }
+
+static void DoDecimalAdd3(benchmark::State& state, int32_t precision, int32_t scale,
+                          bool large = false) {
+  // schema for input fields
+  auto decimal_type = std::make_shared<arrow::Decimal128Type>(precision, scale);
+  auto field0 = field("f0", decimal_type);
+  auto field1 = field("f1", decimal_type);
+  auto field2 = field("f2", decimal_type);
+  auto schema = arrow::schema({field0, field1, field2});
+
+  Decimal128TypePtr add2_type;
+  auto status = DecimalTypeUtil::GetResultType(DecimalTypeUtil::kOpAdd,
+                                               {decimal_type, decimal_type}, &add2_type);
+
+  Decimal128TypePtr output_type;
+  status = DecimalTypeUtil::GetResultType(DecimalTypeUtil::kOpAdd,
+                                          {add2_type, decimal_type}, &output_type);
+
+  // output field
+  auto field_sum = field("add", output_type);
+
+  // Build expression
+  auto part_sum = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(field1), TreeExprBuilder::MakeField(field2)},
+      add2_type);
+  auto sum = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(field0), part_sum}, output_type);
+
+  auto sum_expr = TreeExprBuilder::MakeExpression(sum, field_sum);
+
+  std::shared_ptr<Projector> projector;
+  status = Projector::Make(schema, {sum_expr}, TestConfiguration(), &projector);
+  EXPECT_TRUE(status.ok());
+
+  Decimal128DataGenerator data_generator(large);
+  ProjectEvaluator evaluator(projector);
+
+  status = TimedEvaluate<arrow::Decimal128Type, arrow::Decimal128>(
+      schema, evaluator, data_generator, arrow::default_memory_pool(), 1 * MILLION,
+      16 * THOUSAND, state);
+  ASSERT_OK(status);
+}
+
+static void DoDecimalAdd2(benchmark::State& state, int32_t precision, int32_t scale,
+                          bool large = false) {
+  // schema for input fields
+  auto decimal_type = std::make_shared<arrow::Decimal128Type>(precision, scale);
+  auto field0 = field("f0", decimal_type);
+  auto field1 = field("f1", decimal_type);
+  auto schema = arrow::schema({field0, field1});
+
+  Decimal128TypePtr output_type;
+  auto status = DecimalTypeUtil::GetResultType(
+      DecimalTypeUtil::kOpAdd, {decimal_type, decimal_type}, &output_type);
+
+  // output field
+  auto field_sum = field("add", output_type);
+
+  // Build expression
+  auto sum = TreeExprBuilder::MakeExpression("add", {field0, field1}, field_sum);
+
+  std::shared_ptr<Projector> projector;
+  status = Projector::Make(schema, {sum}, TestConfiguration(), &projector);
+  EXPECT_TRUE(status.ok());
+
+  Decimal128DataGenerator data_generator(large);
+  ProjectEvaluator evaluator(projector);
+
+  status = TimedEvaluate<arrow::Decimal128Type, arrow::Decimal128>(
+      schema, evaluator, data_generator, arrow::default_memory_pool(), 1 * MILLION,
+      16 * THOUSAND, state);
+  ASSERT_OK(status);
+}
+
+static void TimedTestExprCompilation(benchmark::State& state) {
+  int64_t iteration = 0;
+  for (auto _ : state) {
+    // schema for input fields
+    auto field0 = field("f0", int64());
+    auto field1 = field("f1", int64());
+    auto literal = TreeExprBuilder::MakeLiteral(iteration);
+    auto schema = arrow::schema({field0, field1});
+
+    // output field
+    auto field_add = field("c1", int64());
+    auto field_less_than = field("c2", boolean());
+
+    // Build expression
+    auto add_func = TreeExprBuilder::MakeFunction(
+        "add", {TreeExprBuilder::MakeField(field0), literal}, int64());
+    auto less_than_func = TreeExprBuilder::MakeFunction(
+        "less_than", {TreeExprBuilder::MakeField(field1), literal}, boolean());
+
+    auto expr_0 = TreeExprBuilder::MakeExpression(add_func, field_add);
+    auto expr_1 = TreeExprBuilder::MakeExpression(less_than_func, field_less_than);
+
+    std::shared_ptr<Projector> projector;
+    ASSERT_OK(Projector::Make(schema, {expr_0, expr_1}, TestConfiguration(), &projector));
+
+    ++iteration;
+  }
+}
+
+static void DecimalAdd2Fast(benchmark::State& state) {
+  // use lesser precision to test the fast-path
+  DoDecimalAdd2(state, DecimalTypeUtil::kMaxPrecision - 6, 18);
+}
+
+static void DecimalAdd2LeadingZeroes(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd2(state, DecimalTypeUtil::kMaxPrecision, 6);
+}
+
+static void DecimalAdd2LeadingZeroesWithDiv(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd2(state, DecimalTypeUtil::kMaxPrecision, 18);
+}
+
+static void DecimalAdd2Large(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd2(state, DecimalTypeUtil::kMaxPrecision, 18, true);
+}
+
+static void DecimalAdd3Fast(benchmark::State& state) {
+  // use lesser precision to test the fast-path
+  DoDecimalAdd3(state, DecimalTypeUtil::kMaxPrecision - 6, 18);
+}
+
+static void DecimalAdd3LeadingZeroes(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd3(state, DecimalTypeUtil::kMaxPrecision, 6);
+}
+
+static void DecimalAdd3LeadingZeroesWithDiv(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd3(state, DecimalTypeUtil::kMaxPrecision, 18);
+}
+
+static void DecimalAdd3Large(benchmark::State& state) {
+  // use max precision to test the large-integer-path
+  DoDecimalAdd3(state, DecimalTypeUtil::kMaxPrecision, 18, true);
+}
+
+BENCHMARK(TimedTestExprCompilation)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestAdd3)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestBigNested)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestExtractYear)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestFilterAdd2)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestFilterLike)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestCastFloatFromString)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestCastIntFromString)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestAllocs)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestOutputStringAllocs)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestMultiOr)->Unit(benchmark::kMicrosecond);
+BENCHMARK(TimedTestInExpr)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd2Fast)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd2LeadingZeroes)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd2LeadingZeroesWithDiv)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd2Large)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd3Fast)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd3LeadingZeroes)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd3LeadingZeroesWithDiv)->Unit(benchmark::kMicrosecond);
+BENCHMARK(DecimalAdd3Large)->Unit(benchmark::kMicrosecond);
 
 }  // namespace gandiva

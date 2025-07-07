@@ -15,18 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ADD_PARQUET_TEST(arrow-schema-test)
-ADD_PARQUET_TEST(arrow-reader-writer-test)
+arrow_install_all_headers("parquet/arrow")
 
-if(PARQUET_BUILD_BENCHMARKS)
-  ADD_ARROW_BENCHMARK(arrow-reader-writer-benchmark)
-  ARROW_BENCHMARK_LINK_LIBRARIES(arrow-reader-writer-benchmark
-    ${PARQUET_BENCHMARK_LINK_LIBRARIES})
+if(ARROW_FUZZING)
+  add_executable(parquet-arrow-generate-fuzz-corpus generate_fuzz_corpus.cc)
+  if(ARROW_BUILD_STATIC)
+    target_link_libraries(parquet-arrow-generate-fuzz-corpus parquet_static
+                          arrow_testing_static)
+  else()
+    target_link_libraries(parquet-arrow-generate-fuzz-corpus parquet_shared
+                          arrow_testing_shared)
+  endif()
 endif()
 
-# Headers: top level
-install(FILES
-  reader.h
-  schema.h
-  writer.h
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/parquet/arrow")
+add_parquet_fuzz_target(fuzz PREFIX "parquet-arrow")

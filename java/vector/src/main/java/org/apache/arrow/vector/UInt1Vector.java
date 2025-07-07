@@ -17,7 +17,10 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.UInt1ReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableUInt1Holder;
@@ -26,12 +29,22 @@ import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
+import io.netty.buffer.ArrowBuf;
+
 /**
  * UInt1Vector implements a fixed width (1 bytes) vector of
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class UInt1Vector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class UInt1Vector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class UInt1Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class UInt1Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private static final byte TYPE_WIDTH = 1;
   private final FieldReader reader;
 
@@ -55,11 +68,28 @@ public class UInt1Vector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *          vector value retrieval methods                        *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value retrieval methods                        |
+   |                                                                |
+   *----------------------------------------------------------------*/
+  /**
+   * Given a data buffer, get the value stored at a particular position
+   * in the vector.
+   *
+   * <p>To avoid overflow, the returned type is one step up from the signed
+   * type.
+   *
+   * <p>This method is mainly meant for integration tests.
+   *
+   * @param buffer data buffer
+   * @param index position of the element.
+   * @return value stored at the index.
+   */
+  public static short getNoOverflow(final ArrowBuf buffer, final int index) {
+    byte b =  buffer.getByte(index * TYPE_WIDTH);
+    return (short)(0xFF & b);
+  }
 
 
   /**
@@ -69,7 +99,7 @@ public class UInt1Vector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public byte get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getByte(index * TYPE_WIDTH);
@@ -105,23 +135,53 @@ public class UInt1Vector extends BaseFixedWidthVector {
     }
   }
 
+  /**
+   * Returns the value stored at index without the potential for overflow.
+   *
+   * @param index   position of element
+   * @return element at given index
+   */
+  public Short getObjectNoOverflow(int index) {
+    if (isSet(index) == 0) {
+      return null;
+    } else {
+      return getNoOverflow(valueBuffer, index);
+    }
+  }
+
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  /**
+   * Copies the value at fromIndex to thisIndex (including validity).
+   */
   public void copyFrom(int fromIndex, int thisIndex, UInt1Vector from) {
     BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
     final byte value = from.valueBuffer.getByte(fromIndex * TYPE_WIDTH);
     valueBuffer.setByte(thisIndex * TYPE_WIDTH, value);
   }
 
+  /**
+   * Identical to {@link #copyFrom(int, int, UInt1Vector)} but reallocates buffer if index is larger
+   * than capacity.
+   */
   public void copyFromSafe(int fromIndex, int thisIndex, UInt1Vector from) {
     handleSafe(thisIndex);
     copyFrom(fromIndex, thisIndex, from);
   }
 
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
-  /******************************************************************
-   *                                                                *
-   *          vector value setter methods                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value setter methods                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   private void setValue(int index, int value) {
@@ -248,6 +308,10 @@ public class UInt1Vector extends BaseFixedWidthVector {
     BitVectorHelper.setValidityBit(validityBuffer, index, 0);
   }
 
+  /**
+   * Sets the value at index to value isSet > 0, otherwise sets the index position
+   * to invalid/null.
+   */
   public void set(int index, int isSet, byte value) {
     if (isSet > 0) {
       set(index, value);
@@ -256,17 +320,21 @@ public class UInt1Vector extends BaseFixedWidthVector {
     }
   }
 
+  /**
+   * Same as {@link #set(int, int, byte)} but will reallocate the buffer if index
+   * is larger than current capacity.
+   */
   public void setSafe(int index, int isSet, byte value) {
     handleSafe(index);
     set(index, isSet, value);
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *                      vector transfer                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |                      vector transfer                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   @Override
@@ -278,6 +346,35 @@ public class UInt1Vector extends BaseFixedWidthVector {
   public TransferPair makeTransferPair(ValueVector to) {
     return new TransferImpl((UInt1Vector) to);
   }
+
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, (int) value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, (int) value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= 0xFF, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= 0xFF, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  }
+
+
 
   private class TransferImpl implements TransferPair {
     UInt1Vector to;

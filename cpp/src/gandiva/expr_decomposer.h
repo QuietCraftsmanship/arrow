@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EXPR_DECOMPOSER_H
-#define GANDIVA_EXPR_DECOMPOSER_H
+#pragma once
 
+#include <cmath>
 #include <memory>
 #include <stack>
 #include <string>
@@ -27,18 +27,19 @@
 #include "gandiva/expression.h"
 #include "gandiva/node.h"
 #include "gandiva/node_visitor.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
 class FunctionRegistry;
 class Annotator;
 
-/// \brief Decomposes an expression tree to seperate out the validity and
+/// \brief Decomposes an expression tree to separate out the validity and
 /// value expressions.
-class ExprDecomposer : public NodeVisitor {
+class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
  public:
   explicit ExprDecomposer(const FunctionRegistry& registry, Annotator& annotator)
-      : registry_(registry), annotator_(annotator) {}
+      : registry_(registry), annotator_(annotator), nested_if_else_(false) {}
 
   Status Decompose(const Node& root, ValueValidityPairPtr* out) {
     auto status = root.Accept(*this);
@@ -49,11 +50,15 @@ class ExprDecomposer : public NodeVisitor {
   }
 
  private:
+  ARROW_DISALLOW_COPY_AND_ASSIGN(ExprDecomposer);
+
   FRIEND_TEST(TestExprDecomposer, TestStackSimple);
   FRIEND_TEST(TestExprDecomposer, TestNested);
   FRIEND_TEST(TestExprDecomposer, TestInternalIf);
   FRIEND_TEST(TestExprDecomposer, TestParallelIf);
   FRIEND_TEST(TestExprDecomposer, TestIfInCondition);
+  FRIEND_TEST(TestExprDecomposer, TestFunctionBetweenNestedIf);
+  FRIEND_TEST(TestExprDecomposer, TestComplexIfCondition);
 
   Status Visit(const FieldNode& node) override;
   Status Visit(const FunctionNode& node) override;
@@ -62,7 +67,13 @@ class ExprDecomposer : public NodeVisitor {
   Status Visit(const BooleanNode& node) override;
   Status Visit(const InExpressionNode<int32_t>& node) override;
   Status Visit(const InExpressionNode<int64_t>& node) override;
+  Status Visit(const InExpressionNode<float>& node) override;
+  Status Visit(const InExpressionNode<double>& node) override;
+  Status Visit(const InExpressionNode<gandiva::DecimalScalar128>& node) override;
   Status Visit(const InExpressionNode<std::string>& node) override;
+
+  template <typename ctype>
+  Status VisitInGeneric(const InExpressionNode<ctype>& node);
 
   // Optimize a function node, if possible.
   const FunctionNode TryOptimize(const FunctionNode& node);
@@ -83,6 +94,9 @@ class ExprDecomposer : public NodeVisitor {
     StackEntryType entry_type_;
     bool is_terminal_else_;
     int local_bitmap_idx_;
+
+   private:
+    ARROW_DISALLOW_COPY_AND_ASSIGN(IfStackEntry);
   };
 
   // pop 'condition entry' into stack.
@@ -93,7 +107,7 @@ class ExprDecomposer : public NodeVisitor {
 
   // push 'then entry' to stack. returns either a new local bitmap or the parent's
   // bitmap (in case of nested if-else).
-  int PushThenEntry(const IfNode& node);
+  int PushThenEntry(const IfNode& node, bool reuse_bitmap);
 
   // pop 'then entry' from stack.
   void PopThenEntry(const IfNode& node);
@@ -111,8 +125,7 @@ class ExprDecomposer : public NodeVisitor {
   Annotator& annotator_;
   std::stack<std::unique_ptr<IfStackEntry>> if_entries_stack_;
   ValueValidityPairPtr result_;
+  bool nested_if_else_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_EXPR_DECOMPOSER_H

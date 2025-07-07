@@ -3,15 +3,22 @@
   "include": ["../src/**/*.ts"],
   "compileOnSave": false,
   "compilerOptions": {
+    "baseUrl": "./",
+    "rootDir": "../src",
+    "paths": {
+      "apache-arrow/*": ["src/*"]
+    },
 
     /* Basic stuff */
-    "moduleResolution": "node",
-    "lib": ["dom", "esnext", "esnext.asynciterable"],
+    "moduleResolution": "Node",
+    "lib": ["DOM", "ESNext", "ESNext.AsyncIterable"],
 
     /* Control what is emitted */
     "declaration": true,
+    "declarationMap": true,
     "noEmitOnError": true,
     "removeComments": false,
+    "noErrorTruncation": true,
     "downlevelIteration": true,
 
     /* Create inline sourcemaps with sources */
@@ -21,15 +28,23 @@
 
     /* The most restrictive settings possible */
     "strict": true,
+    "noImplicitAny": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    "strictBindCallApply": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true,
+
     "skipLibCheck": false,
     "importHelpers": true,
     "noEmitHelpers": true,
-    "noImplicitAny": true,
     "noUnusedLocals": true,
     "noImplicitReturns": true,
-    "allowUnusedLabels": false,
     "noUnusedParameters": true,
+    "allowUnusedLabels": false,
     "allowUnreachableCode": false,
+    "noStrictGenericChecks": false,
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true
   }

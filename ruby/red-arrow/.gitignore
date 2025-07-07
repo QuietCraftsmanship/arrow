@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/lib/arrow/version.rb
-
+/.yardoc/
+/Gemfile.lock
+/doc/reference/
+/ext/arrow/Makefile
+/ext/arrow/mkmf.log
 /pkg/

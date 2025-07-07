@@ -19,6 +19,8 @@
 
 ## Python library for Apache Arrow
 
+[![pypi](https://img.shields.io/pypi/v/pyarrow.svg)](https://pypi.org/project/pyarrow/) [![conda-forge](https://img.shields.io/conda/vn/conda-forge/pyarrow.svg)](https://anaconda.org/conda-forge/pyarrow)
+
 This library provides a Python API for functionality provided by the Arrow C++
 libraries, along with tools for Arrow integration and interoperability with
 pandas, NumPy, and other software in the Python ecosystem.
@@ -32,29 +34,19 @@ package manager:
 conda install pyarrow -c conda-forge
 ```
 
-On Linux/macOS and Windows, you can also install binary wheels from PyPI with pip:
+On Linux, macOS, and Windows, you can also install binary wheels from PyPI with
+pip:
 
 ```shell
 pip install pyarrow
 ```
 
+If you encounter any issues importing the pip wheels on Windows, you may need
+to install the [Visual C++ Redistributable for Visual Studio 2015][6].
+
 ## Development
 
-### Coding Style
-
-We follow a similar PEP8-like coding style to the [pandas project][3].
-
-The code must pass `flake8` (available from pip or conda) or it will fail the
-build. Check for style errors before submitting your pull request with:
-
-```
-flake8 .
-flake8 --config=.flake8.cython .
-```
-
-### Building from Source
-
-See the [Development][2] page in the documentation.
+See [Python Development][2] in the documentation subproject.
 
 ### Running the unit tests
 
@@ -78,11 +70,14 @@ and look for the "custom options" section.
 
 ### Building the documentation
 
-```bash
-pip install -r doc/requirements.txt
-python setup.py build_sphinx -s doc/source
-```
+See [documentation build instructions][1] in the documentation subproject.
 
-[2]: https://github.com/apache/arrow/blob/master/python/doc/source/development.rst
+[1]: https://github.com/apache/arrow/blob/main/docs/source/developers/documentation.rst
+[2]: https://github.com/apache/arrow/blob/main/docs/source/developers/python.rst
 [3]: https://github.com/pandas-dev/pandas
+
 [4]: https://docs.pytest.org/en/latest/
+
+[5]: https://arrow.apache.org/docs/latest/python/benchmarks.html
+[6]: https://www.microsoft.com/en-us/download/details.aspx?id=48145
+

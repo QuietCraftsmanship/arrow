@@ -23,61 +23,67 @@
 
 G_BEGIN_DECLS
 
-#define GARROW_TYPE_FIELD                       \
-  (garrow_field_get_type())
-#define GARROW_FIELD(obj)                               \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),                    \
-                              GARROW_TYPE_FIELD,        \
-                              GArrowField))
-#define GARROW_FIELD_CLASS(klass)               \
-  (G_TYPE_CHECK_CLASS_CAST((klass),             \
-                           GARROW_TYPE_FIELD,   \
-                           GArrowFieldClass))
-#define GARROW_IS_FIELD(obj)                            \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                    \
-                              GARROW_TYPE_FIELD))
-#define GARROW_IS_FIELD_CLASS(klass)            \
-  (G_TYPE_CHECK_CLASS_TYPE((klass),             \
-                           GARROW_TYPE_FIELD))
-#define GARROW_FIELD_GET_CLASS(obj)             \
-  (G_TYPE_INSTANCE_GET_CLASS((obj),             \
-                             GARROW_TYPE_FIELD, \
-                             GArrowFieldClass))
-
-typedef struct _GArrowField         GArrowField;
-typedef struct _GArrowFieldClass    GArrowFieldClass;
-
-/**
- * GArrowField:
- *
- * It wraps `arrow::Field`.
- */
-struct _GArrowField
-{
-  /*< private >*/
-  GObject parent_instance;
-};
-
+#define GARROW_TYPE_FIELD (garrow_field_get_type())
+GARROW_AVAILABLE_IN_ALL
+G_DECLARE_DERIVABLE_TYPE(GArrowField, garrow_field, GARROW, FIELD, GObject)
 struct _GArrowFieldClass
 {
   GObjectClass parent_class;
 };
 
-GType           garrow_field_get_type      (void) G_GNUC_CONST;
+GARROW_AVAILABLE_IN_6_0
+GArrowField *
+garrow_field_import(gpointer c_abi_schema, GError **error);
 
-GArrowField    *garrow_field_new           (const gchar *name,
-                                            GArrowDataType *data_type);
-GArrowField    *garrow_field_new_full      (const gchar *name,
-                                            GArrowDataType *data_type,
-                                            gboolean nullable);
+GARROW_AVAILABLE_IN_ALL
+GArrowField *
+garrow_field_new(const gchar *name, GArrowDataType *data_type);
+GARROW_AVAILABLE_IN_ALL
+GArrowField *
+garrow_field_new_full(const gchar *name, GArrowDataType *data_type, gboolean nullable);
 
-const gchar    *garrow_field_get_name      (GArrowField *field);
-GArrowDataType *garrow_field_get_data_type (GArrowField *field);
-gboolean        garrow_field_is_nullable   (GArrowField *field);
+GARROW_AVAILABLE_IN_6_0
+gpointer
+garrow_field_export(GArrowField *field, GError **error);
 
-gboolean        garrow_field_equal         (GArrowField *field,
-                                            GArrowField *other_field);
+GARROW_AVAILABLE_IN_ALL
+const gchar *
+garrow_field_get_name(GArrowField *field);
 
-gchar          *garrow_field_to_string     (GArrowField *field);
+GARROW_AVAILABLE_IN_ALL
+GArrowDataType *
+garrow_field_get_data_type(GArrowField *field);
+
+GARROW_AVAILABLE_IN_ALL
+gboolean
+garrow_field_is_nullable(GArrowField *field);
+
+GARROW_AVAILABLE_IN_ALL
+gboolean
+garrow_field_equal(GArrowField *field, GArrowField *other_field);
+
+GARROW_AVAILABLE_IN_ALL
+gchar *
+garrow_field_to_string(GArrowField *field);
+
+GARROW_AVAILABLE_IN_3_0
+gchar *
+garrow_field_to_string_metadata(GArrowField *field, gboolean show_metadata);
+
+GARROW_AVAILABLE_IN_3_0
+gboolean
+garrow_field_has_metadata(GArrowField *field);
+GARROW_AVAILABLE_IN_3_0
+GHashTable *
+garrow_field_get_metadata(GArrowField *field);
+GARROW_AVAILABLE_IN_3_0
+GArrowField *
+garrow_field_with_metadata(GArrowField *field, GHashTable *metadata);
+GARROW_AVAILABLE_IN_3_0
+GArrowField *
+garrow_field_with_merged_metadata(GArrowField *field, GHashTable *metadata);
+GARROW_AVAILABLE_IN_3_0
+GArrowField *
+garrow_field_remove_metadata(GArrowField *field);
 
 G_END_DECLS

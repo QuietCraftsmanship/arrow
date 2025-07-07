@@ -19,8 +19,10 @@
 #include <random>
 #include <string>
 
-#ifndef GANDIVA_GENERATE_DATA_H
-#define GANDIVA_GENERATE_DATA_H
+#include "arrow/util/decimal.h"
+#include "arrow/util/io_util.h"
+
+#pragma once
 
 namespace gandiva {
 
@@ -34,15 +36,13 @@ class DataGenerator {
 
 class Random {
  public:
-  explicit Random(uint32_t seed = 100) : seed_(seed) {}
+  Random() : gen_(::arrow::internal::GetRandomSeed()) {}
+  explicit Random(uint64_t seed) : gen_(seed) {}
 
-  // This is 3 times faster than random_device
-  int32_t next() { return rand_r(&seed_); }
-  // int32_t next() { return random_dev_(); }
+  int32_t next() { return gen_(); }
 
  private:
-  uint32_t seed_;
-  std::random_device random_dev_;
+  std::default_random_engine gen_;
 };
 
 class Int32DataGenerator : public DataGenerator<int32_t> {
@@ -79,6 +79,24 @@ class Int64DataGenerator : public DataGenerator<int64_t> {
   Random random_;
 };
 
+class Decimal128DataGenerator : public DataGenerator<arrow::Decimal128> {
+ public:
+  explicit Decimal128DataGenerator(bool large) : large_(large) {}
+
+  arrow::Decimal128 GenerateData() {
+    uint64_t low = random_.next();
+    int64_t high = random_.next();
+    if (large_) {
+      high += (1ull << 62);
+    }
+    return arrow::Decimal128(high, low);
+  }
+
+ protected:
+  bool large_;
+  Random random_;
+};
+
 class FastUtf8DataGenerator : public DataGenerator<std::string> {
  public:
   explicit FastUtf8DataGenerator(int max_len) : max_len_(max_len), cur_char_('a') {}
@@ -107,6 +125,28 @@ class FastUtf8DataGenerator : public DataGenerator<std::string> {
   char cur_char_;
 };
 
-}  // namespace gandiva
+class Utf8IntDataGenerator : public DataGenerator<std::string> {
+ public:
+  Utf8IntDataGenerator() {}
 
-#endif  // GANDIVA_GENERATE_DATA_H
+  std::string GenerateData() { return std::to_string(random_.next()); }
+
+ private:
+  Random random_;
+};
+
+class Utf8FloatDataGenerator : public DataGenerator<std::string> {
+ public:
+  Utf8FloatDataGenerator() {}
+
+  std::string GenerateData() {
+    return std::to_string(
+        static_cast<float>(random_.next()) /
+        static_cast<float>(RAND_MAX / 100));  // random float between 0.0 to 100.0
+  }
+
+ private:
+  Random random_;
+};
+
+}  // namespace gandiva

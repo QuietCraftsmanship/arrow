@@ -18,10 +18,28 @@
 module Parquet
   module ArrowTableSavable
     private
-    def save_as_parquet(path)
-      chunk_size = @options[:chunk_size] || 1024 # TODO
-      Parquet::ArrowFileWriter.open(@table.schema, path) do |writer|
-        writer.write_table(@table, chunk_size)
+    def save_as_parquet
+      properties = WriterProperties.new
+      @options.each do |key, value|
+        next if value.nil?
+        set_method_name = "set_#{key}"
+        next unless properties.respond_to?(set_method_name)
+        case value
+        when ::Array, ::Hash
+          value.each do |path, v|
+            properties.__send__(set_method_name, v, path)
+          end
+        else
+          properties.__send__(set_method_name, value)
+        end
+      end
+      chunk_size = @options[:chunk_size] || @table.n_rows
+      open_raw_output_stream do |output|
+        ArrowFileWriter.open(@table.schema,
+                             output,
+                             properties) do |writer|
+          writer.write_table(@table, chunk_size)
+        end
       end
     end
   end

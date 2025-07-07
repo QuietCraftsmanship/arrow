@@ -15,63 +15,80 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const del = require('del');
-const path = require('path');
-const { argv } = require('./argv');
-const { promisify } = require('util');
-const glob = promisify(require('glob'));
-const stat = promisify(require('fs').stat);
-const mkdirp = promisify(require('mkdirp'));
-const rimraf = promisify(require('rimraf'));
-const child_process = require(`child_process`);
-const { memoizeTask } = require('./memoize-task');
-const readFile = promisify(require('fs').readFile);
-const exec = promisify(require('child_process').exec);
-const parseXML = promisify(require('xml2js').parseString);
+import { deleteAsync as del } from 'del';
+import path from 'node:path';
+import { mkdirp } from 'mkdirp';
+import { argv } from './argv.js';
+import { promisify } from 'node:util';
+import { glob } from 'glob';
+import child_process from 'node:child_process';
+import { memoizeTask } from './memoize-task.js';
+import fs from 'node:fs';
+const readFile = promisify(fs.readFile);
+import asyncDoneSync from 'async-done';
+const asyncDone = promisify(asyncDoneSync);
+const exec = promisify(child_process.exec);
+import xml2js from 'xml2js';
+const parseXML = promisify(xml2js.parseString);
+import { targetAndModuleCombinations, npmPkgName } from './util.js';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const jestArgv = [];
-argv.update && jestArgv.push(`-u`);
-argv.verbose && jestArgv.push(`--verbose`);
-argv.coverage && jestArgv.push(`--coverage`);
 
-const debugArgv = [`--runInBand`, `--env`, `node-debug`];
-const jest = require.resolve(path.join(`..`, `node_modules`, `.bin`, `jest`));
+if (argv.verbose) {
+    jestArgv.push(`--verbose`);
+} else {
+    jestArgv.push(`--reporters=jest-silent-reporter`);
+}
+
+if (targetAndModuleCombinations.length > 1) {
+    jestArgv.push(`--detectOpenHandles`);
+}
+
+const jest = path.join(path.parse(require.resolve(`jest`)).dir, `../bin/jest.js`);
 const testOptions = {
-    env: { ...process.env },
     stdio: [`ignore`, `inherit`, `inherit`],
+    env: {
+        ...process.env,
+        // hide fs.promises/stream[Symbol.asyncIterator] warnings
+        NODE_NO_WARNINGS: `1`,
+    },
 };
 
-const testTask = ((cache, execArgv, testOptions) => memoizeTask(cache, function test(target, format, debug = false) {
+export const testTask = ((cache, execArgv, testOptions) => memoizeTask(cache, function test(target, format) {
     const opts = { ...testOptions };
-    const args = !debug ? [...execArgv] : [...debugArgv, ...execArgv];
-    if (!argv.coverage) {
-        args.push(`test/${argv.integration ? `integration/*` : `unit/*`}`);
+    const args = [...execArgv];
+    if (format === 'esm' || target === 'ts' || target === 'src' || target === npmPkgName) {
+        args.unshift(`--experimental-vm-modules`);
     }
-    opts.env = { ...opts.env,
+    if (argv.coverage) {
+        args.push(`-c`, `jestconfigs/jest.coverage.config.js`);
+    } else {
+        const cfgname = [target, format].filter(Boolean).join('.');
+        args.push(`-c`, `jestconfigs/jest.${cfgname}.config.js`);
+    }
+    args.push(...(argv._unknown || []).filter((x) => x !== 'test'));
+    args.push(...argv.tests);
+    opts.env = {
+        ...opts.env,
         TEST_TARGET: target,
         TEST_MODULE: format,
-        TEST_TS_SOURCE: !!argv.coverage || (target === 'src') || (opts.env.TEST_TS_SOURCE === 'true'),
-        JSON_PATHS: JSON.stringify(Array.isArray(argv.json_files) ? argv.json_files : [argv.json_files]),
-        ARROW_PATHS: JSON.stringify(Array.isArray(argv.arrow_files) ? argv.arrow_files : [argv.arrow_files]),
+        TEST_DOM_STREAMS: (target === 'src' || format === 'umd').toString(),
+        TEST_NODE_STREAMS: (target === 'src' || format !== 'umd').toString(),
+        TEST_TS_SOURCE: !!argv.coverage || (target === 'src') || (opts.env.TEST_TS_SOURCE === 'true')
     };
-    return !debug ?
-        child_process.spawn(jest, args, opts) :
-        child_process.exec(`node --inspect-brk ${jest} ${args.join(` `)}`, opts);
-}))({}, jestArgv, testOptions);
-
-module.exports = testTask;
-module.exports.testTask = testTask;
-module.exports.cleanTestData = cleanTestData;
-module.exports.createTestData = createTestData;
+    return asyncDone(() => child_process.spawn(`node`, args, opts));
+}))({}, [jest, ...jestArgv], testOptions);
 
 // Pull C++ and Java paths from environment vars first, otherwise sane defaults
 const ARROW_HOME = process.env.ARROW_HOME || path.resolve('../');
 const ARROW_JAVA_DIR = process.env.ARROW_JAVA_DIR || path.join(ARROW_HOME, 'java');
 const CPP_EXE_PATH = process.env.ARROW_CPP_EXE_PATH || path.join(ARROW_HOME, 'cpp/build/debug');
-const ARROW_INTEGRATION_DIR = process.env.ARROW_INTEGRATION_DIR || path.join(ARROW_HOME, 'integration');
-const CPP_JSON_TO_ARROW = path.join(CPP_EXE_PATH, 'json-integration-test');
-const CPP_STREAM_TO_FILE = path.join(CPP_EXE_PATH, 'stream-to-file');
-const CPP_FILE_TO_STREAM = path.join(CPP_EXE_PATH, 'file-to-stream');
+const ARROW_ARCHERY_DIR = process.env.ARROW_ARCHERY_DIR || path.join(ARROW_HOME, 'dev/archery');
+const CPP_JSON_TO_ARROW = path.join(CPP_EXE_PATH, 'arrow-json-integration-test');
+const CPP_FILE_TO_STREAM = path.join(CPP_EXE_PATH, 'arrow-file-to-stream');
 
 const testFilesDir = path.join(ARROW_HOME, 'js/test/data');
 const snapshotsDir = path.join(ARROW_HOME, 'js/test/__snapshots__');
@@ -79,7 +96,7 @@ const cppFilesDir = path.join(testFilesDir, 'cpp');
 const javaFilesDir = path.join(testFilesDir, 'java');
 const jsonFilesDir = path.join(testFilesDir, 'json');
 
-async function cleanTestData() {
+export async function cleanTestData() {
     return await del([
         `${cppFilesDir}/**`,
         `${javaFilesDir}/**`,
@@ -90,11 +107,14 @@ async function cleanTestData() {
 
 async function createTestJSON() {
     await mkdirp(jsonFilesDir);
-    await exec(`shx cp ${ARROW_INTEGRATION_DIR}/data/*.json ${jsonFilesDir}`);
-    await exec(`python3 ${ARROW_INTEGRATION_DIR}/integration_test.py --write_generated_json ${jsonFilesDir}`);
+    await exec(`python3 -B -c '\
+import sys\n\
+sys.path.append("${ARROW_ARCHERY_DIR}")\n\
+from archery.integration.runner import write_js_test_json\n\
+write_js_test_json("${jsonFilesDir}")'`);
 }
 
-async function createTestData() {
+export async function createTestData() {
 
     let JAVA_TOOLS_JAR = process.env.ARROW_JAVA_INTEGRATION_JAR;
     if (!JAVA_TOOLS_JAR) {
@@ -114,7 +134,7 @@ async function createTestData() {
     const errors = [];
     const names = await glob(path.join(jsonFilesDir, '*.json'));
 
-    for (let jsonPath of names) {
+    for (const jsonPath of names) {
         const name = path.parse(path.basename(jsonPath)).name;
         const arrowCppFilePath = path.join(cppFilesDir, 'file', `${name}.arrow`);
         const arrowJavaFilePath = path.join(javaFilesDir, 'file', `${name}.arrow`);
@@ -135,38 +155,33 @@ async function createTestData() {
     }
 
     async function generateCPPFile(jsonPath, filePath) {
-        await rimraf(filePath);
+        await del(filePath);
         return await exec(
-            `${CPP_JSON_TO_ARROW} ${
-            `--integration --mode=JSON_TO_ARROW`} ${
-            `--json=${jsonPath} --arrow=${filePath}`}`,
+            `${CPP_JSON_TO_ARROW} ${`--integration --mode=JSON_TO_ARROW`} ${`--json=${jsonPath} --arrow=${filePath}`}`,
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateCPPStream(filePath, streamPath) {
-        await rimraf(streamPath);
+        await del(streamPath);
         return await exec(
             `${CPP_FILE_TO_STREAM} ${filePath} > ${streamPath}`,
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateJavaFile(jsonPath, filePath) {
-        await rimraf(filePath);
+        await del(filePath);
         return await exec(
-            `java -cp ${JAVA_TOOLS_JAR} ${
-            `org.apache.arrow.tools.Integration -c JSON_TO_ARROW`} ${
-            `-j ${path.resolve(jsonPath)} -a ${filePath}`}`,
+            `java -cp ${JAVA_TOOLS_JAR} ${`org.apache.arrow.tools.Integration -c JSON_TO_ARROW`} ${`-j ${path.resolve(jsonPath)} -a ${filePath}`}`,
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateJavaStream(filePath, streamPath) {
-        await rimraf(streamPath);
+        await del(streamPath);
         return await exec(
-            `java -cp ${JAVA_TOOLS_JAR} ${
-            `org.apache.arrow.tools.FileToStream`} ${filePath} ${streamPath}`,
+            `java -cp ${JAVA_TOOLS_JAR} ${`org.apache.arrow.tools.FileToStream`} ${filePath} ${streamPath}`,
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }

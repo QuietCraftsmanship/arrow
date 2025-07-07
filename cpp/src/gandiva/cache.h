@@ -15,37 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_MODULE_CACHE_H
-#define GANDIVA_MODULE_CACHE_H
+#pragma once
 
+#include <cstdlib>
 #include <mutex>
 
+#include "arrow/util/macros.h"
 #include "gandiva/lru_cache.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
+
+namespace internal {
+// Only called once by GetCacheCapacity().
+// Do the actual work of getting the cache capacity from env var.
+// Also makes the testing easier.
+GANDIVA_EXPORT
+int GetCacheCapacityFromEnvVar();
+}  // namespace internal
+
+GANDIVA_EXPORT
+int GetCacheCapacity();
+
+GANDIVA_EXPORT
+void LogCacheSize(size_t capacity);
 
 template <class KeyType, typename ValueType>
 class Cache {
  public:
-  explicit Cache(size_t capacity = CACHE_SIZE) : cache_(capacity) {}
-  ValueType GetModule(KeyType cache_key) {
-    boost::optional<ValueType> result;
-    mtx_.lock();
+  explicit Cache(size_t capacity) : cache_(capacity) { LogCacheSize(capacity); }
+
+  Cache() : Cache(GetCacheCapacity()) {}
+
+  ValueType GetObjectCode(const KeyType& cache_key) {
+    std::optional<ValueType> result;
+    std::lock_guard<std::mutex> lock(mtx_);
     result = cache_.get(cache_key);
-    mtx_.unlock();
-    return result != boost::none ? result.value() : nullptr;
+    return result != std::nullopt ? *result : nullptr;
   }
 
-  void PutModule(KeyType cache_key, ValueType module) {
-    mtx_.lock();
+  void PutObjectCode(const KeyType& cache_key, const ValueType& module) {
+    std::lock_guard<std::mutex> lock(mtx_);
     cache_.insert(cache_key, module);
-    mtx_.unlock();
   }
 
  private:
   LruCache<KeyType, ValueType> cache_;
-  static const int CACHE_SIZE = 250;
   std::mutex mtx_;
 };
 }  // namespace gandiva
-#endif  // GANDIVA_MODULE_CACHE_H

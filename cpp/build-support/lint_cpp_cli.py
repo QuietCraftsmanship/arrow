@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -19,8 +19,6 @@
 import argparse
 import re
 import os
-import sys
-import traceback
 
 parser = argparse.ArgumentParser(
     description="Check for illegal headers for C++/CLI applications")
@@ -32,6 +30,12 @@ arguments = parser.parse_args()
 _STRIP_COMMENT_REGEX = re.compile('(.+)?(?=//)')
 _NULLPTR_REGEX = re.compile(r'.*\bnullptr\b.*')
 _RETURN_NOT_OK_REGEX = re.compile(r'.*\sRETURN_NOT_OK.*')
+_ASSIGN_OR_RAISE_REGEX = re.compile(r'.*\sASSIGN_OR_RAISE.*')
+_DCHECK_REGEX = re.compile(r'.*\sDCHECK.*')
+
+
+def _paths(paths):
+    return [p.strip().replace('/', os.path.sep) for p in paths.splitlines()]
 
 
 def _strip_comments(line):
@@ -46,13 +50,18 @@ def lint_file(path):
     fail_rules = [
         # rule, error message, rule-specific exclusions list
         (lambda x: '<mutex>' in x, 'Uses <mutex>', []),
+        (lambda x: '<iostream>' in x, 'Uses <iostream>', []),
         (lambda x: re.match(_NULLPTR_REGEX, x), 'Uses nullptr', []),
         (lambda x: re.match(_RETURN_NOT_OK_REGEX, x),
-         'Use ARROW_RETURN_NOT_OK in header files',
-         ['arrow/status.h',
-          'test',
-          'arrow/util/hash.h',
-          'arrow/python/util'])
+         'Use ARROW_RETURN_NOT_OK in header files', _paths('''\
+         arrow/status.h
+         arrow/python/util''')),
+        (lambda x: re.match(_ASSIGN_OR_RAISE_REGEX, x),
+         'Use ARROW_ASSIGN_OR_RAISE in header files', []),
+        (lambda x: re.match(_DCHECK_REGEX, x),
+         'Use ARROW_DCHECK in header files', _paths('''\
+         arrow/util/logging.h'''))
+
     ]
 
     with open(path) as f:
@@ -63,24 +72,26 @@ def lint_file(path):
                     continue
 
                 if rule(stripped_line):
-                    raise Exception('File {0} failed C++/CLI lint check: {1}\n'
-                                    'Line {2}: {3}'
-                                    .format(path, why, i + 1, line))
+                    yield path, why, i, line
 
 
-EXCLUSIONS = [
-    'arrow/python/iterators.h',
-    'arrow/util/macros.h',
-    'arrow/util/parallel.h',
-    'arrow/util/string_view/string_view.hpp',
-    'gandiva/cache.h',
-    'gandiva/jni',
-    'gandiva/precompiled/date.h',
-    'test',
-    'internal'
-]
+EXCLUSIONS = _paths('''\
+    arrow/arrow-config.cmake
+    arrow/python/iterators.h
+    arrow/util/hashing.h
+    arrow/util/macros.h
+    arrow/util/parallel.h
+    arrow/vendored
+    arrow/visitor_inline.h
+    gandiva/cache.h
+    gandiva/jni
+    jni/
+    test
+    internal
+    _generated''')
 
-try:
+
+def lint_files():
     for dirpath, _, filenames in os.walk(arguments.source_path):
         for filename in filenames:
             full_path = os.path.join(dirpath, filename)
@@ -94,9 +105,23 @@ try:
             if exclude:
                 continue
 
+            # Lint file name, except for pkg-config templates
+            if not filename.endswith('.pc.in'):
+                if '-' in filename:
+                    why = ("Please use underscores, not hyphens, "
+                           "in source file names")
+                    yield full_path, why, 0, full_path
+
             # Only run on header files
             if filename.endswith('.h'):
-                lint_file(full_path)
-except Exception:
-    traceback.print_exc()
-    sys.exit(1)
+                for _ in lint_file(full_path):
+                    yield _
+
+
+if __name__ == '__main__':
+    failures = list(lint_files())
+    for path, why, i, line in failures:
+        print('File {0} failed C++/CLI lint check: {1}\n'
+              'Line {2}: {3}'.format(path, why, i + 1, line))
+    if failures:
+        exit(1)

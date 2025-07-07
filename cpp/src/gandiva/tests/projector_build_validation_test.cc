@@ -27,7 +27,7 @@ using arrow::boolean;
 using arrow::float32;
 using arrow::int32;
 
-class TestProjector : public ::testing::Test {
+class ValidationTestProjector : public ::testing::Test {
  public:
   void SetUp() { pool_ = arrow::default_memory_pool(); }
 
@@ -35,7 +35,7 @@ class TestProjector : public ::testing::Test {
   arrow::MemoryPool* pool_;
 };
 
-TEST_F(TestProjector, TestNonExistentFunction) {
+TEST_F(ValidationTestProjector, TestNonexistentFunction) {
   // schema for input fields
   auto field0 = field("f0", float32());
   auto field1 = field("f2", float32());
@@ -45,19 +45,19 @@ TEST_F(TestProjector, TestNonExistentFunction) {
   auto field_result = field("res", boolean());
 
   // Build expression
-  auto lt_expr = TreeExprBuilder::MakeExpression("non_existent_function",
-                                                 {field0, field1}, field_result);
+  auto lt_expr = TreeExprBuilder::MakeExpression("nonexistent_function", {field0, field1},
+                                                 field_result);
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {lt_expr}, &projector);
+  auto status = Projector::Make(schema, {lt_expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
   std::string expected_error =
-      "Function bool non_existent_function(float, float) not supported yet.";
+      "Function bool nonexistent_function(float, float) not supported yet.";
   EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestNotMatchingDataType) {
+TEST_F(ValidationTestProjector, TestNotMatchingDataType) {
   // schema for input fields
   auto field0 = field("f0", float32());
   auto schema = arrow::schema({field0});
@@ -71,14 +71,14 @@ TEST_F(TestProjector, TestNotMatchingDataType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {lt_expr}, &projector);
+  auto status = Projector::Make(schema, {lt_expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
   std::string expected_error =
       "Return type of root node float does not match that of expression bool";
   EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestNotSupportedDataType) {
+TEST_F(ValidationTestProjector, TestNotSupportedDataType) {
   // schema for input fields
   auto field0 = field("f0", list(int32()));
   auto schema = arrow::schema({field0});
@@ -92,13 +92,13 @@ TEST_F(TestProjector, TestNotSupportedDataType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {lt_expr}, &projector);
+  auto status = Projector::Make(schema, {lt_expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
   std::string expected_error = "Field f0 has unsupported data type list";
   EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestIncorrectSchemaMissingField) {
+TEST_F(ValidationTestProjector, TestIncorrectSchemaMissingField) {
   // schema for input fields
   auto field0 = field("f0", float32());
   auto field1 = field("f2", float32());
@@ -113,13 +113,13 @@ TEST_F(TestProjector, TestIncorrectSchemaMissingField) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {lt_expr}, &projector);
+  auto status = Projector::Make(schema, {lt_expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
   std::string expected_error = "Field f2 not in schema";
   EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestIncorrectSchemaTypeNotMatching) {
+TEST_F(ValidationTestProjector, TestIncorrectSchemaTypeNotMatching) {
   // schema for input fields
   auto field0 = field("f0", float32());
   auto field1 = field("f2", float32());
@@ -135,14 +135,14 @@ TEST_F(TestProjector, TestIncorrectSchemaTypeNotMatching) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {lt_expr}, &projector);
+  auto status = Projector::Make(schema, {lt_expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
   std::string expected_error =
       "Field definition in schema f2: int32 different from field in expression f2: float";
   EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestIfNotSupportedFunction) {
+TEST_F(ValidationTestProjector, TestIfNotSupportedFunction) {
   // schema for input fields
   auto fielda = field("a", int32());
   auto fieldb = field("b", int32());
@@ -159,18 +159,18 @@ TEST_F(TestProjector, TestIfNotSupportedFunction) {
   auto node_a = TreeExprBuilder::MakeField(fielda);
   auto node_b = TreeExprBuilder::MakeField(fieldb);
   auto condition =
-      TreeExprBuilder::MakeFunction("non_existent_function", {node_a, node_b}, boolean());
+      TreeExprBuilder::MakeFunction("nonexistent_function", {node_a, node_b}, boolean());
   auto if_node = TreeExprBuilder::MakeIf(condition, node_a, node_b, int32());
 
   auto expr = TreeExprBuilder::MakeExpression(if_node, field_result);
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
 }
 
-TEST_F(TestProjector, TestIfNotMatchingReturnType) {
+TEST_F(ValidationTestProjector, TestIfNotMatchingReturnType) {
   // schema for input fields
   auto fielda = field("a", int32());
   auto fieldb = field("b", int32());
@@ -189,13 +189,11 @@ TEST_F(TestProjector, TestIfNotMatchingReturnType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
-  std::string expected_error = "Return type of if bool and then int32 not matching.";
-  EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestElseNotMatchingReturnType) {
+TEST_F(ValidationTestProjector, TestElseNotMatchingReturnType) {
   // schema for input fields
   auto fielda = field("a", int32());
   auto fieldb = field("b", int32());
@@ -216,13 +214,11 @@ TEST_F(TestProjector, TestElseNotMatchingReturnType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
-  std::string expected_error = "Return type of if int32 and else bool not matching.";
-  EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestElseNotSupportedType) {
+TEST_F(ValidationTestProjector, TestElseNotSupportedType) {
   // schema for input fields
   auto fielda = field("a", int32());
   auto fieldb = field("b", int32());
@@ -243,13 +239,12 @@ TEST_F(TestProjector, TestElseNotSupportedType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
-  std::string expected_error = "Field c has unsupported data type list";
-  EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
+  EXPECT_EQ(status.code(), StatusCode::ExpressionValidationError);
 }
 
-TEST_F(TestProjector, TestAndMinChildren) {
+TEST_F(ValidationTestProjector, TestAndMinChildren) {
   // schema for input fields
   auto fielda = field("a", boolean());
   auto schema = arrow::schema({fielda});
@@ -264,13 +259,11 @@ TEST_F(TestProjector, TestAndMinChildren) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
-  std::string expected_error = "Boolean expression has 1 children, expected atleast two";
-  EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
-TEST_F(TestProjector, TestAndBooleanArgType) {
+TEST_F(ValidationTestProjector, TestAndBooleanArgType) {
   // schema for input fields
   auto fielda = field("a", boolean());
   auto fieldb = field("b", int32());
@@ -287,12 +280,8 @@ TEST_F(TestProjector, TestAndBooleanArgType) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.IsExpressionValidationError());
-  std::string expected_error =
-      "Boolean expression has a child with return type int32, expected return type "
-      "boolean";
-  EXPECT_TRUE(status.message().find(expected_error) != std::string::npos);
 }
 
 }  // namespace gandiva

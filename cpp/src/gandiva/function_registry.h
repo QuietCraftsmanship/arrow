@@ -15,53 +15,84 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_FUNCTION_REGISTRY_H
-#define GANDIVA_FUNCTION_REGISTRY_H
+#pragma once
 
-#include <unordered_map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
+#include "arrow/buffer.h"
+#include "arrow/status.h"
+#include "gandiva/function_holder.h"
+#include "gandiva/function_holder_maker_registry.h"
+#include "gandiva/function_registry_common.h"
 #include "gandiva/gandiva_aliases.h"
 #include "gandiva/native_function.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
 ///\brief Registry of pre-compiled IR functions.
-class FunctionRegistry {
+class GANDIVA_EXPORT FunctionRegistry {
  public:
   using iterator = const NativeFunction*;
+  using FunctionHolderMaker =
+      std::function<arrow::Result<std::shared_ptr<FunctionHolder>>(
+          const FunctionNode& function_node)>;
+
+  FunctionRegistry();
+  FunctionRegistry(const FunctionRegistry&) = delete;
+  FunctionRegistry& operator=(const FunctionRegistry&) = delete;
 
   /// Lookup a pre-compiled function by its signature.
   const NativeFunction* LookupSignature(const FunctionSignature& signature) const;
 
+  /// \brief register a set of functions into the function registry from a given bitcode
+  /// file
+  arrow::Status Register(const std::vector<NativeFunction>& funcs,
+                         const std::string& bitcode_path);
+
+  /// \brief register a set of functions into the function registry from a given bitcode
+  /// buffer
+  arrow::Status Register(const std::vector<NativeFunction>& funcs,
+                         std::shared_ptr<arrow::Buffer> bitcode_buffer);
+
+  /// \brief register a C function into the function registry
+  /// @param func the registered function's metadata
+  /// @param c_function_ptr the function pointer to the
+  /// registered function's implementation
+  /// @param function_holder_maker this will be used as the function holder if the
+  /// function requires a function holder
+  arrow::Status Register(
+      NativeFunction func, void* c_function_ptr,
+      std::optional<FunctionHolderMaker> function_holder_maker = std::nullopt);
+
+  /// \brief get a list of bitcode memory buffers saved in the registry
+  const std::vector<std::shared_ptr<arrow::Buffer>>& GetBitcodeBuffers() const;
+
+  /// \brief get a list of C functions saved in the registry
+  const std::vector<std::pair<NativeFunction, void*>>& GetCFunctions() const;
+
+  const FunctionHolderMakerRegistry& GetFunctionHolderMakerRegistry() const;
+
   iterator begin() const;
   iterator end() const;
+  iterator back() const;
+
+  friend arrow::Result<std::shared_ptr<FunctionRegistry>> MakeDefaultFunctionRegistry();
 
  private:
-  struct KeyHash {
-    std::size_t operator()(const FunctionSignature* k) const { return k->Hash(); }
-  };
+  std::vector<NativeFunction> pc_registry_;
+  SignatureMap pc_registry_map_;
+  std::vector<std::shared_ptr<arrow::Buffer>> bitcode_memory_buffers_;
+  std::vector<std::pair<NativeFunction, void*>> c_functions_;
+  FunctionHolderMakerRegistry holder_maker_registry_;
 
-  struct KeyEquals {
-    bool operator()(const FunctionSignature* s1, const FunctionSignature* s2) const {
-      return *s1 == *s2;
-    }
-  };
-
-  static DataTypePtr time32() { return arrow::time32(arrow::TimeUnit::MILLI); }
-
-  static DataTypePtr time64() { return arrow::time64(arrow::TimeUnit::MICRO); }
-
-  static DataTypePtr timestamp() { return arrow::timestamp(arrow::TimeUnit::MILLI); }
-
-  typedef std::unordered_map<const FunctionSignature*, const NativeFunction*, KeyHash,
-                             KeyEquals>
-      SignatureMap;
-  static SignatureMap InitPCMap();
-
-  static NativeFunction pc_registry_[];
-  static SignatureMap pc_registry_map_;
+  Status Add(NativeFunction func);
 };
 
-}  // namespace gandiva
+/// \brief get the default function registry
+GANDIVA_EXPORT std::shared_ptr<FunctionRegistry> default_function_registry();
 
-#endif  // GANDIVA_FUNCTION_REGISTRY_H
+}  // namespace gandiva

@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_TYPES_H
-#define GANDIVA_TYPES_H
+#pragma once
 
 #include <memory>
 #include <vector>
 
 #include "gandiva/arrow.h"
+#include "gandiva/function_registry.h"
 #include "gandiva/function_signature.h"
 #include "gandiva/gandiva_aliases.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
@@ -31,38 +32,43 @@ class NativeFunction;
 class FunctionRegistry;
 /// \brief Exports types supported by Gandiva for processing.
 ///
-/// Has helper methods for clients to programatically discover
+/// Has helper methods for clients to programmatically discover
 /// data types and functions supported by Gandiva.
-class ExpressionRegistry {
+class GANDIVA_EXPORT ExpressionRegistry {
  public:
-  using iterator = const NativeFunction*;
-  ExpressionRegistry();
+  using native_func_iterator_type = const NativeFunction*;
+  using func_sig_iterator_type = const FunctionSignature*;
+  explicit ExpressionRegistry(std::shared_ptr<FunctionRegistry> function_registry =
+                                  gandiva::default_function_registry());
   ~ExpressionRegistry();
   static DataTypeVector supported_types() { return supported_types_; }
-  class FunctionSignatureIterator {
+  class GANDIVA_EXPORT FunctionSignatureIterator {
    public:
-    explicit FunctionSignatureIterator(iterator it) : it_(it) {}
+    explicit FunctionSignatureIterator(native_func_iterator_type nf_it,
+                                       native_func_iterator_type nf_it_end_);
+    explicit FunctionSignatureIterator(func_sig_iterator_type fs_it);
 
     bool operator!=(const FunctionSignatureIterator& func_sign_it);
 
     FunctionSignature operator*();
 
-    iterator operator++(int);
+    func_sig_iterator_type operator++(int);
 
    private:
-    iterator it_;
+    native_func_iterator_type native_func_it_;
+    const native_func_iterator_type native_func_it_end_;
+    func_sig_iterator_type func_sig_it_;
   };
   const FunctionSignatureIterator function_signature_begin();
   const FunctionSignatureIterator function_signature_end() const;
 
  private:
   static DataTypeVector supported_types_;
-  static DataTypeVector InitSupportedTypes();
-  static void AddArrowTypesToVector(arrow::Type::type& type, DataTypeVector& vector);
-  std::unique_ptr<FunctionRegistry> function_registry_;
+  std::shared_ptr<FunctionRegistry> function_registry_;
 };
 
+/// \brief Get the list of all function signatures.
+GANDIVA_EXPORT
 std::vector<std::shared_ptr<FunctionSignature>> GetRegisteredFunctionSignatures();
 
 }  // namespace gandiva
-#endif  // GANDIVA_TYPES_H

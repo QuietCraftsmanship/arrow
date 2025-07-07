@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_IO_API_H
-#define ARROW_IO_API_H
+#pragma once
 
+#include "arrow/io/buffered.h"
 #include "arrow/io/compressed.h"
 #include "arrow/io/file.h"
 #include "arrow/io/hdfs.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/io/memory.h"
-
-#endif  // ARROW_IO_API_H

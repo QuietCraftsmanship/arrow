@@ -13,14 +13,46 @@ namespace Apache.Arrow.Flatbuf
 /// Arrow implementations do not need to implement all of the message types,
 /// which may include experimental metadata types. For maximum compatibility,
 /// it is best to send data using RecordBatch
-public enum MessageHeader : byte
+internal enum MessageHeader : byte
 {
- NONE = 0,
- Schema = 1,
- DictionaryBatch = 2,
- RecordBatch = 3,
- Tensor = 4,
+  NONE = 0,
+  Schema = 1,
+  DictionaryBatch = 2,
+  RecordBatch = 3,
+  Tensor = 4,
+  SparseTensor = 5,
 };
+
+
+
+static internal class MessageHeaderVerify
+{
+  static public bool Verify(Google.FlatBuffers.Verifier verifier, byte typeId, uint tablePos)
+  {
+    bool result = true;
+    switch((MessageHeader)typeId)
+    {
+      case MessageHeader.Schema:
+        result = SchemaVerify.Verify(verifier, tablePos);
+        break;
+      case MessageHeader.DictionaryBatch:
+        result = DictionaryBatchVerify.Verify(verifier, tablePos);
+        break;
+      case MessageHeader.RecordBatch:
+        result = RecordBatchVerify.Verify(verifier, tablePos);
+        break;
+      case MessageHeader.Tensor:
+        result = TensorVerify.Verify(verifier, tablePos);
+        break;
+      case MessageHeader.SparseTensor:
+        result = SparseTensorVerify.Verify(verifier, tablePos);
+        break;
+      default: result = true;
+        break;
+    }
+    return result;
+  }
+}
 
 
 }

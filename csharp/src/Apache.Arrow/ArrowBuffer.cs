@@ -13,116 +13,84 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using Apache.Arrow.Memory;
 using System;
 using System.Buffers;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using Apache.Arrow.Memory;
 
 namespace Apache.Arrow
 {
-    public partial class ArrowBuffer: IEquatable<ArrowBuffer>
+    public readonly partial struct ArrowBuffer : IEquatable<ArrowBuffer>, IDisposable
     {
-        public ArrowBuffer(Memory<byte> data, int size)
+        private readonly IMemoryOwner<byte> _memoryOwner;
+        private readonly ReadOnlyMemory<byte> _memory;
+
+        public static ArrowBuffer Empty => new ArrowBuffer(Memory<byte>.Empty);
+
+        public ArrowBuffer(ReadOnlyMemory<byte> data)
         {
-            Memory = data;
-            Size = size;
+            _memoryOwner = null;
+            _memory = data;
         }
 
-        /// <summary>
-        /// Allocates an Arrow buffer from a memory pool.
-        /// </summary>
-        /// <param name="size">Size of buffer (in bytes) to allocate.</param>
-        /// <param name="memoryPool">Memory pool to use for allocation. If null, a default memory pool is used.</param>
-        /// <returns></returns>
-        public static ArrowBuffer Allocate(int size, MemoryPool memoryPool = null)
+        internal ArrowBuffer(IMemoryOwner<byte> memoryOwner)
         {
-            if (memoryPool == null)
-                memoryPool = DefaultMemoryPool.Instance.Value;
+            // When wrapping an IMemoryOwner, don't cache the Memory<byte>
+            // since the owner may be disposed, and the cached Memory would
+            // be invalid.
 
-            var buffer = memoryPool.Allocate(size);
-
-            return new ArrowBuffer(buffer, size);
+            _memoryOwner = memoryOwner;
+            _memory = Memory<byte>.Empty;
         }
 
-        /// <summary>
-        /// Allocates an Arrow buffer the same length as the incoming data, then
-        /// copies the specified data to the arrow buffer.
-        /// </summary>
-        /// <param name="data">Data to copy into a new arrow buffer.</param>
-        /// <param name="memoryPool">Memory pool to use for allocation. If null, a default memory pool is used.</param>
-        /// <returns></returns>
-        public static ArrowBuffer FromMemory(Memory<byte> data, MemoryPool memoryPool = default)
-        {
-            var buffer = Allocate(data.Length, memoryPool);
-            data.CopyTo(buffer.Memory);
-            return buffer;
-        }
-
-        public async Task CopyToAsync(Stream stream, CancellationToken cancellationToken = default)
-        {
-            const float chunkSize = 8192f;
-
-            // TODO: Is there a better copy mechanism to use here that does not involve allocating buffers and targets .NET Standard 1.3?
-            // NOTE: Consider specialization for .NET Core 2.1
-
-            var length = Convert.ToInt32(chunkSize);
-            var buffer = ArrayPool<byte>.Shared.Rent(length);
-            var count = Convert.ToInt32(Math.Ceiling(Memory.Length / chunkSize));
-            var offset = 0;
-
-            try
-            {
-                for (var i = 0; i < count; i++)
-                {
-                    var n = Math.Min(length, Memory.Length);
-                    var slice = Memory.Slice(offset, n);
-
-                    slice.CopyTo(buffer);
-
-                    await stream.WriteAsync(buffer, 0, n, cancellationToken);
-
-                    offset += n;
-                }
-            }
-            finally
-            {
-                if (buffer != null)
-                {
-                    ArrayPool<byte>.Shared.Return(buffer);
-                }
-            }
-        }
-
-        public Memory<byte> Memory { get; }
+        public ReadOnlyMemory<byte> Memory =>
+            _memoryOwner != null ? _memoryOwner.Memory : _memory;
 
         public bool IsEmpty => Memory.IsEmpty;
 
-        public int Size { get; }
+        public int Length => Memory.Length;
 
-        public int Capacity => Memory.Length;
+        public ReadOnlySpan<byte> Span
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => Memory.Span;
+        }
 
-        public Span<T> GetSpan<T>(int offset)
-            where T : struct =>
-            MemoryMarshal.Cast<byte, T>(
-                Memory.Span.Slice(offset));
-
-        public Span<T> GetSpan<T>(int offset, int length)
-            where T : struct =>
-            MemoryMarshal.Cast<byte, T>(
-                Memory.Span.Slice(offset, length));
-
-        public Span<T> GetSpan<T>()
-            where T: struct =>
-            MemoryMarshal.Cast<byte, T>(Memory.Span);
+        public ArrowBuffer Clone(MemoryAllocator allocator = default)
+        {
+            return Span.Length == 0 ? Empty : new Builder<byte>(Span.Length)
+                .Append(Span)
+                .Build(allocator);
+        }
 
         public bool Equals(ArrowBuffer other)
         {
-            var lhs = GetSpan<byte>();
-            var rhs = other.GetSpan<byte>();
-            return lhs.SequenceEqual(rhs);
+            return Span.SequenceEqual(other.Span);
+        }
+
+        public void Dispose()
+        {
+            _memoryOwner?.Dispose();
+        }
+
+        internal bool TryExport(ExportedAllocationOwner newOwner, out IntPtr ptr)
+        {
+            if (IsEmpty)
+            {
+                // _memoryOwner could be anything (for example null or a NullMemoryOwner), but it doesn't matter here
+                ptr = IntPtr.Zero;
+                return true;
+            }
+
+            if (_memoryOwner is IOwnableAllocation ownable && ownable.TryAcquire(out ptr, out int offset, out int length))
+            {
+                newOwner.Acquire(ptr, offset, length);
+                ptr += offset;
+                return true;
+            }
+
+            ptr = IntPtr.Zero;
+            return false;
         }
     }
 }

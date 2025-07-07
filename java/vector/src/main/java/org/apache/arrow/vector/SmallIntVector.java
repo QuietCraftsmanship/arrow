@@ -17,7 +17,10 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.SmallIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableSmallIntHolder;
@@ -33,13 +36,22 @@ import io.netty.buffer.ArrowBuf;
  * short values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class SmallIntVector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class SmallIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class SmallIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class SmallIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 2;
   private final FieldReader reader;
 
   /**
    * Instantiate a SmallIntVector. This doesn't allocate any memory for
    * the data in vector.
+   *
    * @param name name of the vector
    * @param allocator allocator for memory management.
    */
@@ -50,6 +62,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
   /**
    * Instantiate a SmallIntVector. This doesn't allocate any memory for
    * the data in vector.
+   *
    * @param name name of the vector
    * @param fieldType type of Field materialized by this vector
    * @param allocator allocator for memory management.
@@ -60,7 +73,8 @@ public class SmallIntVector extends BaseFixedWidthVector {
   }
 
   /**
-   * Get a reader that supports reading values from this vector
+   * Get a reader that supports reading values from this vector.
+   *
    * @return Field Reader for this vector
    */
   @Override
@@ -71,6 +85,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
   /**
    * Get minor type for this vector. The vector holds values belonging
    * to a particular type.
+   *
    * @return {@link org.apache.arrow.vector.types.Types.MinorType}
    */
   @Override
@@ -79,11 +94,11 @@ public class SmallIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *          vector value retrieval methods                        *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value retrieval methods                        |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   /**
@@ -93,7 +108,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public short get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getShort(index * TYPE_WIDTH);
@@ -131,7 +146,8 @@ public class SmallIntVector extends BaseFixedWidthVector {
 
   /**
    * Copy a cell value from a particular index in source vector to a particular
-   * position in this vector
+   * position in this vector.
+   *
    * @param fromIndex position to copy from in source vector
    * @param thisIndex position to copy to in this vector
    * @param from source vector
@@ -146,6 +162,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
    * Same as {@link #copyFrom(int, int, SmallIntVector)} except that
    * it handles the case when the capacity of the vector needs to be expanded
    * before copy.
+   *
    * @param fromIndex position to copy from in source vector
    * @param thisIndex position to copy to in this vector
    * @param from source vector
@@ -156,11 +173,11 @@ public class SmallIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *          vector value setter methods                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |          vector value setter methods                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
 
   private void setValue(int index, int value) {
@@ -290,6 +307,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
   /**
    * Store the given value at a particular position in the vector. isSet indicates
    * whether the value is NULL or not.
+   *
    * @param index position of the new value
    * @param isSet 0 for NULL value, 1 otherwise
    * @param value element value
@@ -306,6 +324,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
    * Same as {@link #set(int, int, short)} except that it handles the case
    * when index is greater than or equal to current value capacity of the
    * vector.
+   *
    * @param index position of the new value
    * @param isSet 0 for NULL value, 1 otherwise
    * @param value element value
@@ -319,7 +338,7 @@ public class SmallIntVector extends BaseFixedWidthVector {
    * Given a data buffer, get the value stored at a particular position
    * in the vector.
    *
-   * This method should not be used externally.
+   * <p>This method should not be used externally.
    *
    * @param buffer data buffer
    * @param index position of the element.
@@ -330,15 +349,16 @@ public class SmallIntVector extends BaseFixedWidthVector {
   }
 
 
-  /******************************************************************
-   *                                                                *
-   *                      vector transfer                           *
-   *                                                                *
-   ******************************************************************/
+  /*----------------------------------------------------------------*
+   |                                                                |
+   |                      vector transfer                           |
+   |                                                                |
+   *----------------------------------------------------------------*/
 
   /**
    * Construct a TransferPair comprising of this and and a target vector of
    * the same type.
+   *
    * @param ref name of the target vector
    * @param allocator allocator for the target vector
    * @return {@link TransferPair}
@@ -350,12 +370,40 @@ public class SmallIntVector extends BaseFixedWidthVector {
 
   /**
    * Construct a TransferPair with a desired target vector of the same type.
+   *
    * @param to target vector
    * @return {@link TransferPair}
    */
   @Override
   public TransferPair makeTransferPair(ValueVector to) {
     return new TransferImpl((SmallIntVector) to);
+  }
+
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, (int) value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, (int) value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Short.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Short.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

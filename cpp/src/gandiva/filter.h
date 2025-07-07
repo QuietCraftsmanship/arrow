@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EXPR_FILTER_H
-#define GANDIVA_EXPR_FILTER_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -29,6 +28,7 @@
 #include "gandiva/condition.h"
 #include "gandiva/configuration.h"
 #include "gandiva/selection_vector.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
@@ -38,12 +38,14 @@ class LLVMGenerator;
 ///
 /// A filter is built for a specific schema and condition. Once the filter is built, it
 /// can be used to evaluate many row batches.
-class Filter {
+class GANDIVA_EXPORT Filter {
  public:
   Filter(std::unique_ptr<LLVMGenerator> llvm_generator, SchemaPtr schema,
          std::shared_ptr<Configuration> config);
 
-  ~Filter() = default;
+  // Inline dtor will attempt to resolve the destructor for
+  // LLVMGenerator on MSVC, so we compile the dtor in the object code
+  ~Filter();
 
   /// Build a filter for the given schema and condition, with the default configuration.
   ///
@@ -74,12 +76,17 @@ class Filter {
   Status Evaluate(const arrow::RecordBatch& batch,
                   std::shared_ptr<SelectionVector> out_selection);
 
+  const std::string& DumpIR();
+
+  void SetBuiltFromCache(bool flag);
+
+  bool GetBuiltFromCache();
+
  private:
-  const std::unique_ptr<LLVMGenerator> llvm_generator_;
-  const SchemaPtr schema_;
-  const std::shared_ptr<Configuration> configuration_;
+  std::unique_ptr<LLVMGenerator> llvm_generator_;
+  SchemaPtr schema_;
+  std::shared_ptr<Configuration> configuration_;
+  bool built_from_cache_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_EXPR_FILTER_H

@@ -13,10 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using System;
-using System.Runtime.CompilerServices;
-using Apache.Arrow.Memory;
 using Apache.Arrow.Tests.Fixtures;
+using System;
+using System.Runtime.InteropServices;
 using Xunit;
 
 namespace Apache.Arrow.Tests
@@ -24,29 +23,36 @@ namespace Apache.Arrow.Tests
     public class ArrowBufferTests
     {
         public class Allocate : 
-            IClassFixture<DefaultMemoryPoolFixture>
+            IClassFixture<DefaultMemoryAllocatorFixture>
         {
-            private readonly DefaultMemoryPoolFixture _memoryPoolFixture;
+            private readonly DefaultMemoryAllocatorFixture _memoryPoolFixture;
 
-            public Allocate(DefaultMemoryPoolFixture memoryPoolFixture)
+            public Allocate(DefaultMemoryAllocatorFixture memoryPoolFixture)
             {
                 _memoryPoolFixture = memoryPoolFixture;
             }
 
             /// <summary>
-            /// Ensure Arrow buffers are allocated in multiples of 8-bytes.
+            /// Ensure Arrow buffers are allocated in multiples of 64 bytes.
             /// </summary>
             /// <param name="size">number of bytes to allocate</param>
             /// <param name="expectedCapacity">expected buffer capacity after allocation</param>
             [Theory]
-            [InlineData(1, 8)]
-            [InlineData(8, 8)]
-            [InlineData(9, 16)]
-            [InlineData(16, 16)]
+            [InlineData(0, 0)]
+            [InlineData(1, 64)]
+            [InlineData(8, 64)]
+            [InlineData(9, 64)]
+            [InlineData(65, 128)]
             public void AllocatesWithExpectedPadding(int size, int expectedCapacity)
             {
-                var buffer = ArrowBuffer.Allocate(size, _memoryPoolFixture.MemoryPool);
-                Assert.Equal(buffer.Capacity, expectedCapacity);
+                var builder = new ArrowBuffer.Builder<byte>(size);
+                for (int i = 0; i < size; i++)
+                {
+                    builder.Append(0);
+                }
+                var buffer = builder.Build();
+
+                Assert.Equal(expectedCapacity, buffer.Length);
             }
 
             /// <summary>
@@ -59,12 +65,16 @@ namespace Apache.Arrow.Tests
             [InlineData(128)]
             public unsafe void AllocatesAlignedToMultipleOf64(int size)
             {
-                var buffer = ArrowBuffer.Allocate(size, _memoryPoolFixture.MemoryPool);
-
-                using (var pin = buffer.Memory.Pin())
+                var builder = new ArrowBuffer.Builder<byte>(size);
+                for (int i = 0; i < size; i++)
                 {
-                    var ptr = new IntPtr(pin.Pointer);
-                    Assert.True(ptr.ToInt64() % 64 == 0);
+                    builder.Append(0);
+                }
+                var buffer = builder.Build();
+
+                fixed (byte* ptr = &buffer.Span.GetPinnableReference())
+                { 
+                    Assert.True(new IntPtr(ptr).ToInt64() % 64 == 0);
                 }
             }
 
@@ -74,15 +84,31 @@ namespace Apache.Arrow.Tests
             [Fact]
             public void HasZeroPadding()
             {
-                var buffer = ArrowBuffer.Allocate(32, _memoryPoolFixture.MemoryPool);
-                var span = buffer.GetSpan<byte>();
-
-                foreach (var b in span)
+                var buffer = new ArrowBuffer.Builder<byte>(10).Append(0).Build();
+                
+                foreach (var b in buffer.Span)
                 {
                     Assert.Equal(0, b);
                 }
             }
 
+        }
+
+        [Fact]
+        public void TestExternalMemoryWrappedAsArrowBuffer()
+        {
+            Memory<byte> memory = new byte[sizeof(int) * 3];
+            Span<byte> spanOfBytes = memory.Span;
+            var span = spanOfBytes.CastTo<int>();
+            span[0] = 0;
+            span[1] = 1;
+            span[2] = 2;
+
+            ArrowBuffer buffer = new ArrowBuffer(memory);
+            Assert.Equal(2, buffer.Span.CastTo<int>()[2]);
+
+            span[2] = 10;
+            Assert.Equal(10, buffer.Span.CastTo<int>()[2]);
         }
     }
 }

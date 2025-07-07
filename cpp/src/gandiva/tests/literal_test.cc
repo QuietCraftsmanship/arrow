@@ -88,8 +88,8 @@ TEST_F(TestLiteral, TestSimpleArithmetic) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status =
-      Projector::Make(schema, {expr_a, expr_b, expr_c, expr_d, expr_e}, &projector);
+  auto status = Projector::Make(schema, {expr_a, expr_b, expr_c, expr_d, expr_e},
+                                TestConfiguration(), &projector);
   EXPECT_TRUE(status.ok());
 
   // Create a row-batch with some sample data
@@ -133,7 +133,7 @@ TEST_F(TestLiteral, TestLiteralHash) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.ok()) << status.message();
 
   auto res1 = field("a", int64());
@@ -142,7 +142,7 @@ TEST_F(TestLiteral, TestLiteralHash) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector1;
-  status = Projector::Make(schema, {expr1}, &projector1);
+  status = Projector::Make(schema, {expr1}, TestConfiguration(), &projector1);
   EXPECT_TRUE(status.ok()) << status.message();
   EXPECT_TRUE(projector.get() != projector1.get());
 }
@@ -165,7 +165,7 @@ TEST_F(TestLiteral, TestNullLiteral) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.ok()) << status.message();
 
   // Create a row-batch with some sample data
@@ -197,7 +197,7 @@ TEST_F(TestLiteral, TestNullLiteralInIf) {
   auto res = field("res", float64());
 
   auto node_a = TreeExprBuilder::MakeField(field_a);
-  auto literal_5 = TreeExprBuilder::MakeLiteral((double_t)5);
+  auto literal_5 = TreeExprBuilder::MakeLiteral(5.0);
   auto a_gt_5 = TreeExprBuilder::MakeFunction("greater_than", {node_a, literal_5},
                                               arrow::boolean());
   auto literal_null = TreeExprBuilder::MakeNull(arrow::float64());
@@ -207,7 +207,7 @@ TEST_F(TestLiteral, TestNullLiteralInIf) {
 
   // Build a projector for the expressions.
   std::shared_ptr<Projector> projector;
-  Status status = Projector::Make(schema, {expr}, &projector);
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
   EXPECT_TRUE(status.ok()) << status.message();
 
   // Create a row-batch with some sample data

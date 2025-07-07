@@ -15,20 +15,41 @@
 # specific language governing permissions and limitations
 # under the License.
 
-project(gandiva)
+add_gandiva_test(projector-test
+                 SOURCES
+                 binary_test.cc
+                 boolean_expr_test.cc
+                 date_time_test.cc
+                 decimal_single_test.cc
+                 decimal_test.cc
+                 filter_project_test.cc
+                 filter_test.cc
+                 hash_test.cc
+                 huge_table_test.cc
+                 if_expr_test.cc
+                 in_expr_test.cc
+                 literal_test.cc
+                 null_validity_test.cc
+                 projector_build_validation_test.cc
+                 projector_test.cc
+                 test_util.cc
+                 to_string_test.cc
+                 utf8_test.cc)
 
-foreach(lib_type "shared" "static")
-  add_gandiva_integ_test(filter_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(projector_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(if_expr_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(literal_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(projector_build_validation_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(boolean_expr_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(utf8_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(binary_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(date_time_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(micro_benchmarks.cc gandiva_${lib_type})
-  add_gandiva_integ_test(to_string_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(hash_test.cc gandiva_${lib_type})
-  add_gandiva_integ_test(in_expr_test.cc gandiva_${lib_type})
-endforeach(lib_type)
+if(ARROW_BUILD_STATIC)
+  add_gandiva_test(projector_test_static
+                   SOURCES
+                   projector_test.cc
+                   test_util.cc
+                   USE_STATIC_LINKING)
+  add_arrow_benchmark(micro_benchmarks
+                      SOURCES
+                      micro_benchmarks.cc
+                      test_util.cc
+                      PREFIX
+                      "gandiva"
+                      EXTRA_LINK_LIBS
+                      gandiva_static)
+endif()
+
+add_subdirectory(external_functions)

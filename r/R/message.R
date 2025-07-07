@@ -15,32 +15,62 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include R6.R
+#' @include arrow-object.R
 
-`arrow::ipc::Message` <- R6Class("arrow::ipc::Message", inherit = `arrow::Object`,
+#' @title Message class
+#'
+#' @usage NULL
+#' @format NULL
+#' @docType class
+#'
+#' @section Methods:
+#'
+#' TODO
+#'
+#' @rdname Message
+#' @name Message
+Message <- R6Class("Message",
+  inherit = ArrowObject,
   public = list(
-    Equals = function(other){
-      assert_that(inherits(other), "arrow::ipc::Message")
-      ipc___Message__Equals(self, other)
+    Equals = function(other, ...) {
+      inherits(other, "Message") && ipc___Message__Equals(self, other)
     },
     body_length = function() ipc___Message__body_length(self),
-    Verify = function() ipc___Message__Verify(self),
-    type = function() ipc___Message__type(self)
+    Verify = function() ipc___Message__Verify(self)
   ),
   active = list(
-    metadata = function() shared_ptr(`arrow::Buffer`, ipc___Message__metadata(self)),
-    body = function() shared_ptr(`arrow::Buffer`, ipc___Message__body(self))
+    type = function() ipc___Message__type(self),
+    metadata = function() ipc___Message__metadata(self),
+    body = function() ipc___Message__body(self)
   )
 )
 
+#' @title MessageReader class
+#'
+#' @usage NULL
+#' @format NULL
+#' @docType class
+#'
+#' @section Methods:
+#'
+#' TODO
+#'
+#' @rdname MessageReader
+#' @name MessageReader
 #' @export
-`==.arrow::ipc::Message` <- function(x, y) x$Equals(y)
-
-`arrow::ipc::MessageReader` <- R6Class("arrow::ipc::MessageReader", inherit = `arrow::Object`,
+MessageReader <- R6Class("MessageReader",
+  inherit = ArrowObject,
   public = list(
-    ReadNextMessage = function() unique_ptr(`arrow::ipc::Message`, ipc___MessageReader__ReadNextMessage(self))
+    ReadNextMessage = function() ipc___MessageReader__ReadNextMessage(self)
   )
 )
+
+MessageReader$create <- function(stream) {
+  if (!inherits(stream, "InputStream")) {
+    stream <- BufferReader$create(stream)
+  }
+  ipc___MessageReader__Open(stream)
+}
 
 #' Read a Message from a stream
 #'
@@ -53,34 +83,15 @@ read_message <- function(stream) {
 
 #' @export
 read_message.default <- function(stream) {
-  stop("unsupported")
+  read_message(BufferReader$create(stream))
 }
 
 #' @export
-`read_message.arrow::io::InputStream` <- function(stream) {
-  unique_ptr(`arrow::ipc::Message`, ipc___ReadMessage(stream) )
-}
-
-#' Open a MessageReader that reads from a stream
-#'
-#' @param stream an InputStream
-#'
-#' @export
-message_reader <- function(stream) {
-  UseMethod("message_reader")
+read_message.InputStream <- function(stream) {
+  ipc___ReadMessage(stream)
 }
 
 #' @export
-message_reader.default <- function(stream) {
-  stop("unsupported")
-}
-
-#' @export
-message_reader.raw <- function(stream) {
-  message_reader(buffer_reader(stream))
-}
-
-#' @export
-`message_reader.arrow::io::InputStream` <- function(stream) {
-  unique_ptr(`arrow::ipc::MessageReader`, ipc___MessageReader__Open(stream))
+read_message.MessageReader <- function(stream) {
+  stream$ReadNextMessage()
 }

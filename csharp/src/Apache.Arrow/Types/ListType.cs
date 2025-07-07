@@ -13,30 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using System;
-using System.Collections.Generic;
-using System.Text;
-
 namespace Apache.Arrow.Types
 {
-    public class ListType: ArrowType
+    public sealed class ListType : NestedType
     {
         public override ArrowTypeId TypeId => ArrowTypeId.List;
         public override string Name => "list";
 
-        public Field ValueField { get; }
-        public IArrowType ValueDataType { get; }
+        public Field ValueField => Fields[0];
 
-        public ListType(Field valueField, IArrowType valueDataType)
-        {
-            ValueField = valueField ?? throw new ArgumentNullException(nameof(valueField));
-            ValueDataType = valueDataType ?? NullType.Default;
-        }
+        public IArrowType ValueDataType => Fields[0].DataType;
 
-        public override void Accept(IArrowTypeVisitor visitor)
-        {
-            if (visitor is IArrowTypeVisitor<ListType> v)
-                v.Visit(this);
-        }
+        public ListType(Field valueField)
+           : base(valueField) { }
+
+        public ListType(IArrowType valueDataType)
+            : this(new Field("item", valueDataType, true)) { }
+
+        public override void Accept(IArrowTypeVisitor visitor) => Accept(this, visitor);
     }
 }

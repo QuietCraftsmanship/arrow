@@ -15,28 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow_types.h"
+#include "./arrow_types.h"
 
-using namespace Rcpp;
+#include <arrow/type.h>
 
-// [[Rcpp::export]]
+// [[arrow::export]]
 std::shared_ptr<arrow::Field> Field__initialize(
-    const std::string& name, const std::shared_ptr<arrow::DataType>& type,
+    const std::string& name, const std::shared_ptr<arrow::DataType>& field,
     bool nullable = true) {
-  return arrow::field(name, type, nullable);
+  return arrow::field(name, field, nullable);
 }
 
-// [[Rcpp::export]]
-std::string Field__ToString(const std::shared_ptr<arrow::Field>& type) {
-  return type->ToString();
+// [[arrow::export]]
+std::string Field__ToString(const std::shared_ptr<arrow::Field>& field) {
+  return field->ToString();
 }
 
-// [[Rcpp::export]]
-std::string Field__name(const std::shared_ptr<arrow::Field>& type) {
-  return type->name();
+// [[arrow::export]]
+std::string Field__name(const std::shared_ptr<arrow::Field>& field) {
+  return field->name();
 }
 
-// [[Rcpp::export]]
-bool Field__nullable(const std::shared_ptr<arrow::Field>& type) {
-  return type->nullable();
+// [[arrow::export]]
+bool Field__Equals(const std::shared_ptr<arrow::Field>& field,
+                   const std::shared_ptr<arrow::Field>& other) {
+  return field->Equals(other);
+}
+
+// [[arrow::export]]
+bool Field__nullable(const std::shared_ptr<arrow::Field>& field) {
+  return field->nullable();
+}
+
+// [[arrow::export]]
+std::shared_ptr<arrow::DataType> Field__type(const std::shared_ptr<arrow::Field>& field) {
+  return field->type();
 }

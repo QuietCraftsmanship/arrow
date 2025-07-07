@@ -17,8 +17,52 @@
 
 module Arrow
   class StructArray
-    def [](i)
-      get_field(i)
+    # @param i [Integer]
+    #   The index of the value to be gotten. You must specify the value index.
+    #
+    #   You can use {Arrow::Array#[]} for convenient value access.
+    #
+    # @return [Hash] The `i`-th struct.
+    def get_value(i)
+      value = {}
+      value_data_type.fields.zip(fields) do |field, field_array|
+        value[field.name] = field_array[i]
+      end
+      value
+    end
+
+    # @overload find_field(index)
+    #   @param index [Integer] The index of the field to be found.
+    #   @return [Arrow::Array, nil]
+    #      The `index`-th field or `nil` for out of range.
+    #
+    # @overload find_field(name)
+    #   @param index [String, Symbol] The name of the field to be found.
+    #   @return [Arrow::Array, nil]
+    #      The field that has `name` or `nil` for nonexistent name.
+    def find_field(index_or_name)
+      case index_or_name
+      when String, Symbol
+        name = index_or_name
+        (@name_to_field ||= build_name_to_field)[name.to_s]
+      else
+        index = index_or_name
+        fields[index]
+      end
+    end
+
+    alias_method :fields_raw, :fields
+    def fields
+      @fields ||= fields_raw
+    end
+
+    private
+    def build_name_to_field
+      name_to_field = {}
+      value_data_type.fields.zip(fields) do |field, field_array|
+        name_to_field[field.name] = field_array
+      end
+      name_to_field
     end
   end
 end

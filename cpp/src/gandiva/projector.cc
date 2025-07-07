@@ -21,10 +21,11 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/util/logging.h"
+
 #include "gandiva/cache.h"
 #include "gandiva/expr_validator.h"
 #include "gandiva/llvm_generator.h"
-#include "gandiva/projector_cache_key.h"
 
 namespace gandiva {
 
@@ -36,50 +37,71 @@ Projector::Projector(std::unique_ptr<LLVMGenerator> llvm_generator, SchemaPtr sc
       output_fields_(output_fields),
       configuration_(configuration) {}
 
+Projector::~Projector() {}
+
 Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
                        std::shared_ptr<Projector>* projector) {
-  return Projector::Make(schema, exprs, ConfigurationBuilder::DefaultConfiguration(),
-                         projector);
+  return Projector::Make(schema, exprs, SelectionVector::Mode::MODE_NONE,
+                         ConfigurationBuilder::DefaultConfiguration(), projector);
 }
 
 Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
                        std::shared_ptr<Configuration> configuration,
                        std::shared_ptr<Projector>* projector) {
-  ARROW_RETURN_FAILURE_IF_FALSE(schema != nullptr,
-                                Status::Invalid("schema cannot be null"));
-  ARROW_RETURN_FAILURE_IF_FALSE(!exprs.empty(),
-                                Status::Invalid("expressions need to be non-empty"));
-  ARROW_RETURN_FAILURE_IF_FALSE(configuration != nullptr,
-                                Status::Invalid("configuration cannot be null"));
+  return Projector::Make(schema, exprs, SelectionVector::Mode::MODE_NONE, configuration,
+                         projector);
+}
+
+Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
+                       SelectionVector::Mode selection_vector_mode,
+                       std::shared_ptr<Configuration> configuration,
+                       std::shared_ptr<Projector>* projector) {
+  ARROW_RETURN_IF(schema == nullptr, Status::Invalid("Schema cannot be null"));
+  ARROW_RETURN_IF(exprs.empty(), Status::Invalid("Expressions cannot be empty"));
+  ARROW_RETURN_IF(configuration == nullptr,
+                  Status::Invalid("Configuration cannot be null"));
 
   // see if equivalent projector was already built
-  static Cache<ProjectorCacheKey, std::shared_ptr<Projector>> cache;
-  ProjectorCacheKey cache_key(schema, configuration, exprs);
-  std::shared_ptr<Projector> cached_projector = cache.GetModule(cache_key);
-  if (cached_projector != nullptr) {
-    *projector = cached_projector;
-    return Status::OK();
+  std::shared_ptr<Cache<ExpressionCacheKey, std::shared_ptr<llvm::MemoryBuffer>>> cache =
+      LLVMGenerator::GetCache();
+
+  ExpressionCacheKey cache_key(schema, configuration, exprs, selection_vector_mode);
+
+  bool is_cached = false;
+
+  std::shared_ptr<llvm::MemoryBuffer> prev_cached_obj;
+  prev_cached_obj = cache->GetObjectCode(cache_key);
+
+  // Verify if previous projector obj code was cached
+  if (prev_cached_obj != nullptr) {
+    is_cached = true;
   }
 
+  GandivaObjectCache obj_cache(cache, cache_key);
+
   // Build LLVM generator, and generate code for the specified expressions
-  std::unique_ptr<LLVMGenerator> llvm_gen;
-  Status status = LLVMGenerator::Make(configuration, &llvm_gen);
-  ARROW_RETURN_NOT_OK(status);
+  ARROW_ASSIGN_OR_RAISE(auto llvm_gen,
+                        LLVMGenerator::Make(configuration, is_cached, obj_cache));
 
   // Run the validation on the expressions.
   // Return if any of the expression is invalid since
   // we will not be able to process further.
-  ExprValidator expr_validator(llvm_gen->types(), schema);
-  for (auto& expr : exprs) {
-    status = expr_validator.Validate(expr);
-    ARROW_RETURN_NOT_OK(status);
+  if (!is_cached) {
+    ExprValidator expr_validator(llvm_gen->types(), schema,
+                                 configuration->function_registry());
+    for (auto& expr : exprs) {
+      ARROW_RETURN_NOT_OK(expr_validator.Validate(expr));
+    }
   }
 
-  status = llvm_gen->Build(exprs);
-  ARROW_RETURN_NOT_OK(status);
+  // Set the object cache for LLVM
+  ARROW_RETURN_NOT_OK(llvm_gen->SetLLVMObjectCache(obj_cache));
+
+  ARROW_RETURN_NOT_OK(llvm_gen->Build(exprs, selection_vector_mode));
 
   // save the output field types. Used for validation at Evaluate() time.
   std::vector<FieldPtr> output_fields;
+  output_fields.reserve(exprs.size());
   for (auto& expr : exprs) {
     output_fields.push_back(expr->result());
   }
@@ -87,15 +109,20 @@ Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
   // Instantiate the projector with the completely built llvm generator
   *projector = std::shared_ptr<Projector>(
       new Projector(std::move(llvm_gen), schema, output_fields, configuration));
-  cache.PutModule(cache_key, *projector);
+  projector->get()->SetBuiltFromCache(is_cached);
 
   return Status::OK();
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch,
-                           const ArrayDataVector& output_data_vecs) {
-  Status status = ValidateEvaluateArgsCommon(batch);
-  ARROW_RETURN_NOT_OK(status);
+                           const ArrayDataVector& output_data_vecs) const {
+  return Evaluate(batch, nullptr, output_data_vecs);
+}
+
+Status Projector::Evaluate(const arrow::RecordBatch& batch,
+                           const SelectionVector* selection_vector,
+                           const ArrayDataVector& output_data_vecs) const {
+  ARROW_RETURN_NOT_OK(ValidateEvaluateArgsCommon(batch));
 
   if (output_data_vecs.size() != output_fields_.size()) {
     std::stringstream ss;
@@ -112,41 +139,42 @@ Status Projector::Evaluate(const arrow::RecordBatch& batch,
       return Status::Invalid(ss.str());
     }
 
-    Status status =
-        ValidateArrayDataCapacity(*array_data, *(output_fields_[idx]), batch.num_rows());
-    ARROW_RETURN_NOT_OK(status);
+    auto num_rows =
+        selection_vector == nullptr ? batch.num_rows() : selection_vector->GetNumSlots();
+
+    ARROW_RETURN_NOT_OK(
+        ValidateArrayDataCapacity(*array_data, *(output_fields_[idx]), num_rows));
     ++idx;
   }
-  return llvm_generator_->Execute(batch, output_data_vecs);
+  return llvm_generator_->Execute(batch, selection_vector, output_data_vecs);
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch, arrow::MemoryPool* pool,
-                           arrow::ArrayVector* output) {
-  Status status = ValidateEvaluateArgsCommon(batch);
-  ARROW_RETURN_NOT_OK(status);
+                           arrow::ArrayVector* output) const {
+  return Evaluate(batch, nullptr, pool, output);
+}
 
-  if (output == nullptr) {
-    return Status::Invalid("output must be non-null.");
-  }
+Status Projector::Evaluate(const arrow::RecordBatch& batch,
+                           const SelectionVector* selection_vector,
+                           arrow::MemoryPool* pool, arrow::ArrayVector* output) const {
+  ARROW_RETURN_NOT_OK(ValidateEvaluateArgsCommon(batch));
+  ARROW_RETURN_IF(output == nullptr, Status::Invalid("Output must be non-null."));
+  ARROW_RETURN_IF(pool == nullptr, Status::Invalid("Memory pool must be non-null."));
 
-  if (pool == nullptr) {
-    return Status::Invalid("memory pool must be non-null.");
-  }
-
+  auto num_rows =
+      selection_vector == nullptr ? batch.num_rows() : selection_vector->GetNumSlots();
   // Allocate the output data vecs.
   ArrayDataVector output_data_vecs;
   for (auto& field : output_fields_) {
     ArrayDataPtr output_data;
 
-    status = AllocArrayData(field->type(), batch.num_rows(), pool, &output_data);
-    ARROW_RETURN_NOT_OK(status);
-
+    ARROW_RETURN_NOT_OK(AllocArrayData(field->type(), num_rows, pool, &output_data));
     output_data_vecs.push_back(output_data);
   }
 
   // Execute the expression(s).
-  status = llvm_generator_->Execute(batch, output_data_vecs);
-  ARROW_RETURN_NOT_OK(status);
+  ARROW_RETURN_NOT_OK(
+      llvm_generator_->Execute(batch, selection_vector, output_data_vecs));
 
   // Create and return array arrays.
   output->clear();
@@ -156,72 +184,167 @@ Status Projector::Evaluate(const arrow::RecordBatch& batch, arrow::MemoryPool* p
   return Status::OK();
 }
 
-// TODO : handle variable-len vectors
+// TODO : handle complex vectors (list/map/..)
 Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
+<<<<<<< HEAD
+                                 arrow::MemoryPool* pool,
+                                 ArrayDataPtr* array_data) const {
+=======
                                  arrow::MemoryPool* pool, ArrayDataPtr* array_data) {
-  if (!arrow::is_primitive(type->id())) {
-    return Status::Invalid("Unsupported output data type " + type->ToString());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+  arrow::Status astatus;
+  std::vector<std::shared_ptr<arrow::Buffer>> buffers;
+
+  // The output vector always has a null bitmap.
+<<<<<<< HEAD
+<<<<<<< HEAD
+  int64_t size = arrow::BitUtil::BytesForBits(num_records);
+=======
+  int64_t size = arrow::bit_util::BytesForBits(num_records);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  ARROW_ASSIGN_OR_RAISE(auto bitmap_buffer, arrow::AllocateBuffer(size, pool));
+  buffers.push_back(std::move(bitmap_buffer));
+=======
+  std::shared_ptr<arrow::Buffer> bitmap_buffer;
+  int64_t size = arrow::BitUtil::BytesForBits(num_records);
+  ARROW_RETURN_NOT_OK(arrow::AllocateBuffer(pool, size, &bitmap_buffer));
+  buffers.push_back(bitmap_buffer);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+
+  // String/Binary vectors have an offsets array.
+  auto type_id = type->id();
+  if (arrow::is_binary_like(type_id)) {
+<<<<<<< HEAD
+<<<<<<< HEAD
+    auto offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+=======
+    auto offsets_len = arrow::bit_util::BytesForBits((num_records + 1) * 32);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+
+    ARROW_ASSIGN_OR_RAISE(auto offsets_buffer, arrow::AllocateBuffer(offsets_len, pool));
+    buffers.push_back(std::move(offsets_buffer));
+=======
+    std::shared_ptr<arrow::Buffer> offsets_buffer;
+    auto offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+
+    ARROW_RETURN_NOT_OK(arrow::AllocateBuffer(pool, offsets_len, &offsets_buffer));
+    buffers.push_back(offsets_buffer);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   }
 
-  arrow::Status astatus;
-  std::shared_ptr<arrow::Buffer> null_bitmap;
-  int64_t size = arrow::BitUtil::BytesForBits(num_records);
-  astatus = arrow::AllocateBuffer(pool, size, &null_bitmap);
-  ARROW_RETURN_NOT_OK(astatus);
+  // The output vector always has a data array.
+  int64_t data_len;
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+  std::shared_ptr<arrow::ResizableBuffer> data_buffer;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
+    const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*type);
+    data_len = arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
+=======
+  std::shared_ptr<arrow::ResizableBuffer> data_buffer;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
+    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*type);
+    data_len = arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+  } else if (arrow::is_binary_like(type_id)) {
+    // we don't know the expected size for varlen output vectors.
+    data_len = 0;
+  } else {
+    return Status::Invalid("Unsupported output data type " + type->ToString());
+  }
+<<<<<<< HEAD
+  ARROW_ASSIGN_OR_RAISE(auto data_buffer, arrow::AllocateResizableBuffer(data_len, pool));
+=======
+  ARROW_RETURN_NOT_OK(arrow::AllocateResizableBuffer(pool, data_len, &data_buffer));
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
-  std::shared_ptr<arrow::Buffer> data;
-  const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*type);
-  int64_t data_len = arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
-  astatus = arrow::AllocateBuffer(pool, data_len, &data);
-  ARROW_RETURN_NOT_OK(astatus);
+  // This is not strictly required but valgrind gets confused and detects this
+  // as uninitialized memory access. See arrow::util::SetBitTo().
+  if (type->id() == arrow::Type::BOOL) {
+    memset(data_buffer->mutable_data(), 0, data_len);
+  }
+<<<<<<< HEAD
+  buffers.push_back(std::move(data_buffer));
 
-  *array_data = arrow::ArrayData::Make(type, num_records, {null_bitmap, data});
+  *array_data = arrow::ArrayData::Make(type, num_records, std::move(buffers));
+=======
+  buffers.push_back(data_buffer);
+
+  *array_data = arrow::ArrayData::Make(type, num_records, buffers);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   return Status::OK();
 }
 
-Status Projector::ValidateEvaluateArgsCommon(const arrow::RecordBatch& batch) {
-  if (!batch.schema()->Equals(*schema_)) {
-    return Status::Invalid("Schema in RecordBatch must match the schema in Make()");
-  }
-  if (batch.num_rows() == 0) {
-    return Status::Invalid("RecordBatch must be non-empty.");
-  }
+Status Projector::ValidateEvaluateArgsCommon(const arrow::RecordBatch& batch) const {
+  ARROW_RETURN_IF(!batch.schema()->Equals(*schema_),
+                  Status::Invalid("Schema in RecordBatch must match schema in Make()"));
+  ARROW_RETURN_IF(batch.num_rows() == 0,
+                  Status::Invalid("RecordBatch must be non-empty."));
+
   return Status::OK();
 }
 
 Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
                                             const arrow::Field& field,
-                                            int64_t num_records) {
-  // verify that there are atleast two buffers (validity and data).
-  if (array_data.buffers.size() < 2) {
-    std::stringstream ss;
-    ss << "number of buffers for output field " << field.name() << "is "
-       << array_data.buffers.size() << ", must have minimum 2.";
-    return Status::Invalid(ss.str());
-  }
+                                            int64_t num_records) const {
+  ARROW_RETURN_IF(array_data.buffers.size() < 2,
+                  Status::Invalid("ArrayData must have at least 2 buffers"));
 
-  // verify size of bitmap buffer.
-  int64_t min_bitmap_len = arrow::BitUtil::BytesForBits(num_records);
+  int64_t min_bitmap_len = arrow::bit_util::BytesForBits(num_records);
   int64_t bitmap_len = array_data.buffers[0]->capacity();
-  if (bitmap_len < min_bitmap_len) {
-    std::stringstream ss;
-    ss << "bitmap buffer for output field " << field.name() << "has size " << bitmap_len
-       << ", must have minimum size " << min_bitmap_len;
-    return Status::Invalid(ss.str());
+  ARROW_RETURN_IF(
+      bitmap_len < min_bitmap_len,
+      Status::Invalid("Bitmap buffer too small for ", field.name(), " expected minimum ",
+                      min_bitmap_len, " actual size ", bitmap_len));
+
+  auto type_id = field.type()->id();
+  if (arrow::is_binary_like(type_id)) {
+    // validate size of offsets buffer.
+<<<<<<< HEAD
+    int64_t min_offsets_len = arrow::bit_util::BytesForBits((num_records + 1) * 32);
+=======
+    int64_t min_offsets_len = arrow::BitUtil::BytesForBits((num_records + 1) * 32);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+    int64_t offsets_len = array_data.buffers[1]->capacity();
+    ARROW_RETURN_IF(
+        offsets_len < min_offsets_len,
+        Status::Invalid("offsets buffer too small for ", field.name(),
+                        " minimum required ", min_offsets_len, " actual ", offsets_len));
+
+    // check that it's resizable.
+    auto resizable = dynamic_cast<arrow::ResizableBuffer*>(array_data.buffers[2].get());
+    ARROW_RETURN_IF(
+        resizable == nullptr,
+        Status::Invalid("data buffer for varlen output vectors must be resizable"));
+  } else if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
+    // verify size of data buffer.
+<<<<<<< HEAD
+    const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*field.type());
+    int64_t min_data_len =
+        arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
+=======
+    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*field.type());
+    int64_t min_data_len =
+        arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+    int64_t data_len = array_data.buffers[1]->capacity();
+    ARROW_RETURN_IF(data_len < min_data_len,
+                    Status::Invalid("Data buffer too small for ", field.name()));
+  } else {
+    return Status::Invalid("Unsupported output data type " + field.type()->ToString());
   }
 
-  // verify size of data buffer.
-  // TODO : handle variable-len vectors
-  const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*field.type());
-  int64_t min_data_len = arrow::BitUtil::BytesForBits(num_records * fw_type.bit_width());
-  int64_t data_len = array_data.buffers[1]->capacity();
-  if (data_len < min_data_len) {
-    std::stringstream ss;
-    ss << "data buffer for output field " << field.name() << " has size " << data_len
-       << ", must have minimum size " << min_data_len;
-    return Status::Invalid(ss.str());
-  }
   return Status::OK();
 }
+
+const std::string& Projector::DumpIR() { return llvm_generator_->ir(); }
+
+void Projector::SetBuiltFromCache(bool flag) { built_from_cache_ = flag; }
+
+bool Projector::GetBuiltFromCache() { return built_from_cache_; }
 
 }  // namespace gandiva

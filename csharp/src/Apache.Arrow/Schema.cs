@@ -13,55 +13,142 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using Apache.Arrow.Types;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 namespace Apache.Arrow
 {
-    public partial class Schema
+    public partial class Schema : IRecordType
     {
-        public IReadOnlyDictionary<string, Field> Fields { get; }
+        [Obsolete("Use `FieldsList` or `FieldsLookup` instead")]
+        public IReadOnlyDictionary<string, Field> Fields => _fieldsDictionary;
+        private readonly Dictionary<string, Field> _fieldsDictionary;
+
+        public IReadOnlyList<Field> FieldsList => _fieldsList;
+        private readonly List<Field> _fieldsList;
+
+        public ILookup<string, Field> FieldsLookup { get; }
+
         public IReadOnlyDictionary<string, string> Metadata { get; }
 
-        public bool HasMetadata =>
-            Metadata != null && Metadata.Count > 0;
+        public bool HasMetadata => Metadata != null && Metadata.Count > 0;
 
-        private readonly IList<Field> _fields;
+        public Field this[int index] => GetFieldByIndex(index);
+
+        public Field this[string name] => GetFieldByName(name);
 
         public Schema(
             IEnumerable<Field> fields,
             IEnumerable<KeyValuePair<string, string>> metadata)
         {
-            if (fields == null)
+            if (fields is null)
             {
                 throw new ArgumentNullException(nameof(fields));
             }
 
-            _fields = fields.ToList();
-
-            Fields = fields.ToDictionary(
-                field => field.Name, field => field,
-                StringComparer.OrdinalIgnoreCase);
+            _fieldsList = fields.ToList();
+            FieldsLookup = _fieldsList.ToLookup(f => f.Name);
+            _fieldsDictionary = FieldsLookup.ToDictionary(g => g.Key, g => g.First());
 
             Metadata = metadata?.ToDictionary(kv => kv.Key, kv => kv.Value);
         }
 
-        public Field GetFieldByIndex(int i)
+        internal Schema(List<Field> fieldsList, IReadOnlyDictionary<string, string> metadata, bool copyCollections)
         {
-            return _fields[i];
+            Debug.Assert(fieldsList != null);
+            Debug.Assert(copyCollections == false, "This internal constructor is to not copy the collections.");
+
+            _fieldsList = fieldsList;
+            FieldsLookup = _fieldsList.ToLookup(f => f.Name);
+            _fieldsDictionary = FieldsLookup.ToDictionary(g => g.Key, g => g.First());
+
+            Metadata = metadata;
         }
 
-        public Field GetFieldByName(string name) =>
-            Fields.TryGetValue(name, out var field) ? field : null;
+        public Field GetFieldByIndex(int i) => _fieldsList[i];
 
-        public int GetFieldIndex(string name, StringComparer comparer = default)
+        public Field GetFieldByName(string name) => FieldsLookup[name].FirstOrDefault();
+
+        public int GetFieldIndex(string name, StringComparer comparer)
         {
-            if (comparer == null)
-                comparer = StringComparer.CurrentCulture;
-
-            return _fields.IndexOf(
-                _fields.Single(x => comparer.Compare(x.Name, name) == 0));
+            IEqualityComparer<string> equalityComparer = (IEqualityComparer<string>)comparer;
+            return GetFieldIndex(name, equalityComparer);
         }
+
+        public int GetFieldIndex(string name, IEqualityComparer<string> comparer = default)
+        {
+            comparer ??= StringComparer.CurrentCulture;
+
+            for (int i = 0; i < _fieldsList.Count; i++)
+            {
+                if (comparer.Equals(_fieldsList[i].Name, name))
+                    return i;
+            }
+
+            return -1;
+        }
+
+        public Schema RemoveField(int fieldIndex)
+        {
+            if (fieldIndex < 0 || fieldIndex >= _fieldsList.Count)
+            {
+                throw new ArgumentException("Invalid fieldIndex", nameof(fieldIndex));
+            }
+
+            IList<Field> fields = Utility.DeleteListElement(_fieldsList, fieldIndex);
+
+            return new Schema(fields, Metadata);
+        }
+
+        public Schema InsertField(int fieldIndex, Field newField)
+        {
+            newField = newField ?? throw new ArgumentNullException(nameof(newField));
+            if (fieldIndex < 0 || fieldIndex > _fieldsList.Count)
+            {
+                throw new ArgumentException(nameof(fieldIndex), $"Invalid fieldIndex {fieldIndex} passed in to Schema.AddField");
+            }
+
+            IList<Field> fields = Utility.AddListElement(_fieldsList, fieldIndex, newField);
+
+            return new Schema(fields, Metadata);
+        }
+
+        public Schema SetField(int fieldIndex, Field newField)
+        {
+            if (fieldIndex < 0 || fieldIndex >= _fieldsList.Count)
+            {
+                throw new ArgumentException($"Invalid fieldIndex {fieldIndex} passed in to Schema.SetColumn");
+            }
+
+            IList<Field> fields = Utility.SetListElement(_fieldsList, fieldIndex, newField);
+
+            return new Schema(fields, Metadata);
+        }
+
+        public void Accept(IArrowTypeVisitor visitor)
+        {
+            if (visitor is IArrowTypeVisitor<Schema> schemaVisitor)
+            {
+                schemaVisitor.Visit(this);
+            }
+            else if (visitor is IArrowTypeVisitor<IRecordType> interfaceVisitor)
+            {
+                interfaceVisitor.Visit(this);
+            }
+            else
+            {
+                visitor.Visit(this);
+            }
+        }
+
+        public override string ToString() => $"{nameof(Schema)}: Num fields={_fieldsList.Count}, Num metadata={Metadata?.Count ?? 0}";
+
+        int IRecordType.FieldCount => _fieldsList.Count;
+        string IArrowType.Name => "RecordBatch";
+        ArrowTypeId IArrowType.TypeId => ArrowTypeId.RecordBatch;
+        bool IArrowType.IsFixedWidth => false;
     }
 }

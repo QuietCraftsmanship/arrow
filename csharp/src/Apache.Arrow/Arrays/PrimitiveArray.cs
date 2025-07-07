@@ -14,57 +14,108 @@
 // limitations under the License.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
-using Apache.Arrow.Memory;
-using Apache.Arrow.Types;
 
 namespace Apache.Arrow
 {
-    public abstract class PrimitiveArray<T> : Array
-        where T : struct
+    public abstract class PrimitiveArray<T> : Array, IReadOnlyList<T?>, ICollection<T?>
+        where T : struct, IEquatable<T>
     {
-        
-    protected PrimitiveArray(ArrayData data)
-        : base(data)
-    {
-        data.EnsureBufferCount(2);
-    }
-
-    public ArrowBuffer ValueBuffer => Data.Buffers[1];
-
-    public Span<T> GetSpan() => ValueBuffer.GetSpan<T>().Slice(0, Length);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public T? GetValue(int index)
-    {
-        var span = GetSpan();
-        return IsValid(index) ? span[index] : (T?) null;
-    }
-
-    public IList<T?> ToList(bool includeNulls = false)
-    {
-        var span = GetSpan();
-        var list = new List<T?>(span.Length);
-
-        for (var i = 0; i < span.Length; i++)
+        protected PrimitiveArray(ArrayData data)
+            : base(data)
         {
-            var value = GetValue(i);
+            data.EnsureBufferCount(2);
+        }
 
-            if (value.HasValue)
+        public ArrowBuffer ValueBuffer => Data.Buffers[1];
+
+        public ReadOnlySpan<T> Values => ValueBuffer.Span.CastTo<T>().Slice(Offset, Length);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public T? GetValue(int index)
+        {
+            if (index < 0 || index >= Length)
             {
-                list.Add(value.Value);
+                throw new ArgumentOutOfRangeException(nameof(index));
             }
-            else
+            return IsValid(index) ? Values[index] : null;
+        }
+
+        public IList<T?> ToList(bool includeNulls = false)
+        {
+            ReadOnlySpan<T> span = Values;
+            var list = new List<T?>(span.Length);
+
+            for (int i = 0; i < span.Length; i++)
             {
-                if (includeNulls)
+                T? value = GetValue(i);
+
+                if (value.HasValue)
                 {
-                    list.Add(null);
+                    list.Add(value.Value);
                 }
+                else
+                {
+                    if (includeNulls)
+                    {
+                        list.Add(null);
+                    }
+                }
+            }
+
+            return list;
+        }
+
+        int IReadOnlyCollection<T?>.Count => Length;
+        T? IReadOnlyList<T?>.this[int index] => GetValue(index);
+
+        IEnumerator<T?> IEnumerable<T?>.GetEnumerator()
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                yield return IsValid(index) ? Values[index] : null;
             }
         }
 
-        return list;
-    }
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                yield return IsValid(index) ? Values[index] : null;
+            }
+        }
+
+        int ICollection<T?>.Count => Length;
+        bool ICollection<T?>.IsReadOnly => true;
+        void ICollection<T?>.Add(T? item) => throw new NotSupportedException("Collection is read-only.");
+        bool ICollection<T?>.Remove(T? item) => throw new NotSupportedException("Collection is read-only.");
+        void ICollection<T?>.Clear() => throw new NotSupportedException("Collection is read-only.");
+
+        bool ICollection<T?>.Contains(T? item)
+        {
+            if (item == null)
+            {
+                return NullCount > 0;
+            }
+
+            ReadOnlySpan<T> values = Values;
+            while (values.Length > 0)
+            {
+                int index = Values.IndexOf(item.Value);
+                if (index < 0 || IsValid(index)) { return index >= 0; }
+                values = values.Slice(index + 1);
+            }
+            return false;
+        }
+
+        void ICollection<T?>.CopyTo(T?[] array, int arrayIndex)
+        {
+            for (int srcIndex = 0, destIndex = arrayIndex; srcIndex < Length; srcIndex++, destIndex++)
+            {
+                array[destIndex] = GetValue(srcIndex);
+            }
+        }
     }
 }

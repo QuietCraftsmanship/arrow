@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_DEX_DEX_H
-#define GANDIVA_DEX_DEX_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -32,11 +31,12 @@
 #include "gandiva/literal_holder.h"
 #include "gandiva/native_function.h"
 #include "gandiva/value_validity_pair.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
 /// \brief Decomposed expression : the validity and value are separated.
-class Dex {
+class GANDIVA_EXPORT Dex {
  public:
   /// Derived classes should simply invoke the Visit api of the visitor.
   virtual void Accept(DexVisitor& visitor) = 0;
@@ -44,7 +44,7 @@ class Dex {
 };
 
 /// Base class for other Vector related Dex.
-class VectorReadBaseDex : public Dex {
+class GANDIVA_EXPORT VectorReadBaseDex : public Dex {
  public:
   explicit VectorReadBaseDex(FieldDescriptorPtr field_desc) : field_desc_(field_desc) {}
 
@@ -59,7 +59,7 @@ class VectorReadBaseDex : public Dex {
 };
 
 /// validity component of a ValueVector
-class VectorReadValidityDex : public VectorReadBaseDex {
+class GANDIVA_EXPORT VectorReadValidityDex : public VectorReadBaseDex {
  public:
   explicit VectorReadValidityDex(FieldDescriptorPtr field_desc)
       : VectorReadBaseDex(field_desc) {}
@@ -70,7 +70,7 @@ class VectorReadValidityDex : public VectorReadBaseDex {
 };
 
 /// value component of a fixed-len ValueVector
-class VectorReadFixedLenValueDex : public VectorReadBaseDex {
+class GANDIVA_EXPORT VectorReadFixedLenValueDex : public VectorReadBaseDex {
  public:
   explicit VectorReadFixedLenValueDex(FieldDescriptorPtr field_desc)
       : VectorReadBaseDex(field_desc) {}
@@ -81,7 +81,7 @@ class VectorReadFixedLenValueDex : public VectorReadBaseDex {
 };
 
 /// value component of a variable-len ValueVector
-class VectorReadVarLenValueDex : public VectorReadBaseDex {
+class GANDIVA_EXPORT VectorReadVarLenValueDex : public VectorReadBaseDex {
  public:
   explicit VectorReadVarLenValueDex(FieldDescriptorPtr field_desc)
       : VectorReadBaseDex(field_desc) {}
@@ -94,7 +94,7 @@ class VectorReadVarLenValueDex : public VectorReadBaseDex {
 };
 
 /// validity based on a local bitmap.
-class LocalBitMapValidityDex : public Dex {
+class GANDIVA_EXPORT LocalBitMapValidityDex : public Dex {
  public:
   explicit LocalBitMapValidityDex(int local_bitmap_idx)
       : local_bitmap_idx_(local_bitmap_idx) {}
@@ -108,20 +108,22 @@ class LocalBitMapValidityDex : public Dex {
 };
 
 /// base function expression
-class FuncDex : public Dex {
+class GANDIVA_EXPORT FuncDex : public Dex {
  public:
   FuncDex(FuncDescriptorPtr func_descriptor, const NativeFunction* native_function,
-          FunctionHolderPtr function_holder, const ValueValidityPairVector& args)
+          FunctionHolderPtr function_holder, int function_holder_idx,
+          const ValueValidityPairVector& args)
       : func_descriptor_(func_descriptor),
         native_function_(native_function),
         function_holder_(function_holder),
+        function_holder_idx_(function_holder_idx),
         args_(args) {}
 
   FuncDescriptorPtr func_descriptor() const { return func_descriptor_; }
 
   const NativeFunction* native_function() const { return native_function_; }
 
-  FunctionHolderPtr function_holder() const { return function_holder_; }
+  int get_holder_idx() const { return function_holder_idx_; }
 
   const ValueValidityPairVector& args() const { return args_; }
 
@@ -129,44 +131,48 @@ class FuncDex : public Dex {
   FuncDescriptorPtr func_descriptor_;
   const NativeFunction* native_function_;
   FunctionHolderPtr function_holder_;
+  int function_holder_idx_;
   ValueValidityPairVector args_;
 };
 
 /// A function expression that only deals with non-null inputs, and generates non-null
 /// outputs.
-class NonNullableFuncDex : public FuncDex {
+class GANDIVA_EXPORT NonNullableFuncDex : public FuncDex {
  public:
   NonNullableFuncDex(FuncDescriptorPtr func_descriptor,
                      const NativeFunction* native_function,
-                     FunctionHolderPtr function_holder,
+                     FunctionHolderPtr function_holder, int function_holder_idx,
                      const ValueValidityPairVector& args)
-      : FuncDex(func_descriptor, native_function, function_holder, args) {}
+      : FuncDex(func_descriptor, native_function, function_holder, function_holder_idx,
+                args) {}
 
   void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
 };
 
 /// A function expression that deals with nullable inputs, but generates non-null
 /// outputs.
-class NullableNeverFuncDex : public FuncDex {
+class GANDIVA_EXPORT NullableNeverFuncDex : public FuncDex {
  public:
   NullableNeverFuncDex(FuncDescriptorPtr func_descriptor,
                        const NativeFunction* native_function,
-                       FunctionHolderPtr function_holder,
+                       FunctionHolderPtr function_holder, int function_holder_idx,
                        const ValueValidityPairVector& args)
-      : FuncDex(func_descriptor, native_function, function_holder, args) {}
+      : FuncDex(func_descriptor, native_function, function_holder, function_holder_idx,
+                args) {}
 
   void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
 };
 
 /// A function expression that deals with nullable inputs, and
 /// nullable outputs.
-class NullableInternalFuncDex : public FuncDex {
+class GANDIVA_EXPORT NullableInternalFuncDex : public FuncDex {
  public:
   NullableInternalFuncDex(FuncDescriptorPtr func_descriptor,
                           const NativeFunction* native_function,
-                          FunctionHolderPtr function_holder,
+                          FunctionHolderPtr function_holder, int function_holder_idx,
                           const ValueValidityPairVector& args, int local_bitmap_idx)
-      : FuncDex(func_descriptor, native_function, function_holder, args),
+      : FuncDex(func_descriptor, native_function, function_holder, function_holder_idx,
+                args),
         local_bitmap_idx_(local_bitmap_idx) {}
 
   void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
@@ -179,17 +185,17 @@ class NullableInternalFuncDex : public FuncDex {
 };
 
 /// special validity type that always returns true.
-class TrueDex : public Dex {
+class GANDIVA_EXPORT TrueDex : public Dex {
   void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
 };
 
 /// special validity type that always returns false.
-class FalseDex : public Dex {
+class GANDIVA_EXPORT FalseDex : public Dex {
   void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
 };
 
 /// decomposed expression for a literal.
-class LiteralDex : public Dex {
+class GANDIVA_EXPORT LiteralDex : public Dex {
  public:
   LiteralDex(DataTypePtr type, const LiteralHolder& holder)
       : type_(type), holder_(holder) {}
@@ -206,7 +212,7 @@ class LiteralDex : public Dex {
 };
 
 /// decomposed if-else expression.
-class IfDex : public Dex {
+class GANDIVA_EXPORT IfDex : public Dex {
  public:
   IfDex(ValueValidityPairPtr condition_vv, ValueValidityPairPtr then_vv,
         ValueValidityPairPtr else_vv, DataTypePtr result_type, int local_bitmap_idx,
@@ -242,7 +248,7 @@ class IfDex : public Dex {
 };
 
 // decomposed boolean expression.
-class BooleanDex : public Dex {
+class GANDIVA_EXPORT BooleanDex : public Dex {
  public:
   BooleanDex(const ValueValidityPairVector& args, int local_bitmap_idx)
       : args_(args), local_bitmap_idx_(local_bitmap_idx) {}
@@ -258,7 +264,7 @@ class BooleanDex : public Dex {
 };
 
 /// Boolean-AND expression
-class BooleanAndDex : public BooleanDex {
+class GANDIVA_EXPORT BooleanAndDex : public BooleanDex {
  public:
   BooleanAndDex(const ValueValidityPairVector& args, int local_bitmap_idx)
       : BooleanDex(args, local_bitmap_idx) {}
@@ -267,7 +273,7 @@ class BooleanAndDex : public BooleanDex {
 };
 
 /// Boolean-OR expression
-class BooleanOrDex : public BooleanDex {
+class GANDIVA_EXPORT BooleanOrDex : public BooleanDex {
  public:
   BooleanOrDex(const ValueValidityPairVector& args, int local_bitmap_idx)
       : BooleanDex(args, local_bitmap_idx) {}
@@ -296,10 +302,51 @@ class InExprDexBase : public Dex {
 
   const std::shared_ptr<InHolder<Type>>& in_holder() const { return in_holder_; }
 
+  void set_holder_idx(int holder_idx) { holder_idx_ = holder_idx; }
+
+  int get_holder_idx() const { return holder_idx_; }
+
  protected:
   ValueValidityPairVector args_;
   std::string runtime_function_;
   std::shared_ptr<InHolder<Type>> in_holder_;
+  int holder_idx_;
+};
+
+template <>
+class InExprDexBase<gandiva::DecimalScalar128> : public Dex {
+ public:
+  InExprDexBase(const ValueValidityPairVector& args,
+                const std::unordered_set<gandiva::DecimalScalar128>& values,
+                int32_t precision, int32_t scale)
+      : args_(args), precision_(precision), scale_(scale) {
+    in_holder_.reset(new InHolder<gandiva::DecimalScalar128>(values));
+  }
+
+  int32_t get_precision() const { return precision_; }
+
+  int32_t get_scale() const { return scale_; }
+
+  const ValueValidityPairVector& args() const { return args_; }
+
+  void Accept(DexVisitor& visitor) override { visitor.Visit(*this); }
+
+  const std::string& runtime_function() const { return runtime_function_; }
+
+  const std::shared_ptr<InHolder<gandiva::DecimalScalar128>>& in_holder() const {
+    return in_holder_;
+  }
+
+  void set_holder_idx(int holder_idx) { holder_idx_ = holder_idx; }
+
+  int get_holder_idx() const { return holder_idx_; }
+
+ protected:
+  ValueValidityPairVector args_;
+  std::string runtime_function_;
+  std::shared_ptr<InHolder<gandiva::DecimalScalar128>> in_holder_;
+  int32_t precision_, scale_;
+  int holder_idx_;
 };
 
 template <>
@@ -323,6 +370,36 @@ class InExprDex<int64_t> : public InExprDexBase<int64_t> {
 };
 
 template <>
+class InExprDex<float> : public InExprDexBase<float> {
+ public:
+  InExprDex(const ValueValidityPairVector& args, const std::unordered_set<float>& values)
+      : InExprDexBase(args, values) {
+    runtime_function_ = "gdv_fn_in_expr_lookup_float";
+  }
+};
+
+template <>
+class InExprDex<double> : public InExprDexBase<double> {
+ public:
+  InExprDex(const ValueValidityPairVector& args, const std::unordered_set<double>& values)
+      : InExprDexBase(args, values) {
+    runtime_function_ = "gdv_fn_in_expr_lookup_double";
+  }
+};
+
+template <>
+class InExprDex<gandiva::DecimalScalar128>
+    : public InExprDexBase<gandiva::DecimalScalar128> {
+ public:
+  InExprDex(const ValueValidityPairVector& args,
+            const std::unordered_set<gandiva::DecimalScalar128>& values,
+            int32_t precision, int32_t scale)
+      : InExprDexBase<gandiva::DecimalScalar128>(args, values, precision, scale) {
+    runtime_function_ = "gdv_fn_in_expr_lookup_decimal";
+  }
+};
+
+template <>
 class InExprDex<std::string> : public InExprDexBase<std::string> {
  public:
   InExprDex(const ValueValidityPairVector& args,
@@ -333,5 +410,3 @@ class InExprDex<std::string> : public InExprDexBase<std::string> {
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_DEX_DEX_H

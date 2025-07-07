@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-namespace FlatBuffers
+namespace Google.FlatBuffers
 {
     /// <summary>
     /// This is the base for both structs and tables.
     /// </summary>
-    public interface IFlatbufferObject
+    internal interface IFlatbufferObject
     {
         void __init(int _i, ByteBuffer _bb);
 

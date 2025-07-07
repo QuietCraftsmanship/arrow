@@ -17,12 +17,23 @@
 
 package org.apache.arrow.vector.dictionary;
 
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.util.Arrays;
+<<<<<<< HEAD
+<<<<<<< HEAD
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.util.hash.ArrowBufHasher;
+import org.apache.arrow.memory.util.hash.SimpleHasher;
+import org.apache.arrow.util.Preconditions;
+=======
 import java.util.HashMap;
 import java.util.Map;
 
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+import java.util.HashMap;
+import java.util.Map;
+
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+import org.apache.arrow.vector.BaseIntVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.types.Types.MinorType;
@@ -30,6 +41,11 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
+/**
+ * Encoder/decoder for Dictionary encoded {@link ValueVector}. Dictionary encoding produces an
+ * integer {@link ValueVector}. Each entry in the Vector is index into the dictionary which can hold
+ * values of any type.
+ */
 public class DictionaryEncoder {
 
   // TODO recursively examine fields?
@@ -56,47 +72,54 @@ public class DictionaryEncoder {
     Field indexField = new Field(valueField.getName(), indexFieldType, null);
 
     // vector to hold our indices (dictionary encoded values)
-    FieldVector indices = indexField.createVector(vector.getAllocator());
+<<<<<<< HEAD
+<<<<<<< HEAD
+    FieldVector createdVector = indexField.createVector(allocator);
+=======
+    FieldVector createdVector = indexField.createVector(vector.getAllocator());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+    FieldVector createdVector = indexField.createVector(vector.getAllocator());
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+    if (! (createdVector instanceof BaseIntVector)) {
+      throw new IllegalArgumentException("Dictionary encoding does not have a valid int type:" +
+          createdVector.getClass());
+    }
+<<<<<<< HEAD
+<<<<<<< HEAD
 
-    // use reflection to pull out the set method
-    // TODO implement a common interface for int vectors
-    Method setter = null;
-    for (Class<?> c : Arrays.asList(int.class, long.class)) {
-      try {
-        setter = indices.getClass().getMethod("setSafe", int.class, c);
-        break;
-      } catch (NoSuchMethodException e) {
-        // ignore
-      }
-    }
-    if (setter == null) {
-      throw new IllegalArgumentException("Dictionary encoding does not have a valid int type:" + indices.getClass());
-    }
+    BaseIntVector indices = (BaseIntVector) createdVector;
+    indices.allocateNew();
+
+    buildIndexVector(vector, indices, hashTable, 0, vector.getValueCount());
+    indices.setValueCount(vector.getValueCount());
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+
+    BaseIntVector indices = (BaseIntVector) createdVector;
+    indices.allocateNew();
 
     int count = vector.getValueCount();
 
-    indices.allocateNew();
-
-    try {
-      for (int i = 0; i < count; i++) {
-        Object value = vector.getObject(i);
-        if (value != null) { // if it's null leave it null
-          // note: this may fail if value was not included in the dictionary
-          Object encoded = lookUps.get(value);
-          if (encoded == null) {
-            throw new IllegalArgumentException("Dictionary encoding not defined for value:" + value);
-          }
-          setter.invoke(indices, i, encoded);
+    for (int i = 0; i < count; i++) {
+      Object value = vector.getObject(i);
+      if (value != null) { // if it's null leave it null
+        // note: this may fail if value was not included in the dictionary
+        Integer encoded = lookUps.get(value);
+        if (encoded == null) {
+          throw new IllegalArgumentException("Dictionary encoding not defined for value:" + value);
         }
+        indices.setEncodedValue(i, encoded);
       }
-    } catch (IllegalAccessException e) {
-      throw new RuntimeException("IllegalAccessException invoking vector mutator set():", e);
-    } catch (InvocationTargetException e) {
-      throw new RuntimeException("InvocationTargetException invoking vector mutator set():", e.getCause());
     }
 
     indices.setValueCount(count);
 
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     return indices;
   }
 

@@ -16,60 +16,134 @@
 // under the License.
 
 import { zip } from 'ix/iterable/zip';
+import { Table, Vector, RecordBatch, util } from 'apache-arrow';
+
+declare global {
+    namespace jest {
+        interface Matchers<R> {
+            toArrowCompare(expected: any): CustomMatcherResult;
+            toEqualTable(expected: Table): CustomMatcherResult;
+            toEqualRecordBatch(expected: RecordBatch): CustomMatcherResult;
+            toEqualVector(expected: Vector | [Vector | null, string?, string?]): CustomMatcherResult;
+        }
+    }
+}
 
 expect.extend({
-    toEqualVector([v1, format1, columnName]: [any, string, string], [v2, format2]: [any, string]) {
+    toEqualTable,
+    toEqualVector,
+    toArrowCompare,
+    toEqualRecordBatch
+});
 
-        const format = (x: any, y: any, msg= ' ') => `${
-            this.utils.printExpected(x)}${
-                msg}${
-            this.utils.printReceived(y)
+function format(jest: jest.MatcherUtils, actual: any, expected: any, msg = ' ') {
+    return `${jest.utils.printReceived(actual)
+        }${msg}${jest.utils.printExpected(expected)
         }`;
+}
 
-        let getFailures = new Array<string>();
-        let propsFailures = new Array<string>();
-        let iteratorFailures = new Array<string>();
-        let allFailures = [
-            { title: 'get', failures: getFailures },
-            { title: 'props', failures: propsFailures },
-            { title: 'iterator', failures: iteratorFailures }
-        ];
+function toArrowCompare(this: jest.MatcherUtils, actual: any, expected: any) {
+    if (!util.createElementComparator(expected)(actual)) {
+        return { pass: false, message: () => format(this, actual, expected, ' should equal ') };
+    }
+    return { pass: true, message: () => '' };
+}
 
-        let props = [
-            // 'name', 'nullable', 'metadata',
-            'type', 'length', 'nullCount'
-        ];
+function toEqualTable(this: jest.MatcherUtils, actual: Table, expected: Table) {
+    const failures = [] as string[];
+    try { expect(actual.numRows).toEqual(expected.numRows); } catch (e) { failures.push(`${e}`); }
+    try { expect(actual.numCols).toEqual(expected.numCols); } catch (e) { failures.push(`${e}`); }
+    try { expect(actual.schema.metadata).toEqual(expected.schema.metadata); } catch (e) { failures.push(`${e}`); }
+    for (let i = -1, n = actual.numCols; ++i < n;) {
+        const v1 = actual.getChildAt(i);
+        const v2 = expected.getChildAt(i);
+        const name = actual.schema.fields[i].name;
+        try {
+            expect([v1, `actual`, name]).toEqualVector([v2, `expected`, name]);
+        } catch (e) { failures.push(`${e}`); }
+    }
+    return {
+        pass: failures.length === 0,
+        message: () => failures.join('\n'),
+    };
+}
 
-        for (let i = -1, n = props.length; ++i < n;) {
-            const prop = props[i];
-            if (`${v1[prop]}` !== `${v2[prop]}`) {
-                propsFailures.push(`${prop}: ${format(v1[prop], v2[prop], ' !== ')}`);
-            }
-        }
+function toEqualRecordBatch(this: jest.MatcherUtils, actual: RecordBatch, expected: RecordBatch) {
+    const failures = [] as string[];
+    try { expect(actual.numRows).toEqual(expected.numRows); } catch (e) { failures.push(`${e}`); }
+    try { expect(actual.numCols).toEqual(expected.numCols); } catch (e) { failures.push(`${e}`); }
+    for (let i = -1, n = actual.numCols; ++i < n;) {
+        const v1 = actual.getChildAt(i);
+        const v2 = expected.getChildAt(i);
+        const name = actual.schema.fields[i].name;
+        try {
+            expect([v1, `actual`, name]).toEqualVector([v2, `expected`, name]);
+        } catch (e) { failures.push(`${e}`); }
+    }
+    return {
+        pass: failures.length === 0,
+        message: () => failures.join('\n'),
+    };
+}
 
-        for (let i = -1, n = v1.length; ++i < n;) {
-            let x1 = v1.get(i), x2 = v2.get(i);
-            if (this.utils.stringify(x1) !== this.utils.stringify(x2)) {
-                getFailures.push(`${i}: ${format(x1, x2, ' !== ')}`);
-            }
-        }
+function toEqualVector<
+    TActual extends Vector | [Vector | null, string?, string?],
+    TExpected extends Vector | [Vector | null, string?]
+>(this: jest.MatcherUtils, actual: TActual, expected: TExpected) {
 
-        let i = -1;
-        for (let [x1, x2] of zip(v1, v2)) {
-            ++i;
-            if (this.utils.stringify(x1) !== this.utils.stringify(x2)) {
-                iteratorFailures.push(`${i}: ${format(x1, x2, ' !== ')}`);
-            }
-        }
+    let [v1, format1 = '', columnName = ''] = Array.isArray(actual) ? actual : [actual];
+    let [v2, format2 = ''] = Array.isArray(expected) ? expected : [expected];
 
+    // if (v1 instanceof Column && columnName === '') { columnName = v1.name; }
+
+    if (v1 == null || v2 == null) {
         return {
-            pass: allFailures.every(({ failures }) => failures.length === 0),
+            pass: false,
             message: () => [
-                `${columnName}: (${format(format1, format2, ' !== ')})\n`,
-                ...allFailures.map(({ failures, title }) =>
-                    !failures.length ? `` : [`${title}:`, ...failures].join(`\n`))
+                [columnName, `(${format(this, format1, format2, ' !== ')})`].filter(Boolean).join(':'),
+                `${v1 == null ? 'actual' : 'expected'} is null`
             ].join('\n')
         };
     }
+
+    const getFailures = new Array<string>();
+    const propsFailures = new Array<string>();
+    const iteratorFailures = new Array<string>();
+    const allFailures = [
+        { title: 'get', failures: getFailures },
+        { title: 'props', failures: propsFailures },
+        { title: 'iterator', failures: iteratorFailures }
+    ];
+
+    const props: (string & keyof Vector)[] = ['type', 'length', 'nullCount'];
+
+    for (let i = -1, n = props.length; ++i < n;) {
+        const prop = props[i];
+        if (`${v1[prop]}` !== `${v2[prop]}`) {
+            propsFailures.push(`${prop}: ${format(this, v1[prop], v2[prop], ' !== ')}`);
+        }
+    }
+    for (let i = -1, n = v1.length; ++i < n;) {
+        const x1 = v1.get(i), x2 = v2.get(i);
+        if (!util.createElementComparator(x2)(x1)) {
+            getFailures.push(`${i}: ${format(this, x1, x2, ' !== ')}`);
+        }
+    }
+
+    let i = -1;
+    for (let [x1, x2] of zip(v1, v2)) {
+        ++i;
+        if (!util.createElementComparator(x2)(x1)) {
+            iteratorFailures.push(`${i}: ${format(this, x1, x2, ' !== ')}`);
+        }
+    }
+
+    return {
+        pass: allFailures.every(({ failures }) => failures.length === 0),
+        message: () => [
+            [columnName, `(${format(this, format1, format2, ' !== ')})`].filter(Boolean).join(':'),
+            ...allFailures.map(({ failures, title }) =>
+                failures.length === 0 ? `` : [`${title}:`, ...failures].join(`\n`))
+        ].join('\n')
+    };
 }
-});

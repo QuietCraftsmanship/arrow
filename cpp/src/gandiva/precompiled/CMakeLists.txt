@@ -15,47 +15,72 @@
 # specific language governing permissions and limitations
 # under the License.
 
-project(gandiva)
-
 set(PRECOMPILED_SRCS
     arithmetic_ops.cc
     bitmap.cc
+    decimal_ops.cc
+    decimal_wrapper.cc
     extended_math_ops.cc
     hash.cc
     print.cc
     string_ops.cc
     time.cc
-    timestamp_arithmetic.cc)
-
-# Create bitcode for each of the source files.
-foreach(SRC_FILE ${PRECOMPILED_SRCS})
-  get_filename_component(SRC_BASE ${SRC_FILE} NAME_WE)
-  get_filename_component(ABSOLUTE_SRC ${SRC_FILE} ABSOLUTE)
-  set(BC_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SRC_BASE}.bc)
-  add_custom_command(
-    OUTPUT ${BC_FILE}
-    COMMAND ${CLANG_EXECUTABLE}
-            -std=c++11 -emit-llvm -O2 -c ${ABSOLUTE_SRC} -o ${BC_FILE}
-            -I${CMAKE_SOURCE_DIR}/src
-    DEPENDS ${SRC_FILE})
-  list(APPEND BC_FILES ${BC_FILE})
+    timestamp_arithmetic.cc
+    ../../arrow/util/basic_decimal.cc)
+set(GANDIVA_PRECOMPILED_BC_FILES)
+foreach(SOURCE ${PRECOMPILED_SRCS})
+  gandiva_add_bitcode(${SOURCE})
+  get_filename_component(SOURCE_BASE ${SOURCE} NAME_WE)
+  list(APPEND GANDIVA_PRECOMPILED_BC_FILES ${CMAKE_CURRENT_BINARY_DIR}/${SOURCE_BASE}.bc)
 endforeach()
 
 # link all of the bitcode files into a single bitcode file.
-add_custom_command(
-  OUTPUT ${GANDIVA_BC_OUTPUT_PATH}
-  COMMAND ${LLVM_LINK_EXECUTABLE}
-          -o ${GANDIVA_BC_OUTPUT_PATH}
-          ${BC_FILES}
-  DEPENDS ${BC_FILES})
+add_custom_command(OUTPUT ${GANDIVA_PRECOMPILED_BC_PATH}
+                   COMMAND ${LLVM_LINK_EXECUTABLE} -o ${GANDIVA_PRECOMPILED_BC_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_FILES}
+                   DEPENDS ${GANDIVA_PRECOMPILED_BC_FILES})
 
-add_custom_target(precompiled ALL DEPENDS ${GANDIVA_BC_OUTPUT_PATH})
+# turn the bitcode file into a C++ static data variable.
+add_custom_command(OUTPUT ${GANDIVA_PRECOMPILED_CC_PATH}
+                   COMMAND ${PYTHON_EXECUTABLE}
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../make_precompiled_bitcode.py"
+                           ${GANDIVA_PRECOMPILED_CC_IN_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_PATH} ${GANDIVA_PRECOMPILED_CC_PATH}
+                   DEPENDS ${GANDIVA_PRECOMPILED_CC_IN_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_PATH})
+
+add_custom_target(precompiled ALL DEPENDS ${GANDIVA_PRECOMPILED_BC_PATH}
+                                          ${GANDIVA_PRECOMPILED_CC_PATH})
 
 # testing
-add_precompiled_unit_test(bitmap_test.cc bitmap.cc)
-add_precompiled_unit_test(epoch_time_point_test.cc)
-add_precompiled_unit_test(time_test.cc time.cc timestamp_arithmetic.cc ../context_helper.cc)
-add_precompiled_unit_test(hash_test.cc hash.cc)
-add_precompiled_unit_test(string_ops_test.cc string_ops.cc ../context_helper.cc)
-add_precompiled_unit_test(arithmetic_ops_test.cc arithmetic_ops.cc ../context_helper.cc)
-add_precompiled_unit_test(extended_math_ops_test.cc extended_math_ops.cc ../context_helper.cc)
+add_gandiva_test(precompiled-test
+                 SOURCES
+                 ../context_helper.cc
+                 bitmap_test.cc
+                 bitmap.cc
+                 epoch_time_point_test.cc
+                 time_test.cc
+                 time.cc
+                 timestamp_arithmetic.cc
+                 ../cast_time.cc
+                 ../../arrow/vendored/datetime.cpp
+                 hash_test.cc
+                 hash.cc
+                 string_ops_test.cc
+                 string_ops.cc
+                 arithmetic_ops_test.cc
+                 arithmetic_ops.cc
+                 extended_math_ops_test.cc
+                 extended_math_ops.cc
+                 decimal_ops_test.cc
+                 decimal_ops.cc
+                 ../decimal_type_util.cc
+                 ../decimal_xlarge.cc
+                 EXTRA_INCLUDES
+                 ${CMAKE_SOURCE_DIR}/src
+                 EXTRA_LINK_LIBS
+                 Boost::headers
+                 DEFINITIONS
+                 GANDIVA_UNIT_TEST=1
+                 ARROW_STATIC
+                 GANDIVA_STATIC)

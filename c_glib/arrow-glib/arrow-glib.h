@@ -19,19 +19,26 @@
 
 #pragma once
 
-#include <arrow-glib/gobject-type.h>
+#include <glib-object.h>
+
 #include <arrow-glib/version.h>
 
 #include <arrow-glib/array.h>
 #include <arrow-glib/array-builder.h>
 #include <arrow-glib/chunked-array.h>
-#include <arrow-glib/column.h>
+#include <arrow-glib/codec.h>
 #include <arrow-glib/compute.h>
 #include <arrow-glib/data-type.h>
+#include <arrow-glib/datum.h>
+#include <arrow-glib/decoder.h>
 #include <arrow-glib/enums.h>
 #include <arrow-glib/error.h>
+#include <arrow-glib/expression.h>
 #include <arrow-glib/field.h>
+#include <arrow-glib/interval.h>
+#include <arrow-glib/memory-pool.h>
 #include <arrow-glib/record-batch.h>
+#include <arrow-glib/scalar.h>
 #include <arrow-glib/schema.h>
 #include <arrow-glib/table.h>
 #include <arrow-glib/table-builder.h>
@@ -46,6 +53,10 @@
 #include <arrow-glib/writable.h>
 #include <arrow-glib/writable-file.h>
 
+#include <arrow-glib/ipc-options.h>
 #include <arrow-glib/metadata-version.h>
 #include <arrow-glib/reader.h>
 #include <arrow-glib/writer.h>
+
+#include <arrow-glib/file-system.h>
+#include <arrow-glib/local-file-system.h>

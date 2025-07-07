@@ -16,56 +16,22 @@
 // under the License.
 
 #include "arrow/builder.h"
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <numeric>
-#include <sstream>
+
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
-#include "arrow/array.h"
-#include "arrow/buffer.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/type_traits.h"
-#include "arrow/util/bit-util.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/decimal.h"
-#include "arrow/util/hash-util.h"
-#include "arrow/util/hash.h"
-#include "arrow/util/logging.h"
-
-#ifdef ARROW_USE_SSE
-#define SSE4_FLAG true
-#else
-#define SSE4_FLAG false
-#endif
+#include "arrow/util/hashing.h"
+#include "arrow/util/logging_internal.h"
+#include "arrow/visit_type_inline.h"
 
 namespace arrow {
 
 using internal::AdaptiveIntBuilderBase;
-using internal::checked_cast;
-
-namespace {
-
-Status TrimBuffer(const int64_t bytes_filled, ResizableBuffer* buffer) {
-  if (buffer) {
-    if (bytes_filled < buffer->size()) {
-      // Trim buffer
-      RETURN_NOT_OK(buffer->Resize(bytes_filled));
-    }
-    // zero the padding
-    buffer->ZeroPadding();
-  } else {
-    // Null buffers are allowed in place of 0-byte buffers
-    DCHECK_EQ(bytes_filled, 0);
-  }
-  return Status::OK();
-}
-
-}  // namespace
 
 Status ArrayBuilder::AppendToBitmap(bool is_valid) {
   if (length_ == capacity_) {
@@ -86,32 +52,33 @@ Status ArrayBuilder::AppendToBitmap(const uint8_t* valid_bytes, int64_t length) 
   return Status::OK();
 }
 
-Status ArrayBuilder::Resize(int64_t capacity) {
-  // Target size of validity (null) bitmap data
-  const int64_t new_bitmap_size = BitUtil::BytesForBits(capacity);
-
-  if (capacity_ == 0) {
-    RETURN_NOT_OK(AllocateResizableBuffer(pool_, new_bitmap_size, &null_bitmap_));
-    null_bitmap_data_ = null_bitmap_->mutable_data();
-
-    // Padding is zeroed by AllocateResizableBuffer
-    memset(null_bitmap_data_, 0, static_cast<size_t>(new_bitmap_size));
-  } else {
-    const int64_t old_bitmap_capacity = null_bitmap_->capacity();
-    RETURN_NOT_OK(null_bitmap_->Resize(new_bitmap_size));
-
-    const int64_t new_bitmap_capacity = null_bitmap_->capacity();
-    null_bitmap_data_ = null_bitmap_->mutable_data();
-
-    // Zero the region between the original capacity and the new capacity,
-    // including padding, which has not been zeroed, unlike
-    // AllocateResizableBuffer
-    if (old_bitmap_capacity < new_bitmap_capacity) {
-      memset(null_bitmap_data_ + old_bitmap_capacity, 0,
-             static_cast<size_t>(new_bitmap_capacity - old_bitmap_capacity));
-    }
-  }
+Status ArrayBuilder::Init(int64_t capacity) {
+  int64_t to_alloc = BitUtil::CeilByte(capacity) / 8;
+  null_bitmap_ = std::make_shared<PoolBuffer>(pool_);
+  RETURN_NOT_OK(null_bitmap_->Resize(to_alloc));
+  // Buffers might allocate more then necessary to satisfy padding requirements
+  const int64_t byte_capacity = null_bitmap_->capacity();
   capacity_ = capacity;
+  null_bitmap_data_ = null_bitmap_->mutable_data();
+  memset(null_bitmap_data_, 0, static_cast<size_t>(byte_capacity));
+  return Status::OK();
+}
+
+Status ArrayBuilder::Resize(int64_t new_bits) {
+  if (!null_bitmap_) {
+    return Init(new_bits);
+  }
+  int64_t new_bytes = BitUtil::CeilByte(new_bits) / 8;
+  int64_t old_bytes = null_bitmap_->size();
+  RETURN_NOT_OK(null_bitmap_->Resize(new_bytes));
+  null_bitmap_data_ = null_bitmap_->mutable_data();
+  // The buffer might be overpadded to deal with padding according to the spec
+  const int64_t byte_capacity = null_bitmap_->capacity();
+  capacity_ = new_bits;
+  if (old_bytes < new_bytes) {
+    memset(null_bitmap_data_ + old_bytes, 0,
+           static_cast<size_t>(byte_capacity - old_bytes));
+  }
   return Status::OK();
 }
 
@@ -130,11 +97,11 @@ Status ArrayBuilder::Finish(std::shared_ptr<Array>* out) {
   return Status::OK();
 }
 
-Status ArrayBuilder::Reserve(int64_t additional_elements) {
-  if (length_ + additional_elements > capacity_) {
+Status ArrayBuilder::Reserve(int64_t elements) {
+  if (length_ + elements > capacity_) {
     // TODO(emkornfield) power of 2 growth is potentially suboptimal
-    int64_t new_size = BitUtil::NextPower2(length_ + additional_elements);
-    return Resize(new_size);
+    int64_t new_capacity = BitUtil::NextPower2(length_ + elements);
+    return Resize(new_capacity);
   }
   return Status::OK();
 }
@@ -155,11 +122,64 @@ void ArrayBuilder::UnsafeAppendToBitmap(const uint8_t* valid_bytes, int64_t leng
     UnsafeSetNotNull(length);
     return;
   }
-  UnsafeAppendToBitmap(valid_bytes, valid_bytes + length);
+
+  int64_t byte_offset = length_ / 8;
+  int64_t bit_offset = length_ % 8;
+  uint8_t bitset = null_bitmap_data_[byte_offset];
+
+  for (int64_t i = 0; i < length; ++i) {
+    if (bit_offset == 8) {
+      bit_offset = 0;
+      null_bitmap_data_[byte_offset] = bitset;
+      byte_offset++;
+      // TODO: Except for the last byte, this shouldn't be needed
+      bitset = null_bitmap_data_[byte_offset];
+    }
+
+    if (valid_bytes[i]) {
+      bitset |= BitUtil::kBitmask[bit_offset];
+    } else {
+      bitset &= BitUtil::kFlippedBitmask[bit_offset];
+      ++null_count_;
+    }
+
+    bit_offset++;
+  }
+  if (bit_offset != 0) {
+    null_bitmap_data_[byte_offset] = bitset;
+  }
+  length_ += length;
 }
 
 void ArrayBuilder::UnsafeAppendToBitmap(const std::vector<bool>& is_valid) {
-  UnsafeAppendToBitmap(is_valid.begin(), is_valid.end());
+  int64_t byte_offset = length_ / 8;
+  int64_t bit_offset = length_ % 8;
+  uint8_t bitset = null_bitmap_data_[byte_offset];
+
+  const int64_t length = static_cast<int64_t>(is_valid.size());
+
+  for (int64_t i = 0; i < length; ++i) {
+    if (bit_offset == 8) {
+      bit_offset = 0;
+      null_bitmap_data_[byte_offset] = bitset;
+      byte_offset++;
+      // TODO: Except for the last byte, this shouldn't be needed
+      bitset = null_bitmap_data_[byte_offset];
+    }
+
+    if (is_valid[i]) {
+      bitset |= BitUtil::kBitmask[bit_offset];
+    } else {
+      bitset &= BitUtil::kFlippedBitmask[bit_offset];
+      ++null_count_;
+    }
+
+    bit_offset++;
+  }
+  if (bit_offset != 0) {
+    null_bitmap_data_[byte_offset] = bitset;
+  }
+  length_ += length;
 }
 
 void ArrayBuilder::UnsafeSetNotNull(int64_t length) {
@@ -180,52 +200,168 @@ void ArrayBuilder::UnsafeSetNotNull(int64_t length) {
   memset(null_bitmap_data_ + ((length_ + pad_to_byte) / 8), 0xFF,
          static_cast<size_t>(fast_length));
 
-  // Trailing bits
+  // Trailing bytes
   for (int64_t i = length_ + pad_to_byte + (fast_length * 8); i < new_length; ++i) {
     BitUtil::SetBit(null_bitmap_data_, i);
   }
 
   length_ = new_length;
 }
+class MemoryPool;
 
 // ----------------------------------------------------------------------
-// Null builder
+// Helper functions
 
-Status NullBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  *out = ArrayData::Make(null(), length_, {nullptr}, length_);
-  length_ = null_count_ = 0;
-  return Status::OK();
-}
+using arrow::internal::checked_cast;
 
-// ----------------------------------------------------------------------
-
-template <typename T>
-void PrimitiveBuilder<T>::Reset() {
-  data_.reset();
-  raw_data_ = nullptr;
-}
-
-template <typename T>
-Status PrimitiveBuilder<T>::Resize(int64_t capacity) {
-  // XXX: Set floor size for now
-  if (capacity < kMinBuilderCapacity) {
-    capacity = kMinBuilderCapacity;
+// Generic int builder that delegates to the builder for a specific
+// type. Used to reduce the number of template instantiations in the
+// exact_index_type case below, to reduce build time and memory usage.
+class ARROW_EXPORT TypeErasedIntBuilder : public ArrayBuilder {
+ public:
+  explicit TypeErasedIntBuilder(MemoryPool* pool = default_memory_pool(),
+                                int64_t alignment = kDefaultBufferAlignment)
+      : ArrayBuilder(pool, alignment) {
+    // Not intended to be used, but adding this is easier than adding a bunch of enable_if
+    // magic to builder_dict.h
+    DCHECK(false);
+  }
+  explicit TypeErasedIntBuilder(const std::shared_ptr<DataType>& type,
+                                MemoryPool* pool = default_memory_pool(),
+                                int64_t alignment = kDefaultBufferAlignment)
+      : ArrayBuilder(pool), type_id_(type->id()) {
+    DCHECK(is_integer(type_id_));
+    switch (type_id_) {
+      case Type::UINT8:
+        builder_ = std::make_unique<UInt8Builder>(pool);
+        break;
+      case Type::INT8:
+        builder_ = std::make_unique<Int8Builder>(pool);
+        break;
+      case Type::UINT16:
+        builder_ = std::make_unique<UInt16Builder>(pool);
+        break;
+      case Type::INT16:
+        builder_ = std::make_unique<Int16Builder>(pool);
+        break;
+      case Type::UINT32:
+        builder_ = std::make_unique<UInt32Builder>(pool);
+        break;
+      case Type::INT32:
+        builder_ = std::make_unique<Int32Builder>(pool);
+        break;
+      case Type::UINT64:
+        builder_ = std::make_unique<UInt64Builder>(pool);
+        break;
+      case Type::INT64:
+        builder_ = std::make_unique<Int64Builder>(pool);
+        break;
+      default:
+        DCHECK(false);
+    }
   }
 
-  int64_t nbytes = TypeTraits<T>::bytes_required(capacity);
-  if (capacity_ == 0) {
-    RETURN_NOT_OK(AllocateResizableBuffer(pool_, nbytes, &data_));
-  } else {
-    RETURN_NOT_OK(data_->Resize(nbytes));
+  void Reset() override { return builder_->Reset(); }
+  Status Append(int32_t value) {
+    switch (type_id_) {
+      case Type::UINT8:
+        return checked_cast<UInt8Builder*>(builder_.get())->Append(value);
+      case Type::INT8:
+        return checked_cast<Int8Builder*>(builder_.get())->Append(value);
+      case Type::UINT16:
+        return checked_cast<UInt16Builder*>(builder_.get())->Append(value);
+      case Type::INT16:
+        return checked_cast<Int16Builder*>(builder_.get())->Append(value);
+      case Type::UINT32:
+        return checked_cast<UInt32Builder*>(builder_.get())->Append(value);
+      case Type::INT32:
+        return checked_cast<Int32Builder*>(builder_.get())->Append(value);
+      case Type::UINT64:
+        return checked_cast<UInt64Builder*>(builder_.get())->Append(value);
+      case Type::INT64:
+        return checked_cast<Int64Builder*>(builder_.get())->Append(value);
+      default:
+        DCHECK(false);
+    }
+    return Status::NotImplemented("Internal implementation error");
+  }
+  Status AppendNull() override { return builder_->AppendNull(); }
+  Status AppendNulls(int64_t length) override { return builder_->AppendNulls(length); }
+  Status AppendEmptyValue() override { return builder_->AppendEmptyValue(); }
+  Status AppendEmptyValues(int64_t length) override {
+    return builder_->AppendEmptyValues(length);
   }
 
-  raw_data_ = reinterpret_cast<value_type*>(data_->mutable_data());
-  return ArrayBuilder::Resize(capacity);
-}
+  Status AppendScalar(const Scalar& scalar, int64_t n_repeats) override {
+    return builder_->AppendScalar(scalar, n_repeats);
+  }
+  Status AppendScalars(const ScalarVector& scalars) override {
+    return builder_->AppendScalars(scalars);
+  }
+  Status AppendArraySlice(const ArraySpan& array, int64_t offset,
+                          int64_t length) override {
+    return builder_->AppendArraySlice(array, offset, length);
+  }
+
+  Status FinishInternal(std::shared_ptr<ArrayData>* out) override {
+    return builder_->FinishInternal(out);
+  }
+
+  std::shared_ptr<DataType> type() const override { return builder_->type(); }
+
+ private:
+  std::unique_ptr<ArrayBuilder> builder_;
+  Type::type type_id_;
+};
+
+struct DictionaryBuilderCase {
+  template <typename ValueType, typename Enable = typename ValueType::c_type>
+  Status Visit(const ValueType&) {
+    return CreateFor<ValueType>();
+  }
+
+  Status Visit(const NullType&) { return CreateFor<NullType>(); }
+  Status Visit(const BinaryType&) { return CreateFor<BinaryType>(); }
+  Status Visit(const StringType&) { return CreateFor<StringType>(); }
+  Status Visit(const LargeBinaryType&) { return CreateFor<LargeBinaryType>(); }
+  Status Visit(const LargeStringType&) { return CreateFor<LargeStringType>(); }
+  Status Visit(const BinaryViewType&) { return CreateFor<BinaryViewType>(); }
+  Status Visit(const StringViewType&) { return CreateFor<StringViewType>(); }
+  Status Visit(const FixedSizeBinaryType&) { return CreateFor<FixedSizeBinaryType>(); }
+  Status Visit(const Decimal32Type&) { return CreateFor<Decimal32Type>(); }
+  Status Visit(const Decimal64Type&) { return CreateFor<Decimal64Type>(); }
+  Status Visit(const Decimal128Type&) { return CreateFor<Decimal128Type>(); }
+  Status Visit(const Decimal256Type&) { return CreateFor<Decimal256Type>(); }
+
+  Status Visit(const DataType& value_type) { return NotImplemented(value_type); }
+  Status Visit(const HalfFloatType& value_type) { return NotImplemented(value_type); }
+  Status NotImplemented(const DataType& value_type) {
+    return Status::NotImplemented(
+        "MakeBuilder: cannot construct builder for dictionaries with value type ",
+        value_type);
+  }
+
+  template <typename ValueType>
+  Status CreateFor() {
+    using AdaptiveBuilderType = DictionaryBuilder<ValueType>;
+    if (dictionary != nullptr) {
+      out->reset(new AdaptiveBuilderType(dictionary, pool));
+    } else if (exact_index_type) {
+      if (!is_integer(index_type->id())) {
+        return Status::TypeError("MakeBuilder: invalid index type ", *index_type);
+      }
+      out->reset(new internal::DictionaryBuilderBase<TypeErasedIntBuilder, ValueType>(
+          index_type, value_type, pool));
+    } else {
+      auto start_int_size = index_type->byte_width();
+      out->reset(new AdaptiveBuilderType(start_int_size, value_type, pool));
+    }
+    return Status::OK();
+  }
 
 template <typename T>
-Status PrimitiveBuilder<T>::AppendValues(const value_type* values, int64_t length,
-                                         const uint8_t* valid_bytes) {
+Status PrimitiveBuilder<T>::Append(const value_type* values, int64_t length,
+                                   const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
 
   if (length > 0) {
@@ -235,12 +371,13 @@ Status PrimitiveBuilder<T>::AppendValues(const value_type* values, int64_t lengt
 
   // length_ is update by these
   ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, length);
+
   return Status::OK();
 }
 
 template <typename T>
-Status PrimitiveBuilder<T>::AppendValues(const value_type* values, int64_t length,
-                                         const std::vector<bool>& is_valid) {
+Status PrimitiveBuilder<T>::Append(const value_type* values, int64_t length,
+                                   const std::vector<bool>& is_valid) {
   RETURN_NOT_OK(Reserve(length));
   DCHECK_EQ(length, static_cast<int64_t>(is_valid.size()));
 
@@ -251,30 +388,33 @@ Status PrimitiveBuilder<T>::AppendValues(const value_type* values, int64_t lengt
 
   // length_ is update by these
   ArrayBuilder::UnsafeAppendToBitmap(is_valid);
+
   return Status::OK();
 }
 
 template <typename T>
-Status PrimitiveBuilder<T>::AppendValues(const std::vector<value_type>& values,
-                                         const std::vector<bool>& is_valid) {
-  return AppendValues(values.data(), static_cast<int64_t>(values.size()), is_valid);
+Status PrimitiveBuilder<T>::Append(const std::vector<value_type>& values,
+                                   const std::vector<bool>& is_valid) {
+  return Append(values.data(), static_cast<int64_t>(values.size()), is_valid);
 }
 
 template <typename T>
-Status PrimitiveBuilder<T>::AppendValues(const std::vector<value_type>& values) {
-  return AppendValues(values.data(), static_cast<int64_t>(values.size()));
+Status PrimitiveBuilder<T>::Append(const std::vector<value_type>& values) {
+  return Append(values.data(), static_cast<int64_t>(values.size()));
 }
 
 template <typename T>
 Status PrimitiveBuilder<T>::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), null_bitmap_.get()));
-  RETURN_NOT_OK(TrimBuffer(TypeTraits<T>::bytes_required(length_), data_.get()));
-
-  *out = ArrayData::Make(type_, length_, {null_bitmap_, data_}, null_count_);
+  const int64_t bytes_required = TypeTraits<T>::bytes_required(length_);
+  if (bytes_required > 0 && bytes_required < data_->size()) {
+    // Trim buffers
+    RETURN_NOT_OK(data_->Resize(bytes_required));
+  }
+  BufferVector buffers = {null_bitmap_, data_};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_);
 
   data_ = null_bitmap_ = nullptr;
   capacity_ = length_ = null_count_ = 0;
-
   return Status::OK();
 }
 
@@ -298,10 +438,17 @@ template class PrimitiveBuilder<DoubleType>;
 AdaptiveIntBuilderBase::AdaptiveIntBuilderBase(MemoryPool* pool)
     : ArrayBuilder(int64(), pool), data_(nullptr), raw_data_(nullptr), int_size_(1) {}
 
-void AdaptiveIntBuilderBase::Reset() {
-  ArrayBuilder::Reset();
-  data_.reset();
-  raw_data_ = nullptr;
+Status AdaptiveIntBuilderBase::Init(int64_t capacity) {
+  RETURN_NOT_OK(ArrayBuilder::Init(capacity));
+  data_ = std::make_shared<PoolBuffer>(pool_);
+
+  int64_t nbytes = capacity * int_size_;
+  RETURN_NOT_OK(data_->Resize(nbytes));
+  // TODO(emkornfield) valgrind complains without this
+  memset(data_->mutable_data(), 0, static_cast<size_t>(nbytes));
+
+  raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
+  return Status::OK();
 }
 
 Status AdaptiveIntBuilderBase::Resize(int64_t capacity) {
@@ -310,20 +457,30 @@ Status AdaptiveIntBuilderBase::Resize(int64_t capacity) {
     capacity = kMinBuilderCapacity;
   }
 
-  int64_t nbytes = capacity * int_size_;
   if (capacity_ == 0) {
-    RETURN_NOT_OK(AllocateResizableBuffer(pool_, nbytes, &data_));
+    RETURN_NOT_OK(Init(capacity));
   } else {
-    RETURN_NOT_OK(data_->Resize(nbytes));
+    RETURN_NOT_OK(ArrayBuilder::Resize(capacity));
+    const int64_t old_bytes = data_->size();
+    const int64_t new_bytes = capacity * int_size_;
+    RETURN_NOT_OK(data_->Resize(new_bytes));
+    raw_data_ = data_->mutable_data();
+    // TODO(emkornfield) valgrind complains without this
+    memset(data_->mutable_data() + old_bytes, 0,
+           static_cast<size_t>(new_bytes - old_bytes));
   }
-  raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
-
-  return ArrayBuilder::Resize(capacity);
+  return Status::OK();
 }
 
 AdaptiveIntBuilder::AdaptiveIntBuilder(MemoryPool* pool) : AdaptiveIntBuilderBase(pool) {}
 
 Status AdaptiveIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
+  const int64_t bytes_required = length_ * int_size_;
+  if (bytes_required > 0 && bytes_required < data_->size()) {
+    // Trim buffers
+    RETURN_NOT_OK(data_->Resize(bytes_required));
+  }
+
   std::shared_ptr<DataType> output_type;
   switch (int_size_) {
     case 1:
@@ -343,18 +500,17 @@ Status AdaptiveIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
       return Status::NotImplemented("Only ints of size 1,2,4,8 are supported");
   }
 
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), null_bitmap_.get()));
-  RETURN_NOT_OK(TrimBuffer(length_ * int_size_, data_.get()));
-
-  *out = ArrayData::Make(output_type, length_, {null_bitmap_, data_}, null_count_);
+  BufferVector buffers = {null_bitmap_, data_};
+  *out =
+      std::make_shared<ArrayData>(output_type, length_, std::move(buffers), null_count_);
 
   data_ = null_bitmap_ = nullptr;
   capacity_ = length_ = null_count_ = 0;
   return Status::OK();
 }
 
-Status AdaptiveIntBuilder::AppendValues(const int64_t* values, int64_t length,
-                                        const uint8_t* valid_bytes) {
+Status AdaptiveIntBuilder::Append(const int64_t* values, int64_t length,
+                                  const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
 
   if (length > 0) {
@@ -406,6 +562,7 @@ Status AdaptiveIntBuilder::AppendValues(const int64_t* values, int64_t length,
 
   // length_ is update by these
   ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, length);
+
   return Status::OK();
 }
 
@@ -477,6 +634,11 @@ AdaptiveUIntBuilder::AdaptiveUIntBuilder(MemoryPool* pool)
     : AdaptiveIntBuilderBase(pool) {}
 
 Status AdaptiveUIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
+  const int64_t bytes_required = length_ * int_size_;
+  if (bytes_required > 0 && bytes_required < data_->size()) {
+    // Trim buffers
+    RETURN_NOT_OK(data_->Resize(bytes_required));
+  }
   std::shared_ptr<DataType> output_type;
   switch (int_size_) {
     case 1:
@@ -496,18 +658,17 @@ Status AdaptiveUIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
       return Status::NotImplemented("Only ints of size 1,2,4,8 are supported");
   }
 
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), null_bitmap_.get()));
-  RETURN_NOT_OK(TrimBuffer(length_ * int_size_, data_.get()));
-
-  *out = ArrayData::Make(output_type, length_, {null_bitmap_, data_}, null_count_);
+  BufferVector buffers = {null_bitmap_, data_};
+  *out =
+      std::make_shared<ArrayData>(output_type, length_, std::move(buffers), null_count_);
 
   data_ = null_bitmap_ = nullptr;
   capacity_ = length_ = null_count_ = 0;
   return Status::OK();
 }
 
-Status AdaptiveUIntBuilder::AppendValues(const uint64_t* values, int64_t length,
-                                         const uint8_t* valid_bytes) {
+Status AdaptiveUIntBuilder::Append(const uint64_t* values, int64_t length,
+                                   const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
 
   if (length > 0) {
@@ -559,6 +720,7 @@ Status AdaptiveUIntBuilder::AppendValues(const uint64_t* values, int64_t length,
 
   // length_ is update by these
   ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, length);
+
   return Status::OK();
 }
 
@@ -634,10 +796,17 @@ BooleanBuilder::BooleanBuilder(const std::shared_ptr<DataType>& type, MemoryPool
   DCHECK_EQ(Type::BOOL, type->id());
 }
 
-void BooleanBuilder::Reset() {
-  ArrayBuilder::Reset();
-  data_.reset();
-  raw_data_ = nullptr;
+Status BooleanBuilder::Init(int64_t capacity) {
+  RETURN_NOT_OK(ArrayBuilder::Init(capacity));
+  data_ = std::make_shared<PoolBuffer>(pool_);
+
+  int64_t nbytes = BitUtil::BytesForBits(capacity);
+  RETURN_NOT_OK(data_->Resize(nbytes));
+  // TODO(emkornfield) valgrind complains without this
+  memset(data_->mutable_data(), 0, static_cast<size_t>(nbytes));
+
+  raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
+  return Status::OK();
 }
 
 Status BooleanBuilder::Resize(int64_t capacity) {
@@ -646,516 +815,132 @@ Status BooleanBuilder::Resize(int64_t capacity) {
     capacity = kMinBuilderCapacity;
   }
 
-  const int64_t new_bitmap_size = BitUtil::BytesForBits(capacity);
   if (capacity_ == 0) {
-    RETURN_NOT_OK(AllocateResizableBuffer(pool_, new_bitmap_size, &data_));
-    raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
-
-    // We zero the memory for booleans to keep things simple; for some reason if
-    // we do not, even though we may write every bit (through in-place | or &),
-    // valgrind will still show a warning. If we do not zero the bytes here, we
-    // will have to be careful to zero them in AppendNull and AppendNulls. Also,
-    // zeroing the bits results in deterministic bits when each byte may have a
-    // mix of nulls and not nulls.
-    //
-    // We only zero up to new_bitmap_size because the padding was zeroed by
-    // AllocateResizableBuffer
-    memset(raw_data_, 0, static_cast<size_t>(new_bitmap_size));
+    RETURN_NOT_OK(Init(capacity));
   } else {
-    const int64_t old_bitmap_capacity = data_->capacity();
-    RETURN_NOT_OK(data_->Resize(new_bitmap_size));
-    const int64_t new_bitmap_capacity = data_->capacity();
+    RETURN_NOT_OK(ArrayBuilder::Resize(capacity));
+    const int64_t old_bytes = data_->size();
+    const int64_t new_bytes = BitUtil::BytesForBits(capacity);
+
+    RETURN_NOT_OK(data_->Resize(new_bytes));
     raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
-
-    // See comment above about why we zero memory for booleans
-    memset(raw_data_ + old_bitmap_capacity, 0,
-           static_cast<size_t>(new_bitmap_capacity - old_bitmap_capacity));
+    memset(data_->mutable_data() + old_bytes, 0,
+           static_cast<size_t>(new_bytes - old_bytes));
   }
-
-  return ArrayBuilder::Resize(capacity);
+  return Status::OK();
 }
 
 Status BooleanBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  int64_t bit_offset = length_ % 8;
-  if (bit_offset > 0) {
-    // Adjust last byte
-    data_->mutable_data()[length_ / 8] &= BitUtil::kPrecedingBitmask[bit_offset];
+  const int64_t bytes_required = BitUtil::BytesForBits(length_);
+
+  if (bytes_required > 0 && bytes_required < data_->size()) {
+    // Trim buffers
+    RETURN_NOT_OK(data_->Resize(bytes_required));
   }
-
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), null_bitmap_.get()));
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), data_.get()));
-
-  *out = ArrayData::Make(boolean(), length_, {null_bitmap_, data_}, null_count_);
+  BufferVector buffers = {null_bitmap_, data_};
+  *out = std::make_shared<ArrayData>(boolean(), length_, std::move(buffers), null_count_);
 
   data_ = null_bitmap_ = nullptr;
   capacity_ = length_ = null_count_ = 0;
   return Status::OK();
 }
 
-Status BooleanBuilder::AppendValues(const uint8_t* values, int64_t length,
-                                    const uint8_t* valid_bytes) {
+Status BooleanBuilder::Append(const uint8_t* values, int64_t length,
+                              const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
 
-  int64_t i = 0;
-  internal::GenerateBitsUnrolled(raw_data_, length_, length,
-                                 [values, &i]() -> bool { return values[i++] != 0; });
+  for (int64_t i = 0; i < length; ++i) {
+    BitUtil::SetBitTo(raw_data_, length_ + i, values[i] != 0);
+  }
 
   // this updates length_
   ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, length);
   return Status::OK();
 }
 
-Status BooleanBuilder::AppendValues(const uint8_t* values, int64_t length,
-                                    const std::vector<bool>& is_valid) {
+Status BooleanBuilder::Append(const uint8_t* values, int64_t length,
+                              const std::vector<bool>& is_valid) {
   RETURN_NOT_OK(Reserve(length));
   DCHECK_EQ(length, static_cast<int64_t>(is_valid.size()));
 
-  int64_t i = 0;
-  internal::GenerateBitsUnrolled(raw_data_, length_, length,
-                                 [values, &i]() -> bool { return values[i++]; });
+  for (int64_t i = 0; i < length; ++i) {
+    BitUtil::SetBitTo(raw_data_, length_ + i, values[i] != 0);
+  }
 
   // this updates length_
   ArrayBuilder::UnsafeAppendToBitmap(is_valid);
   return Status::OK();
 }
 
-Status BooleanBuilder::AppendValues(const std::vector<uint8_t>& values,
-                                    const std::vector<bool>& is_valid) {
-  return AppendValues(values.data(), static_cast<int64_t>(values.size()), is_valid);
+Status BooleanBuilder::Append(const std::vector<uint8_t>& values,
+                              const std::vector<bool>& is_valid) {
+  return Append(values.data(), static_cast<int64_t>(values.size()), is_valid);
 }
 
-Status BooleanBuilder::AppendValues(const std::vector<uint8_t>& values) {
-  return AppendValues(values.data(), static_cast<int64_t>(values.size()));
+Status BooleanBuilder::Append(const std::vector<uint8_t>& values) {
+  return Append(values.data(), static_cast<int64_t>(values.size()));
 }
 
-Status BooleanBuilder::AppendValues(const std::vector<bool>& values,
-                                    const std::vector<bool>& is_valid) {
+Status BooleanBuilder::Append(const std::vector<bool>& values,
+                              const std::vector<bool>& is_valid) {
   const int64_t length = static_cast<int64_t>(values.size());
   RETURN_NOT_OK(Reserve(length));
   DCHECK_EQ(length, static_cast<int64_t>(is_valid.size()));
 
-  int64_t i = 0;
-  internal::GenerateBitsUnrolled(raw_data_, length_, length,
-                                 [&values, &i]() -> bool { return values[i++]; });
+  for (int64_t i = 0; i < length; ++i) {
+    BitUtil::SetBitTo(raw_data_, length_ + i, values[i]);
+  }
 
   // this updates length_
   ArrayBuilder::UnsafeAppendToBitmap(is_valid);
   return Status::OK();
 }
 
-Status BooleanBuilder::AppendValues(const std::vector<bool>& values) {
+Status BooleanBuilder::Append(const std::vector<bool>& values) {
   const int64_t length = static_cast<int64_t>(values.size());
   RETURN_NOT_OK(Reserve(length));
 
-  int64_t i = 0;
-  internal::GenerateBitsUnrolled(raw_data_, length_, length,
-                                 [&values, &i]() -> bool { return values[i++]; });
+  for (int64_t i = 0; i < length; ++i) {
+    BitUtil::SetBitTo(raw_data_, length_ + i, values[i]);
+  }
 
-  // this updates length_
   ArrayBuilder::UnsafeSetNotNull(length);
   return Status::OK();
 }
 
 // ----------------------------------------------------------------------
-// DictionaryBuilder
+// DecimalBuilder
 
-using internal::DictionaryScalar;
-
-namespace {
-
-// A helper class to manage a hash table embedded in a typed Builder.
-template <typename T, typename Enable = void>
-struct DictionaryHashHelper {};
-
-// DictionaryHashHelper implementation for primitive types
-template <typename T>
-struct DictionaryHashHelper<T, enable_if_has_c_type<T>> {
-  using Builder = typename TypeTraits<T>::BuilderType;
-  using Scalar = typename DictionaryScalar<T>::type;
-
-  // Get the dictionary value at the given builder index
-  static Scalar GetDictionaryValue(const Builder& builder, int64_t index) {
-    return builder.GetValue(index);
-  }
-
-  // Compute the hash of a scalar value
-  static int64_t HashValue(const Scalar& value, int byte_width) {
-    return HashUtil::Hash<SSE4_FLAG>(&value, sizeof(Scalar), 0);
-  }
-
-  // Return whether the dictionary value at the given builder index is unequal to value
-  static bool SlotDifferent(const Builder& builder, int64_t index, const Scalar& value) {
-    return GetDictionaryValue(builder, index) != value;
-  }
-
-  // Append a value to the builder
-  static Status AppendValue(Builder& builder, const Scalar& value) {
-    return builder.Append(value);
-  }
-
-  // Append another builder's contents to the builder
-  static Status AppendArray(Builder& builder, const Array& in_array) {
-    const auto& array = checked_cast<const PrimitiveArray&>(in_array);
-    return builder.AppendValues(reinterpret_cast<const Scalar*>(array.values()->data()),
-                                array.length(), nullptr);
-  }
-};
-
-// DictionaryHashHelper implementation for StringType / BinaryType
-template <typename T>
-struct DictionaryHashHelper<T, enable_if_binary<T>> {
-  using Builder = typename TypeTraits<T>::BuilderType;
-  using Scalar = typename DictionaryScalar<T>::type;
-
-  static Scalar GetDictionaryValue(const Builder& builder, int64_t index) {
-    return builder.GetView(index);
-  }
-
-  static int64_t HashValue(const Scalar& value, int byte_width) {
-    return HashUtil::Hash<SSE4_FLAG>(value.data(), static_cast<int32_t>(value.length()),
-                                     0);
-  }
-
-  static bool SlotDifferent(const Builder& builder, int64_t index, const Scalar& value) {
-    const Scalar other = GetDictionaryValue(builder, index);
-    return value.length() != other.length() ||
-           memcmp(value.data(), other.data(), other.length()) != 0;
-  }
-
-  static Status AppendValue(Builder& builder, const Scalar& value) {
-    return builder.Append(value);
-  }
-
-  static Status AppendArray(Builder& builder, const Array& in_array) {
-    const auto& array = checked_cast<const BinaryArray&>(in_array);
-    for (uint64_t index = 0, limit = array.length(); index < limit; ++index) {
-      RETURN_NOT_OK(builder.Append(array.GetView(index)));
-    }
-    return Status::OK();
-  }
-};
-
-// DictionaryHashHelper implementation for FixedSizeBinaryType
-template <typename T>
-struct DictionaryHashHelper<T, enable_if_fixed_size_binary<T>> {
-  using Builder = typename TypeTraits<FixedSizeBinaryType>::BuilderType;
-  using Scalar = typename DictionaryScalar<FixedSizeBinaryType>::type;
-
-  static Scalar GetDictionaryValue(const Builder& builder, int64_t index) {
-    return builder.GetValue(index);
-  }
-
-  static int64_t HashValue(const Scalar& value, int byte_width) {
-    return HashUtil::Hash<SSE4_FLAG>(value, byte_width, 0);
-  }
-
-  static bool SlotDifferent(const Builder& builder, int64_t index, const uint8_t* value) {
-    const int32_t width = builder.byte_width();
-    const uint8_t* other_value = builder.GetValue(index);
-    return memcmp(value, other_value, width) != 0;
-  }
-
-  static Status AppendValue(Builder& builder, const Scalar& value) {
-    return builder.Append(value);
-  }
-
-  static Status AppendArray(Builder& builder, const Array& in_array) {
-    const auto& array = checked_cast<const FixedSizeBinaryArray&>(in_array);
-    for (uint64_t index = 0, limit = array.length(); index < limit; ++index) {
-      const Scalar value = array.GetValue(index);
-      RETURN_NOT_OK(builder.Append(value));
-    }
-    return Status::OK();
-  }
-};
-
-}  // namespace
-
-template <typename T>
-DictionaryBuilder<T>::DictionaryBuilder(const std::shared_ptr<DataType>& type,
-                                        MemoryPool* pool)
-    : ArrayBuilder(type, pool),
-      hash_slots_(nullptr),
-      dict_builder_(type, pool),
-      overflow_dict_builder_(type, pool),
-      values_builder_(pool),
-      byte_width_(-1) {}
-
-DictionaryBuilder<NullType>::DictionaryBuilder(const std::shared_ptr<DataType>& type,
-                                               MemoryPool* pool)
-    : ArrayBuilder(type, pool), values_builder_(pool) {}
-
-template <>
-DictionaryBuilder<FixedSizeBinaryType>::DictionaryBuilder(
-    const std::shared_ptr<DataType>& type, MemoryPool* pool)
-    : ArrayBuilder(type, pool),
-      hash_slots_(nullptr),
-      dict_builder_(type, pool),
-      overflow_dict_builder_(type, pool),
-      values_builder_(pool),
-      byte_width_(checked_cast<const FixedSizeBinaryType&>(*type).byte_width()) {}
-
-template <typename T>
-void DictionaryBuilder<T>::Reset() {
-  dict_builder_.Reset();
-  overflow_dict_builder_.Reset();
-  values_builder_.Reset();
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::Resize(int64_t capacity) {
-  if (capacity < kMinBuilderCapacity) {
-    capacity = kMinBuilderCapacity;
-  }
-
-  if (capacity_ == 0) {
-    // Fill the initial hash table
-    RETURN_NOT_OK(internal::NewHashTable(kInitialHashTableSize, pool_, &hash_table_));
-    hash_slots_ = reinterpret_cast<int32_t*>(hash_table_->mutable_data());
-    hash_table_size_ = kInitialHashTableSize;
-    entry_id_offset_ = 0;
-    mod_bitmask_ = kInitialHashTableSize - 1;
-    hash_table_load_threshold_ =
-        static_cast<int64_t>(static_cast<double>(capacity) * kMaxHashTableLoad);
-  }
-  RETURN_NOT_OK(values_builder_.Resize(capacity));
-  return ArrayBuilder::Resize(capacity);
-}
-
-Status DictionaryBuilder<NullType>::Resize(int64_t capacity) {
-  if (capacity < kMinBuilderCapacity) {
-    capacity = kMinBuilderCapacity;
-  }
-  RETURN_NOT_OK(values_builder_.Resize(capacity));
-  return ArrayBuilder::Resize(capacity);
-}
-
-template <typename T>
-int64_t DictionaryBuilder<T>::HashValue(const Scalar& value) {
-  return DictionaryHashHelper<T>::HashValue(value, byte_width_);
-}
-
-template <typename T>
-typename DictionaryBuilder<T>::Scalar DictionaryBuilder<T>::GetDictionaryValue(
-    typename TypeTraits<T>::BuilderType& dictionary_builder, int64_t index) {
-  return DictionaryHashHelper<T>::GetDictionaryValue(dictionary_builder, index);
-}
-
-template <typename T>
-bool DictionaryBuilder<T>::SlotDifferent(hash_slot_t index, const Scalar& value) {
-  DCHECK_GE(index, 0);
-  if (index >= entry_id_offset_) {
-    // Lookup delta dictionary
-    DCHECK_LT(index - entry_id_offset_, dict_builder_.length());
-    return DictionaryHashHelper<T>::SlotDifferent(
-        dict_builder_, static_cast<int64_t>(index - entry_id_offset_), value);
-  } else {
-    DCHECK_LT(index, overflow_dict_builder_.length());
-    return DictionaryHashHelper<T>::SlotDifferent(overflow_dict_builder_,
-                                                  static_cast<int64_t>(index), value);
-  }
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::AppendDictionary(const Scalar& value) {
-  return DictionaryHashHelper<T>::AppendValue(dict_builder_, value);
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::Append(const Scalar& value) {
-  RETURN_NOT_OK(Reserve(1));
-  // Based on DictEncoder<DType>::Put
-  int64_t j = HashValue(value) & mod_bitmask_;
-  hash_slot_t index = hash_slots_[j];
-
-  // Find an empty slot
-  while (kHashSlotEmpty != index && SlotDifferent(index, value)) {
-    // Linear probing
-    ++j;
-    if (j == hash_table_size_) {
-      j = 0;
-    }
-    index = hash_slots_[j];
-  }
-
-  if (index == kHashSlotEmpty) {
-    // Not in the hash table, so we insert it now
-    index = static_cast<hash_slot_t>(dict_builder_.length() + entry_id_offset_);
-    hash_slots_[j] = index;
-    RETURN_NOT_OK(AppendDictionary(value));
-
-    if (ARROW_PREDICT_FALSE(static_cast<int32_t>(dict_builder_.length()) >
-                            hash_table_load_threshold_)) {
-      RETURN_NOT_OK(DoubleTableSize());
-    }
-  }
-
-  RETURN_NOT_OK(values_builder_.Append(index));
-
-  return Status::OK();
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::AppendNull() {
-  return values_builder_.AppendNull();
-}
-
-Status DictionaryBuilder<NullType>::AppendNull() { return values_builder_.AppendNull(); }
-
-template <typename T>
-Status DictionaryBuilder<T>::AppendArray(const Array& array) {
-  const auto& numeric_array = checked_cast<const NumericArray<T>&>(array);
-  for (int64_t i = 0; i < array.length(); i++) {
-    if (array.IsNull(i)) {
-      RETURN_NOT_OK(AppendNull());
-    } else {
-      RETURN_NOT_OK(Append(numeric_array.Value(i)));
-    }
-  }
-  return Status::OK();
-}
-
-Status DictionaryBuilder<NullType>::AppendArray(const Array& array) {
-  for (int64_t i = 0; i < array.length(); i++) {
-    RETURN_NOT_OK(AppendNull());
-  }
-  return Status::OK();
-}
-
-template <>
-Status DictionaryBuilder<FixedSizeBinaryType>::AppendArray(const Array& array) {
-  if (!type_->Equals(*array.type())) {
-    return Status::Invalid("Cannot append FixedSizeBinary array with non-matching type");
-  }
-
-  const auto& typed_array = checked_cast<const FixedSizeBinaryArray&>(array);
-  for (int64_t i = 0; i < array.length(); i++) {
-    if (array.IsNull(i)) {
-      RETURN_NOT_OK(AppendNull());
-    } else {
-      RETURN_NOT_OK(Append(typed_array.GetValue(i)));
-    }
-  }
-  return Status::OK();
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::DoubleTableSize() {
-#define INNER_LOOP \
-  int64_t j = HashValue(GetDictionaryValue(dict_builder_, index)) & new_mod_bitmask
-
-  DOUBLE_TABLE_SIZE(, INNER_LOOP);
-
-  return Status::OK();
-}
-
-template <typename T>
-Status DictionaryBuilder<T>::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  std::shared_ptr<Array> dictionary;
-  entry_id_offset_ += dict_builder_.length();
-  RETURN_NOT_OK(dict_builder_.Finish(&dictionary));
-
-  // Store current dict entries for further uses of this DictionaryBuilder
-  RETURN_NOT_OK(
-      DictionaryHashHelper<T>::AppendArray(overflow_dict_builder_, *dictionary));
-  DCHECK_EQ(entry_id_offset_, overflow_dict_builder_.length());
-
-  RETURN_NOT_OK(values_builder_.FinishInternal(out));
-  (*out)->type = std::make_shared<DictionaryType>((*out)->type, dictionary);
-
-  dict_builder_.Reset();
-  values_builder_.Reset();
-
-  return Status::OK();
-}
-
-Status DictionaryBuilder<NullType>::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  std::shared_ptr<Array> dictionary = std::make_shared<NullArray>(0);
-
-  RETURN_NOT_OK(values_builder_.FinishInternal(out));
-  (*out)->type = std::make_shared<DictionaryType>((*out)->type, dictionary);
-
-  return Status::OK();
-}
-
-//
-// StringType and BinaryType specializations
-//
-
-#define BINARY_DICTIONARY_SPECIALIZATIONS(Type)                            \
-                                                                           \
-  template <>                                                              \
-  Status DictionaryBuilder<Type>::AppendArray(const Array& array) {        \
-    using ArrayType = typename TypeTraits<Type>::ArrayType;                \
-    const ArrayType& binary_array = checked_cast<const ArrayType&>(array); \
-    for (int64_t i = 0; i < array.length(); i++) {                         \
-      if (array.IsNull(i)) {                                               \
-        RETURN_NOT_OK(AppendNull());                                       \
-      } else {                                                             \
-        RETURN_NOT_OK(Append(binary_array.GetView(i)));                    \
-      }                                                                    \
-    }                                                                      \
-    return Status::OK();                                                   \
-  }
-
-BINARY_DICTIONARY_SPECIALIZATIONS(StringType);
-BINARY_DICTIONARY_SPECIALIZATIONS(BinaryType);
-
-template class DictionaryBuilder<UInt8Type>;
-template class DictionaryBuilder<UInt16Type>;
-template class DictionaryBuilder<UInt32Type>;
-template class DictionaryBuilder<UInt64Type>;
-template class DictionaryBuilder<Int8Type>;
-template class DictionaryBuilder<Int16Type>;
-template class DictionaryBuilder<Int32Type>;
-template class DictionaryBuilder<Int64Type>;
-template class DictionaryBuilder<Date32Type>;
-template class DictionaryBuilder<Date64Type>;
-template class DictionaryBuilder<Time32Type>;
-template class DictionaryBuilder<Time64Type>;
-template class DictionaryBuilder<TimestampType>;
-template class DictionaryBuilder<FloatType>;
-template class DictionaryBuilder<DoubleType>;
-template class DictionaryBuilder<FixedSizeBinaryType>;
-template class DictionaryBuilder<BinaryType>;
-template class DictionaryBuilder<StringType>;
-
-// ----------------------------------------------------------------------
-// Decimal128Builder
-
-Decimal128Builder::Decimal128Builder(const std::shared_ptr<DataType>& type,
-                                     MemoryPool* pool)
+DecimalBuilder::DecimalBuilder(const std::shared_ptr<DataType>& type, MemoryPool* pool)
     : FixedSizeBinaryBuilder(type, pool) {}
 
-Status Decimal128Builder::Append(const Decimal128& value) {
+Status DecimalBuilder::Append(const Decimal128& value) {
   RETURN_NOT_OK(FixedSizeBinaryBuilder::Reserve(1));
   return FixedSizeBinaryBuilder::Append(value.ToBytes());
 }
 
-Status Decimal128Builder::FinishInternal(std::shared_ptr<ArrayData>* out) {
+Status DecimalBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   std::shared_ptr<Buffer> data;
   RETURN_NOT_OK(byte_builder_.Finish(&data));
 
-  *out = ArrayData::Make(type_, length_, {null_bitmap_, data}, null_count_);
-
+  BufferVector buffers = {null_bitmap_, data};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_);
   return Status::OK();
 }
 
 // ----------------------------------------------------------------------
 // ListBuilder
 
-ListBuilder::ListBuilder(MemoryPool* pool,
-                         std::shared_ptr<ArrayBuilder> const& value_builder,
+ListBuilder::ListBuilder(MemoryPool* pool, std::unique_ptr<ArrayBuilder> value_builder,
                          const std::shared_ptr<DataType>& type)
-    : ArrayBuilder(type ? type
-                        : std::static_pointer_cast<DataType>(
-                              std::make_shared<ListType>(value_builder->type())),
+    : ArrayBuilder(type ? type : std::static_pointer_cast<DataType>(
+                                     std::make_shared<ListType>(value_builder->type())),
                    pool),
       offsets_builder_(pool),
-      value_builder_(value_builder) {}
+      value_builder_(std::move(value_builder)) {}
 
-Status ListBuilder::AppendValues(const int32_t* offsets, int64_t length,
-                                 const uint8_t* valid_bytes) {
+Status ListBuilder::Append(const int32_t* offsets, int64_t length,
+                           const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
   UnsafeAppendToBitmap(valid_bytes, length);
   offsets_builder_.UnsafeAppend(offsets, length);
@@ -1164,11 +949,11 @@ Status ListBuilder::AppendValues(const int32_t* offsets, int64_t length,
 
 Status ListBuilder::AppendNextOffset() {
   int64_t num_values = value_builder_->length();
-  if (ARROW_PREDICT_FALSE(num_values > kListMaximumElements)) {
+  if (ARROW_PREDICT_FALSE(num_values >= std::numeric_limits<int32_t>::max())) {
     std::stringstream ss;
     ss << "ListArray cannot contain more then INT32_MAX - 1 child elements,"
        << " have " << num_values;
-    return Status::CapacityError(ss.str());
+    return Status::Invalid(ss.str());
   }
   return offsets_builder_.Append(static_cast<int32_t>(num_values));
 }
@@ -1179,17 +964,23 @@ Status ListBuilder::Append(bool is_valid) {
   return AppendNextOffset();
 }
 
-Status ListBuilder::Resize(int64_t capacity) {
-  DCHECK_LE(capacity, kListMaximumElements);
+Status ListBuilder::Init(int64_t elements) {
+  DCHECK_LT(elements, std::numeric_limits<int32_t>::max());
+  RETURN_NOT_OK(ArrayBuilder::Init(elements));
   // one more then requested for offsets
-  RETURN_NOT_OK(offsets_builder_.Resize((capacity + 1) * sizeof(int32_t)));
+  return offsets_builder_.Resize((elements + 1) * sizeof(int64_t));
+}
+
+Status ListBuilder::Resize(int64_t capacity) {
+  DCHECK_LT(capacity, std::numeric_limits<int32_t>::max());
+  // one more then requested for offsets
+  RETURN_NOT_OK(offsets_builder_.Resize((capacity + 1) * sizeof(int64_t)));
   return ArrayBuilder::Resize(capacity);
 }
 
 Status ListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   RETURN_NOT_OK(AppendNextOffset());
 
-  // Offset padding zeroed by BufferBuilder
   std::shared_ptr<Buffer> offsets;
   RETURN_NOT_OK(offsets_builder_.Finish(&offsets));
 
@@ -1197,14 +988,11 @@ Status ListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   if (values_) {
     items = values_->data();
   } else {
-    if (value_builder_->length() == 0) {
-      // Try to make sure we get a non-null values buffer (ARROW-2744)
-      RETURN_NOT_OK(value_builder_->Resize(0));
-    }
     RETURN_NOT_OK(value_builder_->FinishInternal(&items));
   }
 
-  *out = ArrayData::Make(type_, length_, {null_bitmap_, offsets}, null_count_);
+  BufferVector buffers = {null_bitmap_, offsets};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_);
   (*out)->child_data.emplace_back(std::move(items));
   Reset();
   return Status::OK();
@@ -1212,9 +1000,7 @@ Status ListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 
 void ListBuilder::Reset() {
   ArrayBuilder::Reset();
-  values_.reset();
-  offsets_builder_.Reset();
-  value_builder_->Reset();
+  values_ = nullptr;
 }
 
 ArrayBuilder* ListBuilder::value_builder() const {
@@ -1230,31 +1016,27 @@ BinaryBuilder::BinaryBuilder(const std::shared_ptr<DataType>& type, MemoryPool* 
 
 BinaryBuilder::BinaryBuilder(MemoryPool* pool) : BinaryBuilder(binary(), pool) {}
 
-Status BinaryBuilder::Resize(int64_t capacity) {
-  DCHECK_LE(capacity, kListMaximumElements);
+Status BinaryBuilder::Init(int64_t elements) {
+  DCHECK_LT(elements, std::numeric_limits<int32_t>::max());
+  RETURN_NOT_OK(ArrayBuilder::Init(elements));
   // one more then requested for offsets
-  RETURN_NOT_OK(offsets_builder_.Resize((capacity + 1) * sizeof(int32_t)));
-  return ArrayBuilder::Resize(capacity);
+  return offsets_builder_.Resize((elements + 1) * sizeof(int64_t));
 }
 
-Status BinaryBuilder::ReserveData(int64_t elements) {
-  if (value_data_length() + elements > value_data_capacity()) {
-    if (value_data_length() + elements > kBinaryMemoryLimit) {
-      return Status::CapacityError(
-          "Cannot reserve capacity larger than 2^31 - 1 for binary");
-    }
-    RETURN_NOT_OK(value_data_builder_.Reserve(elements));
-  }
-  return Status::OK();
+Status BinaryBuilder::Resize(int64_t capacity) {
+  DCHECK_LT(capacity, std::numeric_limits<int32_t>::max());
+  // one more then requested for offsets
+  RETURN_NOT_OK(offsets_builder_.Resize((capacity + 1) * sizeof(int64_t)));
+  return ArrayBuilder::Resize(capacity);
 }
 
 Status BinaryBuilder::AppendNextOffset() {
   const int64_t num_bytes = value_data_builder_.length();
-  if (ARROW_PREDICT_FALSE(num_bytes > kBinaryMemoryLimit)) {
+  if (ARROW_PREDICT_FALSE(num_bytes > kMaximumCapacity)) {
     std::stringstream ss;
-    ss << "BinaryArray cannot contain more than " << kBinaryMemoryLimit << " bytes, have "
+    ss << "BinaryArray cannot contain more than " << kMaximumCapacity << " bytes, have "
        << num_bytes;
-    return Status::CapacityError(ss.str());
+    return Status::Invalid(ss.str());
   }
   return offsets_builder_.Append(static_cast<int32_t>(num_bytes));
 }
@@ -1263,7 +1045,6 @@ Status BinaryBuilder::Append(const uint8_t* value, int32_t length) {
   RETURN_NOT_OK(Reserve(1));
   RETURN_NOT_OK(AppendNextOffset());
   RETURN_NOT_OK(value_data_builder_.Append(value, length));
-
   UnsafeAppendToBitmap(true);
   return Status::OK();
 }
@@ -1271,7 +1052,6 @@ Status BinaryBuilder::Append(const uint8_t* value, int32_t length) {
 Status BinaryBuilder::AppendNull() {
   RETURN_NOT_OK(AppendNextOffset());
   RETURN_NOT_OK(Reserve(1));
-
   UnsafeAppendToBitmap(false);
   return Status::OK();
 }
@@ -1279,14 +1059,13 @@ Status BinaryBuilder::AppendNull() {
 Status BinaryBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   // Write final offset (values length)
   RETURN_NOT_OK(AppendNextOffset());
-
-  // These buffers' padding zeroed by BufferBuilder
   std::shared_ptr<Buffer> offsets, value_data;
+
   RETURN_NOT_OK(offsets_builder_.Finish(&offsets));
   RETURN_NOT_OK(value_data_builder_.Finish(&value_data));
 
-  *out = ArrayData::Make(type_, length_, {null_bitmap_, offsets, value_data}, null_count_,
-                         0);
+  BufferVector buffers = {null_bitmap_, offsets, value_data};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_, 0);
   Reset();
   return Status::OK();
 }
@@ -1308,107 +1087,7 @@ const uint8_t* BinaryBuilder::GetValue(int64_t i, int32_t* out_length) const {
   return value_data_builder_.data() + offset;
 }
 
-util::string_view BinaryBuilder::GetView(int64_t i) const {
-  const int32_t* offsets = offsets_builder_.data();
-  int32_t offset = offsets[i];
-  int32_t value_length;
-  if (i == (length_ - 1)) {
-    value_length = static_cast<int32_t>(value_data_builder_.length()) - offset;
-  } else {
-    value_length = offsets[i + 1] - offset;
-  }
-  return util::string_view(
-      reinterpret_cast<const char*>(value_data_builder_.data() + offset), value_length);
-}
-
 StringBuilder::StringBuilder(MemoryPool* pool) : BinaryBuilder(utf8(), pool) {}
-
-Status StringBuilder::AppendValues(const std::vector<std::string>& values,
-                                   const uint8_t* valid_bytes) {
-  std::size_t total_length = std::accumulate(
-      values.begin(), values.end(), 0ULL,
-      [](uint64_t sum, const std::string& str) { return sum + str.size(); });
-  RETURN_NOT_OK(Reserve(values.size()));
-  RETURN_NOT_OK(value_data_builder_.Reserve(total_length));
-  RETURN_NOT_OK(offsets_builder_.Reserve(values.size()));
-
-  if (valid_bytes) {
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      RETURN_NOT_OK(AppendNextOffset());
-      if (valid_bytes[i]) {
-        RETURN_NOT_OK(value_data_builder_.Append(
-            reinterpret_cast<const uint8_t*>(values[i].data()), values[i].size()));
-      }
-    }
-  } else {
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      RETURN_NOT_OK(AppendNextOffset());
-      RETURN_NOT_OK(value_data_builder_.Append(
-          reinterpret_cast<const uint8_t*>(values[i].data()), values[i].size()));
-    }
-  }
-
-  UnsafeAppendToBitmap(valid_bytes, values.size());
-  return Status::OK();
-}
-
-Status StringBuilder::AppendValues(const char** values, int64_t length,
-                                   const uint8_t* valid_bytes) {
-  std::size_t total_length = 0;
-  std::vector<std::size_t> value_lengths(length);
-  bool have_null_value = false;
-  for (int64_t i = 0; i < length; ++i) {
-    if (values[i]) {
-      auto value_length = strlen(values[i]);
-      value_lengths[i] = value_length;
-      total_length += value_length;
-    } else {
-      have_null_value = true;
-    }
-  }
-  RETURN_NOT_OK(Reserve(length));
-  RETURN_NOT_OK(value_data_builder_.Reserve(total_length));
-  RETURN_NOT_OK(offsets_builder_.Reserve(length));
-
-  if (valid_bytes) {
-    int64_t valid_bytes_offset = 0;
-    for (int64_t i = 0; i < length; ++i) {
-      RETURN_NOT_OK(AppendNextOffset());
-      if (valid_bytes[i]) {
-        if (values[i]) {
-          RETURN_NOT_OK(value_data_builder_.Append(
-              reinterpret_cast<const uint8_t*>(values[i]), value_lengths[i]));
-        } else {
-          UnsafeAppendToBitmap(valid_bytes + valid_bytes_offset, i - valid_bytes_offset);
-          UnsafeAppendToBitmap(false);
-          valid_bytes_offset = i + 1;
-        }
-      }
-    }
-    UnsafeAppendToBitmap(valid_bytes + valid_bytes_offset, length - valid_bytes_offset);
-  } else {
-    if (have_null_value) {
-      std::vector<uint8_t> valid_vector(length, 0);
-      for (int64_t i = 0; i < length; ++i) {
-        RETURN_NOT_OK(AppendNextOffset());
-        if (values[i]) {
-          RETURN_NOT_OK(value_data_builder_.Append(
-              reinterpret_cast<const uint8_t*>(values[i]), value_lengths[i]));
-          valid_vector[i] = 1;
-        }
-      }
-      UnsafeAppendToBitmap(valid_vector.data(), length);
-    } else {
-      for (int64_t i = 0; i < length; ++i) {
-        RETURN_NOT_OK(AppendNextOffset());
-        RETURN_NOT_OK(value_data_builder_.Append(
-            reinterpret_cast<const uint8_t*>(values[i]), value_lengths[i]));
-      }
-      UnsafeAppendToBitmap(nullptr, length);
-    }
-  }
-  return Status::OK();
-}
 
 // ----------------------------------------------------------------------
 // Fixed width binary
@@ -1416,11 +1095,17 @@ Status StringBuilder::AppendValues(const char** values, int64_t length,
 FixedSizeBinaryBuilder::FixedSizeBinaryBuilder(const std::shared_ptr<DataType>& type,
                                                MemoryPool* pool)
     : ArrayBuilder(type, pool),
-      byte_width_(checked_cast<const FixedSizeBinaryType&>(*type).byte_width()),
+      byte_width_(static_cast<const FixedSizeBinaryType&>(*type).byte_width()),
       byte_builder_(pool) {}
 
-Status FixedSizeBinaryBuilder::AppendValues(const uint8_t* data, int64_t length,
-                                            const uint8_t* valid_bytes) {
+Status FixedSizeBinaryBuilder::Append(const uint8_t* value) {
+  RETURN_NOT_OK(Reserve(1));
+  UnsafeAppendToBitmap(true);
+  return byte_builder_.Append(value, byte_width_);
+}
+
+Status FixedSizeBinaryBuilder::Append(const uint8_t* data, int64_t length,
+                                      const uint8_t* valid_bytes) {
   RETURN_NOT_OK(Reserve(length));
   UnsafeAppendToBitmap(valid_bytes, length);
   return byte_builder_.Append(data, length * byte_width_);
@@ -1436,9 +1121,9 @@ Status FixedSizeBinaryBuilder::AppendNull() {
   return byte_builder_.Advance(byte_width_);
 }
 
-void FixedSizeBinaryBuilder::Reset() {
-  ArrayBuilder::Reset();
-  byte_builder_.Reset();
+Status FixedSizeBinaryBuilder::Init(int64_t elements) {
+  RETURN_NOT_OK(ArrayBuilder::Init(elements));
+  return byte_builder_.Resize(elements * byte_width_);
 }
 
 Status FixedSizeBinaryBuilder::Resize(int64_t capacity) {
@@ -1450,10 +1135,8 @@ Status FixedSizeBinaryBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   std::shared_ptr<Buffer> data;
   RETURN_NOT_OK(byte_builder_.Finish(&data));
 
-  *out = ArrayData::Make(type_, length_, {null_bitmap_, data}, null_count_);
-
-  null_bitmap_ = nullptr;
-  capacity_ = length_ = null_count_ = 0;
+  BufferVector buffers = {null_bitmap_, data};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_);
   return Status::OK();
 }
 
@@ -1462,35 +1145,21 @@ const uint8_t* FixedSizeBinaryBuilder::GetValue(int64_t i) const {
   return data_ptr + i * byte_width_;
 }
 
-util::string_view FixedSizeBinaryBuilder::GetView(int64_t i) const {
-  const uint8_t* data_ptr = byte_builder_.data();
-  return util::string_view(reinterpret_cast<const char*>(data_ptr + i * byte_width_),
-                           byte_width_);
-}
-
 // ----------------------------------------------------------------------
 // Struct
 
 StructBuilder::StructBuilder(const std::shared_ptr<DataType>& type, MemoryPool* pool,
-                             std::vector<std::shared_ptr<ArrayBuilder>>&& field_builders)
-    : ArrayBuilder(type, pool), field_builders_(std::move(field_builders)) {}
-
-void StructBuilder::Reset() {
-  ArrayBuilder::Reset();
-  for (const auto& field_builder : field_builders_) {
-    field_builder->Reset();
-  }
+                             std::vector<std::unique_ptr<ArrayBuilder>>&& field_builders)
+    : ArrayBuilder(type, pool) {
+  field_builders_ = std::move(field_builders);
 }
+
 Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  RETURN_NOT_OK(TrimBuffer(BitUtil::BytesForBits(length_), null_bitmap_.get()));
-  *out = ArrayData::Make(type_, length_, {null_bitmap_}, null_count_);
+  BufferVector buffers = {null_bitmap_};
+  *out = std::make_shared<ArrayData>(type_, length_, std::move(buffers), null_count_);
 
   (*out)->child_data.resize(field_builders_.size());
   for (size_t i = 0; i < field_builders_.size(); ++i) {
-    if (length_ == 0) {
-      // Try to make sure the child buffers are initialized
-      RETURN_NOT_OK(field_builders_[i]->Resize(0));
-    }
     RETURN_NOT_OK(field_builders_[i]->FinishInternal(&(*out)->child_data[i]));
   }
 
@@ -1501,63 +1170,185 @@ Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 
 // ----------------------------------------------------------------------
 // Helper functions
+  Status Make() { return VisitTypeInline(*value_type, this); }
 
-#define BUILDER_CASE(ENUM, BuilderType)      \
-  case Type::ENUM:                           \
-    out->reset(new BuilderType(type, pool)); \
+  MemoryPool* pool;
+  const std::shared_ptr<DataType>& index_type;
+  const std::shared_ptr<DataType>& value_type;
+  const std::shared_ptr<Array>& dictionary;
+  bool exact_index_type;
+  std::unique_ptr<ArrayBuilder>* out;
+};
+
+struct MakeBuilderImpl {
+  template <typename T>
+  enable_if_not_nested<T, Status> Visit(const T& t) {
+    out.reset(new typename TypeTraits<T>::BuilderType(type, pool));
     return Status::OK();
+  }
 
-// Initially looked at doing this with vtables, but shared pointers makes it
-// difficult
-//
-// TODO(wesm): come up with a less monolithic strategy
+  Status Visit(const DictionaryType& dict_type) {
+    DictionaryBuilderCase visitor = {pool,
+                                     dict_type.index_type(),
+                                     dict_type.value_type(),
+                                     /*dictionary=*/nullptr,
+                                     exact_index_type,
+                                     &out};
+    return visitor.Make();
+  }
+
+  Status Visit(const ListType& list_type) {
+    std::shared_ptr<DataType> value_type = list_type.value_type();
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(value_type));
+    out.reset(new ListBuilder(pool, std::move(value_builder), type));
+    return Status::OK();
+  }
+
+  Status Visit(const LargeListType& list_type) {
+    std::shared_ptr<DataType> value_type = list_type.value_type();
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(value_type));
+    out.reset(new LargeListBuilder(pool, std::move(value_builder), type));
+    return Status::OK();
+  }
+
+  Status Visit(const ListViewType& list_view_type) {
+    std::shared_ptr<DataType> value_type = list_view_type.value_type();
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(value_type));
+    out.reset(new ListViewBuilder(pool, std::move(value_builder), std::move(type)));
+    return Status::OK();
+  }
+
+  Status Visit(const LargeListViewType& large_list_view_type) {
+    std::shared_ptr<DataType> value_type = large_list_view_type.value_type();
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(value_type));
+    out.reset(new LargeListViewBuilder(pool, std::move(value_builder), std::move(type)));
+    return Status::OK();
+  }
+
+  Status Visit(const MapType& map_type) {
+    ARROW_ASSIGN_OR_RAISE(auto key_builder, ChildBuilder(map_type.key_type()));
+    ARROW_ASSIGN_OR_RAISE(auto item_builder, ChildBuilder(map_type.item_type()));
+    out.reset(
+        new MapBuilder(pool, std::move(key_builder), std::move(item_builder), type));
+    return Status::OK();
+  }
+
+  Status Visit(const FixedSizeListType& list_type) {
+    auto value_type = list_type.value_type();
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(value_type));
+    out.reset(new FixedSizeListBuilder(pool, std::move(value_builder), type));
+    return Status::OK();
+  }
+
+  Status Visit(const StructType& struct_type) {
+    ARROW_ASSIGN_OR_RAISE(auto field_builders, FieldBuilders(*type, pool));
+    out.reset(new StructBuilder(type, pool, std::move(field_builders)));
+    return Status::OK();
+  }
+
+  Status Visit(const SparseUnionType&) {
+    ARROW_ASSIGN_OR_RAISE(auto field_builders, FieldBuilders(*type, pool));
+    out.reset(new SparseUnionBuilder(pool, std::move(field_builders), type));
+    return Status::OK();
+  }
+
+  Status Visit(const DenseUnionType&) {
+    ARROW_ASSIGN_OR_RAISE(auto field_builders, FieldBuilders(*type, pool));
+    out.reset(new DenseUnionBuilder(pool, std::move(field_builders), type));
+    return Status::OK();
+  }
+
+  Status Visit(const RunEndEncodedType& ree_type) {
+    ARROW_ASSIGN_OR_RAISE(auto run_end_builder, ChildBuilder(ree_type.run_end_type()));
+    ARROW_ASSIGN_OR_RAISE(auto value_builder, ChildBuilder(ree_type.value_type()));
+    out.reset(new RunEndEncodedBuilder(pool, std::move(run_end_builder),
+                                       std::move(value_builder), type));
+    return Status::OK();
+  }
+
+  Status Visit(const ExtensionType&) { return NotImplemented(); }
+  Status Visit(const DataType&) { return NotImplemented(); }
+
+  Status NotImplemented() {
+    return Status::NotImplemented("MakeBuilder: cannot construct builder for type ",
+                                  type->ToString());
+  }
+
+  Result<std::unique_ptr<ArrayBuilder>> ChildBuilder(
+      const std::shared_ptr<DataType>& type) {
+    MakeBuilderImpl impl{pool, type, exact_index_type, /*out=*/nullptr};
+    RETURN_NOT_OK(VisitTypeInline(*type, &impl));
+    return std::move(impl.out);
+  }
+
+  Result<std::vector<std::shared_ptr<ArrayBuilder>>> FieldBuilders(const DataType& type,
+                                                                   MemoryPool* pool) {
+    std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
+    for (const auto& field : type.fields()) {
+      std::unique_ptr<ArrayBuilder> builder;
+      MakeBuilderImpl impl{pool, field->type(), exact_index_type, /*out=*/nullptr};
+      RETURN_NOT_OK(VisitTypeInline(*field->type(), &impl));
+      field_builders.emplace_back(std::move(impl.out));
+    }
+    return field_builders;
+  }
+
+  MemoryPool* pool;
+  const std::shared_ptr<DataType>& type;
+  bool exact_index_type;
+  std::unique_ptr<ArrayBuilder> out;
+};
+
 Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
                    std::unique_ptr<ArrayBuilder>* out) {
-  switch (type->id()) {
-    case Type::NA: {
-      out->reset(new NullBuilder(pool));
-      return Status::OK();
-    }
-      BUILDER_CASE(UINT8, UInt8Builder);
-      BUILDER_CASE(INT8, Int8Builder);
-      BUILDER_CASE(UINT16, UInt16Builder);
-      BUILDER_CASE(INT16, Int16Builder);
-      BUILDER_CASE(UINT32, UInt32Builder);
-      BUILDER_CASE(INT32, Int32Builder);
-      BUILDER_CASE(UINT64, UInt64Builder);
-      BUILDER_CASE(INT64, Int64Builder);
-      BUILDER_CASE(DATE32, Date32Builder);
-      BUILDER_CASE(DATE64, Date64Builder);
-      BUILDER_CASE(TIME32, Time32Builder);
-      BUILDER_CASE(TIME64, Time64Builder);
-      BUILDER_CASE(TIMESTAMP, TimestampBuilder);
-      BUILDER_CASE(BOOL, BooleanBuilder);
-      BUILDER_CASE(HALF_FLOAT, HalfFloatBuilder);
-      BUILDER_CASE(FLOAT, FloatBuilder);
-      BUILDER_CASE(DOUBLE, DoubleBuilder);
-      BUILDER_CASE(STRING, StringBuilder);
-      BUILDER_CASE(BINARY, BinaryBuilder);
-      BUILDER_CASE(FIXED_SIZE_BINARY, FixedSizeBinaryBuilder);
-      BUILDER_CASE(DECIMAL, Decimal128Builder);
-    case Type::LIST: {
+  MakeBuilderImpl impl{pool, type, /*exact_index_type=*/false, /*out=*/nullptr};
+  RETURN_NOT_OK(VisitTypeInline(*type, &impl));
+  *out = std::move(impl.out);
+  return Status::OK();
+}
+
+<<<<<<< HEAD
+Status MakeBuilderExactIndex(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                             std::unique_ptr<ArrayBuilder>* out) {
+  MakeBuilderImpl impl{pool, type, /*exact_index_type=*/true, /*out=*/nullptr};
+  RETURN_NOT_OK(VisitTypeInline(*type, &impl));
+  *out = std::move(impl.out);
+  return Status::OK();
+=======
+    case Type::FIXED_SIZE_LIST: {
       std::unique_ptr<ArrayBuilder> value_builder;
       std::shared_ptr<DataType> value_type =
-          checked_cast<const ListType&>(*type).value_type();
+          internal::checked_cast<const FixedSizeListType&>(*type).value_type();
       RETURN_NOT_OK(MakeBuilder(pool, value_type, &value_builder));
-      out->reset(new ListBuilder(pool, std::move(value_builder)));
+      out->reset(new FixedSizeListBuilder(pool, std::move(value_builder), type));
       return Status::OK();
     }
 
     case Type::STRUCT: {
+<<<<<<< HEAD
+<<<<<<< HEAD
+      const std::vector<std::shared_ptr<Field>>& fields = type->fields();
+=======
       const std::vector<std::shared_ptr<Field>>& fields = type->children();
-      std::vector<std::shared_ptr<ArrayBuilder>> values_builder;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+      const std::vector<std::shared_ptr<Field>>& fields = type->children();
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+      std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
 
       for (auto it : fields) {
         std::unique_ptr<ArrayBuilder> builder;
         RETURN_NOT_OK(MakeBuilder(pool, it->type(), &builder));
-        values_builder.emplace_back(std::move(builder));
+        field_builders.emplace_back(std::move(builder));
+<<<<<<< HEAD
+<<<<<<< HEAD
       }
-      out->reset(new StructBuilder(type, pool, std::move(values_builder)));
+      out->reset(new StructBuilder(type, pool, std::move(field_builders)));
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+      }
+      out->reset(new StructBuilder(type, pool, std::move(field_builders)));
       return Status::OK();
     }
 
@@ -1567,6 +1358,47 @@ Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
       return Status::NotImplemented(ss.str());
     }
   }
+}
+    case Type::UNION: {
+      const auto& union_type = internal::checked_cast<const UnionType&>(*type);
+      const std::vector<std::shared_ptr<Field>>& fields = type->children();
+      std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
+
+      for (auto it : fields) {
+        std::unique_ptr<ArrayBuilder> builder;
+        RETURN_NOT_OK(MakeBuilder(pool, it->type(), &builder));
+        field_builders.emplace_back(std::move(builder));
+      }
+      if (union_type.mode() == UnionMode::DENSE) {
+        out->reset(new DenseUnionBuilder(pool, std::move(field_builders), type));
+      } else {
+        out->reset(new SparseUnionBuilder(pool, std::move(field_builders), type));
+      }
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+      return Status::OK();
+    }
+
+    default: {
+      return Status::NotImplemented("MakeBuilder: cannot construct builder for type ",
+                                    type->ToString());
+    }
+  }
+  return Status::NotImplemented("MakeBuilder: cannot construct builder for type ",
+                                type->ToString());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+}
+
+Status MakeDictionaryBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                             const std::shared_ptr<Array>& dictionary,
+                             std::unique_ptr<ArrayBuilder>* out) {
+  const auto& dict_type = static_cast<const DictionaryType&>(*type);
+  DictionaryBuilderCase visitor = {
+      pool,       dict_type.index_type(),     dict_type.value_type(),
+      dictionary, /*exact_index_type=*/false, out};
+  return visitor.Make();
 }
 
 }  // namespace arrow

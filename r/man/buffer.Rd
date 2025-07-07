@@ -2,16 +2,19 @@
 % Please edit documentation in R/buffer.R
 \name{buffer}
 \alias{buffer}
-\title{Create a buffer from an R object}
+\title{Create a Buffer}
 \usage{
 buffer(x)
 }
 \arguments{
-\item{x}{R object}
+\item{x}{R object. Only raw, numeric and integer vectors are currently supported}
 }
 \value{
-an instance of \code{arrow::Buffer} that borrows memory from \code{x}
+an instance of \code{Buffer} that borrows memory from \code{x}
 }
 \description{
-Create a buffer from an R object
+Create a Buffer
+}
+\seealso{
+\link{Buffer}
 }

@@ -42,7 +42,7 @@ class TestArray < Test::Unit::TestCase
   def test_is_null
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([true, false],
                  array.length.times.collect {|i| array.null?(i)})
@@ -51,7 +51,7 @@ class TestArray < Test::Unit::TestCase
   def test_is_valid
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([false, true],
                  array.length.times.collect {|i| array.valid?(i)})
@@ -59,7 +59,7 @@ class TestArray < Test::Unit::TestCase
 
   def test_length
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal(1, array.length)
   end
@@ -75,10 +75,10 @@ class TestArray < Test::Unit::TestCase
   def test_null_bitmap
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
-    builder.append(false)
+    builder.append_value(true)
+    builder.append_value(false)
     builder.append_null
-    builder.append(false)
+    builder.append_value(false)
     array = builder.finish
     assert_equal(0b10110, array.null_bitmap.data.to_s.unpack("c*")[0])
   end
@@ -97,9 +97,9 @@ class TestArray < Test::Unit::TestCase
 
   def test_slice
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
-    builder.append(false)
-    builder.append(true)
+    builder.append_value(true)
+    builder.append_value(false)
+    builder.append_value(true)
     array = builder.finish
     sub_array = array.slice(1, 2)
     assert_equal([false, true],
@@ -114,5 +114,123 @@ class TestArray < Test::Unit::TestCase
   true
 ]
     CONTENT
+  end
+
+  sub_test_case("#view") do
+    def test_valid
+      int32_array = build_int32_array([0, 1069547520, -1071644672, nil])
+      assert_equal(build_float_array([0.0, 1.5, -2.5, nil]),
+                   int32_array.view(Arrow::FloatDataType.new))
+    end
+
+    def test_invalid
+      message = "[array][view]: Invalid: " +
+                "Can't view array of type int16 as int8: incompatible layouts"
+      error = assert_raise(Arrow::Error::Invalid) do
+        build_int16_array([0, -1, 3]).view(Arrow::Int8DataType.new)
+      end
+      assert_equal(message, error.message.lines.first.chomp)
+    end
+  end
+
+  sub_test_case("#diff_unified") do
+    def test_no_diff
+      array = build_string_array(["Start", "Shutdown", "Reboot"])
+      other_array = build_string_array(["Start", "Shutdown", "Reboot"])
+      assert_nil(array.diff_unified(other_array))
+    end
+
+    def test_diff
+      array = build_string_array(["Start", "Shutdown", "Reboot"])
+      other_array = build_string_array(["Start", "Running", "Reboot"])
+      assert_equal(<<-STRING.chomp, array.diff_unified(other_array))
+
+@@ -1, +1 @@
+-"Shutdown"
++"Running"
+
+      STRING
+    end
+
+    def test_different_type
+      array = build_string_array(["Start", "Shutdown", "Reboot"])
+      other_array = build_int8_array([2, 3, 6, 10])
+      assert_equal("# Array types differed: string vs int8\n",
+                   array.diff_unified(other_array))
+    end
+  end
+
+  sub_test_case("#concatenate") do
+    def test_no_other_arrays
+      assert_equal(build_int32_array([1, 2, 3]),
+                   build_int32_array([1, 2, 3]).concatenate([]))
+    end
+
+    def test_multiple_other_arrays
+      a = build_int32_array([1, 2, 3])
+      b = build_int32_array([4])
+      c = build_int32_array([5, 6])
+      assert_equal(build_int32_array([1, 2, 3, 4, 5, 6]),
+                   a.concatenate([b, c]))
+    end
+
+    def test_mixed_type
+      int32_array = build_int32_array([1, 2, 3])
+      uint32_array = build_uint32_array([4])
+      message =
+        "[array][concatenate]: Invalid: " +
+        "arrays to be concatenated must be identically typed, " +
+        "but int32 and uint32 were encountered."
+      assert_raise(Arrow::Error::Invalid.new(message)) do
+        int32_array.concatenate([uint32_array])
+      end
+    end
+  end
+
+  sub_test_case("#validate") do
+    def test_valid
+      array = build_int32_array([1, 2, 3, 4, 5])
+      assert do
+        array.validate
+      end
+    end
+
+    def test_invalid
+      message = "[array][validate]: Invalid: Array length is negative"
+      array = Arrow::Int8Array.new(-1, Arrow::Buffer.new(""), Arrow::Buffer.new(""), -1)
+      error = assert_raise(Arrow::Error::Invalid) do
+        array.validate
+      end
+      assert_equal(message,
+                   error.message.lines.first.chomp)
+    end
+  end
+
+  sub_test_case("#validate_full") do
+    def test_valid
+      array = build_int32_array([1, 2, 3, 4, 5])
+      assert do
+        array.validate_full
+      end
+    end
+
+    def test_invalid
+      message = "[array][validate-full]: Invalid: Invalid UTF8 sequence at string index 0"
+
+      # U+3042 HIRAGANA LETTER A, U+3044 HIRAGANA LETTER I
+      data = "\u3042\u3044".b[0..-2]
+      value_offsets = Arrow::Buffer.new([0, data.size].pack("l*"))
+      array = Arrow::StringArray.new(1,
+                                     value_offsets,
+                                     Arrow::Buffer.new(data),
+                                     Arrow::Buffer.new([0b01].pack("C*")),
+                                     -1)
+
+      error = assert_raise(Arrow::Error::Invalid) do
+        array.validate_full
+      end
+      assert_equal(message,
+                   error.message.lines.first.chomp)
+    end
   end
 end

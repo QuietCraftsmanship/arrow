@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_NODE_VISITOR_H
-#define GANDIVA_NODE_VISITOR_H
+#pragma once
 
+#include <cmath>
 #include <string>
 
 #include "arrow/status.h"
 
-#include "gandiva/logging.h"
+#include "arrow/util/logging.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
@@ -35,7 +36,7 @@ template <typename Type>
 class InExpressionNode;
 
 /// \brief Visitor for nodes in the expression tree.
-class NodeVisitor {
+class GANDIVA_EXPORT NodeVisitor {
  public:
   virtual ~NodeVisitor() = default;
 
@@ -46,9 +47,10 @@ class NodeVisitor {
   virtual Status Visit(const BooleanNode& node) = 0;
   virtual Status Visit(const InExpressionNode<int32_t>& node) = 0;
   virtual Status Visit(const InExpressionNode<int64_t>& node) = 0;
+  virtual Status Visit(const InExpressionNode<float>& node) = 0;
+  virtual Status Visit(const InExpressionNode<double>& node) = 0;
+  virtual Status Visit(const InExpressionNode<gandiva::DecimalScalar128>& node) = 0;
   virtual Status Visit(const InExpressionNode<std::string>& node) = 0;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_NODE_VISITOR_H

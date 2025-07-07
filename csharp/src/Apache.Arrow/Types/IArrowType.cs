@@ -13,9 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using System;
-using System.Collections.Generic;
-using System.Text;
 
 namespace Apache.Arrow.Types
 {
@@ -43,12 +40,24 @@ namespace Apache.Arrow.Types
         Time32,
         Time64,
         Interval,
-        Decimal,
+        Decimal128,
+        Decimal256,
         List,
         Struct,
         Union,
         Dictionary,
-        Map
+        Map,
+        FixedSizeList,
+        Duration,
+        RecordBatch,
+        BinaryView,
+        StringView,
+        ListView,
+        LargeList,
+        LargeBinary,
+        LargeString,
+        Decimal32,
+        Decimal64,
     }
 
     public interface IArrowType

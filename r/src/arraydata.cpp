@@ -15,32 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow_types.h"
+#include "./arrow_types.h"
 
-using namespace Rcpp;
+#include <arrow/array/data.h>
 
-// [[Rcpp::export]]
+// [[arrow::export]]
 std::shared_ptr<arrow::DataType> ArrayData__get_type(
     const std::shared_ptr<arrow::ArrayData>& x) {
   return x->type;
 }
 
-// [[Rcpp::export]]
-int ArrayData__get_length(const std::shared_ptr<arrow::ArrayData>& x) {
-  return x->length;
+// [[arrow::export]]
+r_vec_size ArrayData__get_length(const std::shared_ptr<arrow::ArrayData>& x) {
+  return r_vec_size(x->length);
 }
 
-// [[Rcpp::export]]
-int ArrayData__get_null_count(const std::shared_ptr<arrow::ArrayData>& x) {
-  return x->null_count;
+// [[arrow::export]]
+r_vec_size ArrayData__get_null_count(const std::shared_ptr<arrow::ArrayData>& x) {
+  return r_vec_size(x->null_count);
 }
 
-// [[Rcpp::export]]
-int ArrayData__get_offset(const std::shared_ptr<arrow::ArrayData>& x) {
-  return x->offset;
+// [[arrow::export]]
+r_vec_size ArrayData__get_offset(const std::shared_ptr<arrow::ArrayData>& x) {
+  return r_vec_size(x->offset);
 }
 
-// [[Rcpp::export]]
-List ArrayData__buffers(const std::shared_ptr<arrow::ArrayData>& x) {
-  return wrap(x->buffers);
+// [[arrow::export]]
+cpp11::list ArrayData__buffers(const std::shared_ptr<arrow::ArrayData>& x) {
+  return arrow::r::to_r_list(x->buffers);
 }

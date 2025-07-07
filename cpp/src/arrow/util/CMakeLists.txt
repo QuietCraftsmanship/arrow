@@ -15,95 +15,132 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#######################################
+#
 # arrow_util
-#######################################
+#
 
 # Headers: top level
-install(FILES
-  bit-stream-utils.h
-  bit-util.h
-  bpacking.h
-  checked_cast.h
-  compiler-util.h
-  compression.h
-  compression_brotli.h
-  compression_bz2.h
-  compression_lz4.h
-  compression_snappy.h
-  compression_zlib.h
-  compression_zstd.h
-  cpu-info.h
-  decimal.h
-  hash-util.h
-  hash.h
-  io-util.h
-  key_value_metadata.h
-  lazy.h
-  logging.h
-  macros.h
-  memory.h
-  parallel.h
-  rle-encoding.h
-  sse-util.h
-  stl.h
-  stopwatch.h
-  string.h
-  string_view.h
-  thread-pool.h
-  type_traits.h
-  utf8.h
-  variant.h
-  visibility.h
-  windows_compatibility.h
-  DESTINATION include/arrow/util)
+arrow_install_all_headers("arrow/util")
 
-#######################################
+#
 # arrow_test_main
-#######################################
+#
 
-if (ARROW_BUILD_BENCHMARKS)
-  add_library(arrow_benchmark_main benchmark_main.cc)
-  if (APPLE)
-    target_link_libraries(arrow_benchmark_main
-      benchmark_static
-    )
-  elseif(MSVC)
-    target_link_libraries(arrow_benchmark_main
-      benchmark_static
-      Shlwapi.lib
-  )
+if(WIN32)
+  # This manifest enables long file paths on Windows 10+
+  # See https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file#enable-long-paths-in-windows-10-version-1607-and-later
+  if(MSVC)
+    set(IO_UTIL_TEST_SOURCES io_util_test.cc io_util_test.manifest)
   else()
-    target_link_libraries(arrow_benchmark_main
-      benchmark_static
-      pthread
-    )
+    set(IO_UTIL_TEST_SOURCES io_util_test.cc io_util_test.rc)
   endif()
-
-  # TODO(wesm): Some benchmarks include gtest.h
-  add_dependencies(arrow_benchmark_main gtest_static)
+else()
+  set(IO_UTIL_TEST_SOURCES io_util_test.cc)
 endif()
 
-ADD_ARROW_TEST(bit-util-test)
-ADD_ARROW_TEST(checked-cast-test)
-ADD_ARROW_TEST(compression-test)
-ADD_ARROW_TEST(decimal-test)
-ADD_ARROW_TEST(key-value-metadata-test)
-ADD_ARROW_TEST(lazy-test)
-ADD_ARROW_TEST(logging-test)
-ADD_ARROW_TEST(parsing-util-test)
-ADD_ARROW_TEST(rle-encoding-test)
-ADD_ARROW_TEST(stl-util-test)
-ADD_ARROW_TEST(task-group-test)
-ADD_ARROW_TEST(thread-pool-test)
-ADD_ARROW_TEST(utf8-util-test)
+set(ARROW_UTILITY_TEST_LINK_LIBS Boost::headers)
+if(ARROW_USE_XSIMD)
+  list(APPEND ARROW_UTILITY_TEST_LINK_LIBS ${ARROW_XSIMD})
+endif()
+if(ARROW_WITH_OPENTELEMETRY)
+  list(APPEND ARROW_UTILITY_TEST_LINK_LIBS ${ARROW_OPENTELEMETRY_LIBS})
+endif()
+add_arrow_test(utility-test
+               SOURCES
+               align_util_test.cc
+<<<<<<< HEAD
+               bit_block_counter_test.cc
+               bit_util_test.cc
+=======
+               atfork_test.cc
+               byte_size_test.cc
+               byte_stream_split_test.cc
+               cache_test.cc
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+               checked_cast_test.cc
+               compression_test.cc
+               decimal_test.cc
+               float16_test.cc
+               fixed_width_test.cc
+               formatting_util_test.cc
+               key_value_metadata_test.cc
+               hashing_test.cc
+               int_util_test.cc
+               ${IO_UTIL_TEST_SOURCES}
+               iterator_test.cc
+               list_util_test.cc
+               logger_test.cc
+               logging_test.cc
+               math_test.cc
+               queue_test.cc
+               range_test.cc
+               ree_util_test.cc
+               reflection_test.cc
+               rows_to_batches_test.cc
+               small_vector_test.cc
+               span_test.cc
+               stl_util_test.cc
+               string_test.cc
+               tdigest_test.cc
+               test_common.cc
+               time_test.cc
+               tracing_test.cc
+               trie_test.cc
+               uri_test.cc
+               utf8_util_test.cc
+               value_parsing_test.cc
+               EXTRA_LINK_LIBS
+               ${ARROW_UTILITY_TEST_LINK_LIBS})
 
-ADD_ARROW_BENCHMARK(bit-util-benchmark)
-ADD_ARROW_BENCHMARK(compression-benchmark)
-ADD_ARROW_BENCHMARK(decimal-benchmark)
-ADD_ARROW_BENCHMARK(lazy-benchmark)
-ADD_ARROW_BENCHMARK(number-parsing-benchmark)
-ADD_ARROW_BENCHMARK(utf8-util-benchmark)
+add_arrow_test(async-utility-test
+               SOURCES
+               async_generator_test.cc
+               async_util_test.cc
+               test_common.cc)
 
-add_subdirectory(string_view)
-add_subdirectory(variant)
+add_arrow_test(bit-utility-test
+               SOURCES
+               bit_block_counter_test.cc
+               bit_util_test.cc
+               rle_encoding_test.cc)
+
+add_arrow_test(threading-utility-test
+               SOURCES
+               cancel_test.cc
+               counting_semaphore_test.cc
+               future_test.cc
+               task_group_test.cc
+               test_common.cc
+               thread_pool_test.cc)
+
+<<<<<<< HEAD
+=======
+add_arrow_test(crc32-test
+               SOURCES
+               crc32_test.cc
+               EXTRA_LINK_LIBS
+               Boost::headers)
+
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+add_arrow_benchmark(bit_block_counter_benchmark)
+add_arrow_benchmark(bit_util_benchmark)
+add_arrow_benchmark(bitmap_reader_benchmark)
+add_arrow_benchmark(cache_benchmark)
+add_arrow_benchmark(compression_benchmark)
+add_arrow_benchmark(decimal_benchmark)
+add_arrow_benchmark(hashing_benchmark)
+add_arrow_benchmark(int_util_benchmark)
+add_arrow_benchmark(machine_benchmark)
+add_arrow_benchmark(queue_benchmark)
+add_arrow_benchmark(range_benchmark)
+add_arrow_benchmark(small_vector_benchmark)
+add_arrow_benchmark(tdigest_benchmark)
+add_arrow_benchmark(thread_pool_benchmark)
+add_arrow_benchmark(trie_benchmark)
+set(ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS)
+if(ARROW_USE_XSIMD)
+  list(APPEND ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS ${ARROW_XSIMD})
+endif()
+add_arrow_benchmark(utf8_util_benchmark EXTRA_LINK_LIBS
+                    ${ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS})
+add_arrow_benchmark(value_parsing_benchmark)

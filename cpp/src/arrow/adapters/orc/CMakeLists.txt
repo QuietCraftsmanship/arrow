@@ -15,19 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#######################################
+#
 # arrow_orc
-#######################################
+#
 
 # Headers: top level
-install(FILES
-        adapter.h
+install(FILES adapter.h options.h
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/adapters/orc")
 
 # pkg-config support
-configure_file(arrow-orc.pc.in
-  "${CMAKE_CURRENT_BINARY_DIR}/arrow-orc.pc"
-  @ONLY)
-install(
-  FILES "${CMAKE_CURRENT_BINARY_DIR}/arrow-orc.pc"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig/")
+arrow_add_pkg_config("arrow-orc")
+
+if(ARROW_BUILD_STATIC)
+  set(ARROW_ORC_STATIC_LINK_LIBS ${ARROW_TEST_STATIC_LINK_LIBS})
+else()
+  set(ARROW_ORC_STATIC_LINK_LIBS ${ARROW_TEST_SHARED_LINK_LIBS})
+endif()
+add_arrow_test(adapter_test
+               PREFIX
+               "arrow-orc"
+               STATIC_LINK_LIBS
+               orc::orc
+               ${ARROW_ORC_STATIC_LINK_LIBS})
+
+set_source_files_properties(adapter_test.cc PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+                                                       SKIP_UNITY_BUILD_INCLUSION ON)

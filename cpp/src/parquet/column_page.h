@@ -19,16 +19,16 @@
 // Parquet column chunk within a row group. It could be extended in the future
 // to iterate through all data pages in all chunks in a file.
 
-#ifndef PARQUET_COLUMN_PAGE_H
-#define PARQUET_COLUMN_PAGE_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
+#include "parquet/size_statistics.h"
 #include "parquet/statistics.h"
 #include "parquet/types.h"
-#include "parquet/util/memory.h"
 
 namespace parquet {
 
@@ -59,75 +59,87 @@ class Page {
   PageType::type type_;
 };
 
+/// \brief Base type for DataPageV1 and DataPageV2 including common attributes
 class DataPage : public Page {
  public:
-  DataPage(const std::shared_ptr<Buffer>& buffer, int32_t num_values,
-           Encoding::type encoding, Encoding::type definition_level_encoding,
-           Encoding::type repetition_level_encoding,
-           const EncodedStatistics& statistics = EncodedStatistics())
-      : Page(buffer, PageType::DATA_PAGE),
+  int32_t num_values() const { return num_values_; }
+  Encoding::type encoding() const { return encoding_; }
+  int64_t uncompressed_size() const { return uncompressed_size_; }
+  const EncodedStatistics& statistics() const { return statistics_; }
+  /// Return the row ordinal within the row group to the first row in the data page.
+  /// Currently it is only present from data pages created by ColumnWriter in order
+  /// to collect page index.
+  std::optional<int64_t> first_row_index() const { return first_row_index_; }
+  const SizeStatistics& size_statistics() const { return size_statistics_; }
+
+  virtual ~DataPage() = default;
+
+ protected:
+  DataPage(PageType::type type, const std::shared_ptr<Buffer>& buffer, int32_t num_values,
+           Encoding::type encoding, int64_t uncompressed_size,
+           EncodedStatistics statistics, std::optional<int64_t> first_row_index,
+           SizeStatistics size_statistics)
+      : Page(buffer, type),
         num_values_(num_values),
         encoding_(encoding),
+        uncompressed_size_(uncompressed_size),
+        statistics_(std::move(statistics)),
+        first_row_index_(std::move(first_row_index)),
+        size_statistics_(std::move(size_statistics)) {}
+
+  int32_t num_values_;
+  Encoding::type encoding_;
+  int64_t uncompressed_size_;
+  EncodedStatistics statistics_;
+  /// Row ordinal within the row group to the first row in the data page.
+  std::optional<int64_t> first_row_index_;
+  SizeStatistics size_statistics_;
+};
+
+class DataPageV1 : public DataPage {
+ public:
+  DataPageV1(const std::shared_ptr<Buffer>& buffer, int32_t num_values,
+             Encoding::type encoding, Encoding::type definition_level_encoding,
+             Encoding::type repetition_level_encoding, int64_t uncompressed_size,
+             EncodedStatistics statistics = EncodedStatistics(),
+             std::optional<int64_t> first_row_index = std::nullopt,
+             SizeStatistics size_statistics = SizeStatistics())
+      : DataPage(PageType::DATA_PAGE, buffer, num_values, encoding, uncompressed_size,
+                 std::move(statistics), std::move(first_row_index),
+                 std::move(size_statistics)),
         definition_level_encoding_(definition_level_encoding),
-        repetition_level_encoding_(repetition_level_encoding),
-        statistics_(statistics) {}
-
-  int32_t num_values() const { return num_values_; }
-
-  Encoding::type encoding() const { return encoding_; }
+        repetition_level_encoding_(repetition_level_encoding) {}
 
   Encoding::type repetition_level_encoding() const { return repetition_level_encoding_; }
 
   Encoding::type definition_level_encoding() const { return definition_level_encoding_; }
 
-  const EncodedStatistics& statistics() const { return statistics_; }
-
  private:
-  int32_t num_values_;
-  Encoding::type encoding_;
   Encoding::type definition_level_encoding_;
   Encoding::type repetition_level_encoding_;
-  EncodedStatistics statistics_;
 };
 
-class CompressedDataPage : public DataPage {
- public:
-  CompressedDataPage(const std::shared_ptr<Buffer>& buffer, int32_t num_values,
-                     Encoding::type encoding, Encoding::type definition_level_encoding,
-                     Encoding::type repetition_level_encoding, int64_t uncompressed_size,
-                     const EncodedStatistics& statistics = EncodedStatistics())
-      : DataPage(buffer, num_values, encoding, definition_level_encoding,
-                 repetition_level_encoding, statistics),
-        uncompressed_size_(uncompressed_size) {}
-
-  int64_t uncompressed_size() const { return uncompressed_size_; }
-
- private:
-  int64_t uncompressed_size_;
-};
-
-class DataPageV2 : public Page {
+class DataPageV2 : public DataPage {
  public:
   DataPageV2(const std::shared_ptr<Buffer>& buffer, int32_t num_values, int32_t num_nulls,
              int32_t num_rows, Encoding::type encoding,
              int32_t definition_levels_byte_length, int32_t repetition_levels_byte_length,
-             bool is_compressed = false)
-      : Page(buffer, PageType::DATA_PAGE_V2),
-        num_values_(num_values),
+             int64_t uncompressed_size, bool is_compressed = false,
+             EncodedStatistics statistics = EncodedStatistics(),
+             std::optional<int64_t> first_row_index = std::nullopt,
+             SizeStatistics size_statistics = SizeStatistics())
+      : DataPage(PageType::DATA_PAGE_V2, buffer, num_values, encoding, uncompressed_size,
+                 std::move(statistics), std::move(first_row_index),
+                 std::move(size_statistics)),
         num_nulls_(num_nulls),
         num_rows_(num_rows),
-        encoding_(encoding),
         definition_levels_byte_length_(definition_levels_byte_length),
         repetition_levels_byte_length_(repetition_levels_byte_length),
         is_compressed_(is_compressed) {}
 
-  int32_t num_values() const { return num_values_; }
-
   int32_t num_nulls() const { return num_nulls_; }
 
   int32_t num_rows() const { return num_rows_; }
-
-  Encoding::type encoding() const { return encoding_; }
 
   int32_t definition_levels_byte_length() const { return definition_levels_byte_length_; }
 
@@ -136,15 +148,11 @@ class DataPageV2 : public Page {
   bool is_compressed() const { return is_compressed_; }
 
  private:
-  int32_t num_values_;
   int32_t num_nulls_;
   int32_t num_rows_;
-  Encoding::type encoding_;
   int32_t definition_levels_byte_length_;
   int32_t repetition_levels_byte_length_;
   bool is_compressed_;
-
-  // TODO(wesm): format::DataPageHeaderV2.statistics
 };
 
 class DictionaryPage : public Page {
@@ -169,5 +177,3 @@ class DictionaryPage : public Page {
 };
 
 }  // namespace parquet
-
-#endif  // PARQUET_COLUMN_PAGE_H

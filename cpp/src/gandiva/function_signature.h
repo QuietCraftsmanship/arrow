@@ -15,35 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_FUNCTION_SIGNATURE_H
-#define GANDIVA_FUNCTION_SIGNATURE_H
+#pragma once
 
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "gandiva/arrow.h"
-#include "gandiva/logging.h"
+#include "gandiva/visibility.h"
 
 namespace gandiva {
 
 /// \brief Signature for a function : includes the base name, input param types and
 /// output types.
-class FunctionSignature {
+class GANDIVA_EXPORT FunctionSignature {
  public:
-  FunctionSignature(const std::string& base_name, const DataTypeVector& param_types,
-                    DataTypePtr ret_type)
-      : base_name_(base_name), param_types_(param_types), ret_type_(ret_type) {
-    DCHECK_GT(base_name.length(), 0);
-    for (auto it = param_types_.begin(); it != param_types_.end(); it++) {
-      DCHECK(*it);
-    }
-    DCHECK(ret_type);
-  }
+  FunctionSignature(std::string base_name, DataTypeVector param_types,
+                    DataTypePtr ret_type);
 
   bool operator==(const FunctionSignature& other) const;
 
-  /// calculated based on base_name, datatpype id of parameters and datatype id
+  /// calculated based on name, datatype id of parameters and datatype id
   /// of return type.
   std::size_t Hash() const;
 
@@ -56,17 +47,9 @@ class FunctionSignature {
   std::string ToString() const;
 
  private:
-  // TODO : for some of the types, this shouldn't match type specific data. eg. for
-  // decimals, this shouldn't match precision/scale.
-  bool DataTypeEquals(const DataTypePtr left, const DataTypePtr right) const {
-    return left->Equals(right);
-  }
-
   std::string base_name_;
   DataTypeVector param_types_;
   DataTypePtr ret_type_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_FUNCTION_SIGNATURE_H

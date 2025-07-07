@@ -16,34 +16,118 @@
 # under the License.
 
 class SchemaTest < Test::Unit::TestCase
+  include Helper::Omittable
+
   def setup
     @count_field = Arrow::Field.new("count", :uint32)
     @visible_field = Arrow::Field.new("visible", :boolean)
-    @schema = Arrow::Schema.new([@count_field, @visible_field])
   end
 
-  sub_test_case("#[]") do
-    test("[String]") do
-      assert_equal([@count_field, @visible_field],
-                   [@schema["count"], @schema["visible"]])
+  sub_test_case(".new") do
+    test("[Arrow::Field]") do
+      fields = [
+        @count_field,
+        @visible_field,
+      ]
+      assert_equal("count: uint32\n" +
+                   "visible: bool",
+                   Arrow::Schema.new(fields).to_s)
     end
 
-    test("[Symbol]") do
-      assert_equal([@count_field, @visible_field],
-                   [@schema[:count], @schema[:visible]])
+    test("[Arrow::Field, Hash]") do
+      fields = [
+        @count_field,
+        {name: "visible", type: :boolean},
+      ]
+      assert_equal("count: uint32\n" +
+                   "visible: bool",
+                   Arrow::Schema.new(fields).to_s)
     end
 
-    test("[Integer]") do
-      assert_equal([@count_field, @visible_field],
-                   [@schema[0], @schema[1]])
+    test("{String, Symbol => Arrow::DataType}") do
+      fields = {
+        "count" => Arrow::UInt32DataType.new,
+        :visible => :boolean,
+      }
+      assert_equal("count: uint32\n" +
+                   "visible: bool",
+                   Arrow::Schema.new(fields).to_s)
     end
 
-    test("[invalid]") do
-      invalid = []
-      message = "field name or index must be String, Symbol or Integer"
-      message << ": <#{invalid.inspect}>"
-      assert_raise(ArgumentError.new(message)) do
-        @schema[invalid]
+    test("{String, Symbol => Hash}") do
+      fields = {
+        "count" => {type: :uint32},
+        :tags => {
+          type: :list,
+          field: {
+            name: "tag",
+            type: :string,
+          },
+        },
+      }
+      assert_equal("count: uint32\n" +
+                   "tags: list<tag: string>",
+                   Arrow::Schema.new(fields).to_s)
+    end
+  end
+
+  sub_test_case("instance methods") do
+    def setup
+      super
+      @schema = Arrow::Schema.new([@count_field, @visible_field])
+    end
+
+    sub_test_case("#[]") do
+      test("[String]") do
+        assert_equal([@count_field, @visible_field],
+                     [@schema["count"], @schema["visible"]])
+      end
+
+      test("[Symbol]") do
+        assert_equal([@count_field, @visible_field],
+                     [@schema[:count], @schema[:visible]])
+      end
+
+      test("[Integer]") do
+        assert_equal([@count_field, @visible_field],
+                     [@schema[0], @schema[1]])
+      end
+
+      test("[invalid]") do
+        invalid = []
+        message = +"field name or index must be String, Symbol or Integer"
+        message << ": <#{invalid.inspect}>"
+        assert_raise(ArgumentError.new(message)) do
+          @schema[invalid]
+        end
+      end
+    end
+
+    sub_test_case("#==") do
+      test("Arrow::Schema") do
+        assert do
+          @schema == @schema
+        end
+      end
+
+      test("not Arrow::Schema") do
+        assert do
+          not (@schema == 29)
+        end
+      end
+    end
+
+    sub_test_case("#to_s") do
+      test("show_metadata") do
+        require_gi_bindings(3, 4, 2)
+
+        schema = @schema.with_metadata("key" => "value")
+        assert_equal(<<-SCHEMA.chomp, schema.to_s(show_metadata: true))
+count: uint32
+visible: bool
+-- metadata --
+key: value
+        SCHEMA
       end
     end
   end

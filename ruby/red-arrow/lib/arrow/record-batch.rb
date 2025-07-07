@@ -15,18 +15,52 @@
 # specific language governing permissions and limitations
 # under the License.
 
-require "arrow/record-containable"
+require "arrow/raw-table-converter"
 
 module Arrow
   class RecordBatch
-    include RecordContainable
     include Enumerable
+
+    include ColumnContainable
+    include InputReferable
+    include RecordContainable
+
+    class << self
+      def new(*args)
+        n_args = args.size
+        case n_args
+        when 1
+          raw_table_converter = RawTableConverter.new(args[0])
+          n_rows = raw_table_converter.n_rows
+          schema = raw_table_converter.schema
+          values = raw_table_converter.values
+          super(schema, n_rows, values)
+        when 2
+          schema, data = args
+          RecordBatchBuilder.build(schema, data)
+        when 3
+          super
+        else
+          message = "wrong number of arguments (given #{n_args}, expected 1..3)"
+          raise ArgumentError, message
+        end
+      end
+    end
 
     alias_method :each, :each_record
 
-    alias_method :columns_raw, :columns
-    def columns
-      @columns ||= columns_raw
+    alias_method :size, :n_rows
+    alias_method :length, :n_rows
+
+    # Converts the record batch to {Arrow::Table}.
+    #
+    # @return [Arrow::Table]
+    #
+    # @since 0.12.0
+    def to_table
+      table = Table.new(schema, [self])
+      share_input(table)
+      table
     end
 
     def respond_to_missing?(name, include_private)

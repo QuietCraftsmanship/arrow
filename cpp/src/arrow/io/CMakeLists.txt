@@ -18,28 +18,32 @@
 # ----------------------------------------------------------------------
 # arrow_io : Arrow IO interfaces
 
-ADD_ARROW_TEST(io-buffered-test)
-ADD_ARROW_TEST(io-compressed-test)
-ADD_ARROW_TEST(io-file-test)
+add_arrow_test(buffered_test PREFIX "arrow-io")
+add_arrow_test(compressed_test PREFIX "arrow-io")
+add_arrow_test(file_test PREFIX "arrow-io")
 
-if (ARROW_HDFS AND NOT ARROW_BOOST_HEADER_ONLY)
-  ADD_ARROW_TEST(io-hdfs-test NO_VALGRIND)
+if(ARROW_HDFS)
+  add_arrow_test(hdfs_test
+                 NO_VALGRIND
+                 PREFIX
+                 "arrow-io"
+                 EXTRA_LINK_LIBS
+                 arrow::hadoop
+                 Boost::filesystem
+                 Boost::system)
 endif()
 
-ADD_ARROW_TEST(io-memory-test)
-ADD_ARROW_TEST(io-readahead-test)
+add_arrow_test(memory_test PREFIX "arrow-io")
 
-ADD_ARROW_BENCHMARK(io-file-benchmark)
-ADD_ARROW_BENCHMARK(io-memory-benchmark)
+add_arrow_benchmark(file_benchmark PREFIX "arrow-io")
+
+if(NOT (${ARROW_SIMD_LEVEL} STREQUAL "NONE") AND NOT (${ARROW_SIMD_LEVEL} STREQUAL "NEON"
+                                                     ))
+  # This benchmark either requires SSE4.2 or ARMV8 SIMD to be enabled
+  add_arrow_benchmark(memory_benchmark PREFIX "arrow-io")
+endif()
+
+add_arrow_benchmark(compressed_benchmark PREFIX "arrow-io")
 
 # Headers: top level
-install(FILES
-  api.h
-  buffered.h
-  compressed.h
-  file.h
-  hdfs.h
-  interfaces.h
-  memory.h
-  readahead.h
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/io")
+arrow_install_all_headers("arrow/io")

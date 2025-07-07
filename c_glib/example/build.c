@@ -33,13 +33,13 @@ main(int argc, char **argv)
 
     builder = garrow_int32_array_builder_new();
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 29, &error);
+      success = garrow_int32_array_builder_append_value(builder, 29, &error);
     }
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 2929, &error);
+      success = garrow_int32_array_builder_append_value(builder, 2929, &error);
     }
     if (success) {
-      success = garrow_int32_array_builder_append(builder, 292929, &error);
+      success = garrow_int32_array_builder_append_value(builder, 292929, &error);
     }
     if (!success) {
       g_print("failed to append: %s\n", error->message);
@@ -66,8 +66,7 @@ main(int argc, char **argv)
       gint32 value;
 
       value = garrow_int32_array_get_value(GARROW_INT32_ARRAY(array), i);
-      g_print("array[%" G_GINT64_FORMAT "] = %d\n",
-              i, value);
+      g_print("array[%" G_GINT64_FORMAT "] = %d\n", i, value);
     }
   }
 

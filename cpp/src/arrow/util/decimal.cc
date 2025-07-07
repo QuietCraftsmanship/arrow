@@ -18,252 +18,759 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <ostream>
 #include <sstream>
 #include <string>
 
 #include "arrow/status.h"
-#include "arrow/util/bit-util.h"
 #include "arrow/util/decimal.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/decimal_internal.h"
+#include "arrow/util/endian.h"
+#include "arrow/util/formatting.h"
+#include "arrow/util/int128_internal.h"
+#include "arrow/util/int_util_overflow.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
+#include "arrow/util/value_parsing.h"
 
 namespace arrow {
 
-static const Decimal128 ScaleMultipliers[] = {
-    Decimal128(0LL),
-    Decimal128(10LL),
-    Decimal128(100LL),
-    Decimal128(1000LL),
-    Decimal128(10000LL),
-    Decimal128(100000LL),
-    Decimal128(1000000LL),
-    Decimal128(10000000LL),
-    Decimal128(100000000LL),
-    Decimal128(1000000000LL),
-    Decimal128(10000000000LL),
-    Decimal128(100000000000LL),
-    Decimal128(1000000000000LL),
-    Decimal128(10000000000000LL),
-    Decimal128(100000000000000LL),
-    Decimal128(1000000000000000LL),
-    Decimal128(10000000000000000LL),
-    Decimal128(100000000000000000LL),
-    Decimal128(1000000000000000000LL),
-    Decimal128(0LL, 10000000000000000000ULL),
-    Decimal128(5LL, 7766279631452241920ULL),
-    Decimal128(54LL, 3875820019684212736ULL),
-    Decimal128(542LL, 1864712049423024128ULL),
-    Decimal128(5421LL, 200376420520689664ULL),
-    Decimal128(54210LL, 2003764205206896640ULL),
-    Decimal128(542101LL, 1590897978359414784ULL),
-    Decimal128(5421010LL, 15908979783594147840ULL),
-    Decimal128(54210108LL, 11515845246265065472ULL),
-    Decimal128(542101086LL, 4477988020393345024ULL),
-    Decimal128(5421010862LL, 7886392056514347008ULL),
-    Decimal128(54210108624LL, 5076944270305263616ULL),
-    Decimal128(542101086242LL, 13875954555633532928ULL),
-    Decimal128(5421010862427LL, 9632337040368467968ULL),
-    Decimal128(54210108624275LL, 4089650035136921600ULL),
-    Decimal128(542101086242752LL, 4003012203950112768ULL),
-    Decimal128(5421010862427522LL, 3136633892082024448ULL),
-    Decimal128(54210108624275221LL, 12919594847110692864ULL),
-    Decimal128(542101086242752217LL, 68739955140067328ULL),
-    Decimal128(5421010862427522170LL, 687399551400673280ULL)};
+using internal::SafeLeftShift;
+using internal::SafeSignedAdd;
+using internal::uint128_t;
 
-static constexpr uint64_t kIntMask = 0xFFFFFFFF;
-static constexpr auto kCarryBit = static_cast<uint64_t>(1) << static_cast<uint64_t>(32);
+namespace {
 
-Decimal128::Decimal128(const std::string& str) : Decimal128() {
-  Status status(Decimal128::FromString(str, this));
-  DCHECK(status.ok()) << status.message();
-}
-
-Decimal128::Decimal128(const uint8_t* bytes)
-    : Decimal128(BitUtil::FromLittleEndian(reinterpret_cast<const int64_t*>(bytes)[1]),
-                 BitUtil::FromLittleEndian(reinterpret_cast<const uint64_t*>(bytes)[0])) {
-}
-
-std::array<uint8_t, 16> Decimal128::ToBytes() const {
-  std::array<uint8_t, 16> out{{0}};
-  ToBytes(out.data());
-  return out;
-}
-
-void Decimal128::ToBytes(uint8_t* out) const {
-  DCHECK_NE(out, nullptr);
-  reinterpret_cast<uint64_t*>(out)[0] = BitUtil::ToLittleEndian(low_bits_);
-  reinterpret_cast<int64_t*>(out)[1] = BitUtil::ToLittleEndian(high_bits_);
-}
-
-static constexpr Decimal128 kTenTo36(static_cast<int64_t>(0xC097CE7BC90715),
-                                     0xB34B9F1000000000);
-static constexpr Decimal128 kTenTo18(0xDE0B6B3A7640000);
-
-std::string Decimal128::ToIntegerString() const {
-  Decimal128 remainder;
-  std::stringstream buf;
-  bool need_fill = false;
-
-  // get anything above 10 ** 36 and print it
-  Decimal128 top;
-  Status s = Divide(kTenTo36, &top, &remainder);
-  DCHECK(s.ok()) << s.message();
-
-  if (top != 0) {
-    buf << static_cast<int64_t>(top);
-    remainder.Abs();
-    need_fill = true;
+struct BaseDecimalRealConversion {
+  // Return 10**exp, with a fast lookup, assuming `exp` is within bounds
+  template <typename Real>
+  static Real PowerOfTen(int32_t exp) {
+    constexpr int N = kPrecomputedPowersOfTen;
+    DCHECK(exp >= -N && exp <= N);
+    return RealTraits<Real>::powers_of_ten()[exp + N];
   }
 
-  // now get anything above 10 ** 18 and print it
-  Decimal128 tail;
-  s = remainder.Divide(kTenTo18, &top, &tail);
-
-  if (need_fill || top != 0) {
-    if (need_fill) {
-      buf << std::setw(18) << std::setfill('0');
+  // Return 10**exp, with a fast lookup if possible
+  template <typename Real>
+  static Real LargePowerOfTen(int32_t exp) {
+    constexpr int N = kPrecomputedPowersOfTen;
+    if (ARROW_PREDICT_TRUE(exp >= -N && exp <= N)) {
+      return RealTraits<Real>::powers_of_ten()[exp + N];
     } else {
-      need_fill = true;
-      tail.Abs();
+      return std::pow(static_cast<Real>(10), static_cast<Real>(exp));
+    }
+  }
+};
+
+template <typename DecimalType, typename Derived>
+struct DecimalRealConversion : public BaseDecimalRealConversion {
+  using DecimalTypeTraits = DecimalTraits<DecimalType>;
+
+  static constexpr int kMaxPrecision = DecimalType::kMaxPrecision;
+  static constexpr int kMaxScale = DecimalType::kMaxScale;
+
+  static const auto& DecimalPowerOfTen(int exp) {
+    DCHECK(exp >= 0 && exp <= kMaxPrecision);
+    return DecimalTypeTraits::powers_of_ten()[exp];
+  }
+
+  template <typename Real>
+  static Status OverflowError(Real real, int precision, int scale) {
+    return Status::Invalid("Cannot convert ", real, " to ", DecimalTypeTraits::kTypeName,
+                           "(precision = ", precision, ", scale = ", scale,
+                           "): overflow");
+  }
+
+  template <typename Real>
+  static Result<DecimalType> FromPositiveReal(Real real, int32_t precision,
+                                              int32_t scale) {
+    constexpr int kMantissaBits = RealTraits<Real>::kMantissaBits;
+    constexpr int kMantissaDigits = RealTraits<Real>::kMantissaDigits;
+
+    // to avoid precision and rounding issues, we'll unconditionally
+    // throw Decimal32 to the approx algorithm instead. (GH-44216)
+    if constexpr (std::is_base_of_v<BasicDecimal32, DecimalType>) {
+      return Derived::FromPositiveRealApprox(real, precision, scale);
     }
 
-    buf << static_cast<int64_t>(top);
+    // Problem statement: construct the Decimal with the value
+    // closest to `real * 10^scale`.
+    if (scale < 0) {
+      // Negative scales are not handled below, fall back to approx algorithm
+      return Derived::FromPositiveRealApprox(real, precision, scale);
+    }
+
+    // 1. Check that `real` is within acceptable bounds.
+    const Real limit = PowerOfTen<Real>(precision - scale);
+    if (real > limit) {
+      // Checking the limit early helps ensure the computations below do not
+      // overflow.
+      // NOTE: `limit` is allowed here as rounding can make it smaller than
+      // the theoretical limit (for example, 1.0e23 < 10^23).
+      return OverflowError(real, precision, scale);
+    }
+
+    // The algorithm below requires the destination decimal type
+    // to be strictly more precise than the source float type
+    // (see `kSafeMulByTenTo` calculation).
+    if constexpr (kMaxPrecision <= kMantissaDigits) {
+      return Derived::FromPositiveRealApprox(real, precision, scale);
+    }
+
+    // 2. Losslessly convert `real` to `mant * 2**k`
+    int binary_exp = 0;
+    const Real real_mant = std::frexp(real, &binary_exp);
+    // `real_mant` is within 0.5 and 1 and has M bits of precision.
+    // Multiply it by 2^M to get an exact integer.
+    const uint64_t mant = static_cast<uint64_t>(std::ldexp(real_mant, kMantissaBits));
+    const int k = binary_exp - kMantissaBits;
+    // (note that `real = mant * 2^k`)
+
+    // 3. Start with `mant`.
+    // We want to end up with `real * 10^scale` i.e. `mant * 2^k * 10^scale`.
+    DecimalType x(mant);
+
+    if (k < 0) {
+      // k < 0 (i.e. binary_exp < kMantissaBits), is probably the common case
+      // when converting to decimal. It implies right-shifting by -k bits,
+      // while multiplying by 10^scale. We also must avoid overflow (losing
+      // bits on the left) and precision loss (losing bits on the right).
+      int right_shift_by = -k;
+      int mul_by_ten_to = scale;
+
+      // At this point, `x` has kMantissaDigits significant digits but it can
+      // fit kMaxPrecision (excluding sign). We can therefore multiply by up
+      // to 10^(kMaxPrecision - kMantissaDigits).
+      constexpr int kSafeMulByTenTo = kMaxPrecision - kMantissaDigits;
+
+      if (mul_by_ten_to <= kSafeMulByTenTo) {
+        // Scale is small enough, so we can do it all at once.
+        x *= DecimalPowerOfTen(mul_by_ten_to);
+        x = Derived::RoundedRightShift(x, right_shift_by);
+      } else {
+        // Scale is too large, we cannot multiply at once without overflow.
+        // We use an iterative algorithm which alternately shifts left by
+        // multiplying by a power of ten, and shifts right by a number of bits.
+
+        // First multiply `x` by as large a power of ten as possible
+        // without overflowing.
+        x *= DecimalPowerOfTen(kSafeMulByTenTo);
+        mul_by_ten_to -= kSafeMulByTenTo;
+
+        // `x` now has full precision. However, we know we'll only
+        // keep `precision` digits at the end. Extraneous bits/digits
+        // on the right can be safely shifted away, before multiplying
+        // again.
+        // NOTE: if `precision` is the full precision then the algorithm will
+        // lose the last digit. If `precision` is almost the full precision,
+        // there can be an off-by-one error due to rounding.
+        const int mul_step = std::max(1, kMaxPrecision - precision);
+
+        // The running exponent, useful to compute by how much we must
+        // shift right to make place on the left before the next multiply.
+        int total_exp = 0;
+        int total_shift = 0;
+        while (mul_by_ten_to > 0 && right_shift_by > 0) {
+          const int exp = std::min(mul_by_ten_to, mul_step);
+          total_exp += exp;
+          // The supplementary right shift required so that
+          // `x * 10^total_exp / 2^total_shift` fits in the decimal.
+          DCHECK_LT(static_cast<size_t>(total_exp), sizeof(kCeilLog2PowersOfTen));
+          const int bits =
+              std::min(right_shift_by, kCeilLog2PowersOfTen[total_exp] - total_shift);
+          total_shift += bits;
+          // Right shift to make place on the left, then multiply
+          x = Derived::RoundedRightShift(x, bits);
+          right_shift_by -= bits;
+          // Should not overflow thanks to the precautions taken
+          x *= DecimalPowerOfTen(exp);
+          mul_by_ten_to -= exp;
+        }
+        if (mul_by_ten_to > 0) {
+          x *= DecimalPowerOfTen(mul_by_ten_to);
+        }
+        if (right_shift_by > 0) {
+          x = Derived::RoundedRightShift(x, right_shift_by);
+        }
+      }
+    } else {
+      // k >= 0 implies left-shifting by k bits and multiplying by 10^scale.
+      // The order of these operations therefore doesn't matter. We know
+      // we won't overflow because of the limit check above, and we also
+      // won't lose any significant bits on the right.
+      x *= DecimalPowerOfTen(scale);
+      x <<= k;
+    }
+
+    // Rounding might have pushed `x` just above the max precision, check again
+    if (!x.FitsInPrecision(precision)) {
+      return OverflowError(real, precision, scale);
+    }
+    return x;
   }
 
-  // finally print the tail, which is less than 10**18
-  if (need_fill) {
-    buf << std::setw(18) << std::setfill('0');
+  template <typename Real>
+  static Result<DecimalType> FromReal(Real x, int32_t precision, int32_t scale) {
+    DCHECK_GT(precision, 0);
+    DCHECK_LE(precision, kMaxPrecision);
+    DCHECK_GE(scale, -kMaxScale);
+    DCHECK_LE(scale, kMaxScale);
+
+    if (!std::isfinite(x)) {
+      return Status::Invalid("Cannot convert ", x, " to Decimal128");
+    }
+    if (x == 0) {
+      return DecimalType{};
+    }
+    if (x < 0) {
+      ARROW_ASSIGN_OR_RAISE(auto dec, FromPositiveReal(-x, precision, scale));
+      return dec.Negate();
+    } else {
+      return FromPositiveReal(x, precision, scale);
+    }
   }
-  buf << static_cast<int64_t>(tail);
-  return buf.str();
+
+  template <typename Real>
+  static Real ToReal(const DecimalType& decimal, int32_t scale) {
+    DCHECK_GE(scale, -kMaxScale);
+    DCHECK_LE(scale, kMaxScale);
+    if (decimal.IsNegative()) {
+      // Convert the absolute value to avoid precision loss
+      auto abs = decimal;
+      abs.Negate();
+      return -Derived::template ToRealPositive<Real>(abs, scale);
+    } else {
+      return Derived::template ToRealPositive<Real>(decimal, scale);
+    }
+  }
+};
+
+struct Decimal32RealConversion
+    : public DecimalRealConversion<Decimal32, Decimal32RealConversion> {
+  using Base = DecimalRealConversion<Decimal32, Decimal32RealConversion>;
+  using Base::LargePowerOfTen;
+  using Base::PowerOfTen;
+
+  static Decimal32 RoundedRightShift(const Decimal32& x, int bits) {
+    // currently we *only* push to the Approx method for Decimal32
+    // so this should never get called.
+    DCHECK(false);
+    return x;
+  }
+
+  template <typename Real>
+  static Result<Decimal32> FromPositiveRealApprox(Real real, int32_t precision,
+                                                  int32_t scale) {
+    const auto x = std::nearbyint(real * PowerOfTen<Real>(scale));
+    const auto max_abs = PowerOfTen<Real>(precision);
+    if (x <= -max_abs || x >= max_abs) {
+      return OverflowError(real, precision, scale);
+    }
+
+    return Decimal32(static_cast<int32_t>(x));
+  }
+
+  template <typename Real>
+  static Real ToRealPositiveNoSplit(const Decimal32& decimal, int32_t scale) {
+    Real x = static_cast<Real>(decimal.value());
+    x *= LargePowerOfTen<Real>(-scale);
+    return x;
+  }
+
+  template <typename Real>
+  static Real ToRealPositive(const Decimal32& decimal, int32_t scale) {
+    if (scale <= 0 || uint64_t(decimal.value()) <= RealTraits<Real>::kMaxPreciseInteger) {
+      return ToRealPositiveNoSplit<Real>(decimal, scale);
+    }
+
+    Decimal32 whole_decimal, fraction_decimal;
+    decimal.GetWholeAndFraction(scale, &whole_decimal, &fraction_decimal);
+
+    Real whole = ToRealPositiveNoSplit<Real>(whole_decimal, 0);
+    Real fraction = ToRealPositiveNoSplit<Real>(fraction_decimal, scale);
+
+    return whole + fraction;
+  }
+};
+
+struct Decimal64RealConversion
+    : public DecimalRealConversion<Decimal64, Decimal64RealConversion> {
+  using Base = DecimalRealConversion<Decimal64, Decimal64RealConversion>;
+  using Base::LargePowerOfTen;
+  using Base::PowerOfTen;
+
+  static Decimal64 RoundedRightShift(const Decimal64& x, int bits) {
+    if (bits == 0) {
+      return x;
+    }
+
+    int64_t result = x.value();
+    uint64_t shifted = 0;
+    if (bits > 0) {
+      shifted = (static_cast<uint64_t>(result) << (64 - bits));
+      result >>= bits;
+    }
+    constexpr uint64_t kHalf = 0x8000000000000000ULL;
+    if (shifted > kHalf) {
+      // strictly more than half => round up
+      result += 1;
+    } else if (shifted == kHalf) {
+      // exactly half => round to even
+      if ((result & 1) != 0) {
+        result += 1;
+      }
+    } else {
+      // strictly less than half => round down
+    }
+    return Decimal64(result);
+  }
+
+  template <typename Real>
+  static Result<Decimal64> FromPositiveRealApprox(Real real, int32_t precision,
+                                                  int32_t scale) {
+    const auto x = std::nearbyint(real * PowerOfTen<Real>(scale));
+    const auto max_abs = PowerOfTen<Real>(precision);
+    if (x <= -max_abs || x >= max_abs) {
+      return OverflowError(real, precision, scale);
+    }
+
+    return Decimal64(static_cast<int64_t>(x));
+  }
+
+  template <typename Real>
+  static Real ToRealPositiveNoSplit(const Decimal64& decimal, int32_t scale) {
+    Real x = static_cast<Real>(decimal.value());
+    x *= LargePowerOfTen<Real>(-scale);
+    return x;
+  }
+
+  template <typename Real>
+  static Real ToRealPositive(const Decimal64& decimal, int32_t scale) {
+    if (scale <= 0 || uint64_t(decimal.value()) <= RealTraits<Real>::kMaxPreciseInteger) {
+      return ToRealPositiveNoSplit<Real>(decimal, scale);
+    }
+
+    Decimal64 whole_decimal, fraction_decimal;
+    decimal.GetWholeAndFraction(scale, &whole_decimal, &fraction_decimal);
+
+    Real whole = ToRealPositiveNoSplit<Real>(whole_decimal, 0);
+    Real fraction = ToRealPositiveNoSplit<Real>(fraction_decimal, scale);
+
+    return whole + fraction;
+  }
+};
+
+struct Decimal128RealConversion
+    : public DecimalRealConversion<Decimal128, Decimal128RealConversion> {
+  using Base = DecimalRealConversion<Decimal128, Decimal128RealConversion>;
+  using Base::LargePowerOfTen;
+  using Base::PowerOfTen;
+
+  // Right shift positive `x` by positive `bits`, rounded half to even
+  static Decimal128 RoundedRightShift(const Decimal128& x, int bits) {
+    if (bits == 0) {
+      return x;
+    }
+    int64_t result_hi = x.high_bits();
+    uint64_t result_lo = x.low_bits();
+    uint64_t shifted = 0;
+    while (bits >= 64) {
+      // Retain the information that set bits were shifted right.
+      // This is important to detect an exact half.
+      shifted = result_lo | (shifted > 0);
+      result_lo = result_hi;
+      result_hi >>= 63;  // for sign
+      bits -= 64;
+    }
+    if (bits > 0) {
+      shifted = (result_lo << (64 - bits)) | (shifted > 0);
+      result_lo >>= bits;
+      result_lo |= static_cast<uint64_t>(result_hi) << (64 - bits);
+      result_hi >>= bits;
+    }
+    // We almost have our result, but now do the rounding.
+    constexpr uint64_t kHalf = 0x8000000000000000ULL;
+    if (shifted > kHalf) {
+      // Strictly more than half => round up
+      result_lo += 1;
+      result_hi += (result_lo == 0);
+    } else if (shifted == kHalf) {
+      // Exactly half => round to even
+      if ((result_lo & 1) != 0) {
+        result_lo += 1;
+        result_hi += (result_lo == 0);
+      }
+    } else {
+      // Strictly less than half => round down
+    }
+    return Decimal128{result_hi, result_lo};
+  }
+
+  template <typename Real>
+  static Result<Decimal128> FromPositiveRealApprox(Real real, int32_t precision,
+                                                   int32_t scale) {
+    // Approximate algorithm that operates in the FP domain (thus subject
+    // to precision loss).
+    const auto x = std::nearbyint(real * PowerOfTen<double>(scale));
+    const auto max_abs = PowerOfTen<double>(precision);
+    if (x <= -max_abs || x >= max_abs) {
+      return OverflowError(real, precision, scale);
+    }
+    // Extract high and low bits
+    const auto high = std::floor(std::ldexp(x, -64));
+    const auto low = x - std::ldexp(high, 64);
+
+    DCHECK_GE(high, 0);
+    DCHECK_LT(high, 9.223372036854776e+18);  // 2**63
+    DCHECK_GE(low, 0);
+    DCHECK_LT(low, 1.8446744073709552e+19);  // 2**64
+    return Decimal128(static_cast<int64_t>(high), static_cast<uint64_t>(low));
+  }
+
+  template <typename Real>
+  static Real ToRealPositiveNoSplit(const Decimal128& decimal, int32_t scale) {
+    Real x = RealTraits<Real>::two_to_64(static_cast<Real>(decimal.high_bits()));
+    x += static_cast<Real>(decimal.low_bits());
+    x *= LargePowerOfTen<Real>(-scale);
+    return x;
+  }
+
+  /// An approximate conversion from Decimal128 to Real that guarantees:
+  /// 1. If the decimal is an integer, the conversion is exact.
+  /// 2. If the number of fractional digits is <= RealTraits<Real>::kMantissaDigits (e.g.
+  ///    8 for float and 16 for double), the conversion is within 1 ULP of the exact
+  ///    value.
+  /// 3. Otherwise, the conversion is within 2^(-RealTraits<Real>::kMantissaDigits+1)
+  ///    (e.g. 2^-23 for float and 2^-52 for double) of the exact value.
+  /// Here "exact value" means the closest representable value by Real.
+  template <typename Real>
+  static Real ToRealPositive(const Decimal128& decimal, int32_t scale) {
+    if (scale <= 0 || (decimal.high_bits() == 0 &&
+                       decimal.low_bits() <= RealTraits<Real>::kMaxPreciseInteger)) {
+      // No need to split the decimal if it is already an integer (scale <= 0) or if it
+      // can be precisely represented by Real
+      return ToRealPositiveNoSplit<Real>(decimal, scale);
+    }
+
+    // Split decimal into whole and fractional parts to avoid precision loss
+    BasicDecimal128 whole_decimal, fraction_decimal;
+    decimal.GetWholeAndFraction(scale, &whole_decimal, &fraction_decimal);
+
+    Real whole = ToRealPositiveNoSplit<Real>(whole_decimal, 0);
+    Real fraction = ToRealPositiveNoSplit<Real>(fraction_decimal, scale);
+
+    return whole + fraction;
+  }
+};
+
+}  // namespace
+
+Decimal32::Decimal32(const std::string& str) : Decimal32() {
+  *this = FromString(str).ValueOrDie();
+}
+
+Result<Decimal32> Decimal32::FromReal(float x, int32_t precision, int32_t scale) {
+  return Decimal32RealConversion::FromReal(x, precision, scale);
+}
+
+Result<Decimal32> Decimal32::FromReal(double x, int32_t precision, int32_t scale) {
+  return Decimal32RealConversion::FromReal(x, precision, scale);
+}
+
+float Decimal32::ToFloat(int32_t scale) const {
+  return Decimal32RealConversion::ToReal<float>(*this, scale);
+}
+
+double Decimal32::ToDouble(int32_t scale) const {
+  return Decimal32RealConversion::ToReal<double>(*this, scale);
+}
+
+std::string Decimal32::ToIntegerString() const {
+  std::string result;
+  internal::StringFormatter<Int32Type> format;
+  format(value_, [&result](std::string_view formatted) {
+    result.append(formatted.data(), formatted.size());
+  });
+  return result;
+}
+
+Decimal32::operator int64_t() const { return static_cast<int64_t>(value_); }
+
+Decimal32::operator Decimal64() const { return Decimal64(static_cast<int64_t>(value_)); }
+
+Decimal64::Decimal64(const std::string& str) : Decimal64() {
+  *this = FromString(str).ValueOrDie();
+}
+
+Result<Decimal64> Decimal64::FromReal(float x, int32_t precision, int32_t scale) {
+  return Decimal64RealConversion::FromReal(x, precision, scale);
+}
+
+Result<Decimal64> Decimal64::FromReal(double x, int32_t precision, int32_t scale) {
+  return Decimal64RealConversion::FromReal(x, precision, scale);
+}
+
+float Decimal64::ToFloat(int32_t scale) const {
+  return Decimal64RealConversion::ToReal<float>(*this, scale);
+}
+
+double Decimal64::ToDouble(int32_t scale) const {
+  return Decimal64RealConversion::ToReal<double>(*this, scale);
+}
+
+std::string Decimal64::ToIntegerString() const {
+  std::string result;
+  internal::StringFormatter<Int64Type> format;
+  format(value_, [&result](std::string_view formatted) {
+    result.append(formatted.data(), formatted.size());
+  });
+  return result;
+}
+
+Decimal64::operator int64_t() const { return static_cast<int64_t>(value_); }
+
+Decimal128::Decimal128(const std::string& str) : Decimal128() {
+  *this = Decimal128::FromString(str).ValueOrDie();
+}
+
+Result<Decimal128> Decimal128::FromReal(float x, int32_t precision, int32_t scale) {
+  return Decimal128RealConversion::FromReal(x, precision, scale);
+}
+
+Result<Decimal128> Decimal128::FromReal(double x, int32_t precision, int32_t scale) {
+  return Decimal128RealConversion::FromReal(x, precision, scale);
+}
+
+float Decimal128::ToFloat(int32_t scale) const {
+  return Decimal128RealConversion::ToReal<float>(*this, scale);
+}
+
+double Decimal128::ToDouble(int32_t scale) const {
+  return Decimal128RealConversion::ToReal<double>(*this, scale);
+}
+
+template <size_t n>
+static void AppendLittleEndianArrayToString(const std::array<uint64_t, n>& array,
+                                            std::string* result) {
+  const auto most_significant_non_zero =
+      find_if(array.rbegin(), array.rend(), [](uint64_t v) { return v != 0; });
+  if (most_significant_non_zero == array.rend()) {
+    result->push_back('0');
+    return;
+  }
+
+  size_t most_significant_elem_idx = &*most_significant_non_zero - array.data();
+  std::array<uint64_t, n> copy = array;
+  constexpr uint32_t k1e9 = 1000000000U;
+  constexpr size_t kNumBits = n * 64;
+  // Segments will contain the array split into groups that map to decimal digits,
+  // in little endian order. Each segment will hold at most 9 decimal digits.
+  // For example, if the input represents 9876543210123456789, then segments will be
+  // [123456789, 876543210, 9].
+  // The max number of segments needed = ceil(kNumBits * log(2) / log(1e9))
+  // = ceil(kNumBits / 29.897352854) <= ceil(kNumBits / 29).
+  std::array<uint32_t, (kNumBits + 28) / 29> segments;
+  size_t num_segments = 0;
+  uint64_t* most_significant_elem = &copy[most_significant_elem_idx];
+  do {
+    // Compute remainder = copy % 1e9 and copy = copy / 1e9.
+    uint32_t remainder = 0;
+    uint64_t* elem = most_significant_elem;
+    do {
+      // Compute dividend = (remainder << 32) | *elem  (a virtual 96-bit integer);
+      // *elem = dividend / 1e9;
+      // remainder = dividend % 1e9.
+      uint32_t hi = static_cast<uint32_t>(*elem >> 32);
+      uint32_t lo = static_cast<uint32_t>(*elem & bit_util::LeastSignificantBitMask(32));
+      uint64_t dividend_hi = (static_cast<uint64_t>(remainder) << 32) | hi;
+      uint64_t quotient_hi = dividend_hi / k1e9;
+      remainder = static_cast<uint32_t>(dividend_hi % k1e9);
+      uint64_t dividend_lo = (static_cast<uint64_t>(remainder) << 32) | lo;
+      uint64_t quotient_lo = dividend_lo / k1e9;
+      remainder = static_cast<uint32_t>(dividend_lo % k1e9);
+      *elem = (quotient_hi << 32) | quotient_lo;
+    } while (elem-- != copy.data());
+
+    segments[num_segments++] = remainder;
+  } while (*most_significant_elem != 0 || most_significant_elem-- != copy.data());
+
+  size_t old_size = result->size();
+  size_t new_size = old_size + num_segments * 9;
+  result->resize(new_size, '0');
+  char* output = &result->at(old_size);
+  const uint32_t* segment = &segments[num_segments - 1];
+  internal::StringFormatter<UInt32Type> format;
+  // First segment is formatted as-is.
+  format(*segment, [&output](std::string_view formatted) {
+    memcpy(output, formatted.data(), formatted.size());
+    output += formatted.size();
+  });
+  while (segment != segments.data()) {
+    --segment;
+    // Right-pad formatted segment such that e.g. 123 is formatted as "000000123".
+    output += 9;
+    format(*segment, [output](std::string_view formatted) {
+      memcpy(output - formatted.size(), formatted.data(), formatted.size());
+    });
+  }
+  result->resize(output - result->data());
+}
+
+std::string Decimal128::ToIntegerString() const {
+  std::string result;
+  if (high_bits() < 0) {
+    result.push_back('-');
+    Decimal128 abs = *this;
+    abs.Negate();
+    AppendLittleEndianArrayToString<2>(
+        {abs.low_bits(), static_cast<uint64_t>(abs.high_bits())}, &result);
+  } else {
+    AppendLittleEndianArrayToString<2>({low_bits(), static_cast<uint64_t>(high_bits())},
+                                       &result);
+  }
+  return result;
 }
 
 Decimal128::operator int64_t() const {
-  DCHECK(high_bits_ == 0 || high_bits_ == -1)
-      << "Trying to cast an Decimal128 greater than the value range of a "
-         "int64_t. high_bits_ must be equal to 0 or -1, got: "
-      << high_bits_;
-  return static_cast<int64_t>(low_bits_);
+  DCHECK(high_bits() == 0 || high_bits() == -1)
+      << "Trying to cast a Decimal128 greater than the value range of a "
+         "int64_t; high_bits() must be equal to 0 or -1, got: "
+      << high_bits();
+  return static_cast<int64_t>(low_bits());
 }
 
-static std::string ToStringNegativeScale(const std::string& str,
-                                         int32_t adjusted_exponent, bool is_negative) {
-  std::stringstream buf;
-
-  size_t offset = 0;
-  buf << str[offset++];
-
-  if (is_negative) {
-    buf << str[offset++];
-  }
-
-  buf << '.' << str.substr(offset, std::string::npos) << 'E' << std::showpos
-      << adjusted_exponent;
-  return buf.str();
-}
-
-std::string Decimal128::ToString(int32_t scale) const {
-  const std::string str(ToIntegerString());
-
+static void AdjustIntegerStringWithScale(int32_t scale, std::string* str) {
   if (scale == 0) {
-    return str;
+    return;
   }
-
-  const bool is_negative = *this < 0;
-
-  const auto len = static_cast<int32_t>(str.size());
+  DCHECK(str != nullptr);
+  DCHECK(!str->empty());
+  const bool is_negative = str->front() == '-';
   const auto is_negative_offset = static_cast<int32_t>(is_negative);
-  const int32_t adjusted_exponent = -scale + (len - 1 - is_negative_offset);
+  const auto len = static_cast<int32_t>(str->size());
+  const int32_t num_digits = len - is_negative_offset;
+  const int32_t adjusted_exponent = num_digits - 1 - scale;
 
   /// Note that the -6 is taken from the Java BigDecimal documentation.
   if (scale < 0 || adjusted_exponent < -6) {
-    return ToStringNegativeScale(str, adjusted_exponent, is_negative);
+    // Example 1:
+    // Precondition: *str = "123", is_negative_offset = 0, num_digits = 3, scale = -2,
+    //               adjusted_exponent = 4
+    // After inserting decimal point: *str = "1.23"
+    // After appending exponent: *str = "1.23E+4"
+    // Example 2:
+    // Precondition: *str = "-123", is_negative_offset = 1, num_digits = 3, scale = 9,
+    //               adjusted_exponent = -7
+    // After inserting decimal point: *str = "-1.23"
+    // After appending exponent: *str = "-1.23E-7"
+    // Example 3:
+    // Precondition: *str = "0", is_negative_offset = 0, num_digits = 1, scale = -1,
+    //               adjusted_exponent = 1
+    // After inserting decimal point: *str = "0" // Not inserted
+    // After appending exponent: *str = "0E+1"
+    if (num_digits > 1) {
+      str->insert(str->begin() + 1 + is_negative_offset, '.');
+    }
+    str->push_back('E');
+    if (adjusted_exponent >= 0) {
+      str->push_back('+');
+    }
+    internal::StringFormatter<Int32Type> format;
+    format(adjusted_exponent, [str](std::string_view formatted) {
+      str->append(formatted.data(), formatted.size());
+    });
+    return;
   }
 
-  if (is_negative) {
-    if (len - 1 > scale) {
-      const auto n = static_cast<size_t>(len - scale);
-      return str.substr(0, n) + "." + str.substr(n, static_cast<size_t>(scale));
-    }
-
-    if (len - 1 == scale) {
-      return "-0." + str.substr(1, std::string::npos);
-    }
-
-    std::string result("-0." + std::string(static_cast<size_t>(scale - len + 1), '0'));
-    return result + str.substr(1, std::string::npos);
-  }
-
-  if (len > scale) {
+  if (num_digits > scale) {
     const auto n = static_cast<size_t>(len - scale);
-    return str.substr(0, n) + "." + str.substr(n, static_cast<size_t>(scale));
+    // Example 1:
+    // Precondition: *str = "123", len = num_digits = 3, scale = 1, n = 2
+    // After inserting decimal point: *str = "12.3"
+    // Example 2:
+    // Precondition: *str = "-123", len = 4, num_digits = 3, scale = 1, n = 3
+    // After inserting decimal point: *str = "-12.3"
+    str->insert(str->begin() + n, '.');
+    return;
   }
 
-  if (len == scale) {
-    return "0." + str;
-  }
-
-  return "0." + std::string(static_cast<size_t>(scale - len), '0') + str;
+  // Example 1:
+  // Precondition: *str = "123", is_negative_offset = 0, num_digits = 3, scale = 4
+  // After insert: *str = "000123"
+  // After setting decimal point: *str = "0.0123"
+  // Example 2:
+  // Precondition: *str = "-123", is_negative_offset = 1, num_digits = 3, scale = 4
+  // After insert: *str = "-000123"
+  // After setting decimal point: *str = "-0.0123"
+  str->insert(is_negative_offset, scale - num_digits + 2, '0');
+  str->at(is_negative_offset + 1) = '.';
 }
 
-static constexpr auto kInt64DecimalDigits =
-    static_cast<size_t>(std::numeric_limits<int64_t>::digits10);
-static constexpr int64_t kPowersOfTen[kInt64DecimalDigits + 1] = {1LL,
-                                                                  10LL,
-                                                                  100LL,
-                                                                  1000LL,
-                                                                  10000LL,
-                                                                  100000LL,
-                                                                  1000000LL,
-                                                                  10000000LL,
-                                                                  100000000LL,
-                                                                  1000000000LL,
-                                                                  10000000000LL,
-                                                                  100000000000LL,
-                                                                  1000000000000LL,
-                                                                  10000000000000LL,
-                                                                  100000000000000LL,
-                                                                  1000000000000000LL,
-                                                                  10000000000000000LL,
-                                                                  100000000000000000LL,
-                                                                  1000000000000000000LL};
+std::string Decimal32::ToString(int32_t scale) const {
+  if (ARROW_PREDICT_FALSE(scale < -kMaxScale || scale > kMaxScale)) {
+    return "<scale out of range, cannot format Decimal32 value>";
+  }
 
-static void StringToInteger(const std::string& str, Decimal128* out) {
-  using std::size_t;
+  std::string str(ToIntegerString());
+  AdjustIntegerStringWithScale(scale, &str);
+  return str;
+}
 
-  DCHECK_NE(out, nullptr) << "Decimal128 output variable cannot be nullptr";
-  DCHECK_EQ(*out, 0)
-      << "When converting a string to Decimal128 the initial output must be 0";
+std::string Decimal64::ToString(int32_t scale) const {
+  if (ARROW_PREDICT_FALSE(scale < -kMaxScale || scale > kMaxScale)) {
+    return "<scale out of range, cannot format Decimal64 value>";
+  }
 
-  const size_t length = str.length();
+  std::string str(ToIntegerString());
+  AdjustIntegerStringWithScale(scale, &str);
+  return str;
+}
 
-  DCHECK_GT(length, 0) << "length of parsed decimal string should be greater than 0";
+std::string Decimal128::ToString(int32_t scale) const {
+  if (ARROW_PREDICT_FALSE(scale < -kMaxScale || scale > kMaxScale)) {
+    return "<scale out of range, cannot format Decimal128 value>";
+  }
+  std::string str(ToIntegerString());
+  AdjustIntegerStringWithScale(scale, &str);
+  return str;
+}
 
-  for (size_t posn = 0; posn < length;) {
-    const size_t group = std::min(kInt64DecimalDigits, length - posn);
-    const int64_t chunk = std::stoll(str.substr(posn, group));
-    const int64_t multiple = kPowersOfTen[group];
+// Iterates over input and for each group of kInt64DecimalDigits multiple out by
+// the appropriate power of 10 necessary to add source parsed as uint64 and
+// then adds the parsed value of source.
+static inline void ShiftAndAdd(std::string_view input, uint64_t out[], size_t out_size) {
+  for (size_t posn = 0; posn < input.size();) {
+    const size_t group_size = std::min(kInt64DecimalDigits, input.size() - posn);
+    const uint64_t multiple = kUInt64PowersOfTen[group_size];
+    uint64_t chunk = 0;
+    ARROW_CHECK(
+        internal::ParseValue<UInt64Type>(input.data() + posn, group_size, &chunk));
 
-    *out *= multiple;
-    *out += chunk;
-
-    posn += group;
+    for (size_t i = 0; i < out_size; ++i) {
+      uint128_t tmp = out[i];
+      tmp *= multiple;
+      tmp += chunk;
+      out[i] = static_cast<uint64_t>(tmp & 0xFFFFFFFFFFFFFFFFULL);
+      chunk = static_cast<uint64_t>(tmp >> 64);
+    }
+    posn += group_size;
   }
 }
 
 namespace {
 
 struct DecimalComponents {
-  std::string sign;
-  std::string whole_digits;
-  std::string fractional_digits;
-  std::string exponent_sign;
-  std::string exponent_digits;
+  std::string_view whole_digits;
+  std::string_view fractional_digits;
+  int32_t exponent = 0;
+  char sign = 0;
+  bool has_exponent = false;
 };
 
 inline bool IsSign(char c) { return c == '-' || c == '+'; }
@@ -274,14 +781,15 @@ inline bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
 inline bool StartsExponent(char c) { return c == 'e' || c == 'E'; }
 
-inline size_t ParseDigitsRun(const char* s, size_t start, size_t size, std::string* out) {
+inline size_t ParseDigitsRun(const char* s, size_t start, size_t size,
+                             std::string_view* out) {
   size_t pos;
   for (pos = start; pos < size; ++pos) {
     if (!IsDigit(s[pos])) {
       break;
     }
   }
-  *out = std::string(s + start, pos - start);
+  *out = std::string_view(s + start, pos - start);
   return pos;
 }
 
@@ -293,7 +801,7 @@ bool ParseDecimalComponents(const char* s, size_t size, DecimalComponents* out) 
   }
   // Sign of the number
   if (IsSign(s[pos])) {
-    out->sign = std::string(s + pos, 1);
+    out->sign = *(s + pos);
     ++pos;
   }
   // First run of digits
@@ -318,38 +826,44 @@ bool ParseDecimalComponents(const char* s, size_t size, DecimalComponents* out) 
   // Optional exponent
   if (StartsExponent(s[pos])) {
     ++pos;
-    if (pos == size) {
-      return false;
-    }
-    // Optional exponent sign
-    if (IsSign(s[pos])) {
-      out->exponent_sign = std::string(s + pos, 1);
+    if (pos != size && s[pos] == '+') {
       ++pos;
     }
-    pos = ParseDigitsRun(s, pos, size, &out->exponent_digits);
-    if (out->exponent_digits.empty()) {
-      // Need some exponent digits
-      return false;
-    }
+    out->has_exponent = true;
+    return internal::ParseValue<Int32Type>(s + pos, size - pos, &(out->exponent));
   }
   return pos == size;
 }
 
-}  // namespace
+inline Status ToArrowStatus(DecimalStatus dstatus, int num_bits) {
+  switch (dstatus) {
+    case DecimalStatus::kSuccess:
+      return Status::OK();
 
-Status Decimal128::FromString(const std::string& s, Decimal128* out, int32_t* precision,
-                              int32_t* scale) {
+    case DecimalStatus::kDivideByZero:
+      return Status::Invalid("Division by 0 in Decimal", num_bits);
+
+    case DecimalStatus::kOverflow:
+      return Status::Invalid("Overflow occurred during Decimal", num_bits, " operation.");
+
+    case DecimalStatus::kRescaleDataLoss:
+      return Status::Invalid("Rescaling Decimal", num_bits,
+                             " value would cause data loss");
+  }
+  return Status::OK();
+}
+
+template <typename Decimal>
+Status DecimalFromString(const char* type_name, std::string_view s, Decimal* out,
+                         int32_t* precision, int32_t* scale) {
   if (s.empty()) {
-    return Status::Invalid("Empty string cannot be converted to decimal");
+    return Status::Invalid("Empty string cannot be converted to ", type_name);
   }
 
   DecimalComponents dec;
   if (!ParseDecimalComponents(s.data(), s.size(), &dec)) {
-    std::stringstream ss;
-    ss << "The string '" << s << "' is not a valid decimal number";
-    return Status::Invalid(ss.str());
+    return Status::Invalid("The string '", s, "' is not a valid ", type_name, " number");
   }
-  std::string exponent_value = dec.exponent_sign + dec.exponent_digits;
 
   // Count number of significant digits (without leading zeros)
   size_t first_non_zero = dec.whole_digits.find_first_not_of('0');
@@ -357,529 +871,210 @@ Status Decimal128::FromString(const std::string& s, Decimal128* out, int32_t* pr
   if (first_non_zero != std::string::npos) {
     significant_digits += dec.whole_digits.size() - first_non_zero;
   }
+  int32_t parsed_precision = static_cast<int32_t>(significant_digits);
 
-  if (precision != nullptr) {
-    *precision = static_cast<int32_t>(significant_digits);
-  }
-
-  if (scale != nullptr) {
-    if (!exponent_value.empty()) {
-      auto adjusted_exponent = static_cast<int32_t>(std::stol(exponent_value));
-      auto len = static_cast<int32_t>(significant_digits);
-      *scale = -adjusted_exponent + len - 1;
-    } else {
-      *scale = static_cast<int32_t>(dec.fractional_digits.size());
-    }
+  int32_t parsed_scale = 0;
+  if (dec.has_exponent) {
+    auto adjusted_exponent = dec.exponent;
+    parsed_scale =
+        -adjusted_exponent + static_cast<int32_t>(dec.fractional_digits.size());
+  } else {
+    parsed_scale = static_cast<int32_t>(dec.fractional_digits.size());
   }
 
   if (out != nullptr) {
-    *out = 0;
-    StringToInteger(dec.whole_digits + dec.fractional_digits, out);
-    if (dec.sign == "-") {
+    static_assert(Decimal::kBitWidth % 64 == 0, "decimal bit-width not a multiple of 64");
+    std::array<uint64_t, Decimal::kBitWidth / 64> little_endian_array{};
+    ShiftAndAdd(dec.whole_digits, little_endian_array.data(), little_endian_array.size());
+    ShiftAndAdd(dec.fractional_digits, little_endian_array.data(),
+                little_endian_array.size());
+    *out = Decimal(bit_util::little_endian::ToNative(little_endian_array));
+    if (dec.sign == '-') {
       out->Negate();
     }
+  }
 
-    if (scale != nullptr && *scale < 0) {
-      const int32_t abs_scale = std::abs(*scale);
-      *out *= ScaleMultipliers[abs_scale];
-
-      if (precision != nullptr) {
-        *precision += abs_scale;
-      }
-      *scale = 0;
+  if (parsed_scale < 0) {
+    // Force the scale to zero, to avoid negative scales (due to compatibility issues
+    // with external systems such as databases)
+    if (-parsed_scale > Decimal::kMaxScale) {
+      return Status::Invalid("The string '", s, "' cannot be represented as ", type_name);
     }
+    if (out != nullptr) {
+      *out *= Decimal::GetScaleMultiplier(-parsed_scale);
+    }
+    parsed_precision -= parsed_scale;
+    parsed_scale = 0;
+  }
+
+  if (precision != nullptr) {
+    *precision = parsed_precision;
+  }
+  if (scale != nullptr) {
+    *scale = parsed_scale;
   }
 
   return Status::OK();
 }
 
-Decimal128& Decimal128::Negate() {
-  low_bits_ = ~low_bits_ + 1;
-  high_bits_ = ~high_bits_;
-  if (low_bits_ == 0) {
-    ++high_bits_;
-  }
-  return *this;
-}
-
-Decimal128& Decimal128::Abs() { return *this < 0 ? Negate() : *this; }
-
-Decimal128& Decimal128::operator+=(const Decimal128& right) {
-  const uint64_t sum = low_bits_ + right.low_bits_;
-  high_bits_ += right.high_bits_;
-  if (sum < low_bits_) {
-    ++high_bits_;
-  }
-  low_bits_ = sum;
-  return *this;
-}
-
-Decimal128& Decimal128::operator-=(const Decimal128& right) {
-  const uint64_t diff = low_bits_ - right.low_bits_;
-  high_bits_ -= right.high_bits_;
-  if (diff > low_bits_) {
-    --high_bits_;
-  }
-  low_bits_ = diff;
-  return *this;
-}
-
-Decimal128& Decimal128::operator/=(const Decimal128& right) {
-  Decimal128 remainder;
-  Status s = Divide(right, this, &remainder);
-  DCHECK(s.ok());
-  return *this;
-}
-
-Decimal128& Decimal128::operator|=(const Decimal128& right) {
-  low_bits_ |= right.low_bits_;
-  high_bits_ |= right.high_bits_;
-  return *this;
-}
-
-Decimal128& Decimal128::operator&=(const Decimal128& right) {
-  low_bits_ &= right.low_bits_;
-  high_bits_ &= right.high_bits_;
-  return *this;
-}
-
-Decimal128& Decimal128::operator<<=(uint32_t bits) {
-  if (bits != 0) {
-    if (bits < 64) {
-      high_bits_ <<= bits;
-      high_bits_ |= (low_bits_ >> (64 - bits));
-      low_bits_ <<= bits;
-    } else if (bits < 128) {
-      high_bits_ = static_cast<int64_t>(low_bits_) << (bits - 64);
-      low_bits_ = 0;
-    } else {
-      high_bits_ = 0;
-      low_bits_ = 0;
-    }
-  }
-  return *this;
-}
-
-Decimal128& Decimal128::operator>>=(uint32_t bits) {
-  if (bits != 0) {
-    if (bits < 64) {
-      low_bits_ >>= bits;
-      low_bits_ |= static_cast<uint64_t>(high_bits_ << (64 - bits));
-      high_bits_ = static_cast<int64_t>(static_cast<uint64_t>(high_bits_) >> bits);
-    } else if (bits < 128) {
-      low_bits_ = static_cast<uint64_t>(high_bits_ >> (bits - 64));
-      high_bits_ = static_cast<int64_t>(high_bits_ >= 0L ? 0L : -1L);
-    } else {
-      high_bits_ = static_cast<int64_t>(high_bits_ >= 0L ? 0L : -1L);
-      low_bits_ = static_cast<uint64_t>(high_bits_);
-    }
-  }
-  return *this;
-}
-
-Decimal128& Decimal128::operator*=(const Decimal128& right) {
-  // Break the left and right numbers into 32 bit chunks
-  // so that we can multiply them without overflow.
-  const uint64_t L0 = static_cast<uint64_t>(high_bits_) >> 32;
-  const uint64_t L1 = static_cast<uint64_t>(high_bits_) & kIntMask;
-  const uint64_t L2 = low_bits_ >> 32;
-  const uint64_t L3 = low_bits_ & kIntMask;
-
-  const uint64_t R0 = static_cast<uint64_t>(right.high_bits_) >> 32;
-  const uint64_t R1 = static_cast<uint64_t>(right.high_bits_) & kIntMask;
-  const uint64_t R2 = right.low_bits_ >> 32;
-  const uint64_t R3 = right.low_bits_ & kIntMask;
-
-  uint64_t product = L3 * R3;
-  low_bits_ = product & kIntMask;
-
-  uint64_t sum = product >> 32;
-
-  product = L2 * R3;
-  sum += product;
-
-  product = L3 * R2;
-  sum += product;
-
-  low_bits_ += sum << 32;
-
-  high_bits_ = static_cast<int64_t>(sum < product ? kCarryBit : 0);
-  if (sum < product) {
-    high_bits_ += kCarryBit;
+template <typename DecimalClass>
+Status SimpleDecimalFromString(const char* type_name, std::string_view s,
+                               DecimalClass* out, int32_t* precision, int32_t* scale) {
+  if (s.empty()) {
+    return Status::Invalid("Empty string cannot be converted to ", type_name);
   }
 
-  high_bits_ += static_cast<int64_t>(sum >> 32);
-  high_bits_ += L1 * R3 + L2 * R2 + L3 * R1;
-  high_bits_ += (L0 * R3 + L1 * R2 + L2 * R1 + L3 * R0) << 32;
-  return *this;
-}
+  DecimalComponents dec;
+  if (!ParseDecimalComponents(s.data(), s.size(), &dec)) {
+    return Status::Invalid("The string '", s, "' is not a valid ", type_name, " number");
+  }
 
-/// Expands the given value into an array of ints so that we can work on
-/// it. The array will be converted to an absolute value and the wasNegative
-/// flag will be set appropriately. The array will remove leading zeros from
-/// the value.
-/// \param array an array of length 4 to set with the value
-/// \param was_negative a flag for whether the value was original negative
-/// \result the output length of the array
-static int64_t FillInArray(const Decimal128& value, uint32_t* array, bool& was_negative) {
-  uint64_t high;
-  uint64_t low;
-  const int64_t highbits = value.high_bits();
-  const uint64_t lowbits = value.low_bits();
+  // count number of significant digits (without leading zeros)
+  size_t first_non_zero = dec.whole_digits.find_first_not_of('0');
+  size_t significant_digits = dec.fractional_digits.size();
+  if (first_non_zero != std::string::npos) {
+    significant_digits += dec.whole_digits.size() - first_non_zero;
+  }
+  int32_t parsed_precision = static_cast<int32_t>(significant_digits);
 
-  if (highbits < 0) {
-    low = ~lowbits + 1;
-    high = static_cast<uint64_t>(~highbits);
-    if (low == 0) {
-      ++high;
-    }
-    was_negative = true;
+  int32_t parsed_scale = 0;
+  if (dec.has_exponent) {
+    auto adjusted_exponent = dec.exponent;
+    parsed_scale =
+        -adjusted_exponent + static_cast<int32_t>(dec.fractional_digits.size());
   } else {
-    low = lowbits;
-    high = static_cast<uint64_t>(highbits);
-    was_negative = false;
+    parsed_scale = static_cast<int32_t>(dec.fractional_digits.size());
   }
 
-  if (high != 0) {
-    if (high > std::numeric_limits<uint32_t>::max()) {
-      array[0] = static_cast<uint32_t>(high >> 32);
-      array[1] = static_cast<uint32_t>(high);
-      array[2] = static_cast<uint32_t>(low >> 32);
-      array[3] = static_cast<uint32_t>(low);
-      return 4;
+  if (out != nullptr) {
+    uint64_t value{0};
+    ShiftAndAdd(dec.whole_digits, &value, 1);
+    ShiftAndAdd(dec.fractional_digits, &value, 1);
+    if (value > static_cast<uint64_t>(
+                    std::numeric_limits<typename DecimalClass::ValueType>::max())) {
+      return Status::Invalid("The string '", s, "' cannot be represented as ", type_name);
     }
 
-    array[0] = static_cast<uint32_t>(high);
-    array[1] = static_cast<uint32_t>(low >> 32);
-    array[2] = static_cast<uint32_t>(low);
-    return 3;
-  }
-
-  if (low >= std::numeric_limits<uint32_t>::max()) {
-    array[0] = static_cast<uint32_t>(low >> 32);
-    array[1] = static_cast<uint32_t>(low);
-    return 2;
-  }
-
-  if (low == 0) {
-    return 0;
-  }
-
-  array[0] = static_cast<uint32_t>(low);
-  return 1;
-}
-
-/// Shift the number in the array left by bits positions.
-/// \param array the number to shift, must have length elements
-/// \param length the number of entries in the array
-/// \param bits the number of bits to shift (0 <= bits < 32)
-static void ShiftArrayLeft(uint32_t* array, int64_t length, int64_t bits) {
-  if (length > 0 && bits != 0) {
-    for (int64_t i = 0; i < length - 1; ++i) {
-      array[i] = (array[i] << bits) | (array[i + 1] >> (32 - bits));
+    *out = DecimalClass(value);
+    if (dec.sign == '-') {
+      out->Negate();
     }
-    array[length - 1] <<= bits;
   }
-}
 
-/// Shift the number in the array right by bits positions.
-/// \param array the number to shift, must have length elements
-/// \param length the number of entries in the array
-/// \param bits the number of bits to shift (0 <= bits < 32)
-static void ShiftArrayRight(uint32_t* array, int64_t length, int64_t bits) {
-  if (length > 0 && bits != 0) {
-    for (int64_t i = length - 1; i > 0; --i) {
-      array[i] = (array[i] >> bits) | (array[i - 1] << (32 - bits));
+  if (parsed_scale < 0) {
+    // Force the scale to zero, to avoid negative scales (due to compatibility issues
+    // with external systems such as databases)
+    if (-parsed_scale > DecimalClass::kMaxScale) {
+      return Status::Invalid("The string '", s, "' cannot be represented as ", type_name);
     }
-    array[0] >>= bits;
-  }
-}
-
-/// \brief Fix the signs of the result and remainder at the end of the division based on
-/// the signs of the dividend and divisor.
-static void FixDivisionSigns(Decimal128* result, Decimal128* remainder,
-                             bool dividend_was_negative, bool divisor_was_negative) {
-  if (dividend_was_negative != divisor_was_negative) {
-    result->Negate();
+    if (out != nullptr) {
+      *out *= DecimalClass::GetScaleMultiplier(-parsed_scale);
+    }
+    parsed_precision -= parsed_scale;
+    parsed_scale = 0;
   }
 
-  if (dividend_was_negative) {
-    remainder->Negate();
+  if (precision != nullptr) {
+    *precision = parsed_precision;
   }
-}
-
-/// \brief Build a Decimal128 from a list of ints.
-static Status BuildFromArray(Decimal128* value, uint32_t* array, int64_t length) {
-  switch (length) {
-    case 0:
-      *value = {static_cast<int64_t>(0)};
-      break;
-    case 1:
-      *value = {static_cast<int64_t>(array[0])};
-      break;
-    case 2:
-      *value = {static_cast<int64_t>(0),
-                (static_cast<uint64_t>(array[0]) << 32) + array[1]};
-      break;
-    case 3:
-      *value = {static_cast<int64_t>(array[0]),
-                (static_cast<uint64_t>(array[1]) << 32) + array[2]};
-      break;
-    case 4:
-      *value = {(static_cast<int64_t>(array[0]) << 32) + array[1],
-                (static_cast<uint64_t>(array[2]) << 32) + array[3]};
-      break;
-    case 5:
-      if (array[0] != 0) {
-        return Status::Invalid("Can't build Decimal128 with 5 ints.");
-      }
-      *value = {(static_cast<int64_t>(array[1]) << 32) + array[2],
-                (static_cast<uint64_t>(array[3]) << 32) + array[4]};
-      break;
-    default:
-      return Status::Invalid("Unsupported length for building Decimal128");
+  if (scale != nullptr) {
+    *scale = parsed_scale;
   }
 
   return Status::OK();
 }
 
-/// \brief Do a division where the divisor fits into a single 32 bit value.
-static Status SingleDivide(const uint32_t* dividend, int64_t dividend_length,
-                           uint32_t divisor, Decimal128* remainder,
-                           bool dividend_was_negative, bool divisor_was_negative,
-                           Decimal128* result) {
-  uint64_t r = 0;
-  uint32_t result_array[5];
-  for (int64_t j = 0; j < dividend_length; j++) {
-    r <<= 32;
-    r += dividend[j];
-    result_array[j] = static_cast<uint32_t>(r / divisor);
-    r %= divisor;
-  }
-  RETURN_NOT_OK(BuildFromArray(result, result_array, dividend_length));
-  *remainder = static_cast<int64_t>(r);
-  FixDivisionSigns(result, remainder, dividend_was_negative, divisor_was_negative);
-  return Status::OK();
+}  // namespace
+
+Status Decimal32::FromString(std::string_view s, Decimal32* out, int32_t* precision,
+                             int32_t* scale) {
+  return SimpleDecimalFromString("decimal32", s, out, precision, scale);
 }
 
-Status Decimal128::Divide(const Decimal128& divisor, Decimal128* result,
-                          Decimal128* remainder) const {
-  // Split the dividend and divisor into integer pieces so that we can
-  // work on them.
-  uint32_t dividend_array[5];
-  uint32_t divisor_array[4];
-  bool dividend_was_negative;
-  bool divisor_was_negative;
-  // leave an extra zero before the dividend
-  dividend_array[0] = 0;
-  int64_t dividend_length =
-      FillInArray(*this, dividend_array + 1, dividend_was_negative) + 1;
-  int64_t divisor_length = FillInArray(divisor, divisor_array, divisor_was_negative);
-
-  // Handle some of the easy cases.
-  if (dividend_length <= divisor_length) {
-    *remainder = *this;
-    *result = 0;
-    return Status::OK();
-  }
-
-  if (divisor_length == 0) {
-    return Status::Invalid("Division by 0 in Decimal128");
-  }
-
-  if (divisor_length == 1) {
-    return SingleDivide(dividend_array, dividend_length, divisor_array[0], remainder,
-                        dividend_was_negative, divisor_was_negative, result);
-  }
-
-  int64_t result_length = dividend_length - divisor_length;
-  uint32_t result_array[4];
-
-  // Normalize by shifting both by a multiple of 2 so that
-  // the digit guessing is better. The requirement is that
-  // divisor_array[0] is greater than 2**31.
-  int64_t normalize_bits = BitUtil::CountLeadingZeros(divisor_array[0]);
-  ShiftArrayLeft(divisor_array, divisor_length, normalize_bits);
-  ShiftArrayLeft(dividend_array, dividend_length, normalize_bits);
-
-  // compute each digit in the result
-  for (int64_t j = 0; j < result_length; ++j) {
-    // Guess the next digit. At worst it is two too large
-    uint32_t guess = std::numeric_limits<uint32_t>::max();
-    const auto high_dividend =
-        static_cast<uint64_t>(dividend_array[j]) << 32 | dividend_array[j + 1];
-    if (dividend_array[j] != divisor_array[0]) {
-      guess = static_cast<uint32_t>(high_dividend / divisor_array[0]);
-    }
-
-    // catch all of the cases where guess is two too large and most of the
-    // cases where it is one too large
-    auto rhat = static_cast<uint32_t>(high_dividend -
-                                      guess * static_cast<uint64_t>(divisor_array[0]));
-    while (static_cast<uint64_t>(divisor_array[1]) * guess >
-           (static_cast<uint64_t>(rhat) << 32) + dividend_array[j + 2]) {
-      --guess;
-      rhat += divisor_array[0];
-      if (static_cast<uint64_t>(rhat) < divisor_array[0]) {
-        break;
-      }
-    }
-
-    // subtract off the guess * divisor from the dividend
-    uint64_t mult = 0;
-    for (int64_t i = divisor_length - 1; i >= 0; --i) {
-      mult += static_cast<uint64_t>(guess) * divisor_array[i];
-      uint32_t prev = dividend_array[j + i + 1];
-      dividend_array[j + i + 1] -= static_cast<uint32_t>(mult);
-      mult >>= 32;
-      if (dividend_array[j + i + 1] > prev) {
-        ++mult;
-      }
-    }
-    uint32_t prev = dividend_array[j];
-    dividend_array[j] -= static_cast<uint32_t>(mult);
-
-    // if guess was too big, we add back divisor
-    if (dividend_array[j] > prev) {
-      --guess;
-      uint32_t carry = 0;
-      for (int64_t i = divisor_length - 1; i >= 0; --i) {
-        const auto sum =
-            static_cast<uint64_t>(divisor_array[i]) + dividend_array[j + i + 1] + carry;
-        dividend_array[j + i + 1] = static_cast<uint32_t>(sum);
-        carry = static_cast<uint32_t>(sum >> 32);
-      }
-      dividend_array[j] += carry;
-    }
-
-    result_array[j] = guess;
-  }
-
-  // denormalize the remainder
-  ShiftArrayRight(dividend_array, dividend_length, normalize_bits);
-
-  // return result and remainder
-  RETURN_NOT_OK(BuildFromArray(result, result_array, result_length));
-  RETURN_NOT_OK(BuildFromArray(remainder, dividend_array, dividend_length));
-
-  FixDivisionSigns(result, remainder, dividend_was_negative, divisor_was_negative);
-  return Status::OK();
+Status Decimal32::FromString(const std::string& s, Decimal32* out, int32_t* precision,
+                             int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-bool operator==(const Decimal128& left, const Decimal128& right) {
-  return left.high_bits() == right.high_bits() && left.low_bits() == right.low_bits();
+Status Decimal32::FromString(const char* s, Decimal32* out, int32_t* precision,
+                             int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-bool operator!=(const Decimal128& left, const Decimal128& right) {
-  return !operator==(left, right);
+Result<Decimal32> Decimal32::FromString(std::string_view s) {
+  Decimal32 out;
+  RETURN_NOT_OK(FromString(s, &out, nullptr, nullptr));
+  return out;
 }
 
-bool operator<(const Decimal128& left, const Decimal128& right) {
-  return left.high_bits() < right.high_bits() ||
-         (left.high_bits() == right.high_bits() && left.low_bits() < right.low_bits());
+Result<Decimal32> Decimal32::FromString(const std::string& s) {
+  return FromString(std::string_view(s));
 }
 
-bool operator<=(const Decimal128& left, const Decimal128& right) {
-  return !operator>(left, right);
+Result<Decimal32> Decimal32::FromString(const char* s) {
+  return FromString(std::string_view(s));
 }
 
-bool operator>(const Decimal128& left, const Decimal128& right) {
-  return operator<(right, left);
+Status Decimal64::FromString(std::string_view s, Decimal64* out, int32_t* precision,
+                             int32_t* scale) {
+  return SimpleDecimalFromString("decimal64", s, out, precision, scale);
 }
 
-bool operator>=(const Decimal128& left, const Decimal128& right) {
-  return !operator<(left, right);
+Status Decimal64::FromString(const std::string& s, Decimal64* out, int32_t* precision,
+                             int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-Decimal128 operator-(const Decimal128& operand) {
-  Decimal128 result(operand.high_bits(), operand.low_bits());
-  return result.Negate();
+Status Decimal64::FromString(const char* s, Decimal64* out, int32_t* precision,
+                             int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-Decimal128 operator~(const Decimal128& operand) {
-  Decimal128 result(~operand.high_bits(), ~operand.low_bits());
-  return result;
+Result<Decimal64> Decimal64::FromString(std::string_view s) {
+  Decimal64 out;
+  RETURN_NOT_OK(FromString(s, &out, nullptr, nullptr));
+  return out;
 }
 
-Decimal128 operator+(const Decimal128& left, const Decimal128& right) {
-  Decimal128 result(left.high_bits(), left.low_bits());
-  result += right;
-  return result;
+Result<Decimal64> Decimal64::FromString(const std::string& s) {
+  return FromString(std::string_view(s));
 }
 
-Decimal128 operator-(const Decimal128& left, const Decimal128& right) {
-  Decimal128 result(left.high_bits(), left.low_bits());
-  result -= right;
-  return result;
+Result<Decimal64> Decimal64::FromString(const char* s) {
+  return FromString(std::string_view(s));
 }
 
-Decimal128 operator*(const Decimal128& left, const Decimal128& right) {
-  Decimal128 result(left.high_bits(), left.low_bits());
-  result *= right;
-  return result;
+Status Decimal128::FromString(std::string_view s, Decimal128* out, int32_t* precision,
+                              int32_t* scale) {
+  return DecimalFromString("decimal128", s, out, precision, scale);
 }
 
-Decimal128 operator/(const Decimal128& left, const Decimal128& right) {
-  Decimal128 remainder;
-  Decimal128 result;
-  Status s = left.Divide(right, &result, &remainder);
-  DCHECK(s.ok());
-  return result;
+Status Decimal128::FromString(const std::string& s, Decimal128* out, int32_t* precision,
+                              int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-Decimal128 operator%(const Decimal128& left, const Decimal128& right) {
-  Decimal128 remainder;
-  Decimal128 result;
-  Status s = left.Divide(right, &result, &remainder);
-  DCHECK(s.ok());
-  return remainder;
+Status Decimal128::FromString(const char* s, Decimal128* out, int32_t* precision,
+                              int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
 }
 
-static bool RescaleWouldCauseDataLoss(const Decimal128& value, int32_t delta_scale,
-                                      int32_t abs_delta_scale, Decimal128* result) {
-  Decimal128 multiplier(ScaleMultipliers[abs_delta_scale]);
-
-  if (delta_scale < 0) {
-    DCHECK_NE(multiplier, 0);
-    Decimal128 remainder;
-    Status status = value.Divide(multiplier, result, &remainder);
-    DCHECK(status.ok()) << status.message();
-    return remainder != 0;
-  }
-
-  *result = value * multiplier;
-  return (value < 0) ? *result > value : *result < value;
+Result<Decimal128> Decimal128::FromString(std::string_view s) {
+  Decimal128 out;
+  RETURN_NOT_OK(FromString(s, &out, nullptr, nullptr));
+  return out;
 }
 
-Status Decimal128::Rescale(int32_t original_scale, int32_t new_scale,
-                           Decimal128* out) const {
-  DCHECK_NE(out, nullptr) << "out is nullptr";
-  DCHECK_NE(original_scale, new_scale) << "original_scale != new_scale";
+Result<Decimal128> Decimal128::FromString(const std::string& s) {
+  return FromString(std::string_view(s));
+}
 
-  const int32_t delta_scale = new_scale - original_scale;
-  const int32_t abs_delta_scale = std::abs(delta_scale);
-
-  DCHECK_GE(abs_delta_scale, 1);
-  DCHECK_LE(abs_delta_scale, 38);
-
-  Decimal128 result(*this);
-  const bool rescale_would_cause_data_loss =
-      RescaleWouldCauseDataLoss(result, delta_scale, abs_delta_scale, out);
-
-  // Fail if we overflow or truncate
-  if (ARROW_PREDICT_FALSE(rescale_would_cause_data_loss)) {
-    std::stringstream buf;
-    buf << "Rescaling decimal value " << ToString(original_scale)
-        << " from original scale of " << original_scale << " to new scale of "
-        << new_scale << " would cause data loss";
-    return Status::Invalid(buf.str());
-  }
-
-  return Status::OK();
+Result<Decimal128> Decimal128::FromString(const char* s) {
+  return FromString(std::string_view(s));
 }
 
 // Helper function used by Decimal128::FromBigEndian
-static inline uint64_t FromBigEndian(const uint8_t* bytes, int32_t length) {
+static inline uint64_t UInt64FromBigEndian(const uint8_t* bytes, int32_t length) {
   // We don't bounds check the length here because this is called by
   // FromBigEndian that has a Decimal128 as its out parameters and
   // that function is already checking the length of the bytes and only
@@ -889,54 +1084,376 @@ static inline uint64_t FromBigEndian(const uint8_t* bytes, int32_t length) {
   // and doing the conversion in 16, 32 parts, which could
   // possibly create unaligned memory access on certain platforms
   memcpy(reinterpret_cast<uint8_t*>(&result) + 8 - length, bytes, length);
-  return ::arrow::BitUtil::FromBigEndian(result);
+  return ::arrow::bit_util::FromBigEndian(result);
 }
 
-Status Decimal128::FromBigEndian(const uint8_t* bytes, int32_t length, Decimal128* out) {
+Result<Decimal32> Decimal32::FromBigEndian(const uint8_t* bytes, int32_t length) {
+  static constexpr int32_t kMinDecimalBytes = 1;
+  static constexpr int32_t kMaxDecimalBytes = 4;
+
+  if (ARROW_PREDICT_FALSE(length < kMinDecimalBytes || length > kMaxDecimalBytes)) {
+    return Status::Invalid("Length of byte array passed to Decimal32::FromBigEndian was ",
+                           length, ", but must be between ", kMinDecimalBytes, " and ",
+                           kMaxDecimalBytes);
+  }
+
+  const bool is_negative = static_cast<int8_t>(bytes[0]) < 0;
+  int32_t result = is_negative ? 0xffffffff : 0;
+  memcpy(reinterpret_cast<uint8_t*>(&result) + kMaxDecimalBytes - length, bytes, length);
+
+  const auto value = bit_util::FromBigEndian(result);
+  return Decimal32(value);
+}
+
+Status Decimal32::ToArrowStatus(DecimalStatus dstatus) const {
+  return arrow::ToArrowStatus(dstatus, 32);
+}
+
+std::ostream& operator<<(std::ostream& os, const Decimal32& decimal) {
+  os << decimal.ToIntegerString();
+  return os;
+}
+
+Result<Decimal64> Decimal64::FromBigEndian(const uint8_t* bytes, int32_t length) {
+  static constexpr int32_t kMinDecimalBytes = 1;
+  static constexpr int32_t kMaxDecimalBytes = 8;
+
+  if (ARROW_PREDICT_FALSE(length < kMinDecimalBytes || length > kMaxDecimalBytes)) {
+    return Status::Invalid("Length of byte array passed to Decimal64::FromBigEndian was ",
+                           length, ", but must be between ", kMinDecimalBytes, " and ",
+                           kMaxDecimalBytes);
+  }
+
+  const bool is_negative = static_cast<int8_t>(bytes[0]) < 0;
+  int64_t result = is_negative ? 0xffffffffffffffffL : 0;
+  memcpy(reinterpret_cast<uint8_t*>(&result) + kMaxDecimalBytes - length, bytes, length);
+
+  const auto value = bit_util::FromBigEndian(result);
+  return Decimal64(value);
+}
+
+Status Decimal64::ToArrowStatus(DecimalStatus dstatus) const {
+  return arrow::ToArrowStatus(dstatus, 64);
+}
+
+std::ostream& operator<<(std::ostream& os, const Decimal64& decimal) {
+  os << decimal.ToIntegerString();
+  return os;
+}
+
+Result<Decimal128> Decimal128::FromBigEndian(const uint8_t* bytes, int32_t length) {
   static constexpr int32_t kMinDecimalBytes = 1;
   static constexpr int32_t kMaxDecimalBytes = 16;
 
-  int64_t high;
-  uint64_t low;
+  int64_t high, low;
 
-  if (length < kMinDecimalBytes || length > kMaxDecimalBytes) {
-    std::ostringstream stream;
-    stream << "Length of byte array passed to Decimal128::FromBigEndian ";
-    stream << "was " << length << ", but must be between ";
-    stream << kMinDecimalBytes << " and " << kMaxDecimalBytes;
-    return Status::Invalid(stream.str());
+  if (ARROW_PREDICT_FALSE(length < kMinDecimalBytes || length > kMaxDecimalBytes)) {
+    return Status::Invalid("Length of byte array passed to Decimal128::FromBigEndian ",
+                           "was ", length, ", but must be between ", kMinDecimalBytes,
+                           " and ", kMaxDecimalBytes);
   }
 
-  /// Bytes are coming in big-endian, so the first byte is the MSB and therefore holds the
-  /// sign bit.
+  // Bytes are coming in big-endian, so the first byte is the MSB and therefore holds the
+  // sign bit.
   const bool is_negative = static_cast<int8_t>(bytes[0]) < 0;
 
-  /// Sign extend the low bits if necessary
-  low = UINT64_MAX * (is_negative && length < 8);
-  high = -1 * (is_negative && length < kMaxDecimalBytes);
-
-  /// Stop byte of the high bytes
+  // 1. Extract the high bytes
+  // Stop byte of the high bytes
   const int32_t high_bits_offset = std::max(0, length - 8);
+  const auto high_bits = UInt64FromBigEndian(bytes, high_bits_offset);
 
-  /// Shift left enough bits to make room for the incoming int64_t
-  high <<= high_bits_offset * CHAR_BIT;
+  if (high_bits_offset == 8) {
+    // Avoid undefined shift by 64 below
+    high = high_bits;
+  } else {
+    high = -1 * (is_negative && length < kMaxDecimalBytes);
+    // Shift left enough bits to make room for the incoming int64_t
+    high = SafeLeftShift(high, high_bits_offset * CHAR_BIT);
+    // Preserve the upper bits by inplace OR-ing the int64_t
+    high |= high_bits;
+  }
 
-  /// Preserve the upper bits by inplace OR-ing the int64_t
-  uint64_t value = arrow::FromBigEndian(bytes, high_bits_offset);
-  high |= value;
-
-  /// Stop byte of the low bytes
+  // 2. Extract the low bytes
+  // Stop byte of the low bytes
   const int32_t low_bits_offset = std::min(length, 8);
+  const auto low_bits =
+      UInt64FromBigEndian(bytes + high_bits_offset, length - high_bits_offset);
 
-  /// Shift left enough bits to make room for the incoming uint64_t
-  low <<= low_bits_offset * CHAR_BIT;
+  if (low_bits_offset == 8) {
+    // Avoid undefined shift by 64 below
+    low = low_bits;
+  } else {
+    // Sign extend the low bits if necessary
+    low = -1 * (is_negative && length < 8);
+    // Shift left enough bits to make room for the incoming int64_t
+    low = SafeLeftShift(low, low_bits_offset * CHAR_BIT);
+    // Preserve the upper bits by inplace OR-ing the int64_t
+    low |= low_bits;
+  }
 
-  /// Preserve the upper bits by inplace OR-ing the uint64_t
-  value = arrow::FromBigEndian(bytes + high_bits_offset, length - high_bits_offset);
-  low |= value;
+  return Decimal128(high, static_cast<uint64_t>(low));
+}
 
-  *out = Decimal128(high, low);
-  return Status::OK();
+Status Decimal128::ToArrowStatus(DecimalStatus dstatus) const {
+  return arrow::ToArrowStatus(dstatus, 128);
+}
+
+std::ostream& operator<<(std::ostream& os, const Decimal128& decimal) {
+  os << decimal.ToIntegerString();
+  return os;
+}
+
+Decimal256::Decimal256(const std::string& str) : Decimal256() {
+  *this = Decimal256::FromString(str).ValueOrDie();
+}
+
+std::string Decimal256::ToIntegerString() const {
+  std::string result;
+  if (IsNegative()) {
+    result.push_back('-');
+    Decimal256 abs = *this;
+    abs.Negate();
+    AppendLittleEndianArrayToString(
+        bit_util::little_endian::FromNative(abs.native_endian_array()), &result);
+  } else {
+    AppendLittleEndianArrayToString(
+        bit_util::little_endian::FromNative(native_endian_array()), &result);
+  }
+  return result;
+}
+
+std::string Decimal256::ToString(int32_t scale) const {
+  if (ARROW_PREDICT_FALSE(scale < -kMaxScale || scale > kMaxScale)) {
+    return "<scale out of range, cannot format Decimal256 value>";
+  }
+  std::string str(ToIntegerString());
+  AdjustIntegerStringWithScale(scale, &str);
+  return str;
+}
+
+Status Decimal256::FromString(std::string_view s, Decimal256* out, int32_t* precision,
+                              int32_t* scale) {
+  return DecimalFromString("decimal256", s, out, precision, scale);
+}
+
+Status Decimal256::FromString(const std::string& s, Decimal256* out, int32_t* precision,
+                              int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
+}
+
+Status Decimal256::FromString(const char* s, Decimal256* out, int32_t* precision,
+                              int32_t* scale) {
+  return FromString(std::string_view(s), out, precision, scale);
+}
+
+Result<Decimal256> Decimal256::FromString(std::string_view s) {
+  Decimal256 out;
+  RETURN_NOT_OK(FromString(s, &out, nullptr, nullptr));
+  return out;
+}
+
+Result<Decimal256> Decimal256::FromString(const std::string& s) {
+  return FromString(std::string_view(s));
+}
+
+Result<Decimal256> Decimal256::FromString(const char* s) {
+  return FromString(std::string_view(s));
+}
+
+Result<Decimal256> Decimal256::FromBigEndian(const uint8_t* bytes, int32_t length) {
+  static constexpr int32_t kMinDecimalBytes = 1;
+  static constexpr int32_t kMaxDecimalBytes = 32;
+
+  std::array<uint64_t, 4> little_endian_array;
+
+  if (ARROW_PREDICT_FALSE(length < kMinDecimalBytes || length > kMaxDecimalBytes)) {
+    return Status::Invalid("Length of byte array passed to Decimal256::FromBigEndian ",
+                           "was ", length, ", but must be between ", kMinDecimalBytes,
+                           " and ", kMaxDecimalBytes);
+  }
+
+  // Bytes are coming in big-endian, so the first byte is the MSB and therefore holds the
+  // sign bit.
+  const bool is_negative = static_cast<int8_t>(bytes[0]) < 0;
+
+  for (int word_idx = 0; word_idx < 4; word_idx++) {
+    const int32_t word_length = std::min(length, static_cast<int32_t>(sizeof(uint64_t)));
+
+    if (word_length == 8) {
+      // Full words can be assigned as is (and are UB with the shift below).
+      little_endian_array[word_idx] =
+          UInt64FromBigEndian(bytes + length - word_length, word_length);
+    } else {
+      // Sign extend the word its if necessary
+      uint64_t word = -1 * is_negative;
+      if (length > 0) {
+        // Incorporate the actual values if present.
+        // Shift left enough bits to make room for the incoming int64_t
+        word = SafeLeftShift(word, word_length * CHAR_BIT);
+        // Preserve the upper bits by inplace OR-ing the int64_t
+        word |= UInt64FromBigEndian(bytes + length - word_length, word_length);
+      }
+      little_endian_array[word_idx] = word;
+    }
+    // Move on to the next word.
+    length -= word_length;
+  }
+
+  return Decimal256(bit_util::little_endian::ToNative(little_endian_array));
+}
+
+Status Decimal256::ToArrowStatus(DecimalStatus dstatus) const {
+  return arrow::ToArrowStatus(dstatus, 256);
+}
+
+namespace {
+
+struct Decimal256RealConversion
+    : public DecimalRealConversion<Decimal256, Decimal256RealConversion> {
+  using Base = DecimalRealConversion<Decimal256, Decimal256RealConversion>;
+  using Base::LargePowerOfTen;
+  using Base::PowerOfTen;
+
+  // Right shift positive `x` by positive `bits`, rounded half to even
+  static Decimal256 RoundedRightShift(Decimal256 x, int bits) {
+    if (bits == 0) {
+      return x;
+    }
+    const int cross_word_shift = bits / 64;
+    if (cross_word_shift >= Decimal256::kNumWords) {
+      return Decimal256();
+    }
+    const uint32_t in_word_shift = bits % 64;
+    const auto array_le = x.little_endian_array();
+    Decimal256::WordArray shifted_le{};
+    uint64_t shifted_out = 0;
+    // Iterate from LSW to MSW
+    for (int i = 0; i < cross_word_shift; ++i) {
+      // Retain the information that non-zero bits were shifted out.
+      // This is important for half-to-even rounding.
+      shifted_out = (shifted_out > 0) | array_le[i];
+    }
+    if (in_word_shift != 0) {
+      const uint64_t carry_bits = array_le[cross_word_shift] << (64 - in_word_shift);
+      shifted_out = (shifted_out > 0) | (shifted_out >> in_word_shift) | carry_bits;
+    }
+    for (int i = cross_word_shift; i < Decimal256::kNumWords; ++i) {
+      shifted_le[i - cross_word_shift] = array_le[i] >> in_word_shift;
+      if (in_word_shift != 0 && i + 1 < Decimal256::kNumWords) {
+        const uint64_t carry_bits = array_le[i + 1] << (64 - in_word_shift);
+        shifted_le[i - cross_word_shift] |= carry_bits;
+      }
+    }
+    auto result = Decimal256(Decimal256::LittleEndianArray, shifted_le);
+
+    // We almost have our result, but now do the rounding.
+    constexpr uint64_t kHalf = 0x8000000000000000ULL;
+    if (shifted_out > kHalf) {
+      // Strictly more than half => round up
+      result += 1;
+    } else if (shifted_out == kHalf) {
+      // Exactly half => round to even
+      if ((result.low_bits() & 1) != 0) {
+        result += 1;
+      }
+    } else {
+      // Strictly less than half => round down
+    }
+    return result;
+  }
+
+  template <typename Real>
+  static Result<Decimal256> FromPositiveRealApprox(Real real, int32_t precision,
+                                                   int32_t scale) {
+    auto x = std::nearbyint(real * PowerOfTen<double>(scale));
+    const auto max_abs = PowerOfTen<double>(precision);
+    if (x >= max_abs) {
+      return OverflowError(real, precision, scale);
+    }
+    // Extract parts
+    const auto part3 = std::floor(std::ldexp(x, -192));
+    x -= std::ldexp(part3, 192);
+    const auto part2 = std::floor(std::ldexp(x, -128));
+    x -= std::ldexp(part2, 128);
+    const auto part1 = std::floor(std::ldexp(x, -64));
+    x -= std::ldexp(part1, 64);
+    const auto part0 = x;
+
+    DCHECK_GE(part3, 0);
+    DCHECK_LT(part3, 9.223372036854776e+18);  // 2**63
+    DCHECK_GE(part2, 0);
+    DCHECK_LT(part2, 1.8446744073709552e+19);  // 2**64
+    DCHECK_GE(part1, 0);
+    DCHECK_LT(part1, 1.8446744073709552e+19);  // 2**64
+    DCHECK_GE(part0, 0);
+    DCHECK_LT(part0, 1.8446744073709552e+19);  // 2**64
+    return Decimal256(Decimal256::LittleEndianArray,
+                      {static_cast<uint64_t>(part0), static_cast<uint64_t>(part1),
+                       static_cast<uint64_t>(part2), static_cast<uint64_t>(part3)});
+  }
+
+  template <typename Real>
+  static Real ToRealPositiveNoSplit(const Decimal256& decimal, int32_t scale) {
+    DCHECK_GE(decimal, 0);
+    Real x = 0;
+    const auto parts_le = bit_util::little_endian::Make(decimal.native_endian_array());
+    x += RealTraits<Real>::two_to_192(static_cast<Real>(parts_le[3]));
+    x += RealTraits<Real>::two_to_128(static_cast<Real>(parts_le[2]));
+    x += RealTraits<Real>::two_to_64(static_cast<Real>(parts_le[1]));
+    x += static_cast<Real>(parts_le[0]);
+    x *= LargePowerOfTen<Real>(-scale);
+    return x;
+  }
+
+  /// An approximate conversion from Decimal256 to Real that guarantees:
+  /// 1. If the decimal is an integer, the conversion is exact.
+  /// 2. If the number of fractional digits is <= RealTraits<Real>::kMantissaDigits (e.g.
+  ///    8 for float and 16 for double), the conversion is within 1 ULP of the exact
+  ///    value.
+  /// 3. Otherwise, the conversion is within 2^(-RealTraits<Real>::kMantissaDigits+1)
+  ///    (e.g. 2^-23 for float and 2^-52 for double) of the exact value.
+  /// Here "exact value" means the closest representable value by Real.
+  template <typename Real>
+  static Real ToRealPositive(const Decimal256& decimal, int32_t scale) {
+    const auto parts_le = decimal.little_endian_array();
+    if (scale <= 0 || (parts_le[3] == 0 && parts_le[2] == 0 && parts_le[1] == 0 &&
+                       parts_le[0] < RealTraits<Real>::kMaxPreciseInteger)) {
+      // No need to split the decimal if it is already an integer (scale <= 0) or if it
+      // can be precisely represented by Real
+      return ToRealPositiveNoSplit<Real>(decimal, scale);
+    }
+
+    // Split the decimal into whole and fractional parts to avoid precision loss
+    BasicDecimal256 whole_decimal, fraction_decimal;
+    decimal.GetWholeAndFraction(scale, &whole_decimal, &fraction_decimal);
+
+    Real whole = ToRealPositiveNoSplit<Real>(whole_decimal, 0);
+    Real fraction = ToRealPositiveNoSplit<Real>(fraction_decimal, scale);
+    return whole + fraction;
+  }
+};
+
+}  // namespace
+
+Result<Decimal256> Decimal256::FromReal(float x, int32_t precision, int32_t scale) {
+  return Decimal256RealConversion::FromReal(x, precision, scale);
+}
+
+Result<Decimal256> Decimal256::FromReal(double x, int32_t precision, int32_t scale) {
+  return Decimal256RealConversion::FromReal(x, precision, scale);
+}
+
+float Decimal256::ToFloat(int32_t scale) const {
+  return Decimal256RealConversion::ToReal<float>(*this, scale);
+}
+
+double Decimal256::ToDouble(int32_t scale) const {
+  return Decimal256RealConversion::ToReal<double>(*this, scale);
+}
+
+std::ostream& operator<<(std::ostream& os, const Decimal256& decimal) {
+  os << decimal.ToIntegerString();
+  return os;
 }
 
 }  // namespace arrow

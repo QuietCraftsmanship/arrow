@@ -15,17 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ADD_ARROW_TEST(csv-chunker-test)
-ADD_ARROW_TEST(csv-column-builder-test)
-ADD_ARROW_TEST(csv-converter-test)
-ADD_ARROW_TEST(csv-parser-test)
+set(CSV_TEST_SRCS
+    chunker_test.cc
+    column_builder_test.cc
+    column_decoder_test.cc
+    converter_test.cc
+    parser_test.cc
+    reader_test.cc
+    writer_test.cc)
 
-ADD_ARROW_BENCHMARK(csv-converter-benchmark)
-ADD_ARROW_BENCHMARK(csv-parser-benchmark)
+add_arrow_test(csv-test SOURCES ${CSV_TEST_SRCS})
 
-# Headers: top level
-file(GLOB_RECURSE ARROW_CSV_HEADERS "*.h")
+add_arrow_benchmark(converter_benchmark PREFIX "arrow-csv")
+add_arrow_benchmark(parser_benchmark PREFIX "arrow-csv")
+add_arrow_benchmark(writer_benchmark PREFIX "arrow-csv")
 
-install(FILES
-  ${ARROW_CSV_HEADERS}
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/csv")
+arrow_install_all_headers("arrow/csv")
+
+# pkg-config support
+arrow_add_pkg_config("arrow-csv")

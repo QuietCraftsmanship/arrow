@@ -1,11 +1,25 @@
 {
   "extends": "../tsconfig.json",
-  "include": ["./**/*.ts"],
+  "include": ["../src/**/*.ts", "../test/**/*.ts"],
   "compilerOptions": {
-    "target": "es2015",
-    "module": "commonjs",
+    "target": "ESNext",
+    "module": "NodeNext",
+    "rootDir": "../",
     "allowJs": true,
+    "declaration": false,
+    "declarationMap": false,
     "importHelpers": false,
-    "noEmitHelpers": false
+    "noEmit": true,
+    "noEmitHelpers": false,
+    "noEmitOnError": false,
+    "sourceMap": true,
+    "inlineSources": false,
+    "inlineSourceMap": false,
+    "downlevelIteration": false,
+    "baseUrl": "../",
+    "paths": {
+      "apache-arrow": ["src/Arrow.node"],
+      "apache-arrow/*": ["src/*"]
+    }
   }
 }
