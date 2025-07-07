@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// User-defined extension types. EXPERIMENTAL in 0.13.0
+/// User-defined extension types.
 /// \since 0.13.0
 
 #pragma once
@@ -23,8 +23,14 @@
 #include <memory>
 #include <string>
 
-#include "arrow/array.h"
+#include "arrow/array/array_base.h"
+#include "arrow/array/data.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/type.h"
+#include "arrow/type_fwd.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
@@ -37,13 +43,19 @@ class ARROW_EXPORT ExtensionType : public DataType {
   static constexpr const char* type_name() { return "extension"; }
 
   /// \brief The type of array used to represent this extension type's data
-  std::shared_ptr<DataType> storage_type() const { return storage_type_; }
+  const std::shared_ptr<DataType>& storage_type() const { return storage_type_; }
+
+  /// \brief Return the type category of the storage type
+  Type::type storage_id() const override { return storage_type_->id(); }
 
   DataTypeLayout layout() const override;
 
-  std::string ToString() const override;
+  std::string ToString(bool show_metadata = false) const override;
 
   std::string name() const override { return "extension"; }
+
+  int32_t byte_width() const override { return storage_type_->byte_width(); }
+  int bit_width() const override { return storage_type_->bit_width(); }
 
   /// \brief Unique name of extension type used to identify type for
   /// serialization
@@ -65,11 +77,9 @@ class ARROW_EXPORT ExtensionType : public DataType {
   /// \param[in] storage_type the physical storage type of the extension
   /// \param[in] serialized_data the serialized representation produced by
   /// Serialize
-  /// \param[out] out the reconstructed extension type
-  /// \return Status
-  virtual Status Deserialize(std::shared_ptr<DataType> storage_type,
-                             const std::string& serialized_data,
-                             std::shared_ptr<DataType>* out) const = 0;
+  virtual Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized_data) const = 0;
 
   /// \brief Create a serialized representation of the extension type's
   /// metadata. The storage type will be handled automatically in IPC code
@@ -77,9 +87,18 @@ class ARROW_EXPORT ExtensionType : public DataType {
   /// \return the serialized representation
   virtual std::string Serialize() const = 0;
 
+  /// \brief Wrap the given storage array as an extension array
+  static std::shared_ptr<Array> WrapArray(const std::shared_ptr<DataType>& ext_type,
+                                          const std::shared_ptr<Array>& storage);
+
+  /// \brief Wrap the given chunked storage array as a chunked extension array
+  static std::shared_ptr<ChunkedArray> WrapArray(
+      const std::shared_ptr<DataType>& ext_type,
+      const std::shared_ptr<ChunkedArray>& storage);
+
  protected:
   explicit ExtensionType(std::shared_ptr<DataType> storage_type)
-      : DataType(Type::EXTENSION), storage_type_(storage_type) {}
+      : DataType(Type::EXTENSION), storage_type_(std::move(storage_type)) {}
 
   std::shared_ptr<DataType> storage_type_;
 };
@@ -87,6 +106,7 @@ class ARROW_EXPORT ExtensionType : public DataType {
 /// \brief Base array class for user-defined extension types
 class ARROW_EXPORT ExtensionArray : public Array {
  public:
+  using TypeClass = ExtensionType;
   /// \brief Construct an ExtensionArray from an ArrayData.
   ///
   /// The ArrayData must have the right ExtensionType.
@@ -101,7 +121,7 @@ class ARROW_EXPORT ExtensionArray : public Array {
   }
 
   /// \brief The physical storage for the extension array
-  std::shared_ptr<Array> storage() const { return storage_; }
+  const std::shared_ptr<Array>& storage() const { return storage_; }
 
  protected:
   void SetData(const std::shared_ptr<ArrayData>& data);

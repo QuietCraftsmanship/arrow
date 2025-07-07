@@ -14,62 +14,30 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef ARROW_UTIL_BIT_UTIL_H
-#define ARROW_UTIL_BIT_UTIL_H
 
-#ifdef _WIN32
-#define ARROW_LITTLE_ENDIAN 1
-#else
-#ifdef __APPLE__
-#include <machine/endian.h>
-#else
-#include <endian.h>
-#endif
-#
-#ifndef __BYTE_ORDER__
-#error "__BYTE_ORDER__ not defined"
-#endif
-#
-#ifndef __ORDER_LITTLE_ENDIAN__
-#error "__ORDER_LITTLE_ENDIAN__ not defined"
-#endif
-#
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#define ARROW_LITTLE_ENDIAN 1
-#else
-#define ARROW_LITTLE_ENDIAN 0
-#endif
-#endif
+#pragma once
 
 #if defined(_MSC_VER)
-#include <intrin.h>
-#pragma intrinsic(_BitScanReverse)
-#pragma intrinsic(_BitScanForward)
-#define ARROW_BYTE_SWAP64 _byteswap_uint64
-#define ARROW_BYTE_SWAP32 _byteswap_ulong
+#  if defined(_M_AMD64) || defined(_M_X64)
+#    include <intrin.h>  // IWYU pragma: keep
+#  endif
+
+#  pragma intrinsic(_BitScanReverse)
+#  pragma intrinsic(_BitScanForward)
+#  define ARROW_POPCOUNT64 __popcnt64
+#  define ARROW_POPCOUNT32 __popcnt
 #else
-#define ARROW_BYTE_SWAP64 __builtin_bswap64
-#define ARROW_BYTE_SWAP32 __builtin_bswap32
+#  define ARROW_POPCOUNT64 __builtin_popcountll
+#  define ARROW_POPCOUNT32 __builtin_popcount
 #endif
 
-#include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <limits>
-#include <memory>
 #include <type_traits>
-#include <vector>
 
 #include "arrow/util/macros.h"
-#include "arrow/util/type_traits.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
-
-class Buffer;
-class MemoryPool;
-class Status;
-
 namespace detail {
 
 template <typename Integer>
@@ -79,7 +47,7 @@ typename std::make_unsigned<Integer>::type as_unsigned(Integer x) {
 
 }  // namespace detail
 
-namespace BitUtil {
+namespace bit_util {
 
 // The number of set bits in a given unsigned byte value, pre-computed
 //
@@ -98,16 +66,23 @@ static constexpr uint8_t kBytePopcount[] = {
     5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 3, 4, 4, 5, 4, 5, 5, 6,
     4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8};
 
+static inline uint64_t PopCount(uint64_t bitmap) { return ARROW_POPCOUNT64(bitmap); }
+static inline uint32_t PopCount(uint32_t bitmap) { return ARROW_POPCOUNT32(bitmap); }
+
 //
 // Bit-related computations on integer values
 //
 
 // Returns the ceil of value/divisor
 constexpr int64_t CeilDiv(int64_t value, int64_t divisor) {
-  return value / divisor + (value % divisor != 0);
+  return (value == 0) ? 0 : 1 + (value - 1) / divisor;
 }
 
-constexpr int64_t BytesForBits(int64_t bits) { return (bits + 7) >> 3; }
+// Return the number of bytes needed to fit the given number of bits
+constexpr int64_t BytesForBits(int64_t bits) {
+  // This formula avoids integer overflow on very large `bits`
+  return (bits >> 3) + ((bits & 7) != 0);
+}
 
 constexpr bool IsPowerOf2(int64_t value) {
   return value > 0 && (value & (value - 1)) == 0;
@@ -137,9 +112,15 @@ constexpr bool IsMultipleOf64(int64_t n) { return (n & 63) == 0; }
 
 constexpr bool IsMultipleOf8(int64_t n) { return (n & 7) == 0; }
 
+// Returns a mask for the bit_index lower order bits.
+// Only valid for bit_index in the range [0, 64).
+constexpr uint64_t LeastSignificantBitMask(int64_t bit_index) {
+  return (static_cast<uint64_t>(1) << bit_index) - 1;
+}
+
 // Returns 'value' rounded up to the nearest multiple of 'factor'
 constexpr int64_t RoundUp(int64_t value, int64_t factor) {
-  return (value + (factor - 1)) / factor * factor;
+  return CeilDiv(value, factor) * factor;
 }
 
 // Returns 'value' rounded down to the nearest multiple of 'factor'
@@ -180,7 +161,7 @@ constexpr int64_t RoundUpToMultipleOf64(int64_t num) {
 //
 // The covering bytes is the length (in bytes) of this new aligned slice.
 constexpr int64_t CoveringBytes(int64_t offset, int64_t length) {
-  return (BitUtil::RoundUp(length + offset, 8) - BitUtil::RoundDown(offset, 8)) / 8;
+  return (bit_util::RoundUp(length + offset, 8) - bit_util::RoundDown(offset, 8)) / 8;
 }
 
 // Returns the 'num_bits' least-significant bits of 'v'.
@@ -294,107 +275,6 @@ static inline int Log2(uint64_t x) {
 }
 
 //
-// Byte-swap 16-bit, 32-bit and 64-bit values
-//
-
-// Swap the byte order (i.e. endianess)
-static inline int64_t ByteSwap(int64_t value) { return ARROW_BYTE_SWAP64(value); }
-static inline uint64_t ByteSwap(uint64_t value) {
-  return static_cast<uint64_t>(ARROW_BYTE_SWAP64(value));
-}
-static inline int32_t ByteSwap(int32_t value) { return ARROW_BYTE_SWAP32(value); }
-static inline uint32_t ByteSwap(uint32_t value) {
-  return static_cast<uint32_t>(ARROW_BYTE_SWAP32(value));
-}
-static inline int16_t ByteSwap(int16_t value) {
-  constexpr auto m = static_cast<int16_t>(0xff);
-  return static_cast<int16_t>(((value >> 8) & m) | ((value & m) << 8));
-}
-static inline uint16_t ByteSwap(uint16_t value) {
-  return static_cast<uint16_t>(ByteSwap(static_cast<int16_t>(value)));
-}
-
-// Write the swapped bytes into dst. Src and dst cannot overlap.
-static inline void ByteSwap(void* dst, const void* src, int len) {
-  switch (len) {
-    case 1:
-      *reinterpret_cast<int8_t*>(dst) = *reinterpret_cast<const int8_t*>(src);
-      return;
-    case 2:
-      *reinterpret_cast<int16_t*>(dst) = ByteSwap(*reinterpret_cast<const int16_t*>(src));
-      return;
-    case 4:
-      *reinterpret_cast<int32_t*>(dst) = ByteSwap(*reinterpret_cast<const int32_t*>(src));
-      return;
-    case 8:
-      *reinterpret_cast<int64_t*>(dst) = ByteSwap(*reinterpret_cast<const int64_t*>(src));
-      return;
-    default:
-      break;
-  }
-
-  auto d = reinterpret_cast<uint8_t*>(dst);
-  auto s = reinterpret_cast<const uint8_t*>(src);
-  for (int i = 0; i < len; ++i) {
-    d[i] = s[len - i - 1];
-  }
-}
-
-// Convert to little/big endian format from the machine's native endian format.
-#if ARROW_LITTLE_ENDIAN
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T ToBigEndian(T value) {
-  return ByteSwap(value);
-}
-
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T ToLittleEndian(T value) {
-  return value;
-}
-#else
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T ToBigEndian(T value) {
-  return value;
-}
-
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T ToLittleEndian(T value) {
-  return ByteSwap(value);
-}
-#endif
-
-// Convert from big/little endian format to the machine's native endian format.
-#if ARROW_LITTLE_ENDIAN
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T FromBigEndian(T value) {
-  return ByteSwap(value);
-}
-
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T FromLittleEndian(T value) {
-  return value;
-}
-#else
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T FromBigEndian(T value) {
-  return value;
-}
-
-template <typename T, typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t,
-                                                           uint32_t, int16_t, uint16_t>>
-static inline T FromLittleEndian(T value) {
-  return ByteSwap(value);
-}
-#endif
-
-//
 // Utilities for reading and writing individual bits by their index
 // in a memory area.
 //
@@ -412,12 +292,14 @@ static constexpr uint8_t kPrecedingWrappingBitmask[] = {255, 1, 3, 7, 15, 31, 63
 // the bitwise complement version of kPrecedingBitmask
 static constexpr uint8_t kTrailingBitmask[] = {255, 254, 252, 248, 240, 224, 192, 128};
 
-static inline bool GetBit(const uint8_t* bits, uint64_t i) {
+static constexpr bool GetBit(const uint8_t* bits, uint64_t i) {
   return (bits[i >> 3] >> (i & 0x07)) & 1;
 }
 
 // Gets the i-th bit from a byte. Should only be used with i <= 7.
-static inline bool GetBitFromByte(uint8_t byte, uint8_t i) { return byte & kBitmask[i]; }
+static constexpr bool GetBitFromByte(uint8_t byte, uint8_t i) {
+  return byte & kBitmask[i];
+}
 
 static inline void ClearBit(uint8_t* bits, int64_t i) {
   bits[i / 8] &= kFlippedBitmask[i % 8];
@@ -435,503 +317,53 @@ static inline void SetBitTo(uint8_t* bits, int64_t i, bool bit_is_set) {
 }
 
 /// \brief set or clear a range of bits quickly
-static inline void SetBitsTo(uint8_t* bits, int64_t start_offset, int64_t length,
-                             bool bits_are_set) {
-  if (length == 0) return;
+ARROW_EXPORT
+void SetBitsTo(uint8_t* bits, int64_t start_offset, int64_t length, bool bits_are_set);
 
-  const auto i_begin = start_offset;
-  const auto i_end = start_offset + length;
-  const uint8_t fill_byte = static_cast<uint8_t>(-static_cast<uint8_t>(bits_are_set));
+/// \brief Sets all bits in the bitmap to true
+ARROW_EXPORT
+void SetBitmap(uint8_t* data, int64_t offset, int64_t length);
 
-  const auto bytes_begin = i_begin / 8;
-  const auto bytes_end = i_end / 8 + 1;
+/// \brief Clears all bits in the bitmap (set to false)
+ARROW_EXPORT
+void ClearBitmap(uint8_t* data, int64_t offset, int64_t length);
 
-  const auto first_byte_mask = kPrecedingBitmask[i_begin % 8];
-  const auto last_byte_mask = kTrailingBitmask[i_end % 8];
+/// Returns a mask with lower i bits set to 1. If i >= sizeof(Word)*8, all-ones will be
+/// returned
+/// ex:
+/// ref: https://stackoverflow.com/a/59523400
+template <typename Word>
+constexpr Word PrecedingWordBitmask(unsigned int const i) {
+  return static_cast<Word>(static_cast<Word>(i < sizeof(Word) * 8)
+                           << (i & (sizeof(Word) * 8 - 1))) -
+         1;
+}
+static_assert(PrecedingWordBitmask<uint8_t>(0) == 0x00, "");
+static_assert(PrecedingWordBitmask<uint8_t>(4) == 0x0f, "");
+static_assert(PrecedingWordBitmask<uint8_t>(8) == 0xff, "");
+static_assert(PrecedingWordBitmask<uint16_t>(8) == 0x00ff, "");
 
-  if (bytes_end == bytes_begin + 1) {
-    // set bits within a single byte
-    const auto only_byte_mask =
-        i_end % 8 == 0 ? first_byte_mask
-                       : static_cast<uint8_t>(first_byte_mask | last_byte_mask);
-    bits[bytes_begin] &= only_byte_mask;
-    bits[bytes_begin] |= static_cast<uint8_t>(fill_byte & ~only_byte_mask);
-    return;
-  }
-
-  // set/clear trailing bits of first byte
-  bits[bytes_begin] &= first_byte_mask;
-  bits[bytes_begin] |= static_cast<uint8_t>(fill_byte & ~first_byte_mask);
-
-  if (bytes_end - bytes_begin > 2) {
-    // set/clear whole bytes
-    std::memset(bits + bytes_begin + 1, fill_byte,
-                static_cast<size_t>(bytes_end - bytes_begin - 2));
-  }
-
-  if (i_end % 8 == 0) return;
-
-  // set/clear leading bits of last byte
-  bits[bytes_end - 1] &= last_byte_mask;
-  bits[bytes_end - 1] |= static_cast<uint8_t>(fill_byte & ~last_byte_mask);
+/// \brief Create a word with low `n` bits from `low` and high `sizeof(Word)-n` bits
+/// from `high`.
+/// Word ret
+/// for (i = 0; i < sizeof(Word)*8; i++){
+///     ret[i]= i < n ? low[i]: high[i];
+/// }
+template <typename Word>
+constexpr Word SpliceWord(int n, Word low, Word high) {
+  return (high & ~PrecedingWordBitmask<Word>(n)) | (low & PrecedingWordBitmask<Word>(n));
 }
 
-/// \brief Convert vector of bytes to bitmap buffer
-ARROW_EXPORT
-Status BytesToBits(const std::vector<uint8_t>&, MemoryPool*, std::shared_ptr<Buffer>*);
-
-}  // namespace BitUtil
-
-namespace internal {
-
-class BitmapReader {
- public:
-  BitmapReader(const uint8_t* bitmap, int64_t start_offset, int64_t length)
-      : bitmap_(bitmap), position_(0), length_(length) {
-    current_byte_ = 0;
-    byte_offset_ = start_offset / 8;
-    bit_offset_ = start_offset % 8;
-    if (length > 0) {
-      current_byte_ = bitmap[byte_offset_];
-    }
-  }
-
-  bool IsSet() const { return (current_byte_ & (1 << bit_offset_)) != 0; }
-
-  bool IsNotSet() const { return (current_byte_ & (1 << bit_offset_)) == 0; }
-
-  void Next() {
-    ++bit_offset_;
-    ++position_;
-    if (ARROW_PREDICT_FALSE(bit_offset_ == 8)) {
-      bit_offset_ = 0;
-      ++byte_offset_;
-      if (ARROW_PREDICT_TRUE(position_ < length_)) {
-        current_byte_ = bitmap_[byte_offset_];
-      }
-    }
-  }
-
- private:
-  const uint8_t* bitmap_;
-  int64_t position_;
-  int64_t length_;
-
-  uint8_t current_byte_;
-  int64_t byte_offset_;
-  int64_t bit_offset_;
-};
-
-class BitmapWriter {
-  // A sequential bitwise writer that preserves surrounding bit values.
-
- public:
-  BitmapWriter(uint8_t* bitmap, int64_t start_offset, int64_t length)
-      : bitmap_(bitmap), position_(0), length_(length) {
-    byte_offset_ = start_offset / 8;
-    bit_mask_ = BitUtil::kBitmask[start_offset % 8];
-    if (length > 0) {
-      current_byte_ = bitmap[byte_offset_];
-    } else {
-      current_byte_ = 0;
-    }
-  }
-
-  void Set() { current_byte_ |= bit_mask_; }
-
-  void Clear() { current_byte_ &= bit_mask_ ^ 0xFF; }
-
-  void Next() {
-    bit_mask_ = static_cast<uint8_t>(bit_mask_ << 1);
-    ++position_;
-    if (bit_mask_ == 0) {
-      // Finished this byte, need advancing
-      bit_mask_ = 0x01;
-      bitmap_[byte_offset_++] = current_byte_;
-      if (ARROW_PREDICT_TRUE(position_ < length_)) {
-        current_byte_ = bitmap_[byte_offset_];
-      }
-    }
-  }
-
-  void Finish() {
-    // Store current byte if we didn't went past bitmap storage
-    if (length_ > 0 && (bit_mask_ != 0x01 || position_ < length_)) {
-      bitmap_[byte_offset_] = current_byte_;
-    }
-  }
-
-  int64_t position() const { return position_; }
-
- private:
-  uint8_t* bitmap_;
-  int64_t position_;
-  int64_t length_;
-
-  uint8_t current_byte_;
-  uint8_t bit_mask_;
-  int64_t byte_offset_;
-};
-
-class FirstTimeBitmapWriter {
-  // Like BitmapWriter, but any bit values *following* the bits written
-  // might be clobbered.  It is hence faster than BitmapWriter, and can
-  // also avoid false positives with Valgrind.
-
- public:
-  FirstTimeBitmapWriter(uint8_t* bitmap, int64_t start_offset, int64_t length)
-      : bitmap_(bitmap), position_(0), length_(length) {
-    current_byte_ = 0;
-    byte_offset_ = start_offset / 8;
-    bit_mask_ = BitUtil::kBitmask[start_offset % 8];
-    if (length > 0) {
-      current_byte_ = bitmap[byte_offset_] & BitUtil::kPrecedingBitmask[start_offset % 8];
-    } else {
-      current_byte_ = 0;
-    }
-  }
-
-  void Set() { current_byte_ |= bit_mask_; }
-
-  void Clear() {}
-
-  void Next() {
-    bit_mask_ = static_cast<uint8_t>(bit_mask_ << 1);
-    ++position_;
-    if (bit_mask_ == 0) {
-      // Finished this byte, need advancing
-      bit_mask_ = 0x01;
-      bitmap_[byte_offset_++] = current_byte_;
-      current_byte_ = 0;
-    }
-  }
-
-  void Finish() {
-    // Store current byte if we didn't went past bitmap storage
-    if (length_ > 0 && (bit_mask_ != 0x01 || position_ < length_)) {
-      bitmap_[byte_offset_] = current_byte_;
-    }
-  }
-
-  int64_t position() const { return position_; }
-
- private:
-  uint8_t* bitmap_;
-  int64_t position_;
-  int64_t length_;
-
-  uint8_t current_byte_;
-  uint8_t bit_mask_;
-  int64_t byte_offset_;
-};
-
-// A std::generate() like function to write sequential bits into a bitmap area.
-// Bits preceding the bitmap area are preserved, bits following the bitmap
-// area may be clobbered.
-
-template <class Generator>
-void GenerateBits(uint8_t* bitmap, int64_t start_offset, int64_t length, Generator&& g) {
-  if (length == 0) {
-    return;
-  }
-  uint8_t* cur = bitmap + start_offset / 8;
-  uint8_t bit_mask = BitUtil::kBitmask[start_offset % 8];
-  uint8_t current_byte = *cur & BitUtil::kPrecedingBitmask[start_offset % 8];
-
-  for (int64_t index = 0; index < length; ++index) {
-    const bool bit = g();
-    current_byte = bit ? (current_byte | bit_mask) : current_byte;
-    bit_mask = static_cast<uint8_t>(bit_mask << 1);
-    if (bit_mask == 0) {
-      bit_mask = 1;
-      *cur++ = current_byte;
-      current_byte = 0;
-    }
-  }
-  if (bit_mask != 1) {
-    *cur++ = current_byte;
+/// \brief Pack integers into a bitmap in batches of 8
+template <int batch_size>
+void PackBits(const uint32_t* values, uint8_t* out) {
+  for (int i = 0; i < batch_size / 8; ++i) {
+    *out++ = static_cast<uint8_t>(values[0] | values[1] << 1 | values[2] << 2 |
+                                  values[3] << 3 | values[4] << 4 | values[5] << 5 |
+                                  values[6] << 6 | values[7] << 7);
+    values += 8;
   }
 }
 
-// Like GenerateBits(), but unrolls its main loop for higher performance.
-
-template <class Generator>
-void GenerateBitsUnrolled(uint8_t* bitmap, int64_t start_offset, int64_t length,
-                          Generator&& g) {
-  if (length == 0) {
-    return;
-  }
-  uint8_t current_byte;
-  uint8_t* cur = bitmap + start_offset / 8;
-  const uint64_t start_bit_offset = start_offset % 8;
-  uint8_t bit_mask = BitUtil::kBitmask[start_bit_offset];
-  int64_t remaining = length;
-
-  if (bit_mask != 0x01) {
-    current_byte = *cur & BitUtil::kPrecedingBitmask[start_bit_offset];
-    while (bit_mask != 0 && remaining > 0) {
-      current_byte = g() ? (current_byte | bit_mask) : current_byte;
-      bit_mask = static_cast<uint8_t>(bit_mask << 1);
-      --remaining;
-    }
-    *cur++ = current_byte;
-  }
-
-  int64_t remaining_bytes = remaining / 8;
-  while (remaining_bytes-- > 0) {
-    current_byte = 0;
-    current_byte = g() ? current_byte | 0x01 : current_byte;
-    current_byte = g() ? current_byte | 0x02 : current_byte;
-    current_byte = g() ? current_byte | 0x04 : current_byte;
-    current_byte = g() ? current_byte | 0x08 : current_byte;
-    current_byte = g() ? current_byte | 0x10 : current_byte;
-    current_byte = g() ? current_byte | 0x20 : current_byte;
-    current_byte = g() ? current_byte | 0x40 : current_byte;
-    current_byte = g() ? current_byte | 0x80 : current_byte;
-    *cur++ = current_byte;
-  }
-
-  int64_t remaining_bits = remaining % 8;
-  if (remaining_bits) {
-    current_byte = 0;
-    bit_mask = 0x01;
-    while (remaining_bits-- > 0) {
-      current_byte = g() ? (current_byte | bit_mask) : current_byte;
-      bit_mask = static_cast<uint8_t>(bit_mask << 1);
-    }
-    *cur++ = current_byte;
-  }
-}
-
-// A function that visits each bit in a bitmap and calls a visitor function with a
-// boolean representation of that bit. This is intended to be analogous to
-// GenerateBits.
-template <class Visitor>
-void VisitBits(const uint8_t* bitmap, int64_t start_offset, int64_t length,
-               Visitor&& visit) {
-  BitmapReader reader(bitmap, start_offset, length);
-  for (int64_t index = 0; index < length; ++index) {
-    visit(reader.IsSet());
-    reader.Next();
-  }
-}
-
-// Like VisitBits(), but unrolls its main loop for better performance.
-template <class Visitor>
-void VisitBitsUnrolled(const uint8_t* bitmap, int64_t start_offset, int64_t length,
-                       Visitor&& visit) {
-  if (length == 0) {
-    return;
-  }
-
-  // Start by visiting any bits preceding the first full byte.
-  int64_t num_bits_before_full_bytes =
-      BitUtil::RoundUpToMultipleOf8(start_offset) - start_offset;
-  // Truncate num_bits_before_full_bytes if it is greater than length.
-  if (num_bits_before_full_bytes > length) {
-    num_bits_before_full_bytes = length;
-  }
-  // Use the non loop-unrolled VisitBits since we don't want to add branches
-  VisitBits<Visitor>(bitmap, start_offset, num_bits_before_full_bytes, visit);
-
-  // Shift the start pointer to the first full byte and compute the
-  // number of full bytes to be read.
-  const uint8_t* first_full_byte = bitmap + BitUtil::CeilDiv(start_offset, 8);
-  const int64_t num_full_bytes = (length - num_bits_before_full_bytes) / 8;
-
-  // Iterate over each full byte of the input bitmap and call the visitor in
-  // a loop-unrolled manner.
-  for (int64_t byte_index = 0; byte_index < num_full_bytes; ++byte_index) {
-    // Get the current bit-packed byte value from the bitmap.
-    const uint8_t byte = *(first_full_byte + byte_index);
-
-    // Execute the visitor function on each bit of the current byte.
-    visit(BitUtil::GetBitFromByte(byte, 0));
-    visit(BitUtil::GetBitFromByte(byte, 1));
-    visit(BitUtil::GetBitFromByte(byte, 2));
-    visit(BitUtil::GetBitFromByte(byte, 3));
-    visit(BitUtil::GetBitFromByte(byte, 4));
-    visit(BitUtil::GetBitFromByte(byte, 5));
-    visit(BitUtil::GetBitFromByte(byte, 6));
-    visit(BitUtil::GetBitFromByte(byte, 7));
-  }
-
-  // Write any leftover bits in the last byte.
-  const int64_t num_bits_after_full_bytes = (length - num_bits_before_full_bytes) % 8;
-  VisitBits<Visitor>(first_full_byte + num_full_bytes, 0, num_bits_after_full_bytes,
-                     visit);
-}
-
-// ----------------------------------------------------------------------
-// Bitmap utilities
-
-/// Copy a bit range of an existing bitmap
-///
-/// \param[in] pool memory pool to allocate memory from
-/// \param[in] bitmap source data
-/// \param[in] offset bit offset into the source data
-/// \param[in] length number of bits to copy
-/// \param[out] out the resulting copy
-///
-/// \return Status message
-ARROW_EXPORT
-Status CopyBitmap(MemoryPool* pool, const uint8_t* bitmap, int64_t offset, int64_t length,
-                  std::shared_ptr<Buffer>* out);
-
-/// Copy a bit range of an existing bitmap into an existing bitmap
-///
-/// \param[in] bitmap source data
-/// \param[in] offset bit offset into the source data
-/// \param[in] length number of bits to copy
-/// \param[in] dest_offset bit offset into the destination
-/// \param[in] restore_trailing_bits don't clobber bits outside the destination range
-/// \param[out] dest the destination buffer, must have at least space for
-/// (offset + length) bits
-ARROW_EXPORT
-void CopyBitmap(const uint8_t* bitmap, int64_t offset, int64_t length, uint8_t* dest,
-                int64_t dest_offset, bool restore_trailing_bits = true);
-
-/// Invert a bit range of an existing bitmap into an existing bitmap
-///
-/// \param[in] bitmap source data
-/// \param[in] offset bit offset into the source data
-/// \param[in] length number of bits to copy
-/// \param[in] dest_offset bit offset into the destination
-/// \param[out] dest the destination buffer, must have at least space for
-/// (offset + length) bits
-ARROW_EXPORT
-void InvertBitmap(const uint8_t* bitmap, int64_t offset, int64_t length, uint8_t* dest,
-                  int64_t dest_offset);
-
-/// Invert a bit range of an existing bitmap
-///
-/// \param[in] pool memory pool to allocate memory from
-/// \param[in] bitmap source data
-/// \param[in] offset bit offset into the source data
-/// \param[in] length number of bits to copy
-/// \param[out] out the resulting copy
-///
-/// \return Status message
-ARROW_EXPORT
-Status InvertBitmap(MemoryPool* pool, const uint8_t* bitmap, int64_t offset,
-                    int64_t length, std::shared_ptr<Buffer>* out);
-
-/// Compute the number of 1's in the given data array
-///
-/// \param[in] data a packed LSB-ordered bitmap as a byte array
-/// \param[in] bit_offset a bitwise offset into the bitmap
-/// \param[in] length the number of bits to inspect in the bitmap relative to
-/// the offset
-///
-/// \return The number of set (1) bits in the range
-ARROW_EXPORT
-int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length);
-
-ARROW_EXPORT
-bool BitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right,
-                  int64_t right_offset, int64_t bit_length);
-
-/// \brief Do a "bitmap and" on right and left buffers starting at
-/// their respective bit-offsets for the given bit-length and put
-/// the results in out_buffer starting at the given bit-offset.
-///
-/// out_buffer will be allocated and initialized to zeros using pool before
-/// the operation.
-ARROW_EXPORT
-Status BitmapAnd(MemoryPool* pool, const uint8_t* left, int64_t left_offset,
-                 const uint8_t* right, int64_t right_offset, int64_t length,
-                 int64_t out_offset, std::shared_ptr<Buffer>* out_buffer);
-
-/// \brief Do a "bitmap and" on right and left buffers starting at
-/// their respective bit-offsets for the given bit-length and put
-/// the results in out starting at the given bit-offset.
-ARROW_EXPORT
-void BitmapAnd(const uint8_t* left, int64_t left_offset, const uint8_t* right,
-               int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
-
-/// \brief Do a "bitmap or" for the given bit length on right and left buffers
-/// starting at their respective bit-offsets and put the results in out_buffer
-/// starting at the given bit-offset.
-///
-/// out_buffer will be allocated and initialized to zeros using pool before
-/// the operation.
-ARROW_EXPORT
-Status BitmapOr(MemoryPool* pool, const uint8_t* left, int64_t left_offset,
-                const uint8_t* right, int64_t right_offset, int64_t length,
-                int64_t out_offset, std::shared_ptr<Buffer>* out_buffer);
-
-/// \brief Do a "bitmap or" for the given bit length on right and left buffers
-/// starting at their respective bit-offsets and put the results in out
-/// starting at the given bit-offset.
-ARROW_EXPORT
-void BitmapOr(const uint8_t* left, int64_t left_offset, const uint8_t* right,
-              int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
-
-/// \brief Do a "bitmap xor" for the given bit-length on right and left
-/// buffers starting at their respective bit-offsets and put the results in
-/// out_buffer starting at the given bit offset.
-///
-/// out_buffer will be allocated and initialized to zeros using pool before
-/// the operation.
-ARROW_EXPORT
-Status BitmapXor(MemoryPool* pool, const uint8_t* left, int64_t left_offset,
-                 const uint8_t* right, int64_t right_offset, int64_t length,
-                 int64_t out_offset, std::shared_ptr<Buffer>* out_buffer);
-
-/// \brief Do a "bitmap xor" for the given bit-length on right and left
-/// buffers starting at their respective bit-offsets and put the results in
-/// out starting at the given bit offset.
-ARROW_EXPORT
-void BitmapXor(const uint8_t* left, int64_t left_offset, const uint8_t* right,
-               int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
-
-/// \brief Generate Bitmap with all position to `value` except for one found
-/// at `straggler_pos`.
-ARROW_EXPORT
-Status BitmapAllButOne(MemoryPool* pool, int64_t length, int64_t straggler_pos,
-                       std::shared_ptr<Buffer>* output, bool value = true);
-
-/// \brief Store a stack of bitsets efficiently. The top bitset may be
-/// accessed and its bits may be modified, but it may not be resized.
-class BitsetStack {
- public:
-  using reference = typename std::vector<bool>::reference;
-
-  /// \brief push a bitset onto the stack
-  /// \param size number of bits in the next bitset
-  /// \param value initial value for bits in the pushed bitset
-  void Push(int size, bool value) {
-    offsets_.push_back(bit_count());
-    bits_.resize(bit_count() + size, value);
-  }
-
-  /// \brief number of bits in the bitset at the top of the stack
-  int TopSize() const {
-    if (offsets_.size() == 0) return 0;
-    return bit_count() - offsets_.back();
-  }
-
-  /// \brief pop a bitset off the stack
-  void Pop() {
-    bits_.resize(offsets_.back());
-    offsets_.pop_back();
-  }
-
-  /// \brief get the value of a bit in the top bitset
-  /// \param i index of the bit to access
-  bool operator[](int i) const { return bits_[offsets_.back() + i]; }
-
-  /// \brief get a mutable reference to a bit in the top bitset
-  /// \param i index of the bit to access
-  reference operator[](int i) { return bits_[offsets_.back() + i]; }
-
- private:
-  int bit_count() const { return static_cast<int>(bits_.size()); }
-  std::vector<bool> bits_;
-  std::vector<int> offsets_;
-};
-
-}  // namespace internal
+}  // namespace bit_util
 }  // namespace arrow
-
-#endif  // ARROW_UTIL_BIT_UTIL_H

@@ -23,17 +23,27 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/array.h"
+#include "arrow/buffer.h"
 #include "arrow/json/converter.h"
 #include "arrow/table.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/stl.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/task_group.h"
 
 namespace arrow {
 
+using internal::checked_cast;
 using internal::TaskGroup;
 
 namespace json {
+namespace {
+
+Status MakeChunkedArrayBuilder(const std::shared_ptr<TaskGroup>& task_group,
+                               MemoryPool* pool, const PromotionGraph* promotion_graph,
+                               const std::shared_ptr<DataType>& type,
+                               bool allow_promotion,
+                               std::shared_ptr<ChunkedArrayBuilder>* out);
 
 class NonNestedChunkedArrayBuilder : public ChunkedArrayBuilder {
  public:
@@ -60,7 +70,9 @@ class NonNestedChunkedArrayBuilder : public ChunkedArrayBuilder {
   std::shared_ptr<Converter> converter_;
 };
 
-class TypedChunkedArrayBuilder : public NonNestedChunkedArrayBuilder {
+class TypedChunkedArrayBuilder
+    : public NonNestedChunkedArrayBuilder,
+      public std::enable_shared_from_this<TypedChunkedArrayBuilder> {
  public:
   using NonNestedChunkedArrayBuilder::NonNestedChunkedArrayBuilder;
 
@@ -72,17 +84,21 @@ class TypedChunkedArrayBuilder : public NonNestedChunkedArrayBuilder {
     }
     lock.unlock();
 
-    task_group_->Append([this, block_index, unconverted] {
+    auto self = shared_from_this();
+
+    task_group_->Append([self, block_index, unconverted] {
       std::shared_ptr<Array> converted;
-      RETURN_NOT_OK(converter_->Convert(unconverted, &converted));
-      std::unique_lock<std::mutex> lock(mutex_);
-      chunks_[block_index] = std::move(converted);
+      RETURN_NOT_OK(self->converter_->Convert(unconverted, &converted));
+      std::unique_lock<std::mutex> lock(self->mutex_);
+      self->chunks_[block_index] = std::move(converted);
       return Status::OK();
     });
   }
 };
 
-class InferringChunkedArrayBuilder : public NonNestedChunkedArrayBuilder {
+class InferringChunkedArrayBuilder
+    : public NonNestedChunkedArrayBuilder,
+      public std::enable_shared_from_this<InferringChunkedArrayBuilder> {
  public:
   InferringChunkedArrayBuilder(const std::shared_ptr<TaskGroup>& task_group,
                                const PromotionGraph* promotion_graph,
@@ -105,8 +121,9 @@ class InferringChunkedArrayBuilder : public NonNestedChunkedArrayBuilder {
   }
 
   void ScheduleConvertChunk(int64_t block_index) {
-    task_group_->Append([this, block_index] {
-      return TryConvertChunk(static_cast<size_t>(block_index));
+    auto self = shared_from_this();
+    task_group_->Append([self, block_index] {
+      return self->TryConvertChunk(static_cast<size_t>(block_index));
     });
   }
 
@@ -173,7 +190,7 @@ class InferringChunkedArrayBuilder : public NonNestedChunkedArrayBuilder {
 class ChunkedListArrayBuilder : public ChunkedArrayBuilder {
  public:
   ChunkedListArrayBuilder(const std::shared_ptr<TaskGroup>& task_group, MemoryPool* pool,
-                          std::unique_ptr<ChunkedArrayBuilder> value_builder,
+                          std::shared_ptr<ChunkedArrayBuilder> value_builder,
                           const std::shared_ptr<Field>& value_field)
       : ChunkedArrayBuilder(task_group),
         pool_(pool),
@@ -191,14 +208,10 @@ class ChunkedListArrayBuilder : public ChunkedArrayBuilder {
               const std::shared_ptr<Array>& unconverted) override {
     std::unique_lock<std::mutex> lock(mutex_);
 
-    auto list_array = static_cast<const ListArray*>(unconverted.get());
-
     if (null_bitmap_chunks_.size() <= static_cast<size_t>(block_index)) {
       null_bitmap_chunks_.resize(static_cast<size_t>(block_index) + 1, nullptr);
       offset_chunks_.resize(null_bitmap_chunks_.size(), nullptr);
     }
-    null_bitmap_chunks_[block_index] = unconverted->null_bitmap();
-    offset_chunks_[block_index] = list_array->value_offsets();
 
     if (unconverted->type_id() == Type::NA) {
       auto st = InsertNull(block_index, unconverted->length());
@@ -209,23 +222,28 @@ class ChunkedListArrayBuilder : public ChunkedArrayBuilder {
     }
 
     DCHECK_EQ(unconverted->type_id(), Type::LIST);
-    value_builder_->Insert(block_index, list_array->list_type()->value_field(),
-                           list_array->values());
+    const auto& list_array = checked_cast<const ListArray&>(*unconverted);
+
+    null_bitmap_chunks_[block_index] = unconverted->null_bitmap();
+    offset_chunks_[block_index] = list_array.value_offsets();
+
+    value_builder_->Insert(block_index, list_array.list_type()->value_field(),
+                           list_array.values());
   }
 
   Status Finish(std::shared_ptr<ChunkedArray>* out) override {
     RETURN_NOT_OK(task_group_->Finish());
 
-    std::shared_ptr<ChunkedArray> child_array;
-    RETURN_NOT_OK(value_builder_->Finish(&child_array));
+    std::shared_ptr<ChunkedArray> value_array;
+    RETURN_NOT_OK(value_builder_->Finish(&value_array));
 
-    auto type = list(value_field_->WithType(child_array->type()));
+    auto type = list(value_field_->WithType(value_array->type())->WithMetadata(nullptr));
     ArrayVector chunks(null_bitmap_chunks_.size());
     for (size_t i = 0; i < null_bitmap_chunks_.size(); ++i) {
-      auto child_chunk = child_array->chunk(static_cast<int>(i));
-      chunks[i] =
-          std::make_shared<ListArray>(type, child_chunk->length(), offset_chunks_[i],
-                                      child_chunk, null_bitmap_chunks_[i]);
+      auto value_chunk = value_array->chunk(static_cast<int>(i));
+      auto length = offset_chunks_[i]->size() / sizeof(int32_t) - 1;
+      chunks[i] = std::make_shared<ListArray>(type, length, offset_chunks_[i],
+                                              value_chunk, null_bitmap_chunks_[i]);
     }
 
     *out = std::make_shared<ChunkedArray>(std::move(chunks), type);
@@ -237,12 +255,12 @@ class ChunkedListArrayBuilder : public ChunkedArrayBuilder {
   Status InsertNull(int64_t block_index, int64_t length) {
     value_builder_->Insert(block_index, value_field_, std::make_shared<NullArray>(0));
 
-    RETURN_NOT_OK(AllocateBitmap(pool_, length, &null_bitmap_chunks_[block_index]));
-    std::memset(null_bitmap_chunks_[block_index]->mutable_data(), 0,
-                null_bitmap_chunks_[block_index]->size());
+    ARROW_ASSIGN_OR_RAISE(null_bitmap_chunks_[block_index],
+                          AllocateEmptyBitmap(length, pool_));
 
     int64_t offsets_length = (length + 1) * sizeof(int32_t);
-    RETURN_NOT_OK(AllocateBuffer(pool_, offsets_length, &offset_chunks_[block_index]));
+    ARROW_ASSIGN_OR_RAISE(offset_chunks_[block_index],
+                          AllocateBuffer(offsets_length, pool_));
     std::memset(offset_chunks_[block_index]->mutable_data(), 0, offsets_length);
 
     return Status::OK();
@@ -250,7 +268,7 @@ class ChunkedListArrayBuilder : public ChunkedArrayBuilder {
 
   std::mutex mutex_;
   MemoryPool* pool_;
-  std::unique_ptr<ChunkedArrayBuilder> value_builder_;
+  std::shared_ptr<ChunkedArrayBuilder> value_builder_;
   BufferVector offset_chunks_, null_bitmap_chunks_;
   std::shared_ptr<Field> value_field_;
 };
@@ -260,7 +278,7 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
   ChunkedStructArrayBuilder(
       const std::shared_ptr<TaskGroup>& task_group, MemoryPool* pool,
       const PromotionGraph* promotion_graph,
-      std::vector<std::pair<std::string, std::unique_ptr<ChunkedArrayBuilder>>>
+      std::vector<std::pair<std::string, std::shared_ptr<ChunkedArrayBuilder>>>
           name_builders)
       : ChunkedArrayBuilder(task_group), pool_(pool), promotion_graph_(promotion_graph) {
     for (auto&& name_builder : name_builders) {
@@ -283,12 +301,13 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
     chunk_lengths_[block_index] = unconverted->length();
 
     if (unconverted->type_id() == Type::NA) {
-      auto st =
-          AllocateBitmap(pool_, unconverted->length(), &null_bitmap_chunks_[block_index]);
-      std::memset(null_bitmap_chunks_[block_index]->mutable_data(), 0,
-                  null_bitmap_chunks_[block_index]->size());
-
-      if (!st.ok()) {
+      auto maybe_buffer = AllocateBitmap(unconverted->length(), pool_);
+      if (maybe_buffer.ok()) {
+        null_bitmap_chunks_[block_index] = *std::move(maybe_buffer);
+        std::memset(null_bitmap_chunks_[block_index]->mutable_data(), 0,
+                    null_bitmap_chunks_[block_index]->size());
+      } else {
+        Status st = maybe_buffer.status();
         task_group_->Append([st] { return st; });
       }
 
@@ -296,17 +315,17 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
       return;
     }
 
-    auto struct_array = std::static_pointer_cast<StructArray>(unconverted);
+    const auto& struct_array = checked_cast<const StructArray&>(*unconverted);
     if (promotion_graph_ == nullptr) {
       // If unexpected fields are ignored or result in an error then all parsers will emit
       // columns exclusively in the ordering specified in ParseOptions::explicit_schema,
       // so child_builders_ is immutable and no associative lookup is necessary.
       for (int i = 0; i < unconverted->num_fields(); ++i) {
-        child_builders_[i]->Insert(block_index, unconverted->type()->child(i),
-                                   struct_array->field(i));
+        child_builders_[i]->Insert(block_index, unconverted->type()->field(i),
+                                   struct_array.field(i));
       }
     } else {
-      auto st = InsertChildren(block_index, struct_array.get());
+      auto st = InsertChildren(block_index, struct_array);
       if (!st.ok()) {
         return task_group_->Append([st] { return st; });
       }
@@ -374,10 +393,10 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
   // Insert children associatively by name; the unconverted block may have unexpected or
   // differently ordered fields
   // call from Insert() only, with mutex_ locked
-  Status InsertChildren(int64_t block_index, const StructArray* unconverted) {
-    const auto& fields = unconverted->type()->children();
+  Status InsertChildren(int64_t block_index, const StructArray& unconverted) {
+    const auto& fields = unconverted.type()->fields();
 
-    for (int i = 0; i < unconverted->num_fields(); ++i) {
+    for (int i = 0; i < unconverted.num_fields(); ++i) {
       auto it = name_to_index_.find(fields[i]->name());
 
       if (it == name_to_index_.end()) {
@@ -390,15 +409,15 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
         auto new_index = static_cast<int>(name_to_index_.size());
         it = name_to_index_.emplace(fields[i]->name(), new_index).first;
 
-        std::unique_ptr<ChunkedArrayBuilder> child_builder;
+        std::shared_ptr<ChunkedArrayBuilder> child_builder;
         RETURN_NOT_OK(MakeChunkedArrayBuilder(task_group_, pool_, promotion_graph_, type,
-                                              &child_builder));
+                                              /*allow_promotion=*/true, &child_builder));
         child_builders_.emplace_back(std::move(child_builder));
       }
 
-      auto unconverted_field = unconverted->type()->child(i);
+      auto unconverted_field = unconverted.type()->field(i);
       child_builders_[it->second]->Insert(block_index, unconverted_field,
-                                          unconverted->field(i));
+                                          unconverted.field(i));
 
       child_absent_[block_index].resize(child_builders_.size(), true);
       child_absent_[block_index][it->second] = false;
@@ -411,7 +430,7 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
   MemoryPool* pool_;
   const PromotionGraph* promotion_graph_;
   std::unordered_map<std::string, int> name_to_index_;
-  std::vector<std::unique_ptr<ChunkedArrayBuilder>> child_builders_;
+  std::vector<std::shared_ptr<ChunkedArrayBuilder>> child_builders_;
   std::vector<std::vector<bool>> child_absent_;
   BufferVector null_bitmap_chunks_;
   std::vector<int64_t> chunk_lengths_;
@@ -420,39 +439,63 @@ class ChunkedStructArrayBuilder : public ChunkedArrayBuilder {
 Status MakeChunkedArrayBuilder(const std::shared_ptr<TaskGroup>& task_group,
                                MemoryPool* pool, const PromotionGraph* promotion_graph,
                                const std::shared_ptr<DataType>& type,
-                               std::unique_ptr<ChunkedArrayBuilder>* out) {
+                               bool allow_promotion,
+                               std::shared_ptr<ChunkedArrayBuilder>* out) {
+  // If a promotion graph is provided, unexpected fields will be allowed - using the graph
+  // recursively for itself and any child fields (via the `allow_promotion` parameter).
+  // Fields provided in the schema will adhere to their corresponding type. However,
+  // structs defined in the schema may obtain unexpected child fields, which will use the
+  // promotion graph as well.
+  //
+  // If a promotion graph is not provided, unexpected fields are always ignored and
+  // type inference never occurs.
   if (type->id() == Type::STRUCT) {
-    std::vector<std::pair<std::string, std::unique_ptr<ChunkedArrayBuilder>>>
+    std::vector<std::pair<std::string, std::shared_ptr<ChunkedArrayBuilder>>>
         child_builders;
-    for (const auto& f : type->children()) {
-      std::unique_ptr<ChunkedArrayBuilder> child_builder;
+    for (const auto& f : type->fields()) {
+      std::shared_ptr<ChunkedArrayBuilder> child_builder;
       RETURN_NOT_OK(MakeChunkedArrayBuilder(task_group, pool, promotion_graph, f->type(),
-                                            &child_builder));
+                                            allow_promotion, &child_builder));
       child_builders.emplace_back(f->name(), std::move(child_builder));
     }
-    *out = internal::make_unique<ChunkedStructArrayBuilder>(
-        task_group, pool, promotion_graph, std::move(child_builders));
+    *out = std::make_shared<ChunkedStructArrayBuilder>(task_group, pool, promotion_graph,
+                                                       std::move(child_builders));
     return Status::OK();
   }
   if (type->id() == Type::LIST) {
-    auto list_type = static_cast<const ListType*>(type.get());
-    std::unique_ptr<ChunkedArrayBuilder> value_builder;
+    const auto& list_type = checked_cast<const ListType&>(*type);
+    std::shared_ptr<ChunkedArrayBuilder> value_builder;
     RETURN_NOT_OK(MakeChunkedArrayBuilder(task_group, pool, promotion_graph,
-                                          list_type->value_type(), &value_builder));
-    *out = internal::make_unique<ChunkedListArrayBuilder>(
-        task_group, pool, std::move(value_builder), list_type->value_field());
+                                          list_type.value_type(), allow_promotion,
+                                          &value_builder));
+    *out = std::make_shared<ChunkedListArrayBuilder>(
+        task_group, pool, std::move(value_builder), list_type.value_field());
     return Status::OK();
   }
+
+  // Construct the "leaf" builder
   std::shared_ptr<Converter> converter;
   RETURN_NOT_OK(MakeConverter(type, pool, &converter));
-  if (promotion_graph) {
-    *out = internal::make_unique<InferringChunkedArrayBuilder>(
-        task_group, promotion_graph, std::move(converter));
+  if (allow_promotion && promotion_graph) {
+    *out = std::make_shared<InferringChunkedArrayBuilder>(task_group, promotion_graph,
+                                                          std::move(converter));
   } else {
-    *out =
-        internal::make_unique<TypedChunkedArrayBuilder>(task_group, std::move(converter));
+    *out = std::make_shared<TypedChunkedArrayBuilder>(task_group, std::move(converter));
   }
   return Status::OK();
+}
+
+}  // namespace
+
+// This overload is exposed to the user and will only be called once on instantiation to
+// canonicalize any explicitly-defined fields. Such fields won't be subject to
+// type inference/promotion
+Status MakeChunkedArrayBuilder(const std::shared_ptr<TaskGroup>& task_group,
+                               MemoryPool* pool, const PromotionGraph* promotion_graph,
+                               const std::shared_ptr<DataType>& type,
+                               std::shared_ptr<ChunkedArrayBuilder>* out) {
+  return MakeChunkedArrayBuilder(task_group, pool, promotion_graph, type,
+                                 /*allow_promotion=*/false, out);
 }
 
 }  // namespace json

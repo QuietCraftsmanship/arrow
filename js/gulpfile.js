@@ -15,25 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const del = require('del');
-const gulp = require('gulp');
-const { Observable } = require('rxjs');
-const cleanTask = require('./gulp/clean-task');
-const compileTask = require('./gulp/compile-task');
-const packageTask = require('./gulp/package-task');
-const { targets, modules } = require('./gulp/argv');
-const { testTask, createTestData, cleanTestData } = require('./gulp/test-task');
-const {
-    taskName, combinations,
-    targetDir, knownTargets,
-    npmPkgName, UMDSourceTargets,
-    tasksToSkipPerTargetOrFormat
-} = require('./gulp/util');
+import { deleteAsync as del } from 'del';
+import os from "os";
+import gulp from "gulp";
+import { targets } from "./gulp/argv.js";
+import { from as ObservableFrom, bindNodeCallback as ObservableBindNodeCallback } from "rxjs";
+import { mergeMap } from "rxjs/operators";
+import cleanTask from "./gulp/clean-task.js";
+import compileTask from "./gulp/compile-task.js";
+import packageTask from "./gulp/package-task.js";
+import { testTask, createTestData, cleanTestData } from "./gulp/test-task.js";
+import { esbuildTask, rollupTask, webpackTask, execBundleTask } from "./gulp/bundle-task.js";
+import { taskName, combinations, targetDir, knownTargets, npmPkgName, tasksToSkipPerTargetOrFormat, targetAndModuleCombinations } from "./gulp/util.js";
 
 for (const [target, format] of combinations([`all`], [`all`])) {
     const task = taskName(target, format);
     gulp.task(`clean:${task}`, cleanTask(target, format));
-    gulp.task( `test:${task}`,  testTask(target, format));
+    gulp.task(`test:${task}`, testTask(target, format));
     gulp.task(`compile:${task}`, compileTask(target, format));
     gulp.task(`package:${task}`, packageTask(target, format));
     gulp.task(`build:${task}`, gulp.series(
@@ -46,7 +44,7 @@ for (const [target, format] of combinations([`all`], [`all`])) {
 // a minifier, so we special case that here.
 knownTargets.forEach((target) => {
     const umd = taskName(target, `umd`);
-    const cls = taskName(UMDSourceTargets[target], `cls`);
+    const cls = taskName(target, `cls`);
     gulp.task(`build:${umd}`, gulp.series(
         `build:${cls}`,
         `clean:${umd}`, `compile:${umd}`, `package:${umd}`,
@@ -56,15 +54,19 @@ knownTargets.forEach((target) => {
     ));
 });
 
-// The main "apache-arrow" module builds the es5/umd, es2015/cjs,
-// es2015/esm, and es2015/umd targets, then copies and renames the
+gulp.task(`build:ts`, gulp.series(
+    `build:es5:umd`, `clean:ts`, `compile:ts`, `package:ts`
+));
+
+// The main "apache-arrow" module builds the es2015/umd, es2015/cjs,
+// es2015/esm, and esnext/umd targets, then copies and renames the
 // compiled output into the apache-arrow folder
 gulp.task(`build:${npmPkgName}`,
     gulp.series(
         gulp.parallel(
-            `build:${taskName(`es5`, `umd`)}`,
-            `build:${taskName(`esnext`, `cjs`)}`,
-            `build:${taskName(`esnext`, `esm`)}`,
+            `build:${taskName(`es2015`, `umd`)}`,
+            `build:${taskName(`es2015`, `cjs`)}`,
+            `build:${taskName(`es2015`, `esm`)}`,
             `build:${taskName(`esnext`, `umd`)}`
         ),
         `clean:${npmPkgName}`,
@@ -81,19 +83,27 @@ gulp.task(`clean`, gulp.parallel(getTasks(`clean`)));
 gulp.task(`build`, gulpConcurrent(getTasks(`build`)));
 gulp.task(`compile`, gulpConcurrent(getTasks(`compile`)));
 gulp.task(`package`, gulpConcurrent(getTasks(`package`)));
-gulp.task(`default`,  gulp.series(`clean`, `build`, `test`));
+gulp.task(`default`, gulp.series(`clean`, `build`, `test`));
 
-function gulpConcurrent(tasks) {
-    const numCPUs = Math.max(1, require('os').cpus().length * 0.75) | 0;
-    return () => Observable.from(tasks.map((task) => gulp.series(task)))
-        .flatMap((task) => Observable.bindNodeCallback(task)(), numCPUs);
+gulp.task(`bundle:esbuild`, esbuildTask());
+gulp.task(`bundle:rollup`, rollupTask());
+gulp.task(`bundle:webpack`, webpackTask());
+gulp.task(`bundle:webpack:analyze`, webpackTask({ analyze: true }));
+gulp.task(`bundle:clean`, () => del(`test/bundle/**/*-bundle.js`));
+gulp.task(`bundle:exec`, execBundleTask());
+
+gulp.task(`bundle`, gulp.series(`bundle:clean`, `bundle:esbuild`, `bundle:rollup`, `bundle:webpack`, `bundle:exec`));
+
+function gulpConcurrent(tasks, numCPUs = Math.max(1, os.cpus().length * 0.5) | 0) {
+    return () => ObservableFrom(tasks.map((task) => gulp.series(task)))
+        .pipe(mergeMap((task) => ObservableBindNodeCallback(task)(), numCPUs || 1));
 }
 
 function getTasks(name) {
     const tasks = [];
-    if (targets.indexOf(`ts`) !== -1) tasks.push(`${name}:ts`);
-    if (targets.indexOf(npmPkgName) !== -1) tasks.push(`${name}:${npmPkgName}`);
-    for (const [target, format] of combinations(targets, modules)) {
+    if (targets.includes(`ts`)) tasks.push(`${name}:ts`);
+    if (targets.includes(npmPkgName)) tasks.push(`${name}:${npmPkgName}`);
+    for (const [target, format] of targetAndModuleCombinations) {
         if (tasksToSkipPerTargetOrFormat[target] && tasksToSkipPerTargetOrFormat[target][name]) continue;
         if (tasksToSkipPerTargetOrFormat[format] && tasksToSkipPerTargetOrFormat[format][name]) continue;
         tasks.push(`${name}:${taskName(target, format)}`);

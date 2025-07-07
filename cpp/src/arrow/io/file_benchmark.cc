@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow/api.h"
 #include "arrow/io/buffered.h"
 #include "arrow/io/file.h"
 #include "arrow/testing/gtest_util.h"
@@ -34,17 +33,20 @@
 
 #ifdef _WIN32
 
-#include <io.h>
+#  include <io.h>
 
 #else
 
-#include <fcntl.h>
-#include <poll.h>
-#include <unistd.h>
+#  include <fcntl.h>
+#  include <poll.h>
+#  include <unistd.h>
 
 #endif
 
 namespace arrow {
+
+using internal::FileDescriptor;
+using internal::Pipe;
 
 std::string GetNullFile() {
 #ifdef _WIN32
@@ -98,9 +100,7 @@ class BackgroundReader {
         break;
       } else if (ret == WAIT_OBJECT_0) {
         // File ready for reading
-        int64_t bytes_read;
-        ARROW_CHECK_OK(internal::FileRead(fd_, buffer_, buffer_size_, &bytes_read));
-        total_bytes_ += bytes_read;
+        total_bytes_ += *internal::FileRead(fd_, buffer_, buffer_size_);
       } else {
         ARROW_LOG(FATAL) << "Unexpected WaitForMultipleObjects return value " << ret;
       }
@@ -131,32 +131,24 @@ class BackgroundReader {
   }
   void Stop() {
     const uint8_t data[] = "x";
-    ABORT_NOT_OK(internal::FileWrite(wakeup_w_, data, 1));
+    ABORT_NOT_OK(internal::FileWrite(wakeup_pipe_.wfd.fd(), data, 1));
   }
   void Join() { worker_->join(); }
 
-  ~BackgroundReader() {
-    for (int fd : {fd_, wakeup_r_, wakeup_w_}) {
-      ABORT_NOT_OK(internal::FileClose(fd));
-    }
-  }
-
  protected:
-  explicit BackgroundReader(int fd) : fd_(fd), total_bytes_(0) {
-    // Prepare self-pipe trick
-    int wakeupfd[2];
-    ABORT_NOT_OK(internal::CreatePipe(wakeupfd));
-    wakeup_r_ = wakeupfd[0];
-    wakeup_w_ = wakeupfd[1];
+  explicit BackgroundReader(int fd)
+      : fd_(fd), wakeup_pipe_(*internal::CreatePipe()), total_bytes_(0) {
     // Put fd in non-blocking mode
     fcntl(fd, F_SETFL, O_NONBLOCK);
+    // Note the wakeup pipe itself does not need to be non-blocking,
+    // since we're not actually reading from it.
   }
 
   void LoopReading() {
     struct pollfd pollfds[2];
-    pollfds[0].fd = fd_;
+    pollfds[0].fd = fd_.fd();
     pollfds[0].events = POLLIN;
-    pollfds[1].fd = wakeup_r_;
+    pollfds[1].fd = wakeup_pipe_.rfd.fd();
     pollfds[1].events = POLLIN;
     while (true) {
       int ret = poll(pollfds, 2, -1 /* timeout */);
@@ -171,14 +163,16 @@ class BackgroundReader {
       if (!(pollfds[0].revents & POLLIN)) {
         continue;
       }
-      int64_t bytes_read;
+      auto result = internal::FileRead(fd_.fd(), buffer_, buffer_size_);
       // There could be a spurious wakeup followed by EAGAIN
-      ARROW_UNUSED(internal::FileRead(fd_, buffer_, buffer_size_, &bytes_read));
-      total_bytes_ += bytes_read;
+      if (result.ok()) {
+        total_bytes_ += *result;
+      }
     }
   }
 
-  int fd_, wakeup_r_, wakeup_w_;
+  FileDescriptor fd_;
+  Pipe wakeup_pipe_;
   int64_t total_bytes_;
 
   static const int64_t buffer_size_ = 16384;
@@ -193,17 +187,16 @@ class BackgroundReader {
 // the other end.
 static void SetupPipeWriter(std::shared_ptr<io::OutputStream>* stream,
                             std::shared_ptr<BackgroundReader>* reader) {
-  int fd[2];
-  ABORT_NOT_OK(internal::CreatePipe(fd));
-  ABORT_NOT_OK(io::FileOutputStream::Open(fd[1], stream));
-  *reader = BackgroundReader::StartReader(fd[0]);
+  auto pipe = *internal::CreatePipe();
+  *stream = *io::FileOutputStream::Open(pipe.wfd.Detach());
+  *reader = BackgroundReader::StartReader(pipe.rfd.Detach());
 }
 
 static void BenchmarkStreamingWrites(benchmark::State& state,
-                                     std::valarray<int64_t> sizes,
+                                     const std::valarray<int64_t>& sizes,
                                      io::OutputStream* stream,
                                      BackgroundReader* reader = nullptr) {
-  const std::string datastr(*std::max_element(std::begin(sizes), std::end(sizes)), 'x');
+  const std::string datastr(sizes.max(), 'x');
   const void* data = datastr.data();
   const int64_t sum_sizes = sizes.sum();
 
@@ -227,25 +220,22 @@ static void BenchmarkStreamingWrites(benchmark::State& state,
 
 // Benchmark writing to /dev/null
 //
-// This situation is irrealistic as the kernel likely doesn't
+// This situation is unrealistic as the kernel likely doesn't
 // copy the data at all, so we only measure small writes.
 
 static void FileOutputStreamSmallWritesToNull(
     benchmark::State& state) {  // NOLINT non-const reference
-  std::shared_ptr<io::OutputStream> stream;
-  ABORT_NOT_OK(io::FileOutputStream::Open(GetNullFile(), &stream));
+  auto stream = *io::FileOutputStream::Open(GetNullFile());
 
   BenchmarkStreamingWrites(state, small_sizes, stream.get());
 }
 
 static void BufferedOutputStreamSmallWritesToNull(
     benchmark::State& state) {  // NOLINT non-const reference
-  std::shared_ptr<io::OutputStream> file;
-  ABORT_NOT_OK(io::FileOutputStream::Open(GetNullFile(), &file));
+  auto file = *io::FileOutputStream::Open(GetNullFile());
 
-  std::shared_ptr<io::BufferedOutputStream> buffered_file;
-  ABORT_NOT_OK(io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(), file,
-                                                &buffered_file));
+  auto buffered_file =
+      *io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(), file);
   BenchmarkStreamingWrites(state, small_sizes, buffered_file.get());
 }
 
@@ -277,9 +267,8 @@ static void BufferedOutputStreamSmallWritesToPipe(
   std::shared_ptr<BackgroundReader> reader;
   SetupPipeWriter(&stream, &reader);
 
-  std::shared_ptr<io::BufferedOutputStream> buffered_stream;
-  ABORT_NOT_OK(io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(),
-                                                stream, &buffered_stream));
+  auto buffered_stream =
+      *io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(), stream);
   BenchmarkStreamingWrites(state, small_sizes, buffered_stream.get(), reader.get());
 }
 
@@ -289,9 +278,8 @@ static void BufferedOutputStreamLargeWritesToPipe(
   std::shared_ptr<BackgroundReader> reader;
   SetupPipeWriter(&stream, &reader);
 
-  std::shared_ptr<io::BufferedOutputStream> buffered_stream;
-  ABORT_NOT_OK(io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(),
-                                                stream, &buffered_stream));
+  auto buffered_stream =
+      *io::BufferedOutputStream::Create(kBufferSize, default_memory_pool(), stream);
 
   BenchmarkStreamingWrites(state, large_sizes, buffered_stream.get(), reader.get());
 }

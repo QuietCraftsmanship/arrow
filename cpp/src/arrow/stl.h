@@ -15,24 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_STL_H
-#define ARROW_STL_H
+#pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "arrow/builder.h"
+#include "arrow/array.h"
+#include "arrow/array/builder_base.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_nested.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/chunked_array.h"
 #include "arrow/compute/api.h"
 #include "arrow/status.h"
 #include "arrow/table.h"
-#include "arrow/type.h"
+#include "arrow/type_fwd.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/macros.h"
 
 namespace arrow {
 
@@ -42,11 +48,32 @@ namespace stl {
 
 namespace internal {
 
+template <typename T, typename = void>
+struct is_optional_like : public std::false_type {};
+
+template <typename T, typename = void>
+struct is_dereferencable : public std::false_type {};
+
+template <typename T>
+struct is_dereferencable<T, arrow::internal::void_t<decltype(*std::declval<T>())>>
+    : public std::true_type {};
+
+template <typename T>
+struct is_optional_like<
+    T, typename std::enable_if<
+           std::is_constructible<bool, T>::value && is_dereferencable<T>::value &&
+           !std::is_array<typename std::remove_reference<T>::type>::value>::type>
+    : public std::true_type {};
+
 template <size_t N, typename Tuple>
-using BareTupleElement = typename std::remove_const<typename std::remove_reference<
-    typename std::tuple_element<N, Tuple>::type>::type>::type;
+using BareTupleElement =
+    typename std::decay<typename std::tuple_element<N, Tuple>::type>::type;
 
 }  // namespace internal
+
+template <typename T, typename R = void>
+using enable_if_optional_like =
+    typename std::enable_if<internal::is_optional_like<T>::value, R>::type;
 
 /// Traits meta class to map standard C/C++ types to equivalent Arrow types.
 template <typename T, typename Enable = void>
@@ -60,10 +87,11 @@ using CBuilderType =
 /// Default implementation of AppendListValues.
 ///
 /// This function can be specialized by user to take advantage of appending
-/// contigiuous ranges while appending. This default implementation will call
+/// contiguous ranges while appending. This default implementation will call
 /// ConversionTraits<ValueCType>::AppendRow() for each value in the range.
 template <typename ValueCType, typename Range>
-Status AppendListValues(CBuilderType<ValueCType>& value_builder, Range&& cell_range) {
+inline Status AppendListValues(CBuilderType<ValueCType>& value_builder,
+                               Range&& cell_range) {
   for (auto const& value : cell_range) {
     ARROW_RETURN_NOT_OK(ConversionTraits<ValueCType>::AppendRow(value_builder, value));
   }
@@ -81,11 +109,10 @@ Status AppendListValues(CBuilderType<ValueCType>& value_builder, Range&& cell_ra
                            size_t j) {                                              \
       return array.Value(j);                                                        \
     }                                                                               \
-    constexpr static bool nullable = false;                                         \
   };                                                                                \
                                                                                     \
   template <>                                                                       \
-  Status AppendListValues<CType_, const std::vector<CType_>&>(                      \
+  inline Status AppendListValues<CType_, const std::vector<CType_>&>(               \
       typename TypeTraits<ArrowType_>::BuilderType & value_builder,                 \
       const std::vector<CType_>& cell_range) {                                      \
     return value_builder.AppendValues(cell_range);                                  \
@@ -111,7 +138,6 @@ struct ConversionTraits<std::string> : public CTypeTraits<std::string> {
   static std::string GetEntry(const StringArray& array, size_t j) {
     return array.GetString(j);
   }
-  constexpr static bool nullable = false;
 };
 
 /// Append cell range elements as a single value to the list builder.
@@ -159,19 +185,44 @@ struct ConversionTraits<std::vector<ValueCType>>
     }
     return vec;
   }
+};
 
-  constexpr static bool nullable = false;
+template <class ValueCType, std::size_t N>
+struct ConversionTraits<std::array<ValueCType, N>>
+    : public CTypeTraits<std::array<ValueCType, N>> {
+  static arrow::Status AppendRow(FixedSizeListBuilder& builder,
+                                 const std::array<ValueCType, N>& values) {
+    auto vb =
+        ::arrow::internal::checked_cast<typename CTypeTraits<ValueCType>::BuilderType*>(
+            builder.value_builder());
+    ARROW_RETURN_NOT_OK(builder.Append());
+    return vb->AppendValues(values.data(), N);
+  }
+
+  static std::array<ValueCType, N> GetEntry(const ::arrow::FixedSizeListArray& array,
+                                            size_t j) {
+    using ElementArrayType = typename TypeTraits<
+        typename stl::ConversionTraits<ValueCType>::ArrowType>::ArrayType;
+
+    const ElementArrayType& value_array =
+        ::arrow::internal::checked_cast<const ElementArrayType&>(*array.values());
+
+    std::array<ValueCType, N> arr;
+    for (size_t i = 0; i < N; i++) {
+      arr[i] = stl::ConversionTraits<ValueCType>::GetEntry(value_array,
+                                                           array.value_offset(j) + i);
+    }
+    return arr;
+  }
 };
 
 template <typename Optional>
 struct ConversionTraits<Optional, enable_if_optional_like<Optional>>
-    : public CTypeTraits<Optional> {
-  // Dependent names from base template class needs to be brought into scope.
-  using typename CTypeTraits<Optional>::OptionalInnerType;
-  using typename CTypeTraits<Optional>::ArrowType;
-  using CTypeTraits<Optional>::type_singleton;
-
-  constexpr static bool nullable = true;
+    : public CTypeTraits<typename std::decay<decltype(*std::declval<Optional>())>::type> {
+  using OptionalInnerType =
+      typename std::decay<decltype(*std::declval<Optional>())>::type;
+  using typename CTypeTraits<OptionalInnerType>::ArrowType;
+  using CTypeTraits<OptionalInnerType>::type_singleton;
 
   static Status AppendRow(typename TypeTraits<ArrowType>::BuilderType& builder,
                           const Optional& cell) {
@@ -200,8 +251,8 @@ struct SchemaFromTuple {
       const std::vector<std::string>& names) {
     std::vector<std::shared_ptr<Field>> ret =
         SchemaFromTuple<Tuple, N - 1>::MakeSchemaRecursion(names);
-    std::shared_ptr<DataType> type = CTypeTraits<Element>::type_singleton();
-    ret.push_back(field(names[N - 1], type, ConversionTraits<Element>::nullable));
+    auto type = ConversionTraits<Element>::type_singleton();
+    ret.push_back(field(names[N - 1], type, internal::is_optional_like<Element>::value));
     return ret;
   }
 
@@ -232,7 +283,8 @@ struct SchemaFromTuple {
     std::vector<std::shared_ptr<Field>> ret =
         SchemaFromTuple<Tuple, N - 1>::MakeSchemaRecursionT(names);
     std::shared_ptr<DataType> type = ConversionTraits<Element>::type_singleton();
-    ret.push_back(field(get<N - 1>(names), type, ConversionTraits<Element>::nullable));
+    ret.push_back(
+        field(get<N - 1>(names), type, internal::is_optional_like<Element>::value));
     return ret;
   }
 
@@ -319,19 +371,18 @@ struct RowIterator<Tuple, 0> {
 template <typename Tuple, std::size_t N = std::tuple_size<Tuple>::value>
 struct EnsureColumnTypes {
   static Status Cast(const Table& table, std::shared_ptr<Table>* table_owner,
-                     const compute::CastOptions& cast_options,
-                     compute::FunctionContext* ctx,
+                     const compute::CastOptions& cast_options, compute::ExecContext* ctx,
                      std::reference_wrapper<const ::arrow::Table>* result) {
     using Element = BareTupleElement<N - 1, Tuple>;
     std::shared_ptr<DataType> expected_type = ConversionTraits<Element>::type_singleton();
 
     if (!table.schema()->field(N - 1)->type()->Equals(*expected_type)) {
-      compute::Datum casted;
-      ARROW_RETURN_NOT_OK(compute::Cast(ctx, compute::Datum(table.column(N - 1)),
-                                        expected_type, cast_options, &casted));
+      ARROW_ASSIGN_OR_RAISE(
+          Datum casted,
+          compute::Cast(table.column(N - 1), expected_type, cast_options, ctx));
       auto new_field = table.schema()->field(N - 1)->WithType(expected_type);
-      ARROW_RETURN_NOT_OK(
-          table.SetColumn(N - 1, new_field, casted.chunked_array(), table_owner));
+      ARROW_ASSIGN_OR_RAISE(*table_owner,
+                            table.SetColumn(N - 1, new_field, casted.chunked_array()));
       *result = **table_owner;
     }
 
@@ -342,9 +393,8 @@ struct EnsureColumnTypes {
 
 template <typename Tuple>
 struct EnsureColumnTypes<Tuple, 0> {
-  static Status Cast(const Table& table, std::shared_ptr<Table>* table_ownder,
-                     const compute::CastOptions& cast_options,
-                     compute::FunctionContext* ctx,
+  static Status Cast(const Table& table, std::shared_ptr<Table>* table_owner,
+                     const compute::CastOptions& cast_options, compute::ExecContext* ctx,
                      std::reference_wrapper<const ::arrow::Table>* result) {
     return Status::OK();
   }
@@ -402,30 +452,27 @@ Status TableFromTupleRange(MemoryPool* pool, Range&& rows,
     arrays.emplace_back(array);
   }
 
-  *table = Table::Make(schema, arrays);
+  *table = Table::Make(std::move(schema), std::move(arrays));
 
   return Status::OK();
 }
 
 template <typename Range>
 Status TupleRangeFromTable(const Table& table, const compute::CastOptions& cast_options,
-                           compute::FunctionContext* ctx, Range* rows) {
+                           compute::ExecContext* ctx, Range* rows) {
   using row_type = typename std::decay<decltype(*std::begin(*rows))>::type;
   constexpr std::size_t n_columns = std::tuple_size<row_type>::value;
 
   if (table.schema()->num_fields() != n_columns) {
-    std::stringstream ss;
-    ss << "Number of columns in the table does not match the width of the target: ";
-    ss << table.schema()->num_fields() << " != " << n_columns;
-    return Status::Invalid(ss.str());
+    return Status::Invalid(
+        "Number of columns in the table does not match the width of the target: ",
+        table.schema()->num_fields(), " != ", n_columns);
   }
 
-  // TODO: Use std::size with C++17
-  if (rows->size() != static_cast<size_t>(table.num_rows())) {
-    std::stringstream ss;
-    ss << "Number of rows in the table does not match the size of the target: ";
-    ss << table.num_rows() << " != " << rows->size();
-    return Status::Invalid(ss.str());
+  if (std::size(*rows) != static_cast<size_t>(table.num_rows())) {
+    return Status::Invalid(
+        "Number of rows in the table does not match the size of the target: ",
+        table.num_rows(), " != ", std::size(*rows));
   }
 
   // Check that all columns have the correct type, otherwise cast them.
@@ -442,5 +489,3 @@ Status TupleRangeFromTable(const Table& table, const compute::CastOptions& cast_
 
 }  // namespace stl
 }  // namespace arrow
-
-#endif  // ARROW_STL_H

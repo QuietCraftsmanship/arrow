@@ -22,7 +22,6 @@
 #pragma once
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <memory>
 #include <random>
@@ -32,13 +31,25 @@
 
 #include <gtest/gtest.h>
 
+#include "arrow/io/memory.h"
 #include "arrow/testing/util.h"
+#include "arrow/util/float16.h"
 
 #include "parquet/column_page.h"
 #include "parquet/column_reader.h"
 #include "parquet/column_writer.h"
 #include "parquet/encoding.h"
 #include "parquet/platform.h"
+
+// https://github.com/google/googletest/pull/2904 might not be available
+// in our version of gtest/gmock
+#define EXPECT_THROW_THAT(callable, ex_type, property)   \
+  EXPECT_THROW(                                          \
+      try { (callable)(); } catch (const ex_type& err) { \
+        EXPECT_THAT(err, (property));                    \
+        throw;                                           \
+      },                                                 \
+      ex_type)
 
 namespace parquet {
 
@@ -138,12 +149,21 @@ inline void random_numbers(int n, uint32_t seed, double min_value, double max_va
 void random_Int96_numbers(int n, uint32_t seed, int32_t min_value, int32_t max_value,
                           Int96* out);
 
+void random_float16_numbers(int n, uint32_t seed, ::arrow::util::Float16 min_value,
+                            ::arrow::util::Float16 max_value, uint16_t* out);
+
 void random_fixed_byte_array(int n, uint32_t seed, uint8_t* buf, int len, FLBA* out);
 
 void random_byte_array(int n, uint32_t seed, uint8_t* buf, ByteArray* out, int min_size,
                        int max_size);
 
 void random_byte_array(int n, uint32_t seed, uint8_t* buf, ByteArray* out, int max_size);
+
+void prefixed_random_byte_array(int n, uint32_t seed, uint8_t* buf, ByteArray* out,
+                                int min_size, int max_size, double prefixed_probability);
+
+void prefixed_random_byte_array(int n, uint32_t seed, uint8_t* buf, int len, FLBA* out,
+                                double prefixed_probability);
 
 template <typename Type, typename Sequence>
 std::shared_ptr<Buffer> EncodeValues(Encoding::type encoding, bool use_dictionary,
@@ -155,10 +175,16 @@ std::shared_ptr<Buffer> EncodeValues(Encoding::type encoding, bool use_dictionar
 }
 
 template <typename T>
+static void InitValues(int num_values, uint32_t seed, std::vector<T>& values,
+                       std::vector<uint8_t>& buffer) {
+  random_numbers(num_values, seed, std::numeric_limits<T>::min(),
+                 std::numeric_limits<T>::max(), values.data());
+}
+
+template <typename T>
 static void InitValues(int num_values, std::vector<T>& values,
                        std::vector<uint8_t>& buffer) {
-  random_numbers(num_values, 0, std::numeric_limits<T>::min(),
-                 std::numeric_limits<T>::max(), values.data());
+  InitValues(num_values, 0, values, buffer);
 }
 
 template <typename T>
@@ -177,6 +203,12 @@ static void InitDictValues(int num_values, int num_dicts, std::vector<T>& values
   for (int i = num_dicts * repeat_factor; i < num_values; ++i) {
     std::memcpy(&values[i], &values[i - num_dicts * repeat_factor], sizeof(T));
   }
+}
+
+template <>
+inline void InitDictValues<bool>(int num_values, int num_dicts, std::vector<bool>& values,
+                                 std::vector<uint8_t>& buffer) {
+  // No op for bool
 }
 
 class MockPageReader : public PageReader {
@@ -205,7 +237,7 @@ class MockPageReader : public PageReader {
 template <typename Type>
 class DataPageBuilder {
  public:
-  typedef typename Type::c_type T;
+  using c_type = typename Type::c_type;
 
   // This class writes data and metadata to the passed inputs
   explicit DataPageBuilder(ArrowOutputStream* sink)
@@ -236,7 +268,7 @@ class DataPageBuilder {
     have_rep_levels_ = true;
   }
 
-  void AppendValues(const ColumnDescriptor* d, const std::vector<T>& values,
+  void AppendValues(const ColumnDescriptor* d, const std::vector<c_type>& values,
                     Encoding::type encoding = Encoding::PLAIN) {
     std::shared_ptr<Buffer> values_sink = EncodeValues<Type>(
         encoding, false, values.data(), static_cast<int>(values.size()), d);
@@ -274,8 +306,8 @@ class DataPageBuilder {
       ParquetException::NYI("only rle encoding currently implemented");
     }
 
-    // TODO: compute a more precise maximum size for the encoded levels
-    std::vector<uint8_t> encode_buffer(levels.size() * 2);
+    std::vector<uint8_t> encode_buffer(LevelEncoder::MaxBufferSize(
+        Encoding::RLE, max_level, static_cast<int>(levels.size())));
 
     // We encode into separate memory from the output stream because the
     // RLE-encoded bytes have to be preceded in the stream by their absolute
@@ -332,18 +364,17 @@ static std::shared_ptr<DataPageV1> MakeDataPage(
 
   if (encoding == Encoding::PLAIN) {
     page_builder.AppendValues(d, values, encoding);
-    num_values = page_builder.num_values();
+    num_values = std::max(page_builder.num_values(), num_vals);
   } else {  // DICTIONARY PAGES
     PARQUET_THROW_NOT_OK(page_stream->Write(indices, indices_size));
     num_values = std::max(page_builder.num_values(), num_vals);
   }
 
-  std::shared_ptr<Buffer> buffer;
-  PARQUET_THROW_NOT_OK(page_stream->Finish(&buffer));
+  PARQUET_ASSIGN_OR_THROW(auto buffer, page_stream->Finish());
 
   return std::make_shared<DataPageV1>(buffer, num_values, encoding,
                                       page_builder.def_level_encoding(),
-                                      page_builder.rep_level_encoding());
+                                      page_builder.rep_level_encoding(), buffer->size());
 }
 
 template <typename TYPE>
@@ -510,16 +541,16 @@ static inline int MakePages(const ColumnDescriptor* d, int num_pages, int levels
                             std::vector<typename Type::c_type>& values,
                             std::vector<uint8_t>& buffer,
                             std::vector<std::shared_ptr<Page>>& pages,
-                            Encoding::type encoding = Encoding::PLAIN) {
+                            Encoding::type encoding = Encoding::PLAIN,
+                            uint32_t seed = 0) {
   int num_levels = levels_per_page * num_pages;
   int num_values = 0;
-  uint32_t seed = 0;
   int16_t zero = 0;
   int16_t max_def_level = d->max_definition_level();
   int16_t max_rep_level = d->max_repetition_level();
   std::vector<int> values_per_page(num_pages, levels_per_page);
   // Create definition levels
-  if (max_def_level > 0) {
+  if (max_def_level > 0 && num_levels != 0) {
     def_levels.resize(num_levels);
     random_numbers(num_levels, seed, zero, max_def_level, def_levels.data());
     for (int p = 0; p < num_pages; p++) {
@@ -535,10 +566,22 @@ static inline int MakePages(const ColumnDescriptor* d, int num_pages, int levels
   } else {
     num_values = num_levels;
   }
-  // Create repitition levels
-  if (max_rep_level > 0) {
+  // Create repetition levels
+  if (max_rep_level > 0 && num_levels != 0) {
     rep_levels.resize(num_levels);
-    random_numbers(num_levels, seed, zero, max_rep_level, rep_levels.data());
+    // Using a different seed so that def_levels and rep_levels are different.
+    random_numbers(num_levels, seed + 789, zero, max_rep_level, rep_levels.data());
+    // The generated levels are random. Force the very first page to start with a new
+    // record.
+    rep_levels[0] = 0;
+    // For a null value, rep_levels and def_levels are both 0.
+    // If we have a repeated value right after this, it needs to start with
+    // rep_level = 0 to indicate a new record.
+    for (int i = 0; i < num_levels - 1; ++i) {
+      if (rep_levels[i] == 0 && def_levels[i] == 0) {
+        rep_levels[i + 1] = 0;
+      }
+    }
   }
   // Create values
   values.resize(num_values);
@@ -561,21 +604,24 @@ static inline int MakePages(const ColumnDescriptor* d, int num_pages, int levels
 // Test data generation
 
 template <>
-void inline InitValues<bool>(int num_values, std::vector<bool>& values,
+void inline InitValues<bool>(int num_values, uint32_t seed, std::vector<bool>& values,
                              std::vector<uint8_t>& buffer) {
   values = {};
-  ::arrow::random_is_valid(num_values, 1., &values,
-                           static_cast<int>(::arrow::random_seed()));
+  if (seed == 0) {
+    seed = static_cast<uint32_t>(::arrow::random_seed());
+  }
+  ::arrow::random_is_valid(num_values, 0.5, &values, static_cast<int>(seed));
 }
 
 template <>
-inline void InitValues<ByteArray>(int num_values, std::vector<ByteArray>& values,
+inline void InitValues<ByteArray>(int num_values, uint32_t seed,
+                                  std::vector<ByteArray>& values,
                                   std::vector<uint8_t>& buffer) {
   int max_byte_array_len = 12;
   int num_bytes = static_cast<int>(max_byte_array_len + sizeof(uint32_t));
   size_t nbytes = num_values * num_bytes;
   buffer.resize(nbytes);
-  random_byte_array(num_values, 0, buffer.data(), values.data(), max_byte_array_len);
+  random_byte_array(num_values, seed, buffer.data(), values.data(), max_byte_array_len);
 }
 
 inline void InitWideByteArrayValues(int num_values, std::vector<ByteArray>& values,
@@ -588,17 +634,17 @@ inline void InitWideByteArrayValues(int num_values, std::vector<ByteArray>& valu
 }
 
 template <>
-inline void InitValues<FLBA>(int num_values, std::vector<FLBA>& values,
+inline void InitValues<FLBA>(int num_values, uint32_t seed, std::vector<FLBA>& values,
                              std::vector<uint8_t>& buffer) {
   size_t nbytes = num_values * FLBA_LENGTH;
   buffer.resize(nbytes);
-  random_fixed_byte_array(num_values, 0, buffer.data(), FLBA_LENGTH, values.data());
+  random_fixed_byte_array(num_values, seed, buffer.data(), FLBA_LENGTH, values.data());
 }
 
 template <>
-inline void InitValues<Int96>(int num_values, std::vector<Int96>& values,
+inline void InitValues<Int96>(int num_values, uint32_t seed, std::vector<Int96>& values,
                               std::vector<uint8_t>& buffer) {
-  random_Int96_numbers(num_values, 0, std::numeric_limits<int32_t>::min(),
+  random_Int96_numbers(num_values, seed, std::numeric_limits<int32_t>::min(),
                        std::numeric_limits<int32_t>::max(), values.data());
 }
 
@@ -612,7 +658,7 @@ inline std::string TestColumnName(int i) {
 template <typename TestType>
 class PrimitiveTypedTest : public ::testing::Test {
  public:
-  typedef typename TestType::c_type T;
+  using c_type = typename TestType::c_type;
 
   void SetUpSchema(Repetition::type repetition, int num_columns = 1) {
     std::vector<schema::NodePtr> fields;
@@ -626,7 +672,7 @@ class PrimitiveTypedTest : public ::testing::Test {
     schema_.Init(node_);
   }
 
-  void GenerateData(int64_t num_values);
+  void GenerateData(int64_t num_values, uint32_t seed = 0);
   void SetupValuesOut(int64_t num_values);
   void SyncValuesOut();
 
@@ -635,19 +681,19 @@ class PrimitiveTypedTest : public ::testing::Test {
   SchemaDescriptor schema_;
 
   // Input buffers
-  std::vector<T> values_;
+  std::vector<c_type> values_;
 
   std::vector<int16_t> def_levels_;
 
   std::vector<uint8_t> buffer_;
   // Pointer to the values, needed as we cannot use std::vector<bool>::data()
-  T* values_ptr_;
+  c_type* values_ptr_;
   std::vector<uint8_t> bool_buffer_;
 
   // Output buffers
-  std::vector<T> values_out_;
+  std::vector<c_type> values_out_;
   std::vector<uint8_t> bool_buffer_out_;
-  T* values_out_ptr_;
+  c_type* values_out_ptr_;
 };
 
 template <typename TestType>
@@ -656,7 +702,7 @@ inline void PrimitiveTypedTest<TestType>::SyncValuesOut() {}
 template <>
 inline void PrimitiveTypedTest<BooleanType>::SyncValuesOut() {
   std::vector<uint8_t>::const_iterator source_iterator = bool_buffer_out_.begin();
-  std::vector<T>::iterator destination_iterator = values_out_.begin();
+  std::vector<c_type>::iterator destination_iterator = values_out_.begin();
   while (source_iterator != bool_buffer_out_.end()) {
     *destination_iterator++ = *source_iterator++ != 0;
   }
@@ -683,27 +729,105 @@ inline void PrimitiveTypedTest<BooleanType>::SetupValuesOut(int64_t num_values) 
 }
 
 template <typename TestType>
-inline void PrimitiveTypedTest<TestType>::GenerateData(int64_t num_values) {
+inline void PrimitiveTypedTest<TestType>::GenerateData(int64_t num_values,
+                                                       uint32_t seed) {
   def_levels_.resize(num_values);
   values_.resize(num_values);
 
-  InitValues<T>(static_cast<int>(num_values), values_, buffer_);
+  InitValues<c_type>(static_cast<int>(num_values), seed, values_, buffer_);
   values_ptr_ = values_.data();
 
   std::fill(def_levels_.begin(), def_levels_.end(), 1);
 }
 
 template <>
-inline void PrimitiveTypedTest<BooleanType>::GenerateData(int64_t num_values) {
+inline void PrimitiveTypedTest<BooleanType>::GenerateData(int64_t num_values,
+                                                          uint32_t seed) {
   def_levels_.resize(num_values);
   values_.resize(num_values);
 
-  InitValues<T>(static_cast<int>(num_values), values_, buffer_);
+  InitValues<c_type>(static_cast<int>(num_values), seed, values_, buffer_);
   bool_buffer_.resize(num_values);
   std::copy(values_.begin(), values_.end(), bool_buffer_.begin());
   values_ptr_ = reinterpret_cast<bool*>(bool_buffer_.data());
 
   std::fill(def_levels_.begin(), def_levels_.end(), 1);
+}
+
+// ----------------------------------------------------------------------
+// test data generation
+
+template <typename T>
+inline void GenerateData(int num_values, T* out, std::vector<uint8_t>* heap) {
+  // seed the prng so failure is deterministic
+  random_numbers(num_values, 0, std::numeric_limits<T>::min(),
+                 std::numeric_limits<T>::max(), out);
+}
+
+template <typename T>
+inline void GenerateBoundData(int num_values, T* out, T min, T max,
+                              std::vector<uint8_t>* heap) {
+  // seed the prng so failure is deterministic
+  random_numbers(num_values, 0, min, max, out);
+}
+
+template <>
+inline void GenerateData<bool>(int num_values, bool* out, std::vector<uint8_t>* heap) {
+  // seed the prng so failure is deterministic
+  random_bools(num_values, 0.5, 0, out);
+}
+
+template <>
+inline void GenerateData<Int96>(int num_values, Int96* out, std::vector<uint8_t>* heap) {
+  // seed the prng so failure is deterministic
+  random_Int96_numbers(num_values, 0, std::numeric_limits<int32_t>::min(),
+                       std::numeric_limits<int32_t>::max(), out);
+}
+
+template <>
+inline void GenerateData<ByteArray>(int num_values, ByteArray* out,
+                                    std::vector<uint8_t>* heap) {
+  int max_byte_array_len = 12;
+  heap->resize(num_values * max_byte_array_len);
+  // seed the prng so failure is deterministic
+  random_byte_array(num_values, 0, heap->data(), out, 2, max_byte_array_len);
+}
+
+// Generate ByteArray or FLBA data where there is a given probability
+// for each value to share a common prefix with its predecessor.
+// This is useful to exercise prefix-based encodings such as DELTA_BYTE_ARRAY.
+template <typename T>
+inline void GeneratePrefixedData(int num_values, T* out, std::vector<uint8_t>* heap,
+                                 double prefixed_probability);
+
+template <>
+inline void GeneratePrefixedData(int num_values, ByteArray* out,
+                                 std::vector<uint8_t>* heap,
+                                 double prefixed_probability) {
+  int max_byte_array_len = 12;
+  heap->resize(num_values * max_byte_array_len);
+  // seed the prng so failure is deterministic
+  prefixed_random_byte_array(num_values, /*seed=*/0, heap->data(), out, /*min_size=*/2,
+                             /*max_size=*/max_byte_array_len, prefixed_probability);
+}
+
+static constexpr int kGenerateDataFLBALength = 8;
+
+template <>
+inline void GeneratePrefixedData<FLBA>(int num_values, FLBA* out,
+                                       std::vector<uint8_t>* heap,
+                                       double prefixed_probability) {
+  heap->resize(num_values * kGenerateDataFLBALength);
+  // seed the prng so failure is deterministic
+  prefixed_random_byte_array(num_values, /*seed=*/0, heap->data(),
+                             kGenerateDataFLBALength, out, prefixed_probability);
+}
+
+template <>
+inline void GenerateData<FLBA>(int num_values, FLBA* out, std::vector<uint8_t>* heap) {
+  heap->resize(num_values * kGenerateDataFLBALength);
+  // seed the prng so failure is deterministic
+  random_fixed_byte_array(num_values, 0, heap->data(), kGenerateDataFLBALength, out);
 }
 
 }  // namespace test

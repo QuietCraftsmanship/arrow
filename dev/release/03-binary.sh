@@ -70,6 +70,13 @@ if ! jq --help > /dev/null 2>&1; then
   exit 1
 fi
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+if [ -n "${SOURCE_BINTRAY_REPOSITORY_CUSTOM}" ]; then
+  SOURCE_BINTRAY_REPOSITORY=${SOURCE_BINTRAY_REPOSITORY_CUSTOM}
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 : ${BINTRAY_REPOSITORY:=apache/arrow}
 : ${SOURCE_BINTRAY_REPOSITORY:=${BINTRAY_REPOSITORY}}
 
@@ -123,6 +130,10 @@ docker_run_gpg_ready() {
 if [ \$(id -u) -ne ${docker_uid} ]; then
   usermod --uid ${docker_uid} arrow
   chown -R arrow: ~arrow
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 fi
 /usr/sbin/sshd -D
 "
@@ -138,6 +149,12 @@ fi
   rm -rf ${container_id_dir}
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+. binary-common.sh
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 bintray() {
   local command=$1
   shift
@@ -196,7 +213,7 @@ download_files() {
       --fail \
       --location \
       --output ${file} \
-      ${BINTRAY_DOWNLOAD_URL_BASE}/${SOURCE_BINTRAY_REPOSITORY}/${file}
+      ${BINTRAY_DOWNLOAD_URL_BASE}/${SOURCE_BINTRAY_REPOSITORY}/${file} &
   done
 }
 
@@ -248,18 +265,18 @@ sign_and_upload_file() {
 
   local sha256=$(shasum -a 256 ${local_path} | awk '{print $1}')
   local download_path=/${BINTRAY_REPOSITORY}/${target}-rc/${upload_path}
-  local source_upload=no
-  if ! curl \
+  if curl \
        --fail \
        --head \
        ${BINTRAY_DOWNLOAD_URL_BASE}${download_path} | \
          grep -q "^X-Checksum-Sha2: ${sha256}"; then
-    upload_file ${version} ${rc} ${target} ${local_path} ${upload_path}
-    source_upload=yes
+    return 0
   fi
 
+  upload_file ${version} ${rc} ${target} ${local_path} ${upload_path}
+
   local suffix=
-  for suffix in asc sha512; do
+  for suffix in asc sha256 sha512; do
     pushd $(dirname ${local_path})
     local local_path_base=$(basename ${local_path})
     local output_dir=$(mktemp -d -t "arrow-binary-sign.XXXXX")
@@ -278,18 +295,7 @@ sign_and_upload_file() {
           ${local_path_base} > ${output}
         ;;
     esac
-    local need_upload=no
-    if [ "${source_upload}" = "yes" ]; then
-      need_upload=yes
-    elif ! curl \
-           --fail \
-           --head \
-           ${BINTRAY_DOWNLOAD_URL_BASE}${download_path}.${suffix}; then
-      need_upload=yes
-    fi
-    if [ "${need_upload}" = "yes" ]; then
-      upload_file ${version} ${rc} ${target} ${output} ${upload_path}.${suffix}
-    fi
+    upload_file ${version} ${rc} ${target} ${output} ${upload_path}.${suffix}
     rm -rf ${output_dir}
     popd
   done
@@ -326,8 +332,9 @@ upload_deb() {
 
   local base_path=
   for base_path in *; do
-    upload_deb_file ${version} ${rc} ${distribution} ${code_name} ${base_path}
+    upload_deb_file ${version} ${rc} ${distribution} ${code_name} ${base_path} &
   done
+  wait
 }
 
 upload_apt() {
@@ -341,6 +348,7 @@ upload_apt() {
   pushd ${tmp_dir}
 
   download_files ${version} ${rc} ${distribution}
+  wait
 
   pushd ${distribution}-rc
 
@@ -356,7 +364,7 @@ upload_apt() {
     ${rc} \
     ${distribution} \
     ${keyring_name} \
-    ${keyring_name}
+    ${keyring_name} &
 
   local pool_code_name=
   for pool_code_name in pool/*; do
@@ -402,8 +410,9 @@ upload_apt() {
         ${rc} \
         ${distribution} \
         ${path} \
-        ${path}
+        ${path} &
     done
+    wait
   done
   popd
 
@@ -454,8 +463,9 @@ upload_rpm() {
       ${rc} \
       ${distribution} \
       ${distribution_version} \
-      ${rpm_path}
+      ${rpm_path} &
   done
+  wait
 }
 
 upload_yum() {
@@ -471,6 +481,7 @@ upload_yum() {
   pushd ${tmp_dir}
 
   download_files ${version} ${rc} ${distribution}
+  wait
 
   pushd ${distribution}-rc
   local keyring_name=RPM-GPG-KEY-apache-arrow
@@ -480,7 +491,7 @@ upload_yum() {
     ${rc} \
     ${distribution} \
     ${keyring_name} \
-    ${keyring_name}
+    ${keyring_name} &
   local version_dir=
   local arch_dir=
   local repo_path=
@@ -494,10 +505,11 @@ upload_yum() {
           ${rc} \
           ${distribution} \
           ${repo_path} \
-          ${repo_path}
+          ${repo_path} &
       done
     done
   done
+  wait
   popd
 
   popd
@@ -521,13 +533,18 @@ upload_python() {
       ${rc} \
       ${target} \
       ${base_path} \
-      ${version}-rc${rc}/${base_path}
+      ${version}-rc${rc}/${base_path} &
   done
+  wait
 }
 
 docker build -t ${docker_image_name} ${SOURCE_DIR}/binary
 
 chmod go-rwx "${docker_ssh_key}"
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 # By default upload all artifacts.
 # To deactivate one category, deactivate the category and all of its dependents.
@@ -581,13 +598,13 @@ for dir in *; do
       debian)
         if [ ${UPLOAD_DEBIAN_DEB} -gt 0 ]; then
           ensure_version ${version} ${rc} ${distribution}
-          upload_deb ${version} ${rc} ${distribution} ${code_name}
+          upload_deb ${version} ${rc} ${distribution} ${code_name} &
         fi
         ;;
       ubuntu)
         if [ ${UPLOAD_UBUNTU_DEB} -gt 0 ]; then
           ensure_version ${version} ${rc} ${distribution}
-          upload_deb ${version} ${rc} ${distribution} ${code_name}
+          upload_deb ${version} ${rc} ${distribution} ${code_name} &
         fi
         ;;
     esac
@@ -596,18 +613,19 @@ for dir in *; do
     pushd ${dir}
     if [ ${UPLOAD_CENTOS_RPM} -gt 0 ]; then
       ensure_version ${version} ${rc} ${distribution}
-      upload_rpm ${version} ${rc} ${distribution} ${distribution_version}
+      upload_rpm ${version} ${rc} ${distribution} ${distribution_version} &
     fi
     popd
   elif [ ${is_python} = "yes" ]; then
     pushd ${dir}
     if [ ${UPLOAD_PYTHON} -gt 0 ]; then
       ensure_version ${version} ${rc} python
-      upload_python ${version} ${rc}
+      upload_python ${version} ${rc} &
     fi
     popd
   fi
 done
+wait
 popd
 
 if [ ${have_debian} = "yes" ]; then

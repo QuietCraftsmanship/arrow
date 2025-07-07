@@ -15,24 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// import * as fs from 'fs';
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../data/tables';
+import { generateRandomTables } from '../../data/tables.js';
+import { ArrowIOTestHelper } from './helpers.js';
 
-import { ArrowIOTestHelper } from './helpers';
-import { MessageReader, AsyncMessageReader } from '../../Arrow';
+import { AsyncMessageReader, MessageReader } from 'apache-arrow';
 
 for (const table of generateRandomTables([10, 20, 30])) {
 
     const io = ArrowIOTestHelper.stream(table);
     const name = `[\n ${table.schema.fields.join(',\n ')}\n]`;
-    const numMessages = table.chunks.reduce((numMessages, batch) => {
-        return numMessages +
-            /* recordBatch message */ 1 +
-            /* dictionary messages */ batch.dictionaries.size;
-    }, /* schema message */ 1);
+
+    const numDictionaries = table.batches.reduce((dictionaries, batch) => {
+        return [...batch.dictionaries.values()]
+            .flatMap((dictionary) => dictionary.data)
+            .reduce((dictionaries, data) => dictionaries.add(data), dictionaries);
+    }, new Set()).size;
+
+    const numMessages = /* schema message */ 1 +
+                        /* recordBatch messages */ table.batches.length +
+                        /* dictionary messages */ numDictionaries;
 
     const validate = validateMessageReader.bind(0, numMessages);
     const validateAsync = validateAsyncMessageReader.bind(0, numMessages);
@@ -59,7 +60,7 @@ for (const table of generateRandomTables([10, 20, 30])) {
 export function validateMessageReader(numMessages: number, source: any) {
     const reader = new MessageReader(source);
     let index = 0;
-    for (let message of reader) {
+    for (const message of reader) {
 
         if (index === 0) {
             expect(message.isSchema()).toBe(true);
@@ -85,7 +86,7 @@ export function validateMessageReader(numMessages: number, source: any) {
 export async function validateAsyncMessageReader(numMessages: number, source: any) {
     const reader = new AsyncMessageReader(source);
     let index = 0;
-    for await (let message of reader) {
+    for await (const message of reader) {
 
         if (index === 0) {
             expect(message.isSchema()).toBe(true);

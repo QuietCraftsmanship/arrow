@@ -1,6 +1,7 @@
-cython
+cffi
 hypothesis
+packaging
 pandas
-pathlib2; python_version < "3.4"
 pytest
 pytz
+pyuwsgi; sys.platform != 'win32' and python_version < '3.13'

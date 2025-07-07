@@ -19,14 +19,21 @@
 
 #include <string>
 
+#include "arrow/status_internal.h"
 #include "arrow/util/logging.h"
 
-namespace arrow {
-
-namespace internal {
+namespace arrow::internal {
 
 void DieWithMessage(const std::string& msg) { ARROW_LOG(FATAL) << msg; }
 
-}  // namespace internal
+void InvalidValueOrDie(const Status& st) {
+  DieWithMessage(std::string("ValueOrDie called on an error: ") + st.ToString());
+}
 
-}  // namespace arrow
+Status UninitializedResult() {
+  static StatusConstant uninitialized_result{StatusCode::UnknownError,
+                                             "Uninitialized Result<T>"};
+  return uninitialized_result;
+}
+
+}  // namespace arrow::internal

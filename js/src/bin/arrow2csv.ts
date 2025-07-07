@@ -17,26 +17,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/* tslint:disable */
+/* eslint-disable unicorn/no-array-for-each */
 
-import * as fs from 'fs';
-import * as stream from 'stream';
-import { valueToString } from '../util/pretty';
-import { Schema, RecordBatch, RecordBatchReader, AsyncByteQueue } from '../Arrow.node';
+import * as fs from 'node:fs';
+import * as stream from 'node:stream';
+import { Schema, RecordBatch, RecordBatchReader, AsyncByteQueue, util } from '../Arrow.js';
 
-const padLeft = require('pad-left');
-const bignumJSONParse = require('json-bignum').parse;
-const argv = require(`command-line-args`)(cliOpts(), { partial: true });
+import * as commandLineUsage from 'command-line-usage';
+import * as commandLineArgs from 'command-line-args';
+// @ts-ignore
+import { parse as bignumJSONParse } from 'json-bignum';
+
+const argv = commandLineArgs(cliOpts(), { partial: true });
 const files = argv.help ? [] : [...(argv.file || []), ...(argv._unknown || [])].filter(Boolean);
 
 const state = { ...argv, closed: false, maxColWidths: [10] };
 
 type ToStringState = {
-    hr: string;
-    sep: string;
-    schema: any;
-    closed: boolean;
-    metadata: boolean;
+    hr?: string;
+    sep?: string;
+    schema?: any;
+    closed?: boolean;
+    metadata?: boolean;
     maxColWidths: number[];
 };
 
@@ -54,9 +56,10 @@ type ToStringState = {
         if (state.closed) { break; }
         for await (reader of recordBatchReaders(source)) {
             hasReaders = true;
-            const transformToString = batchesToString(state, reader.schema);
+            const batches = stream.Readable.from(reader);
+            const toString = batchesToString(state, reader.schema);
             await pipeTo(
-                reader.pipe(transformToString),
+                batches.pipe(toString),
                 process.stdout, { end: false }
             ).catch(() => state.closed = true); // Handle EPIPE errors
         }
@@ -65,12 +68,12 @@ type ToStringState = {
 
     return hasReaders ? 0 : print_usage();
 })()
-.then((x) => +x || 0, (err) => {
-    if (err) {
-        console.error(`${err && err.stack || err}`);
-    }
-    return process.exitCode || 1;
-}).then((code) => process.exit(code));
+    .then((x) => +x || 0, (err) => {
+        if (err) {
+            console.error(`${err?.stack || err}`);
+        }
+        return process.exitCode || 1;
+    }).then((code) => process.exit(code));
 
 function pipeTo(source: NodeJS.ReadableStream, sink: NodeJS.WritableStream, opts?: { end: boolean }) {
     return new Promise((resolve, reject) => {
@@ -78,7 +81,7 @@ function pipeTo(source: NodeJS.ReadableStream, sink: NodeJS.WritableStream, opts
         source.on('end', onEnd).pipe(sink, opts).on('error', onErr);
 
         function onEnd() { done(undefined, resolve); }
-        function onErr(err:any) { done(err, reject); }
+        function onErr(err: any) { done(err, reject); }
         function done(e: any, cb: (e?: any) => void) {
             source.removeListener('end', onEnd);
             sink.removeListener('error', onErr);
@@ -87,24 +90,24 @@ function pipeTo(source: NodeJS.ReadableStream, sink: NodeJS.WritableStream, opts
     });
 }
 
-async function *recordBatchReaders(createSourceStream: () => NodeJS.ReadableStream) {
+async function* recordBatchReaders(createSourceStream: () => NodeJS.ReadableStream): AsyncGenerator<RecordBatchReader, void, void> {
 
-    let json = new AsyncByteQueue();
-    let stream = new AsyncByteQueue();
-    let source = createSourceStream();
+    const json = new AsyncByteQueue();
+    const stream = new AsyncByteQueue();
+    const source = createSourceStream();
     let reader: RecordBatchReader | null = null;
     let readers: AsyncIterable<RecordBatchReader> | null = null;
     // tee the input source, just in case it's JSON
     source.on('end', () => [stream, json].forEach((y) => y.close()))
         .on('data', (x) => [stream, json].forEach((y) => y.write(x)))
-       .on('error', (e) => [stream, json].forEach((y) => y.abort(e)));
+        .on('error', (e) => [stream, json].forEach((y) => y.abort(e)));
 
     try {
         for await (reader of RecordBatchReader.readAll(stream)) {
             reader && (yield reader);
         }
         if (reader) return;
-    } catch (e) { readers = null; }
+    } catch { readers = null; }
 
     if (!readers) {
         await json.closed;
@@ -114,7 +117,7 @@ async function *recordBatchReaders(createSourceStream: () => NodeJS.ReadableStre
             for await (reader of RecordBatchReader.readAll(bignumJSONParse(await json.toString()))) {
                 reader && (yield reader);
             }
-        } catch (e) { readers = null; }
+        } catch { readers = null; }
     }
 }
 
@@ -123,9 +126,9 @@ function batchesToString(state: ToStringState, schema: Schema) {
     let rowId = 0;
     let batchId = -1;
     let maxColWidths = [10];
-    const { hr, sep } = state;
+    const { hr, sep, metadata } = state;
 
-    const header = ['row_id', ...schema.fields.map((f) => `${f}`)].map(valueToString);
+    const header = ['row_id', ...schema.fields.map((f) => `${f}`)].map(val => util.valueToString(val));
 
     state.maxColWidths = header.map((x, i) => Math.max(maxColWidths[i] || 0, x.length));
 
@@ -138,7 +141,7 @@ function batchesToString(state: ToStringState, schema: Schema) {
             if (batchId === -1) {
                 hr && this.push(`${horizontalRule(state.maxColWidths, hr, sep)}\n\n`);
                 this.push(`${formatRow(header, maxColWidths, sep)}\n`);
-                if (state.metadata && schema.metadata.size > 0) {
+                if (metadata && schema.metadata.size > 0) {
                     this.push(`metadata:\n${formatMetadata(schema.metadata)}\n`);
                 }
             }
@@ -146,27 +149,27 @@ function batchesToString(state: ToStringState, schema: Schema) {
             cb();
         },
         transform(batch: RecordBatch, _enc: string, cb: (error?: Error, data?: any) => void) {
-    
-            batch = !(state.schema && state.schema.length) ? batch : batch.select(...state.schema);
-    
+
+            batch = !state.schema?.length ? batch : batch.select(state.schema);
+
             if (state.closed) { return cb(undefined, null); }
-    
+
             // Pass one to convert to strings and count max column widths
             state.maxColWidths = measureColumnWidths(rowId, batch, header.map((x, i) => Math.max(maxColWidths[i] || 0, x.length)));
-    
-            // If this is the first batch in a stream, print a top horizontal rule, schema metadata, and 
+
+            // If this is the first batch in a stream, print a top horizontal rule, schema metadata, and
             if (++batchId === 0) {
                 hr && this.push(`${horizontalRule(state.maxColWidths, hr, sep)}\n`);
-                if (state.metadata && batch.schema.metadata.size > 0) {
+                if (metadata && batch.schema.metadata.size > 0) {
                     this.push(`metadata:\n${formatMetadata(batch.schema.metadata)}\n`);
                     hr && this.push(`${horizontalRule(state.maxColWidths, hr, sep)}\n`);
                 }
-                if (batch.length <= 0 || batch.numCols <= 0) {
+                if (batch.numRows <= 0 || batch.numCols <= 0) {
                     this.push(`${formatRow(header, maxColWidths = state.maxColWidths, sep)}\n`);
                 }
             }
-    
-            if (batch.length > 0 && batch.numCols > 0) {
+
+            if (batch.numRows > 0 && batch.numCols > 0) {
                 // If any of the column widths changed, print the header again
                 if (rowId % 350 !== 0 && JSON.stringify(state.maxColWidths) !== JSON.stringify(maxColWidths)) {
                     this.push(`${formatRow(header, state.maxColWidths, sep)}\n`);
@@ -174,10 +177,10 @@ function batchesToString(state: ToStringState, schema: Schema) {
                 maxColWidths = state.maxColWidths;
                 for (const row of batch) {
                     if (state.closed) { break; } else if (!row) { continue; }
-                    if (rowId++ % 350 === 0) {
+                    if (rowId % 350 === 0) {
                         this.push(`${formatRow(header, maxColWidths, sep)}\n`);
                     }
-                    this.push(`${formatRow([rowId, ...row.toArray()].map(valueToString), maxColWidths, sep)}\n`);
+                    this.push(`${formatRow([rowId++, ...row.toArray()].map(v => util.valueToString(v)), maxColWidths, sep)}\n`);
                 }
             }
             cb();
@@ -186,11 +189,19 @@ function batchesToString(state: ToStringState, schema: Schema) {
 }
 
 function horizontalRule(maxColWidths: number[], hr = '', sep = ' | ') {
-    return ` ${padLeft('', maxColWidths.reduce((x, y) => x + y, -2 + maxColWidths.length * sep.length), hr)}`;
+    return ` ${''.padStart(maxColWidths.reduce((x, y) => x + y, -2 + maxColWidths.length * sep.length), hr)}`;
 }
 
 function formatRow(row: string[] = [], maxColWidths: number[] = [], sep = ' | ') {
-    return `${row.map((x, j) => padLeft(x, maxColWidths[j])).join(sep)}`;
+    return row.map((x, j) => x.padStart(maxColWidths[j])).join(sep);
+}
+
+function formatMetadataValue(value = '') {
+    let parsed = value;
+    try {
+        parsed = JSON.stringify(JSON.parse(value), null, 2);
+    } catch { parsed = value; }
+    return util.valueToString(parsed).split('\n').join('\n  ');
 }
 
 function formatMetadata(metadata: Map<string, string>) {
@@ -198,14 +209,6 @@ function formatMetadata(metadata: Map<string, string>) {
     return [...metadata].map(([key, val]) =>
         `  ${key}: ${formatMetadataValue(val)}`
     ).join(',  \n');
-
-    function formatMetadataValue(value: string = '') {
-        let parsed = value;
-        try {
-            parsed = JSON.stringify(JSON.parse(value), null, 2);
-        } catch (e) { parsed = value; }
-        return valueToString(parsed).split('\n').join('\n  ');
-    }
 }
 
 function measureColumnWidths(rowId: number, batch: RecordBatch, maxColWidths: number[] = []) {
@@ -225,14 +228,14 @@ function measureColumnWidths(rowId: number, batch: RecordBatch, maxColWidths: nu
                 // 6 |                                          null
                 // 7 |     [2755142991,4192423256,2994359,467878370]
                 const elementWidth = typedArrayElementWidths.get(val.constructor)!;
-    
+
                 maxColWidths[j + 1] = Math.max(maxColWidths[j + 1] || 0,
                     2 + // brackets on each end
                     (val.length - 1) + // commas between elements
                     (val.length * elementWidth) // width of stringified 2^N-1
                 );
             } else {
-                maxColWidths[j + 1] = Math.max(maxColWidths[j + 1] || 0, valueToString(val).length);
+                maxColWidths[j + 1] = Math.max(maxColWidths[j + 1] || 0, util.valueToString(val).length);
             }
             ++j;
         }
@@ -256,7 +259,7 @@ const typedArrayElementWidths = (() => {
         [Float32Array, maxElementWidth(Float32Array)],
         [Float64Array, maxElementWidth(Float64Array)],
         [Uint8ClampedArray, maxElementWidth(Uint8ClampedArray)]
-    ])
+    ]);
 })();
 
 function cliOpts() {
@@ -295,11 +298,11 @@ function cliOpts() {
             name: 'help', optional: true, default: false,
             description: 'Print this usage guide.'
         }
-    ];    
+    ];
 }
 
 function print_usage() {
-    console.log(require('command-line-usage')([
+    console.log(commandLineUsage([
         {
             header: 'arrow2csv',
             content: 'Print a CSV from an Arrow file'

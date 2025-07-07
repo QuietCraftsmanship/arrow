@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <memory>
+#include <type_traits>
 
 #include "arrow/util/macros.h"
 
@@ -29,41 +30,57 @@ namespace util {
 
 namespace internal {
 
-static uint8_t non_null_filler;
+constexpr uint8_t kNonNullFiller = 0;
 
 }  // namespace internal
 
 /// \brief Returns maybe_null if not null or a non-null pointer to an arbitrary memory
 /// that shouldn't be dereferenced.
 ///
-/// Memset/Memcpy are undefinfed when a nullptr is passed as an argument use this utility
+/// Memset/Memcpy are undefined when a nullptr is passed as an argument use this utility
 /// method to wrap locations where this could happen.
 ///
 /// Note: Flatbuffers has UBSan warnings if a zero length vector is passed.
-/// https://github.com/google/flatbuffers/pull/5355 is trying to resolve them.
+/// https://github.com/google/flatbuffers/pull/5355 is trying to resolve
+/// them.
 template <typename T>
-inline T* MakeNonNull(T* maybe_null) {
+inline T* MakeNonNull(T* maybe_null = NULLPTR) {
   if (ARROW_PREDICT_TRUE(maybe_null != NULLPTR)) {
     return maybe_null;
   }
 
-  return reinterpret_cast<T*>(&internal::non_null_filler);
+  return const_cast<T*>(reinterpret_cast<const T*>(&internal::kNonNullFiller));
 }
 
 template <typename T>
-inline typename std::enable_if<std::is_integral<T>::value, T>::type SafeLoadAs(
+inline std::enable_if_t<std::is_trivially_copyable_v<T>, T> SafeLoadAs(
     const uint8_t* unaligned) {
-  typename std::remove_const<T>::type ret;
+  std::remove_const_t<T> ret;
   std::memcpy(&ret, unaligned, sizeof(T));
   return ret;
 }
 
 template <typename T>
-inline typename std::enable_if<std::is_integral<T>::value, T>::type SafeLoad(
-    const T* unaligned) {
-  typename std::remove_const<T>::type ret;
-  std::memcpy(&ret, unaligned, sizeof(T));
+inline std::enable_if_t<std::is_trivially_copyable_v<T>, T> SafeLoad(const T* unaligned) {
+  std::remove_const_t<T> ret;
+  std::memcpy(&ret, static_cast<const void*>(unaligned), sizeof(T));
   return ret;
+}
+
+template <typename U, typename T>
+inline std::enable_if_t<std::is_trivially_copyable_v<T> &&
+                            std::is_trivially_copyable_v<U> && sizeof(T) == sizeof(U),
+                        U>
+SafeCopy(T value) {
+  std::remove_const_t<U> ret;
+  std::memcpy(&ret, static_cast<const void*>(&value), sizeof(T));
+  return ret;
+}
+
+template <typename T>
+inline std::enable_if_t<std::is_trivially_copyable_v<T>, void> SafeStore(void* unaligned,
+                                                                         T value) {
+  std::memcpy(unaligned, &value, sizeof(T));
 }
 
 }  // namespace util

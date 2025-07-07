@@ -18,22 +18,36 @@
 #pragma once
 
 #include <memory>
-#include <vector>
 
-#include "arrow/array.h"
-#include "arrow/memory_pool.h"
+#include "arrow/type_fwd.h"
+#include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
+namespace internal {
 
 /// \brief Concatenate arrays
 ///
 /// \param[in] arrays a vector of arrays to be concatenated
 /// \param[in] pool memory to store the result will be allocated from this memory pool
-/// \param[out] out the resulting concatenated array
-/// \return Status
+/// \param[out] out_suggested_cast if a non-OK Result is returned, the function might set
+///   out_suggested_cast to a cast suggestion that would allow concatenating the arrays
+///   without overflow of offsets (e.g. string to large_string)
+///
+/// \return the concatenated array
 ARROW_EXPORT
-Status Concatenate(const ArrayVector& arrays, MemoryPool* pool,
-                   std::shared_ptr<Array>* out);
+Result<std::shared_ptr<Array>> Concatenate(const ArrayVector& arrays, MemoryPool* pool,
+                                           std::shared_ptr<DataType>* out_suggested_cast);
+
+}  // namespace internal
+
+/// \brief Concatenate arrays
+///
+/// \param[in] arrays a vector of arrays to be concatenated
+/// \param[in] pool memory to store the result will be allocated from this memory pool
+/// \return the concatenated array
+ARROW_EXPORT
+Result<std::shared_ptr<Array>> Concatenate(const ArrayVector& arrays,
+                                           MemoryPool* pool = default_memory_pool());
 
 }  // namespace arrow

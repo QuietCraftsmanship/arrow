@@ -31,28 +31,52 @@
 #' @name DictionaryType
 DictionaryType <- R6Class("DictionaryType",
   inherit = FixedWidthType,
-
+  public = list(
+    ToString = function() {
+      prettier_dictionary_type(DataType__ToString(self))
+    },
+    code = function(namespace = FALSE) {
+      details <- list()
+      if (self$index_type != int32()) {
+        details$index_type <- self$index_type$code(namespace)
+      }
+      if (self$value_type != utf8()) {
+        details$value_type <- self$value_type$code(namespace)
+      }
+      if (isTRUE(self$ordered)) {
+        details$ordered <- TRUE
+      }
+      call2("dictionary", !!!details, .ns = if (namespace) "arrow")
+    }
+  ),
   active = list(
-    index_type = function() DataType$create(DictionaryType__index_type(self)),
-    value_type = function() DataType$create(DictionaryType__value_type(self)),
+    index_type = function() DictionaryType__index_type(self),
+    value_type = function() DictionaryType__value_type(self),
     name = function() DictionaryType__name(self),
     ordered = function() DictionaryType__ordered(self)
   )
 )
+DictionaryType$create <- function(index_type = int32(),
+                                  value_type = utf8(),
+                                  ordered = FALSE) {
+  assert_is(index_type, "DataType")
+  assert_is(value_type, "DataType")
+  DictionaryType__initialize(index_type, value_type, ordered)
+}
 
 #' Create a dictionary type
 #'
-#' @param index_type index type, e.g. [int32()]
-#' @param value_type value type, probably [utf8()]
-#' @param ordered Is this an ordered dictionary ?
+#' @param index_type A DataType for the indices (default [int32()])
+#' @param value_type A DataType for the values (default [utf8()])
+#' @param ordered Is this an ordered dictionary (default `FALSE`)?
 #'
 #' @return A [DictionaryType]
 #' @seealso [Other Arrow data types][data-type]
 #' @export
-dictionary <- function(index_type, value_type, ordered = FALSE) {
-  assert_that(
-    inherits(index_type, "DataType"),
-    inherits(index_type, "DataType")
-  )
-  shared_ptr(DictionaryType, DictionaryType__initialize(index_type, value_type, ordered))
+dictionary <- DictionaryType$create
+
+prettier_dictionary_type <- function(x) {
+  # Prettier format the "ordered" attribute
+  x <- sub(", ordered=0", "", x)
+  sub("ordered=1", "ordered", x)
 }

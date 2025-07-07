@@ -25,6 +25,11 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "arrow/testing/gtest_compat.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/testing/matchers.h"
+#include "arrow/util/functional.h"
+
 namespace arrow {
 
 namespace {
@@ -32,10 +37,10 @@ namespace {
 using ::testing::Eq;
 
 StatusCode kErrorCode = StatusCode::Invalid;
-constexpr char kErrorMessage[] = "Invalid argument";
+constexpr const char* kErrorMessage = "Invalid argument";
 
 const int kIntElement = 42;
-constexpr char kStringElement[] =
+constexpr const char* kStringElement =
     "The Answer to the Ultimate Question of Life, the Universe, and Everything";
 
 // A data type without a default constructor.
@@ -44,6 +49,10 @@ struct Foo {
   std::string baz;
 
   explicit Foo(int value) : bar(value), baz(kStringElement) {}
+
+  bool operator==(const Foo& other) const {
+    return (bar == other.bar) && (baz == other.baz);
+  }
 };
 
 // A data type with only copy constructors.
@@ -57,7 +66,7 @@ struct CopyOnlyDataType {
 };
 
 struct ImplicitlyCopyConvertible {
-  ImplicitlyCopyConvertible(const CopyOnlyDataType& co)  // NOLINT(runtime/explicit)
+  ImplicitlyCopyConvertible(const CopyOnlyDataType& co)  // NOLINT runtime/explicit
       : copy_only(co) {}
 
   CopyOnlyDataType copy_only;
@@ -67,21 +76,35 @@ struct ImplicitlyCopyConvertible {
 struct MoveOnlyDataType {
   explicit MoveOnlyDataType(int x) : data(new int(x)) {}
 
-  MoveOnlyDataType(MoveOnlyDataType&& other) : data(other.data) { other.data = nullptr; }
-
   MoveOnlyDataType(const MoveOnlyDataType& other) = delete;
   MoveOnlyDataType& operator=(const MoveOnlyDataType& other) = delete;
 
-  ~MoveOnlyDataType() {
-    delete data;
-    data = nullptr;
+  MoveOnlyDataType(MoveOnlyDataType&& other) { MoveFrom(&other); }
+  MoveOnlyDataType& operator=(MoveOnlyDataType&& other) {
+    MoveFrom(&other);
+    return *this;
   }
 
-  int* data;
+  ~MoveOnlyDataType() { Destroy(); }
+
+  void Destroy() {
+    if (data != nullptr) {
+      delete data;
+      data = nullptr;
+    }
+  }
+
+  void MoveFrom(MoveOnlyDataType* other) {
+    Destroy();
+    data = other->data;
+    other->data = nullptr;
+  }
+
+  int* data = nullptr;
 };
 
 struct ImplicitlyMoveConvertible {
-  ImplicitlyMoveConvertible(MoveOnlyDataType&& mo)  // NOLINT(runtime/explicit)
+  ImplicitlyMoveConvertible(MoveOnlyDataType&& mo)  // NOLINT runtime/explicit
       : move_only(std::move(mo)) {}
 
   MoveOnlyDataType move_only;
@@ -112,6 +135,10 @@ struct HeapAllocatedObject {
   }
 
   ~HeapAllocatedObject() { delete value; }
+
+  bool operator==(const HeapAllocatedObject& other) const {
+    return *value == *other.value;
+  }
 };
 
 // Constructs a Foo.
@@ -149,14 +176,6 @@ struct StringVectorCtor {
   std::vector<std::string> operator()() { return {kStringElement, kErrorMessage}; }
 };
 
-bool operator==(const Foo& lhs, const Foo& rhs) {
-  return (lhs.bar == rhs.bar) && (lhs.baz == rhs.baz);
-}
-
-bool operator==(const HeapAllocatedObject& lhs, const HeapAllocatedObject& rhs) {
-  return *lhs.value == *rhs.value;
-}
-
 // Returns an rvalue reference to the Result<T> object pointed to by
 // |result|.
 template <class T>
@@ -168,11 +187,10 @@ Result<T>&& MoveResult(Result<T>* result) {
 template <typename T>
 class ResultTest : public ::testing::Test {};
 
-typedef ::testing::Types<IntCtor, FooCtor, StringCtor, StringVectorCtor,
-                         HeapAllocatedObjectCtor>
-    TestTypes;
+using TestTypes = ::testing::Types<IntCtor, FooCtor, StringCtor, StringVectorCtor,
+                                   HeapAllocatedObjectCtor>;
 
-TYPED_TEST_CASE(ResultTest, TestTypes);
+TYPED_TEST_SUITE(ResultTest, TestTypes);
 
 // Verify that the default constructor for Result constructs an object with a
 // non-ok status.
@@ -298,9 +316,6 @@ TYPED_TEST(ResultTest, MoveConstructorNonOkStatus) {
   Result<typename TypeParam::value_type> result1(status);
   Result<typename TypeParam::value_type> result2(std::move(result1));
 
-  // Verify that the status of the donor object was updated.
-  EXPECT_FALSE(result1.ok());
-
   // Verify that the destination object contains the status previously held by
   // the donor.
   EXPECT_FALSE(result2.ok());
@@ -313,9 +328,6 @@ TYPED_TEST(ResultTest, MoveConstructorOkStatus) {
   typename TypeParam::value_type value = TypeParam()();
   Result<typename TypeParam::value_type> result1(value);
   Result<typename TypeParam::value_type> result2(std::move(result1));
-
-  // Verify that the donor object was updated to contain a non-ok status.
-  EXPECT_FALSE(result1.ok());
 
   // The destination object should possess the value previously held by the
   // donor.
@@ -334,9 +346,6 @@ TYPED_TEST(ResultTest, MoveAssignmentOperatorNonOkStatus) {
   // Invoke the move-assignment operator.
   result2 = std::move(result1);
 
-  // Verify that the status of the donor object was updated.
-  EXPECT_FALSE(result1.ok());
-
   // Verify that the destination object contains the status previously held by
   // the donor.
   EXPECT_FALSE(result2.ok());
@@ -352,9 +361,6 @@ TYPED_TEST(ResultTest, MoveAssignmentOperatorOkStatus) {
 
   // Invoke the move-assignment operator.
   result2 = std::move(result1);
-
-  // Verify that the donor object was updated to contain a non-ok status.
-  EXPECT_FALSE(result1.ok());
 
   // The destination object should possess the value previously held by the
   // donor.
@@ -397,8 +403,8 @@ TYPED_TEST(ResultTest, MoveAssignmentSelfOkStatus) {
 
 // Verify that a Result object can be constructed from a move-only type.
 TEST(ResultTest, InitializationMoveOnlyType) {
-  std::string* str = new std::string(kStringElement);
-  std::unique_ptr<std::string> value(str);
+  std::unique_ptr<std::string> value(new std::string(kStringElement));
+  auto str = value.get();
   Result<std::unique_ptr<std::string>> result(std::move(value));
 
   ASSERT_TRUE(result.ok());
@@ -407,13 +413,10 @@ TEST(ResultTest, InitializationMoveOnlyType) {
 
 // Verify that a Result object can be move-constructed from a move-only type.
 TEST(ResultTest, MoveConstructorMoveOnlyType) {
-  std::string* str = new std::string(kStringElement);
-  std::unique_ptr<std::string> value(str);
+  std::unique_ptr<std::string> value(new std::string(kStringElement));
+  auto str = value.get();
   Result<std::unique_ptr<std::string>> result1(std::move(value));
   Result<std::unique_ptr<std::string>> result2(std::move(result1));
-
-  // Verify that the donor object was updated to contain a non-ok status.
-  EXPECT_FALSE(result1.ok());
 
   // The destination object should possess the value previously held by the
   // donor.
@@ -424,16 +427,13 @@ TEST(ResultTest, MoveConstructorMoveOnlyType) {
 // Verify that a Result object can be move-assigned to from a Result object
 // containing a move-only type.
 TEST(ResultTest, MoveAssignmentMoveOnlyType) {
-  std::string* str = new std::string(kStringElement);
-  std::unique_ptr<std::string> value(str);
+  std::unique_ptr<std::string> value(new std::string(kStringElement));
+  auto str = value.get();
   Result<std::unique_ptr<std::string>> result1(std::move(value));
   Result<std::unique_ptr<std::string>> result2(Status(kErrorCode, kErrorMessage));
 
   // Invoke the move-assignment operator.
   result2 = std::move(result1);
-
-  // Verify that the donor object was updated to contain a non-ok status.
-  EXPECT_FALSE(result1.ok());
 
   // The destination object should possess the value previously held by the
   // donor.
@@ -443,16 +443,13 @@ TEST(ResultTest, MoveAssignmentMoveOnlyType) {
 
 // Verify that a value can be moved out of a Result object via ValueOrDie().
 TEST(ResultTest, ValueOrDieMovedValue) {
-  std::string* str = new std::string(kStringElement);
-  std::unique_ptr<std::string> value(str);
+  std::unique_ptr<std::string> value(new std::string(kStringElement));
+  auto str = value.get();
   Result<std::unique_ptr<std::string>> result(std::move(value));
 
   std::unique_ptr<std::string> moved_value = std::move(result).ValueOrDie();
   EXPECT_EQ(moved_value.get(), str);
   EXPECT_EQ(*moved_value, kStringElement);
-
-  // Verify that the Result object was invalidated after the value was moved.
-  EXPECT_FALSE(result.ok());
 }
 
 // Verify that a Result<T> is implicitly constructible from some U, where T is
@@ -473,6 +470,170 @@ TEST(ResultTest, TemplateValueMoveConstruction) {
 
   EXPECT_TRUE(result.ok());
   EXPECT_EQ(*result.ValueOrDie().move_only.data, kIntElement);
+}
+
+// Verify that an error rvalue Result<T> allows access if an alternative is provided
+TEST(ResultTest, ErrorRvalueValueOrAlternative) {
+  Result<MoveOnlyDataType> result = Status::Invalid("");
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(*std::move(result).ValueOr(MoveOnlyDataType{kIntElement}).data, kIntElement);
+}
+
+// Verify that an ok rvalue Result<T> will ignore a provided alternative
+TEST(ResultTest, OkRvalueValueOrAlternative) {
+  Result<MoveOnlyDataType> result = MoveOnlyDataType{kIntElement};
+
+  EXPECT_TRUE(result.ok());
+  EXPECT_EQ(*std::move(result).ValueOr(MoveOnlyDataType{kIntElement - 1}).data,
+            kIntElement);
+}
+
+// Verify that an error rvalue Result<T> allows access if an alternative factory is
+// provided
+TEST(ResultTest, ErrorRvalueValueOrGeneratedAlternative) {
+  Result<MoveOnlyDataType> result = Status::Invalid("");
+
+  EXPECT_FALSE(result.ok());
+  auto out = std::move(result).ValueOrElse([] { return MoveOnlyDataType{kIntElement}; });
+  EXPECT_EQ(*out.data, kIntElement);
+}
+
+// Verify that an ok rvalue Result<T> allows access if an alternative factory is provided
+TEST(ResultTest, OkRvalueValueOrGeneratedAlternative) {
+  Result<MoveOnlyDataType> result = MoveOnlyDataType{kIntElement};
+
+  EXPECT_TRUE(result.ok());
+  auto out =
+      std::move(result).ValueOrElse([] { return MoveOnlyDataType{kIntElement - 1}; });
+  EXPECT_EQ(*out.data, kIntElement);
+}
+
+// Verify that a Result<T> can be unpacked to T
+TEST(ResultTest, StatusReturnAdapterCopyValue) {
+  Result<CopyOnlyDataType> result(CopyOnlyDataType{kIntElement});
+  CopyOnlyDataType copy_only{0};
+
+  EXPECT_TRUE(std::move(result).Value(&copy_only).ok());
+  EXPECT_EQ(copy_only.data, kIntElement);
+}
+
+// Verify that a Result<T> can be unpacked to some U, where U is
+// a type which has a constructor taking a const T &.
+TEST(ResultTest, StatusReturnAdapterCopyAndConvertValue) {
+  Result<CopyOnlyDataType> result(CopyOnlyDataType{kIntElement});
+  ImplicitlyCopyConvertible implicitly_convertible(CopyOnlyDataType{0});
+
+  EXPECT_TRUE(std::move(result).Value(&implicitly_convertible).ok());
+  EXPECT_EQ(implicitly_convertible.copy_only.data, kIntElement);
+}
+
+// Verify that a Result<T> can be unpacked to T
+TEST(ResultTest, StatusReturnAdapterMoveValue) {
+  {
+    Result<MoveOnlyDataType> result(MoveOnlyDataType{kIntElement});
+    MoveOnlyDataType move_only{0};
+
+    EXPECT_TRUE(std::move(result).Value(&move_only).ok());
+    EXPECT_EQ(*move_only.data, kIntElement);
+  }
+  {
+    Result<MoveOnlyDataType> result(MoveOnlyDataType{kIntElement});
+    auto move_only = std::move(result).ValueOrDie();
+    EXPECT_EQ(*move_only.data, kIntElement);
+  }
+  {
+    Result<MoveOnlyDataType> result(MoveOnlyDataType{kIntElement});
+    auto move_only = *std::move(result);
+    EXPECT_EQ(*move_only.data, kIntElement);
+  }
+}
+
+// Verify that a Result<T> can be unpacked to some U, where U is
+// a type which has a constructor taking a T &&.
+TEST(ResultTest, StatusReturnAdapterMoveAndConvertValue) {
+  Result<MoveOnlyDataType> result(MoveOnlyDataType{kIntElement});
+  ImplicitlyMoveConvertible implicitly_convertible(MoveOnlyDataType{0});
+
+  EXPECT_TRUE(std::move(result).Value(&implicitly_convertible).ok());
+  EXPECT_EQ(*implicitly_convertible.move_only.data, kIntElement);
+}
+
+// Verify that a Result<T> can be queried for a stored value or an alternative.
+TEST(ResultTest, ValueOrAlternative) {
+  EXPECT_EQ(Result<MoveOnlyDataType>(MoveOnlyDataType{kIntElement})
+                .ValueOr(MoveOnlyDataType{0})
+                .data[0],
+            kIntElement);
+
+  EXPECT_EQ(
+      Result<MoveOnlyDataType>(Status::Invalid("")).ValueOr(MoveOnlyDataType{0}).data[0],
+      0);
+}
+
+TEST(ResultTest, MapFunctionToConstValue) {
+  static auto error = Status::Invalid("some error message");
+
+  const Result<MoveOnlyDataType> result(MoveOnlyDataType{kIntElement});
+
+  auto const_mapped =
+      result.Map([](const MoveOnlyDataType& m) -> Result<int> { return *m.data; });
+  EXPECT_TRUE(const_mapped.ok());
+  EXPECT_EQ(const_mapped.ValueOrDie(), kIntElement);
+
+  auto const_error =
+      result.Map([](const MoveOnlyDataType& m) -> Result<int> { return error; });
+  EXPECT_FALSE(const_error.ok());
+  EXPECT_EQ(const_error.status(), error);
+}
+
+TEST(ResultTest, MapFunctionToRrefValue) {
+  static auto error = Status::Invalid("some error message");
+
+  auto result = [] { return Result<MoveOnlyDataType>(MoveOnlyDataType{kIntElement}); };
+
+  auto move_mapped =
+      result().Map([](MoveOnlyDataType m) -> Result<int> { return std::move(*m.data); });
+  EXPECT_TRUE(move_mapped.ok());
+  EXPECT_EQ(move_mapped.ValueOrDie(), kIntElement);
+
+  auto move_error = result().Map([](MoveOnlyDataType m) -> Result<int> { return error; });
+  EXPECT_FALSE(move_error.ok());
+  EXPECT_EQ(move_error.status(), error);
+}
+
+TEST(ResultTest, MapFunctionToConstError) {
+  static auto error = Status::Invalid("some error message");
+  static auto other_error = Status::Invalid("some other error message");
+
+  const Result<MoveOnlyDataType> result(error);
+
+  auto const_mapped =
+      result.Map([](const MoveOnlyDataType& m) -> Result<int> { return *m.data; });
+  EXPECT_FALSE(const_mapped.ok());
+  EXPECT_EQ(const_mapped.status(), error);  // error is *not* replaced by a value
+
+  auto const_error =
+      result.Map([](const MoveOnlyDataType& m) -> Result<int> { return other_error; });
+  EXPECT_FALSE(const_error.ok());
+  EXPECT_EQ(const_error.status(), error);  // error is *not* replaced by other_error
+}
+
+TEST(ResultTest, MapFunctionToRrefError) {
+  static auto error = Status::Invalid("some error message");
+  static auto other_error = Status::Invalid("some other error message");
+
+  auto result = [] { return Result<MoveOnlyDataType>(error); };
+
+  auto move_mapped =
+      result().Map([](MoveOnlyDataType m) -> Result<int> { return std::move(*m.data); });
+  EXPECT_FALSE(move_mapped.ok());
+  EXPECT_EQ(move_mapped.status(), error);  // error is *not* replaced by a value
+
+  auto move_error =
+      result().Map([](MoveOnlyDataType m) -> Result<int> { return other_error; });
+  EXPECT_FALSE(move_error.ok());
+  EXPECT_EQ(move_error.status(), error);  // error is *not* replaced by other_error
 }
 
 // Verify that a Result<U> is assignable to a Result<T>, where T
@@ -499,10 +660,6 @@ TEST(ResultTest, TemplateMoveAssign) {
 
   EXPECT_TRUE(result2.ok());
   EXPECT_EQ(*result2.ValueOrDie().move_only.data, kIntElement);
-
-  //  NOLINTNEXTLINE use after move.
-  EXPECT_FALSE(result.ok());
-  //  NOLINTNEXTLINE use after move.
 }
 
 // Verify that a Result<U> is constructible from a Result<T>, where T is a
@@ -527,10 +684,125 @@ TEST(ResultTest, TemplateMoveConstruct) {
 
   EXPECT_TRUE(result2.ok());
   EXPECT_EQ(*result2.ValueOrDie().move_only.data, kIntElement);
+}
 
-  //  NOLINTNEXTLINE use after move.
-  EXPECT_FALSE(result.ok());
-  //  NOLINTNEXTLINE use after move.
+TEST(ResultTest, Equality) {
+  EXPECT_EQ(Result<int>(), Result<int>());
+  EXPECT_EQ(Result<int>(3), Result<int>(3));
+  EXPECT_EQ(Result<int>(Status::Invalid("error")), Result<int>(Status::Invalid("error")));
+
+  EXPECT_NE(Result<int>(), Result<int>(3));
+  EXPECT_NE(Result<int>(Status::Invalid("error")), Result<int>(3));
+  EXPECT_NE(Result<int>(3333), Result<int>(0));
+  EXPECT_NE(Result<int>(Status::Invalid("error")),
+            Result<int>(Status::Invalid("other error")));
+
+  {
+    Result<int> moved_from(3);
+    auto moved_to = std::move(moved_from);
+    EXPECT_EQ(moved_to, Result<int>(3));
+  }
+  {
+    Result<std::vector<int>> a, b, c;
+    a = std::vector<int>{1, 2, 3, 4, 5};
+    b = std::vector<int>{1, 2, 3, 4, 5};
+    c = std::vector<int>{1, 2, 3, 4};
+    EXPECT_EQ(a, b);
+    EXPECT_NE(a, c);
+
+    c = std::move(b);
+    EXPECT_EQ(a, c);
+    EXPECT_EQ(c.ValueOrDie(), (std::vector<int>{1, 2, 3, 4, 5}));
+    EXPECT_NE(a, b);  // b's value was moved
+  }
+}
+
+TEST(ResultTest, ViewAsStatus) {
+  Result<int> ok(3);
+  Result<int> err(Status::Invalid("error"));
+
+  auto ViewAsStatus = [](const void* ptr) { return static_cast<const Status*>(ptr); };
+
+  EXPECT_EQ(ViewAsStatus(&ok), &ok.status());
+  EXPECT_EQ(ViewAsStatus(&err), &err.status());
+}
+
+TEST(ResultTest, MatcherExamples) {
+  EXPECT_THAT(Result<int>(Status::Invalid("arbitrary error")),
+              Raises(StatusCode::Invalid));
+
+  EXPECT_THAT(Result<int>(Status::Invalid("arbitrary error")),
+              Raises(StatusCode::Invalid, testing::HasSubstr("arbitrary")));
+
+  // message doesn't match, so no match
+  EXPECT_THAT(
+      Result<int>(Status::Invalid("arbitrary error")),
+      testing::Not(Raises(StatusCode::Invalid, testing::HasSubstr("reasonable"))));
+
+  // different error code, so no match
+  EXPECT_THAT(Result<int>(Status::TypeError("arbitrary error")),
+              testing::Not(Raises(StatusCode::Invalid)));
+
+  // not an error, so no match
+  EXPECT_THAT(Result<int>(333), testing::Not(Raises(StatusCode::Invalid)));
+
+  EXPECT_THAT(Result<std::string>("hello world"),
+              ResultWith(testing::HasSubstr("hello")));
+
+  EXPECT_THAT(Result<std::string>(Status::Invalid("XXX")),
+              testing::Not(ResultWith(testing::HasSubstr("hello"))));
+
+  // holds a value, but that value doesn't match the given pattern
+  EXPECT_THAT(Result<std::string>("foo bar"),
+              testing::Not(ResultWith(testing::HasSubstr("hello"))));
+}
+
+TEST(ResultTest, MatcherDescriptions) {
+  testing::Matcher<Result<std::string>> matcher = ResultWith(testing::HasSubstr("hello"));
+
+  {
+    std::stringstream ss;
+    matcher.DescribeTo(&ss);
+    EXPECT_THAT(ss.str(), testing::StrEq("value has substring \"hello\""));
+  }
+
+  {
+    std::stringstream ss;
+    matcher.DescribeNegationTo(&ss);
+    EXPECT_THAT(ss.str(), testing::StrEq("value has no substring \"hello\""));
+  }
+}
+
+TEST(ResultTest, MatcherExplanations) {
+  testing::Matcher<Result<std::string>> matcher = ResultWith(testing::HasSubstr("hello"));
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_TRUE(matcher.MatchAndExplain(Result<std::string>("hello world"), &listener));
+    EXPECT_THAT(listener.str(), testing::StrEq("whose value \"hello world\" matches"));
+  }
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_FALSE(matcher.MatchAndExplain(Result<std::string>("foo bar"), &listener));
+    EXPECT_THAT(listener.str(), testing::StrEq("whose value \"foo bar\" doesn't match"));
+  }
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_FALSE(matcher.MatchAndExplain(Status::TypeError("XXX"), &listener));
+    EXPECT_THAT(listener.str(),
+                testing::StrEq("whose error \"Type error: XXX\" doesn't match"));
+  }
+}
+
+TEST(ResultTest, ValueOrGeneratedMoveOnlyGenerator) {
+  Result<MoveOnlyDataType> result = Status::Invalid("");
+  internal::FnOnce<MoveOnlyDataType()> alternative_generator = [] {
+    return MoveOnlyDataType{kIntElement};
+  };
+  auto out = std::move(result).ValueOrElse(std::move(alternative_generator));
+  EXPECT_EQ(*out.data, kIntElement);
 }
 
 }  // namespace

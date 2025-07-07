@@ -15,7 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-context("read-write")
 
 test_that("table round trip", {
   tbl <- tibble::tibble(
@@ -34,11 +33,11 @@ test_that("table round trip", {
   expect_equal(chunked_array_int$null_count, 0L)
   expect_equal(chunked_array_int$as_vector(), tbl$int)
 
-  # arrow::Array
+  # Array
   chunks_int <- chunked_array_int$chunks
   expect_equal(length(chunks_int), chunked_array_int$num_chunks)
-  for( i in seq_along(chunks_int)){
-    expect_equal(chunked_array_int$chunk(i-1L), chunks_int[[i]])
+  for (i in seq_along(chunks_int)) {
+    expect_equal(chunked_array_int$chunk(i - 1L), chunks_int[[i]])
   }
 
   # ChunkedArray
@@ -47,11 +46,11 @@ test_that("table round trip", {
   expect_equal(chunked_array_dbl$null_count, 0L)
   expect_equal(chunked_array_dbl$as_vector(), tbl$dbl)
 
-  # arrow::Array
+  # Array
   chunks_dbl <- chunked_array_dbl$chunks
   expect_equal(length(chunks_dbl), chunked_array_dbl$num_chunks)
-  for( i in seq_along(chunks_dbl)){
-    expect_equal(chunked_array_dbl$chunk(i-1L), chunks_dbl[[i]])
+  for (i in seq_along(chunks_dbl)) {
+    expect_equal(chunked_array_dbl$chunk(i - 1L), chunks_dbl[[i]])
   }
 
   # ChunkedArray
@@ -60,16 +59,16 @@ test_that("table round trip", {
   expect_equal(chunked_array_raw$null_count, 0L)
   expect_equal(chunked_array_raw$as_vector(), as.integer(tbl$raw))
 
-  # arrow::Array
+  # Array
   chunks_raw <- chunked_array_raw$chunks
   expect_equal(length(chunks_raw), chunked_array_raw$num_chunks)
-  for( i in seq_along(chunks_raw)){
-    expect_equal(chunked_array_raw$chunk(i-1L), chunks_raw[[i]])
+  for (i in seq_along(chunks_raw)) {
+    expect_equal(chunked_array_raw$chunk(i - 1L), chunks_raw[[i]])
   }
   tf <- tempfile()
-  write_arrow(tbl, tf)
+  write_feather(tbl, tf)
 
-  res <- read_arrow(tf)
+  res <- read_feather(tf)
   expect_identical(tbl$int, res$int)
   expect_identical(tbl$dbl, res$dbl)
   expect_identical(as.integer(tbl$raw), res$raw)
@@ -97,12 +96,12 @@ test_that("table round trip handles NA in integer and numeric", {
 
   expect_equal(tab$column(0)$type, int32())
   expect_equal(tab$column(1)$type, float64())
-  expect_equal(tab$column(2)$type, int8())
+  expect_equal(tab$column(2)$type, uint8())
 
   tf <- tempfile()
-  write_arrow(tbl, tf)
+  write_feather(tbl, tf)
 
-  res <- read_arrow(tf)
+  res <- read_feather(tf)
   expect_identical(tbl$int, res$int)
   expect_identical(tbl$dbl, res$dbl)
   expect_identical(as.integer(tbl$raw), res$raw)
@@ -111,4 +110,16 @@ test_that("table round trip handles NA in integer and numeric", {
   expect_true(is.na(res$dbl[6]))
   expect_true(is.na(res$dbl[10]))
   unlink(tf)
+})
+
+test_that("reading/writing a raw vector (sparklyr integration)", {
+  # These are effectively what sparklyr calls to get data to/from Spark
+  read_from_raw_test <- function(x) {
+    as.data.frame(RecordBatchStreamReader$create(x)$read_next_batch())
+  }
+  bytes <- write_to_raw(example_data)
+  expect_type(bytes, "raw")
+  expect_equal_data_frame(read_from_raw_test(bytes), example_data)
+  # this could just be `read_ipc_stream(x)`; propose that
+  expect_equal_data_frame(read_ipc_stream(bytes), example_data)
 })

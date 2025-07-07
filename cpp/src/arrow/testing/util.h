@@ -23,78 +23,54 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "arrow/buffer.h"
-#include "arrow/builder.h"
 #include "arrow/record_batch.h"
 #include "arrow/status.h"
+#include "arrow/testing/visibility.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/visibility.h"
-#include "arrow/visitor_inline.h"
 
 namespace arrow {
-
-class Array;
-class ChunkedArray;
-class MemoryPool;
-class RecordBatch;
-class Table;
-
-using ArrayVector = std::vector<std::shared_ptr<Array>>;
 
 template <typename T>
 Status CopyBufferFromVector(const std::vector<T>& values, MemoryPool* pool,
                             std::shared_ptr<Buffer>* result) {
   int64_t nbytes = static_cast<int>(values.size()) * sizeof(T);
 
-  std::shared_ptr<Buffer> buffer;
-  RETURN_NOT_OK(AllocateBuffer(pool, nbytes, &buffer));
+  ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateBuffer(nbytes, pool));
   auto immutable_data = reinterpret_cast<const uint8_t*>(values.data());
   std::copy(immutable_data, immutable_data + nbytes, buffer->mutable_data());
   memset(buffer->mutable_data() + nbytes, 0,
          static_cast<size_t>(buffer->capacity() - nbytes));
 
-  *result = buffer;
+  *result = std::move(buffer);
   return Status::OK();
 }
 
 // Sets approximately pct_null of the first n bytes in null_bytes to zero
 // and the rest to non-zero (true) values.
-ARROW_EXPORT void random_null_bytes(int64_t n, double pct_null, uint8_t* null_bytes);
-ARROW_EXPORT void random_is_valid(int64_t n, double pct_null, std::vector<bool>* is_valid,
-                                  int random_seed = 0);
-ARROW_EXPORT void random_bytes(int64_t n, uint32_t seed, uint8_t* out);
-ARROW_EXPORT std::string random_string(int64_t n, uint32_t seed);
-ARROW_EXPORT int32_t DecimalSize(int32_t precision);
-ARROW_EXPORT void random_decimals(int64_t n, uint32_t seed, int32_t precision,
-                                  uint8_t* out);
-ARROW_EXPORT void random_ascii(int64_t n, uint32_t seed, uint8_t* out);
-ARROW_EXPORT int64_t CountNulls(const std::vector<uint8_t>& valid_bytes);
+ARROW_TESTING_EXPORT void random_null_bytes(int64_t n, double pct_null,
+                                            uint8_t* null_bytes);
+ARROW_TESTING_EXPORT void random_is_valid(int64_t n, double pct_null,
+                                          std::vector<bool>* is_valid,
+                                          int random_seed = 0);
+ARROW_TESTING_EXPORT void random_bytes(int64_t n, uint32_t seed, uint8_t* out);
+ARROW_TESTING_EXPORT std::string random_string(int64_t n, uint32_t seed);
+ARROW_TESTING_EXPORT int32_t DecimalSize(int32_t precision);
+ARROW_TESTING_EXPORT void random_ascii(int64_t n, uint32_t seed, uint8_t* out);
+ARROW_TESTING_EXPORT int64_t CountNulls(const std::vector<uint8_t>& valid_bytes);
 
-ARROW_EXPORT Status MakeRandomByteBuffer(int64_t length, MemoryPool* pool,
-                                         std::shared_ptr<ResizableBuffer>* out,
-                                         uint32_t seed = 0);
+ARROW_TESTING_EXPORT Status MakeRandomByteBuffer(int64_t length, MemoryPool* pool,
+                                                 std::shared_ptr<ResizableBuffer>* out,
+                                                 uint32_t seed = 0);
 
-ARROW_EXPORT uint64_t random_seed();
-
-template <class T, class Builder>
-Status MakeArray(const std::vector<uint8_t>& valid_bytes, const std::vector<T>& values,
-                 int64_t size, Builder* builder, std::shared_ptr<Array>* out) {
-  // Append the first 1000
-  for (int64_t i = 0; i < size; ++i) {
-    if (valid_bytes[i] > 0) {
-      RETURN_NOT_OK(builder->Append(values[i]));
-    } else {
-      RETURN_NOT_OK(builder->AppendNull());
-    }
-  }
-  return builder->Finish(out);
-}
+ARROW_TESTING_EXPORT uint64_t random_seed();
 
 #define DECL_T() typedef typename TestFixture::T T;
 
@@ -126,61 +102,43 @@ class BatchIterator : public RecordBatchReader {
   size_t position_;
 };
 
-template <typename Fn>
-struct VisitBuilderImpl {
-  template <typename T, typename BuilderType = typename TypeTraits<T>::BuilderType,
-            // need to let SFINAE drop this Visit when it would result in
-            // [](NullBuilder*){}(double_builder)
-            typename E = typename std::result_of<Fn(BuilderType*)>::type>
-  Status Visit(const T&) {
-    fn_(internal::checked_cast<BuilderType*>(builder_));
-    return Status::OK();
-  }
-
-  Status Visit(const DataType& t) {
-    return Status::NotImplemented("visiting builders of type ", t);
-  }
-
-  Status Visit() { return VisitTypeInline(*builder_->type(), this); }
-
-  ArrayBuilder* builder_;
-  Fn fn_;
-};
-
-template <typename Fn>
-Status VisitBuilder(ArrayBuilder* builder, Fn&& fn) {
-  return VisitBuilderImpl<Fn>{builder, std::forward<Fn>(fn)}.Visit();
+static inline std::vector<std::shared_ptr<DataType> (*)(FieldVector, std::vector<int8_t>)>
+UnionTypeFactories() {
+  return {sparse_union, dense_union};
 }
 
-template <typename Fn>
-Result<std::shared_ptr<Array>> ArrayFromBuilderVisitor(
-    const std::shared_ptr<DataType>& type, int64_t initial_capacity,
-    int64_t visitor_repetitions, Fn&& fn) {
-  std::unique_ptr<ArrayBuilder> builder;
-  RETURN_NOT_OK(MakeBuilder(default_memory_pool(), type, &builder));
+// Return the value of the ARROW_TEST_DATA environment variable or return error
+// Status
+ARROW_TESTING_EXPORT Status GetTestResourceRoot(std::string*);
 
-  if (initial_capacity != 0) {
-    RETURN_NOT_OK(builder->Resize(initial_capacity));
-  }
+// Return the value of the ARROW_TIMEZONE_DATABASE environment variable
+ARROW_TESTING_EXPORT std::optional<std::string> GetTestTimezoneDatabaseRoot();
 
-  for (int64_t i = 0; i < visitor_repetitions; ++i) {
-    RETURN_NOT_OK(VisitBuilder(builder.get(), std::forward<Fn>(fn)));
-  }
-
-  std::shared_ptr<Array> out;
-  RETURN_NOT_OK(builder->Finish(&out));
-  return std::move(out);
-}
-
-template <typename Fn>
-Result<std::shared_ptr<Array>> ArrayFromBuilderVisitor(
-    const std::shared_ptr<DataType>& type, int64_t length, Fn&& fn) {
-  return ArrayFromBuilderVisitor(type, length, length, std::forward<Fn>(fn));
-}
+// Set the Timezone database based on the ARROW_TIMEZONE_DATABASE env variable
+// This is only relevant on Windows, since other OSs have compatible databases built-in
+ARROW_TESTING_EXPORT Status InitTestTimezoneDatabase();
 
 // Get a TCP port number to listen on.  This is a different number every time,
-// as reusing the same port accross tests can produce spurious bind errors on
+// as reusing the same port across tests can produce spurious bind errors on
 // Windows.
-ARROW_EXPORT int GetListenPort();
+ARROW_TESTING_EXPORT int GetListenPort();
+
+// Get a IPv4 "address:port" to listen on.  The address will be a loopback
+// address.  Compared to GetListenPort(), this will minimize the risk of
+// port conflicts.
+ARROW_TESTING_EXPORT std::string GetListenAddress();
+
+// Get a "host:port" to listen on. Compared to GetListenAddress(), this function would use
+// the host passed in.
+ARROW_TESTING_EXPORT std::string GetListenAddress(const std::string& host);
+
+ARROW_TESTING_EXPORT
+const std::vector<std::shared_ptr<DataType>>& all_dictionary_index_types();
+
+// Get a list of supported hardware flags from the given candidates.
+// The result will always contain 0, meaning no optional CPU feature enabled at all.
+ARROW_TESTING_EXPORT
+std::vector<int64_t> GetSupportedHardwareFlags(
+    const std::vector<int64_t>& candidate_flags);
 
 }  // namespace arrow

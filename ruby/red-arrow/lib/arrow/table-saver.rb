@@ -32,6 +32,30 @@ module Arrow
     end
 
     def save
+      if @output.is_a?(URI)
+        custom_save_method = "save_to_uri"
+      else
+        custom_save_method = "save_to_file"
+      end
+      unless respond_to?(custom_save_method, true)
+        available_schemes = []
+        (methods(true) | private_methods(true)).each do |name|
+          match_data = /\Asave_to_/.match(name.to_s)
+          if match_data
+            available_schemes << match_data.post_match
+          end
+        end
+        message = "Arrow::Table save source must be one of ["
+        message << available_schemes.join(", ")
+        message << "]: #{@output.scheme.inspect}"
+        raise ArgumentError, message
+      end
+      __send__(custom_save_method)
+      @table
+    end
+
+    private
+    def save_to_file
       format = @options[:format]
       custom_save_method = "save_as_#{format}"
       unless respond_to?(custom_save_method, true)
@@ -42,6 +66,8 @@ module Arrow
             available_formats << match_data.post_match
           end
         end
+        deprecated_formats = ["batch", "stream"]
+        available_formats -= deprecated_formats
         message = "Arrow::Table save format must be one of ["
         message << available_formats.join(", ")
         message << "]: #{format.inspect}"
@@ -55,21 +81,24 @@ module Arrow
       end
     end
 
-    private
     def fill_options
       if @options[:format] and @options.key?(:compression)
         return
       end
 
-      if @output.is_a?(Buffer)
+      case @output
+      when Buffer
         info = {}
+      when URI
+        extension = PathExtension.new(@output.path)
+        info = extension.extract
       else
         extension = PathExtension.new(@output)
         info = extension.extract
       end
       format = info[:format]
       @options = @options.dup
-      if format and respond_to?("save_as_#{format}", true)
+      if format
         @options[:format] ||= format.to_sym
       else
         @options[:format] ||= :arrow
@@ -110,35 +139,62 @@ module Arrow
     end
 
     def save_as_arrow
-      save_as_batch
+      save_as_arrow_file
     end
 
-    def save_as_batch
+    # @since 1.0.0
+    def save_as_arrow_file
       save_raw(RecordBatchFileWriter)
     end
 
-    def save_as_stream
+    # @deprecated Use `format: :arrow_batch` instead.
+    def save_as_batch
+      save_as_arrow_file
+    end
+
+    # @since 7.0.0
+    def save_as_arrows
       save_raw(RecordBatchStreamWriter)
     end
 
-    def save_as_csv
+    # @since 1.0.0
+    def save_as_arrow_streaming
+      save_as_arrows
+    end
+
+    # @deprecated Use `format: :arrow_streaming` instead.
+    def save_as_stream
+      save_as_arrows
+    end
+
+    def csv_save(**options)
       open_output_stream do |output|
-        csv = CSV.new(output)
+        csv = CSV.new(output, **options)
         names = @table.schema.fields.collect(&:name)
         csv << names
-        @table.each_record(reuse_record: true) do |record|
-          csv << names.collect do |name|
-            record[name]
-          end
+        @table.raw_records.each do |record|
+          csv << record
         end
       end
     end
 
+    def save_as_csv
+      csv_save
+    end
+
+    def save_as_tsv
+      csv_save(col_sep: "\t")
+    end
+
     def save_as_feather
-      open_output_stream do |output|
-        FeatherFileWriter.open(output) do |writer|
-          writer.write(@table)
-        end
+      properties = FeatherWriteProperties.new
+      properties.class.properties.each do |name|
+        value = @options[name.to_sym]
+        next if value.nil?
+        properties.__send__("#{name}=", value)
+      end
+      open_raw_output_stream do |output|
+        @table.write_as_feather(output, properties)
       end
     end
   end

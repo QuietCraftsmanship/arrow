@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_IO_HDFS_INTERNAL
-#define ARROW_IO_HDFS_INTERNAL
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -34,16 +33,11 @@ namespace arrow {
 
 class Status;
 
-namespace io {
-namespace internal {
+namespace io::internal {
 
 // NOTE(wesm): cpplint does not like use of short and other imprecise C types
 struct LibHdfsShim {
-#ifndef _WIN32
   void* handle;
-#else
-  HINSTANCE handle;
-#endif
 
   hdfsBuilder* (*hdfsNewBuilder)(void);
   void (*hdfsBuilderSetNameNode)(hdfsBuilder* bld, const char* nn);
@@ -214,11 +208,7 @@ struct LibHdfsShim {
 };
 
 // TODO(wesm): Remove these exports when we are linking statically
-Status ARROW_EXPORT ConnectLibHdfs(LibHdfsShim** driver);
-Status ARROW_EXPORT ConnectLibHdfs3(LibHdfsShim** driver);
+ARROW_EXPORT Status ConnectLibHdfs(LibHdfsShim** driver);
 
-}  // namespace internal
-}  // namespace io
+}  // namespace io::internal
 }  // namespace arrow
-
-#endif  // ARROW_IO_HDFS_INTERNAL

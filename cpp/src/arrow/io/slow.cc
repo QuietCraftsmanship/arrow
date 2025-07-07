@@ -26,7 +26,9 @@
 
 #include "arrow/buffer.h"
 #include "arrow/io/util_internal.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"
 
 namespace arrow {
@@ -63,8 +65,8 @@ void LatencyGenerator::Sleep() {
 }
 
 std::shared_ptr<LatencyGenerator> LatencyGenerator::Make(double average_latency) {
-  auto seed = static_cast<int32_t>(std::random_device()());
-  return std::make_shared<LatencyGeneratorImpl>(average_latency, seed);
+  return std::make_shared<LatencyGeneratorImpl>(
+      average_latency, static_cast<int32_t>(::arrow::internal::GetRandomSeed()));
 }
 
 std::shared_ptr<LatencyGenerator> LatencyGenerator::Make(double average_latency,
@@ -83,20 +85,20 @@ Status SlowInputStream::Abort() { return stream_->Abort(); }
 
 bool SlowInputStream::closed() const { return stream_->closed(); }
 
-Status SlowInputStream::Tell(int64_t* position) const { return stream_->Tell(position); }
+Result<int64_t> SlowInputStream::Tell() const { return stream_->Tell(); }
 
-Status SlowInputStream::Read(int64_t nbytes, int64_t* bytes_read, void* out) {
-  latencies_->Sleep();
-  return stream_->Read(nbytes, bytes_read, out);
-}
-
-Status SlowInputStream::Read(int64_t nbytes, std::shared_ptr<Buffer>* out) {
+Result<int64_t> SlowInputStream::Read(int64_t nbytes, void* out) {
   latencies_->Sleep();
   return stream_->Read(nbytes, out);
 }
 
-Status SlowInputStream::Peek(int64_t nbytes, util::string_view* out) {
-  return stream_->Peek(nbytes, out);
+Result<std::shared_ptr<Buffer>> SlowInputStream::Read(int64_t nbytes) {
+  latencies_->Sleep();
+  return stream_->Read(nbytes);
+}
+
+Result<std::string_view> SlowInputStream::Peek(int64_t nbytes) {
+  return stream_->Peek(nbytes);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -110,38 +112,36 @@ Status SlowRandomAccessFile::Abort() { return stream_->Abort(); }
 
 bool SlowRandomAccessFile::closed() const { return stream_->closed(); }
 
-Status SlowRandomAccessFile::GetSize(int64_t* size) { return stream_->GetSize(size); }
+Result<int64_t> SlowRandomAccessFile::GetSize() { return stream_->GetSize(); }
 
 Status SlowRandomAccessFile::Seek(int64_t position) { return stream_->Seek(position); }
 
-Status SlowRandomAccessFile::Tell(int64_t* position) const {
-  return stream_->Tell(position);
-}
+Result<int64_t> SlowRandomAccessFile::Tell() const { return stream_->Tell(); }
 
-Status SlowRandomAccessFile::Read(int64_t nbytes, int64_t* bytes_read, void* out) {
-  latencies_->Sleep();
-  return stream_->Read(nbytes, bytes_read, out);
-}
-
-Status SlowRandomAccessFile::Read(int64_t nbytes, std::shared_ptr<Buffer>* out) {
+Result<int64_t> SlowRandomAccessFile::Read(int64_t nbytes, void* out) {
   latencies_->Sleep();
   return stream_->Read(nbytes, out);
 }
 
-Status SlowRandomAccessFile::ReadAt(int64_t position, int64_t nbytes, int64_t* bytes_read,
-                                    void* out) {
+Result<std::shared_ptr<Buffer>> SlowRandomAccessFile::Read(int64_t nbytes) {
   latencies_->Sleep();
-  return stream_->ReadAt(position, nbytes, bytes_read, out);
+  return stream_->Read(nbytes);
 }
 
-Status SlowRandomAccessFile::ReadAt(int64_t position, int64_t nbytes,
-                                    std::shared_ptr<Buffer>* out) {
+Result<int64_t> SlowRandomAccessFile::ReadAt(int64_t position, int64_t nbytes,
+                                             void* out) {
   latencies_->Sleep();
   return stream_->ReadAt(position, nbytes, out);
 }
 
-Status SlowRandomAccessFile::Peek(int64_t nbytes, util::string_view* out) {
-  return stream_->Peek(nbytes, out);
+Result<std::shared_ptr<Buffer>> SlowRandomAccessFile::ReadAt(int64_t position,
+                                                             int64_t nbytes) {
+  latencies_->Sleep();
+  return stream_->ReadAt(position, nbytes);
+}
+
+Result<std::string_view> SlowRandomAccessFile::Peek(int64_t nbytes) {
+  return stream_->Peek(nbytes);
 }
 
 }  // namespace io

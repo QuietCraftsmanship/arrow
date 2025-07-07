@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Readable } from 'stream';
-import { isIterable, isAsyncIterable } from '../../util/compat';
+import { Readable, ReadableOptions as ReadableOptions_ } from 'node:stream';
+import { isIterable, isAsyncIterable } from '../../util/compat.js';
 
 /** @ignore */
-type ReadableOptions = import('stream').ReadableOptions;
+type ReadableOptions = ReadableOptions_;
+/** @ignore */
+type SourceIterator<T> = Generator<T, void, number | null>;
+/** @ignore */
+type AsyncSourceIterator<T> = AsyncGenerator<T, void, number | null>;
 
 /** @ignore */
 export function toNodeStream<T>(source: Iterable<T> | AsyncIterable<T>, options?: ReadableOptions): Readable {
-    if (isAsyncIterable<T>(source)) { return new AsyncIterableReadable(source[Symbol.asyncIterator](), options); }
-    if (isIterable<T>(source)) { return new IterableReadable(source[Symbol.iterator](), options); }
+    if (isAsyncIterable<T>(source)) { return new AsyncIterableReadable(source[Symbol.asyncIterator]() as AsyncSourceIterator<T>, options); }
+    if (isIterable<T>(source)) { return new IterableReadable(source[Symbol.iterator]() as SourceIterator<T>, options); }
     /* istanbul ignore next */
     throw new Error(`toNodeStream() must be called with an Iterable or AsyncIterable`);
 }
@@ -33,8 +37,8 @@ export function toNodeStream<T>(source: Iterable<T> | AsyncIterable<T>, options?
 class IterableReadable<T extends Uint8Array | any> extends Readable {
     private _pulling: boolean;
     private _bytesMode: boolean;
-    private _iterator: Iterator<T>;
-    constructor(it: Iterator<T>, options?: ReadableOptions) {
+    private _iterator: SourceIterator<T>;
+    constructor(it: SourceIterator<T>, options?: ReadableOptions) {
         super(options);
         this._iterator = it;
         this._pulling = false;
@@ -47,12 +51,13 @@ class IterableReadable<T extends Uint8Array | any> extends Readable {
         }
     }
     _destroy(e: Error | null, cb: (e: Error | null) => void) {
-        let it = this._iterator, fn: any;
+        const it = this._iterator;
+        let fn: any;
         it && (fn = e != null && it.throw || it.return);
-        fn && fn.call(it, e);
+        fn?.call(it, e);
         cb && cb(null);
     }
-    private _pull(size: number, it: Iterator<T>) {
+    private _pull(size: number, it: SourceIterator<T>) {
         const bm = this._bytesMode;
         let r: IteratorResult<T> | null = null;
         while (this.readable && !(r = it.next(bm ? size : null)).done) {
@@ -61,7 +66,7 @@ class IterableReadable<T extends Uint8Array | any> extends Readable {
             }
             if (!this.push(r.value) || size <= 0) { break; }
         }
-        if ((r && r.done || !this.readable) && (this.push(null) || true)) {
+        if ((r?.done || !this.readable) && (this.push(null) || true)) {
             it.return && it.return();
         }
         return !this.readable;
@@ -72,8 +77,8 @@ class IterableReadable<T extends Uint8Array | any> extends Readable {
 class AsyncIterableReadable<T extends Uint8Array | any> extends Readable {
     private _pulling: boolean;
     private _bytesMode: boolean;
-    private _iterator: AsyncIterator<T>;
-    constructor(it: AsyncIterator<T>, options?: ReadableOptions) {
+    private _iterator: AsyncSourceIterator<T>;
+    constructor(it: AsyncSourceIterator<T>, options?: ReadableOptions) {
         super(options);
         this._iterator = it;
         this._pulling = false;
@@ -86,11 +91,12 @@ class AsyncIterableReadable<T extends Uint8Array | any> extends Readable {
         }
     }
     _destroy(e: Error | null, cb: (e: Error | null) => void) {
-        let it = this._iterator, fn: any;
+        const it = this._iterator;
+        let fn: any;
         it && (fn = e != null && it.throw || it.return);
-        fn && fn.call(it, e).then(() => cb && cb(null)) || (cb && cb(null));
+        fn?.call(it, e).then(() => cb && cb(null)) || (cb && cb(null));
     }
-    private async _pull(size: number, it: AsyncIterator<T>) {
+    private async _pull(size: number, it: AsyncSourceIterator<T>) {
         const bm = this._bytesMode;
         let r: IteratorResult<T> | null = null;
         while (this.readable && !(r = await it.next(bm ? size : null)).done) {
@@ -99,7 +105,7 @@ class AsyncIterableReadable<T extends Uint8Array | any> extends Readable {
             }
             if (!this.push(r.value) || size <= 0) { break; }
         }
-        if ((r && r.done || !this.readable) && (this.push(null) || true)) {
+        if ((r?.done || !this.readable) && (this.push(null) || true)) {
             it.return && it.return();
         }
         return !this.readable;

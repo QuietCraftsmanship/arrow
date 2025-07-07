@@ -16,8 +16,8 @@
 // under the License.
 
 #ifndef _WIN32
-#include <fcntl.h>  // IWYU pragma: keep
-#include <unistd.h>
+#  include <fcntl.h>  // IWYU pragma: keep
+#  include <unistd.h>
 #endif
 
 #include <atomic>
@@ -36,32 +36,41 @@
 #include "arrow/buffer.h"
 #include "arrow/io/file.h"
 #include "arrow/io/interfaces.h"
+#include "arrow/io/stdio.h"
 #include "arrow/io/test_common.h"
 #include "arrow/memory_pool.h"
 #include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
+#include "arrow/util/config.h"
+#include "arrow/util/future.h"
 #include "arrow/util/io_util.h"
 
 namespace arrow {
 
 using internal::CreatePipe;
 using internal::FileClose;
+using internal::FileDescriptor;
 using internal::FileGetSize;
-using internal::FileNameFromString;
 using internal::FileOpenReadable;
 using internal::FileOpenWritable;
 using internal::FileRead;
 using internal::FileSeek;
 using internal::PlatformFilename;
+using internal::TemporaryDir;
 
 namespace io {
 
 class FileTestFixture : public ::testing::Test {
  public:
   void SetUp() {
-    path_ = "arrow-test-io-file.txt";
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("file-test-"));
+    path_ = TempFile("arrow-test-io-file.txt");
     EnsureFileDeleted();
+  }
+
+  std::string TempFile(std::string_view path) {
+    return temp_dir_->path().Join(std::string(path)).ValueOrDie().ToString();
   }
 
   void TearDown() { EnsureFileDeleted(); }
@@ -73,6 +82,7 @@ class FileTestFixture : public ::testing::Test {
   }
 
  protected:
+  std::unique_ptr<TemporaryDir> temp_dir_;
   std::string path_;
 };
 
@@ -82,65 +92,46 @@ class FileTestFixture : public ::testing::Test {
 class TestFileOutputStream : public FileTestFixture {
  public:
   void OpenFile(bool append = false) {
-    ASSERT_OK(FileOutputStream::Open(path_, append, &file_));
-    ASSERT_OK(FileOutputStream::Open(path_, append, &stream_));
+    ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(path_, append));
   }
+
   void OpenFileDescriptor() {
-    PlatformFilename file_name;
-    ASSERT_OK(FileNameFromString(path_, &file_name));
-    int fd_file, fd_stream;
-    ASSERT_OK(FileOpenWritable(file_name, true /* write_only */, false /* truncate */,
-                               false /* append */, &fd_file));
-    ASSERT_OK(FileOutputStream::Open(fd_file, &file_));
-    ASSERT_OK(FileOpenWritable(file_name, true /* write_only */, false /* truncate */,
-                               false /* append */, &fd_stream));
-    ASSERT_OK(FileOutputStream::Open(fd_stream, &stream_));
+    ASSERT_OK_AND_ASSIGN(auto file_name, PlatformFilename::FromString(path_));
+    ASSERT_OK_AND_ASSIGN(
+        FileDescriptor fd,
+        FileOpenWritable(file_name, true /* write_only */, false /* truncate */));
+    ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(fd.Detach()));
   }
 
  protected:
   std::shared_ptr<FileOutputStream> file_;
-  std::shared_ptr<OutputStream> stream_;
 };
 
 #if defined(_MSC_VER)
 TEST_F(TestFileOutputStream, FileNameWideCharConversionRangeException) {
-  std::shared_ptr<FileOutputStream> file;
   // Invalid utf-8 filename
   std::string file_name = "\x80";
-  ASSERT_RAISES(Invalid, FileOutputStream::Open(file_name, &file));
-
-  std::shared_ptr<OutputStream> stream;
-  ASSERT_RAISES(Invalid, FileOutputStream::Open(file_name, &stream));
-
-  std::shared_ptr<ReadableFile> rd_file;
-  ASSERT_RAISES(Invalid, ReadableFile::Open(file_name, &rd_file));
+  ASSERT_RAISES(Invalid, FileOutputStream::Open(file_name));
+  ASSERT_RAISES(Invalid, ReadableFile::Open(file_name));
 }
 
 // TODO add a test with a valid utf-8 filename
 #endif
 
 TEST_F(TestFileOutputStream, DestructorClosesFile) {
-  int fd_file, fd_stream;
+  int fd_file;
 
   OpenFile();
   fd_file = file_->file_descriptor();
-  fd_stream = std::static_pointer_cast<FileOutputStream>(stream_)->file_descriptor();
   ASSERT_FALSE(FileIsClosed(fd_file));
   file_.reset();
   ASSERT_TRUE(FileIsClosed(fd_file));
-  ASSERT_FALSE(FileIsClosed(fd_stream));
-  stream_.reset();
-  ASSERT_TRUE(FileIsClosed(fd_stream));
 
   OpenFileDescriptor();
   fd_file = file_->file_descriptor();
-  fd_stream = std::static_pointer_cast<FileOutputStream>(stream_)->file_descriptor();
   ASSERT_FALSE(FileIsClosed(fd_file));
   file_.reset();
   ASSERT_TRUE(FileIsClosed(fd_file));
-  ASSERT_FALSE(FileIsClosed(fd_stream));
-  stream_.reset();
-  ASSERT_TRUE(FileIsClosed(fd_stream));
 }
 
 TEST_F(TestFileOutputStream, Close) {
@@ -160,45 +151,31 @@ TEST_F(TestFileOutputStream, Close) {
   ASSERT_OK(file_->Close());
 
   AssertFileContents(path_, data);
-
-  ASSERT_OK(stream_->Write(data, strlen(data)));
-
-  fd = std::static_pointer_cast<FileOutputStream>(stream_)->file_descriptor();
-  ASSERT_FALSE(stream_->closed());
-  ASSERT_OK(stream_->Close());
-  ASSERT_TRUE(stream_->closed());
-  ASSERT_TRUE(FileIsClosed(fd));
-  ASSERT_RAISES(Invalid, stream_->Write(data, strlen(data)));
-
-  // Idempotent
-  ASSERT_OK(stream_->Close());
-
-  AssertFileContents(path_, data);
 }
 
 TEST_F(TestFileOutputStream, FromFileDescriptor) {
   OpenFileDescriptor();
-  stream_.reset();
 
   std::string data1 = "test";
   ASSERT_OK(file_->Write(data1.data(), data1.size()));
-  int fd = file_->file_descriptor();
+  int raw_fd = file_->file_descriptor();
   ASSERT_OK(file_->Close());
-  ASSERT_TRUE(FileIsClosed(fd));
+  ASSERT_TRUE(FileIsClosed(raw_fd));
 
   AssertFileContents(path_, data1);
 
   // Re-open at end of file
-  PlatformFilename file_name;
-  ASSERT_OK(FileNameFromString(path_, &file_name));
-  ASSERT_OK(FileOpenWritable(file_name, true /* write_only */, false /* truncate */,
-                             false /* append */, &fd));
-  ASSERT_OK(FileSeek(fd, 0, SEEK_END));
-  ASSERT_OK(FileOutputStream::Open(fd, &stream_));
+  ASSERT_OK_AND_ASSIGN(auto file_name, PlatformFilename::FromString(path_));
+  ASSERT_OK_AND_ASSIGN(
+      FileDescriptor fd,
+      FileOpenWritable(file_name, true /* write_only */, false /* truncate */));
+  raw_fd = fd.Detach();
+  ASSERT_OK(FileSeek(raw_fd, 0, SEEK_END));
+  ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(raw_fd));
 
   std::string data2 = "data";
-  ASSERT_OK(stream_->Write(data2.data(), data2.size()));
-  ASSERT_OK(stream_->Close());
+  ASSERT_OK(file_->Write(data2.data(), data2.size()));
+  ASSERT_OK(file_->Close());
 
   AssertFileContents(path_, data1 + data2);
 }
@@ -209,82 +186,44 @@ TEST_F(TestFileOutputStream, InvalidWrites) {
   const char* data = "";
 
   ASSERT_RAISES(IOError, file_->Write(data, -1));
-  ASSERT_RAISES(IOError, stream_->Write(data, -1));
 }
 
 TEST_F(TestFileOutputStream, Tell) {
   OpenFile();
 
-  int64_t position;
-  ASSERT_OK(file_->Tell(&position));
-  ASSERT_EQ(0, position);
+  ASSERT_OK_AND_EQ(0, file_->Tell());
 
   const char* data = "testdata";
   ASSERT_OK(file_->Write(data, 8));
-  ASSERT_OK(file_->Tell(&position));
-  ASSERT_EQ(8, position);
-
-  ASSERT_OK(stream_->Tell(&position));
-  ASSERT_EQ(0, position);
-
-  ASSERT_OK(stream_->Write(Buffer::FromString(data)));
-  ASSERT_OK(stream_->Tell(&position));
-  ASSERT_EQ(8, position);
+  ASSERT_OK_AND_EQ(8, file_->Tell());
 }
 
 TEST_F(TestFileOutputStream, TruncatesNewFile) {
-  ASSERT_OK(FileOutputStream::Open(path_, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(path_));
 
   const char* data = "testdata";
   ASSERT_OK(file_->Write(data, strlen(data)));
   ASSERT_OK(file_->Close());
 
-  ASSERT_OK(FileOutputStream::Open(path_, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(path_));
   ASSERT_OK(file_->Close());
-
-  AssertFileContents(path_, "");
-
-  // Same with stream-returning API
-  ASSERT_OK(FileOutputStream::Open(path_, &stream_));
-
-  ASSERT_OK(stream_->Write(data, strlen(data)));
-  ASSERT_OK(stream_->Close());
-
-  ASSERT_OK(FileOutputStream::Open(path_, &stream_));
-  ASSERT_OK(stream_->Close());
 
   AssertFileContents(path_, "");
 }
 
 TEST_F(TestFileOutputStream, Append) {
-  ASSERT_OK(FileOutputStream::Open(path_, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(path_));
   {
     const char* data = "test";
     ASSERT_OK(file_->Write(data, strlen(data)));
   }
   ASSERT_OK(file_->Close());
-  ASSERT_OK(FileOutputStream::Open(path_, true /* append */, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, FileOutputStream::Open(path_, true /* append */));
   {
     const char* data = "data";
     ASSERT_OK(file_->Write(data, strlen(data)));
   }
   ASSERT_OK(file_->Close());
-  AssertFileContents(path_, "testdata");
-
-  // Same with stream-returning API
-  ASSERT_OK(FileOutputStream::Open(path_, &stream_));
-  {
-    const char* data = "test";
-    ASSERT_OK(stream_->Write(data, strlen(data)));
-  }
-  ASSERT_OK(stream_->Close());
-
-  ASSERT_OK(FileOutputStream::Open(path_, true /* append */, &stream_));
-  {
-    const char* data = "data";
-    ASSERT_OK(stream_->Write(data, strlen(data)));
-  }
-  ASSERT_OK(stream_->Close());
   AssertFileContents(path_, "testdata");
 }
 
@@ -293,7 +232,7 @@ TEST_F(TestFileOutputStream, Append) {
 
 class TestReadableFile : public FileTestFixture {
  public:
-  void OpenFile() { ASSERT_OK(ReadableFile::Open(path_, &file_)); }
+  void OpenFile() { ASSERT_OK_AND_ASSIGN(file_, ReadableFile::Open(path_)); }
 
   void MakeTestFile() {
     std::string data = "testdata";
@@ -311,8 +250,7 @@ TEST_F(TestReadableFile, DestructorClosesFile) {
 
   int fd;
   {
-    std::shared_ptr<ReadableFile> file;
-    ASSERT_OK(ReadableFile::Open(path_, &file));
+    ASSERT_OK_AND_ASSIGN(auto file, ReadableFile::Open(path_));
     fd = file->file_descriptor();
   }
   ASSERT_TRUE(FileIsClosed(fd));
@@ -337,26 +275,24 @@ TEST_F(TestReadableFile, Close) {
 TEST_F(TestReadableFile, FromFileDescriptor) {
   MakeTestFile();
 
-  PlatformFilename file_name;
-  int fd = -2;
-  ASSERT_OK(FileNameFromString(path_, &file_name));
-  ASSERT_OK(FileOpenReadable(file_name, &fd));
-  ASSERT_GE(fd, 0);
-  ASSERT_OK(FileSeek(fd, 4));
+  ASSERT_OK_AND_ASSIGN(auto file_name, PlatformFilename::FromString(path_));
+  ASSERT_OK_AND_ASSIGN(FileDescriptor fd, FileOpenReadable(file_name));
+  int raw_fd = fd.fd();
+  ASSERT_GE(raw_fd, 0);
+  ASSERT_OK(FileSeek(raw_fd, 4));
 
-  ASSERT_OK(ReadableFile::Open(fd, &file_));
-  ASSERT_EQ(file_->file_descriptor(), fd);
-  std::shared_ptr<Buffer> buf;
-  ASSERT_OK(file_->Read(5, &buf));
+  ASSERT_OK_AND_ASSIGN(file_, ReadableFile::Open(fd.Detach()));
+  ASSERT_EQ(file_->file_descriptor(), raw_fd);
+  ASSERT_OK_AND_ASSIGN(auto buf, file_->Read(5));
   ASSERT_EQ(buf->size(), 4);
   ASSERT_TRUE(buf->Equals(Buffer("data")));
 
-  ASSERT_FALSE(FileIsClosed(fd));
+  ASSERT_FALSE(FileIsClosed(raw_fd));
   ASSERT_OK(file_->Close());
-  ASSERT_TRUE(FileIsClosed(fd));
+  ASSERT_TRUE(FileIsClosed(raw_fd));
   // Idempotent
   ASSERT_OK(file_->Close());
-  ASSERT_TRUE(FileIsClosed(fd));
+  ASSERT_TRUE(FileIsClosed(raw_fd));
 }
 
 TEST_F(TestReadableFile, Peek) {
@@ -364,34 +300,25 @@ TEST_F(TestReadableFile, Peek) {
   OpenFile();
 
   // Cannot peek
-  util::string_view peek;
-  ASSERT_RAISES(NotImplemented, file_->Peek(4, &peek));
+  ASSERT_RAISES(NotImplemented, file_->Peek(4));
 }
 
 TEST_F(TestReadableFile, SeekTellSize) {
   MakeTestFile();
   OpenFile();
 
-  int64_t position;
-  ASSERT_OK(file_->Tell(&position));
-  ASSERT_EQ(0, position);
+  ASSERT_OK_AND_EQ(0, file_->Tell());
 
   ASSERT_OK(file_->Seek(4));
-  ASSERT_OK(file_->Tell(&position));
-  ASSERT_EQ(4, position);
-
-  ASSERT_OK(file_->Seek(100));
-  ASSERT_OK(file_->Tell(&position));
+  ASSERT_OK_AND_EQ(4, file_->Tell());
 
   // Can seek past end of file
-  ASSERT_EQ(100, position);
+  ASSERT_OK(file_->Seek(100));
+  ASSERT_OK_AND_EQ(100, file_->Tell());
 
-  int64_t size;
-  ASSERT_OK(file_->GetSize(&size));
-  ASSERT_EQ(8, size);
+  ASSERT_OK_AND_EQ(8, file_->GetSize());
 
-  ASSERT_OK(file_->Tell(&position));
-  ASSERT_EQ(100, position);
+  ASSERT_OK_AND_EQ(100, file_->Tell());
 
   // does not support zero copy
   ASSERT_FALSE(file_->supports_zero_copy());
@@ -403,26 +330,21 @@ TEST_F(TestReadableFile, Read) {
   MakeTestFile();
   OpenFile();
 
-  int64_t bytes_read;
-  ASSERT_OK(file_->Read(4, &bytes_read, buffer));
-  ASSERT_EQ(4, bytes_read);
+  ASSERT_OK_AND_EQ(4, file_->Read(4, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, "test", 4));
 
-  ASSERT_OK(file_->Read(10, &bytes_read, buffer));
-  ASSERT_EQ(4, bytes_read);
+  ASSERT_OK_AND_EQ(4, file_->Read(10, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, "data", 4));
 
   // Test incomplete read, ARROW-1094
-  std::shared_ptr<Buffer> buf;
-  int64_t size;
-  ASSERT_OK(file_->GetSize(&size));
+  ASSERT_OK_AND_ASSIGN(int64_t size, file_->GetSize());
 
   ASSERT_OK(file_->Seek(1));
-  ASSERT_OK(file_->Read(size, &buf));
+  ASSERT_OK_AND_ASSIGN(auto buf, file_->Read(size));
   ASSERT_EQ(size - 1, buf->size());
 
   ASSERT_OK(file_->Close());
-  ASSERT_RAISES(Invalid, file_->Read(1, &buf));
+  ASSERT_RAISES(Invalid, file_->Read(1));
 }
 
 TEST_F(TestReadableFile, ReadAt) {
@@ -432,50 +354,86 @@ TEST_F(TestReadableFile, ReadAt) {
   MakeTestFile();
   OpenFile();
 
-  int64_t bytes_read;
-
-  ASSERT_OK(file_->ReadAt(0, 4, &bytes_read, buffer));
-  ASSERT_EQ(4, bytes_read);
+  ASSERT_OK_AND_EQ(4, file_->ReadAt(0, 4, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, "test", 4));
 
-  ASSERT_OK(file_->ReadAt(1, 10, &bytes_read, buffer));
-  ASSERT_EQ(7, bytes_read);
+  ASSERT_OK_AND_EQ(7, file_->ReadAt(1, 10, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, "estdata", 7));
 
   // Check buffer API
-  std::shared_ptr<Buffer> buffer2;
-
-  ASSERT_OK(file_->ReadAt(2, 5, &buffer2));
+  ASSERT_OK_AND_ASSIGN(auto buffer2, file_->ReadAt(2, 5));
   ASSERT_EQ(5, buffer2->size());
 
   Buffer expected(reinterpret_cast<const uint8_t*>(test_data + 2), 5);
   ASSERT_TRUE(buffer2->Equals(expected));
 
+  // Invalid reads
+  ASSERT_RAISES(Invalid, file_->ReadAt(-1, 1));
+  ASSERT_RAISES(Invalid, file_->ReadAt(1, -1));
+  ASSERT_RAISES(Invalid, file_->ReadAt(-1, 1, buffer));
+  ASSERT_RAISES(Invalid, file_->ReadAt(1, -1, buffer));
+
   ASSERT_OK(file_->Close());
-  ASSERT_RAISES(Invalid, file_->ReadAt(0, 1, &buffer2));
+  ASSERT_RAISES(Invalid, file_->ReadAt(0, 1));
 }
 
-TEST_F(TestReadableFile, SeekingRequired) {
-  std::shared_ptr<Buffer> buffer;
-
+TEST_F(TestReadableFile, ReadAsync) {
   MakeTestFile();
   OpenFile();
 
-  ASSERT_OK(file_->ReadAt(0, 4, &buffer));
+  auto fut1 = file_->ReadAsync({}, 1, 10);
+  auto fut2 = file_->ReadAsync({}, 0, 4);
+  ASSERT_OK_AND_ASSIGN(auto buf1, fut1.result());
+  ASSERT_OK_AND_ASSIGN(auto buf2, fut2.result());
+  AssertBufferEqual(*buf1, "estdata");
+  AssertBufferEqual(*buf2, "test");
+}
+
+TEST_F(TestReadableFile, ReadManyAsync) {
+  MakeTestFile();
+  OpenFile();
+
+  std::vector<ReadRange> ranges = {{1, 3}, {2, 5}, {4, 2}};
+  auto futs = file_->ReadManyAsync(std::move(ranges));
+
+  ASSERT_EQ(futs.size(), 3);
+  ASSERT_OK_AND_ASSIGN(auto buf1, futs[0].result());
+  ASSERT_OK_AND_ASSIGN(auto buf2, futs[1].result());
+  ASSERT_OK_AND_ASSIGN(auto buf3, futs[2].result());
+  AssertBufferEqual(*buf1, "est");
+  AssertBufferEqual(*buf2, "stdat");
+  AssertBufferEqual(*buf3, "da");
+}
+
+TEST_F(TestReadableFile, SeekingRequired) {
+  MakeTestFile();
+  OpenFile();
+
+  ASSERT_OK_AND_ASSIGN(auto buffer, file_->ReadAt(0, 4));
   AssertBufferEqual(*buffer, "test");
 
-  ASSERT_RAISES(Invalid, file_->Read(4, &buffer));
+  ASSERT_RAISES(Invalid, file_->Read(4));
   ASSERT_OK(file_->Seek(0));
-  ASSERT_OK(file_->Read(4, &buffer));
+  ASSERT_OK_AND_ASSIGN(buffer, file_->Read(4));
   AssertBufferEqual(*buffer, "test");
 }
 
-TEST_F(TestReadableFile, NonExistentFile) {
-  std::string path = "0xDEADBEEF.txt";
-  Status s = ReadableFile::Open(path, &file_);
-  ASSERT_TRUE(s.IsIOError());
+TEST_F(TestReadableFile, WillNeed) {
+  MakeTestFile();
+  OpenFile();
 
-  std::string message = s.message();
+  ASSERT_OK(file_->WillNeed({}));
+  ASSERT_OK(file_->WillNeed({{0, 3}, {4, 6}}));
+  ASSERT_OK(file_->WillNeed({{10, 0}}));
+
+  ASSERT_RAISES(Invalid, file_->WillNeed({{-1, -1}}));
+}
+
+TEST_F(TestReadableFile, NonexistentFile) {
+  std::string path = "0xDEADBEEF.txt";
+  auto maybe_file = ReadableFile::Open(path);
+  ASSERT_RAISES(IOError, maybe_file);
+  std::string message = maybe_file.status().message();
   ASSERT_NE(std::string::npos, message.find(path));
 }
 
@@ -483,15 +441,18 @@ class MyMemoryPool : public MemoryPool {
  public:
   MyMemoryPool() : num_allocations_(0) {}
 
-  Status Allocate(int64_t size, uint8_t** out) override {
+  Status Allocate(int64_t size, int64_t /*alignment*/, uint8_t** out) override {
     *out = reinterpret_cast<uint8_t*>(std::malloc(size));
     ++num_allocations_;
     return Status::OK();
   }
 
-  void Free(uint8_t* buffer, int64_t size) override { std::free(buffer); }
+  void Free(uint8_t* buffer, int64_t size, int64_t /*alignment*/) override {
+    std::free(buffer);
+  }
 
-  Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override {
+  Status Reallocate(int64_t old_size, int64_t new_size, int64_t /*alignment*/,
+                    uint8_t** ptr) override {
     *ptr = reinterpret_cast<uint8_t*>(std::realloc(*ptr, new_size));
 
     if (*ptr == NULL) {
@@ -503,9 +464,11 @@ class MyMemoryPool : public MemoryPool {
 
   int64_t bytes_allocated() const override { return -1; }
 
+  int64_t total_bytes_allocated() const override { return -1; }
+
   std::string backend_name() const override { return "my"; }
 
-  int64_t num_allocations() const { return num_allocations_.load(); }
+  int64_t num_allocations() const override { return num_allocations_.load(); }
 
  private:
   std::atomic<int64_t> num_allocations_;
@@ -515,16 +478,19 @@ TEST_F(TestReadableFile, CustomMemoryPool) {
   MakeTestFile();
 
   MyMemoryPool pool;
-  ASSERT_OK(ReadableFile::Open(path_, &pool, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, ReadableFile::Open(path_, &pool));
 
-  std::shared_ptr<Buffer> buffer;
-  ASSERT_OK(file_->ReadAt(0, 4, &buffer));
-  ASSERT_OK(file_->ReadAt(4, 8, &buffer));
+  ASSERT_OK_AND_ASSIGN(auto buffer, file_->ReadAt(0, 4));
+  ASSERT_OK_AND_ASSIGN(buffer, file_->ReadAt(4, 8));
 
   ASSERT_EQ(2, pool.num_allocations());
 }
 
 TEST_F(TestReadableFile, ThreadSafety) {
+#ifndef ARROW_ENABLE_THREADING
+  GTEST_SKIP() << "Test requires threading support";
+#endif
+
   std::string data = "foobar";
   {
     std::ofstream stream;
@@ -533,17 +499,15 @@ TEST_F(TestReadableFile, ThreadSafety) {
   }
 
   MyMemoryPool pool;
-  ASSERT_OK(ReadableFile::Open(path_, &pool, &file_));
+  ASSERT_OK_AND_ASSIGN(file_, ReadableFile::Open(path_, &pool));
 
   std::atomic<int> correct_count(0);
   int niter = 30000;
 
   auto ReadData = [&correct_count, &data, &niter, this]() {
-    std::shared_ptr<Buffer> buffer;
-
     for (int i = 0; i < niter; ++i) {
       const int offset = i % 3;
-      ASSERT_OK(file_->ReadAt(offset, 3, &buffer));
+      ASSERT_OK_AND_ASSIGN(auto buffer, file_->ReadAt(offset, 3));
       if (0 == memcmp(data.c_str() + offset, buffer->data(), 3)) {
         correct_count += 1;
       }
@@ -566,64 +530,59 @@ TEST_F(TestReadableFile, ThreadSafety) {
 class TestPipeIO : public ::testing::Test {
  public:
   void MakePipe() {
-    int fd[2];
-    ASSERT_OK(CreatePipe(fd));
-    r_ = fd[0];
-    w_ = fd[1];
-    ASSERT_GE(r_, 0);
-    ASSERT_GE(w_, 0);
+    ASSERT_OK_AND_ASSIGN(pipe_, CreatePipe());
+    ASSERT_GE(pipe_.rfd.fd(), 0);
+    ASSERT_GE(pipe_.rfd.fd(), 0);
   }
   void ClosePipe() {
-    if (r_ != -1) {
-      ASSERT_OK(FileClose(r_));
-      r_ = -1;
-    }
-    if (w_ != -1) {
-      ASSERT_OK(FileClose(w_));
-      w_ = -1;
-    }
+    ASSERT_OK(pipe_.rfd.Close());
+    ASSERT_OK(pipe_.wfd.Close());
   }
   void TearDown() { ClosePipe(); }
 
  protected:
-  int r_ = -1, w_ = -1;
+  ::arrow::internal::Pipe pipe_;
 };
 
 TEST_F(TestPipeIO, TestWrite) {
+#ifdef __EMSCRIPTEN__
+  GTEST_SKIP() << "Pipes not supported on Emscripten";
+#endif
   std::string data1 = "test", data2 = "data!";
   std::shared_ptr<FileOutputStream> file;
   uint8_t buffer[10];
   int64_t bytes_read;
 
   MakePipe();
-  ASSERT_OK(FileOutputStream::Open(w_, &file));
-  w_ = -1;  // now owned by FileOutputStream
+  ASSERT_OK_AND_ASSIGN(file, FileOutputStream::Open(pipe_.wfd.Detach()));
 
   ASSERT_OK(file->Write(data1.data(), data1.size()));
-  ASSERT_OK(FileRead(r_, buffer, 4, &bytes_read));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 4));
   ASSERT_EQ(bytes_read, 4);
   ASSERT_EQ(0, std::memcmp(buffer, "test", 4));
 
   ASSERT_OK(file->Write(Buffer::FromString(std::string(data2))));
-  ASSERT_OK(FileRead(r_, buffer, 4, &bytes_read));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 4));
   ASSERT_EQ(bytes_read, 4);
   ASSERT_EQ(0, std::memcmp(buffer, "data", 4));
 
   ASSERT_FALSE(file->closed());
   ASSERT_OK(file->Close());
   ASSERT_TRUE(file->closed());
-  ASSERT_OK(FileRead(r_, buffer, 2, &bytes_read));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 2));
   ASSERT_EQ(bytes_read, 1);
   ASSERT_EQ(0, std::memcmp(buffer, "!", 1));
   // EOF reached
-  ASSERT_OK(FileRead(r_, buffer, 2, &bytes_read));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 2));
   ASSERT_EQ(bytes_read, 0);
 }
 
 TEST_F(TestPipeIO, ReadableFileFails) {
+#ifdef __EMSCRIPTEN__
+  GTEST_SKIP() << "Pipes not supported on Emscripten";
+#endif
   // ReadableFile fails on non-seekable fd
-  std::shared_ptr<ReadableFile> file;
-  ASSERT_RAISES(IOError, ReadableFile::Open(r_, &file));
+  ASSERT_RAISES(IOError, ReadableFile::Open(pipe_.rfd.fd()));
 }
 
 // ----------------------------------------------------------------------
@@ -631,19 +590,27 @@ TEST_F(TestPipeIO, ReadableFileFails) {
 
 class TestMemoryMappedFile : public ::testing::Test, public MemoryMapFixture {
  public:
-  void TearDown() { MemoryMapFixture::TearDown(); }
+  void SetUp() override {
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("memory-map-test-"));
+  }
+
+  void TearDown() override { MemoryMapFixture::TearDown(); }
+
+  std::string TempFile(std::string_view path) {
+    return temp_dir_->path().Join(std::string(path)).ValueOrDie().ToString();
+  }
+
+ protected:
+  std::unique_ptr<TemporaryDir> temp_dir_;
 };
 
 TEST_F(TestMemoryMappedFile, InvalidUsages) {}
 
-TEST_F(TestMemoryMappedFile, ZeroSizeFlie) {
-  std::string path = "io-memory-map-zero-size";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(0, path, &result));
+TEST_F(TestMemoryMappedFile, ZeroSizeFile) {
+  std::string path = TempFile("io-memory-map-zero-size");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(0, path));
 
-  int64_t size = -1;
-  ASSERT_OK(result->Tell(&size));
-  ASSERT_EQ(0, size);
+  ASSERT_OK_AND_EQ(0, result->Tell());
 }
 
 TEST_F(TestMemoryMappedFile, MapPartFile) {
@@ -656,72 +623,109 @@ TEST_F(TestMemoryMappedFile, MapPartFile) {
 
   const int reps = 128;
 
-  std::string path = "io-memory-map-offset";
-  std::shared_ptr<MemoryMappedFile> result;
+  std::string path = TempFile("io-memory-map-offset");
 
   // file size = 128k
   CreateFile(path, reps * buffer_size);
 
   // map failed with unaligned offset
-  ASSERT_RAISES(IOError, MemoryMappedFile::Open(path, FileMode::READWRITE, unalign_offset,
-                                                4096, &result));
+  ASSERT_RAISES(IOError,
+                MemoryMappedFile::Open(path, FileMode::READWRITE, unalign_offset, 4096));
 
   // map failed if length is greater than file size
-  ASSERT_RAISES(Invalid, MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 409600,
-                                                &result));
+  ASSERT_RAISES(Invalid,
+                MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 409600));
 
-  // map succssed with valid file region <64k-68k>
-  ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 4096, &result));
+  // map succeeded with valid file region <64k-68k>
+  ASSERT_OK_AND_ASSIGN(auto result,
+                       MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 4096));
 
-  int64_t file_size;
-  ASSERT_OK(result->GetSize(&file_size));
-  ASSERT_EQ(file_size, 4096);
+  ASSERT_OK_AND_EQ(4096, result->GetSize());
 
-  int64_t position;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, 0);
+  ASSERT_OK_AND_EQ(0, result->Tell());
 
-  std::shared_ptr<Buffer> out_buffer;
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
 
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, buffer_size);
+  ASSERT_OK_AND_EQ(buffer_size, result->Tell());
 
   ASSERT_OK(result->Seek(4096));
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, 4096);
+  ASSERT_OK_AND_EQ(4096, result->Tell());
 
   // Resize is not supported
   ASSERT_RAISES(IOError, result->Resize(4096));
 
   // Write beyond memory mapped length
-  ASSERT_RAISES(Invalid, result->WriteAt(4096, buffer.data(), buffer_size));
+  ASSERT_RAISES(IOError, result->WriteAt(4096, buffer.data(), buffer_size));
 }
 
 TEST_F(TestMemoryMappedFile, WriteRead) {
   const int64_t buffer_size = 1024;
   std::vector<uint8_t> buffer(buffer_size);
-
   random_bytes(1024, 0, buffer.data());
 
   const int reps = 5;
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(reps * buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(reps * buffer_size, path));
 
   int64_t position = 0;
-  std::shared_ptr<Buffer> out_buffer;
   for (int i = 0; i < reps; ++i) {
     ASSERT_OK(result->Write(buffer.data(), buffer_size));
-    ASSERT_OK(result->ReadAt(position, buffer_size, &out_buffer));
+    ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(position, buffer_size));
 
     ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
 
     position += buffer_size;
   }
+}
+
+TEST_F(TestMemoryMappedFile, ReadAsync) {
+  const int64_t buffer_size = 1024;
+  std::vector<uint8_t> buffer(buffer_size);
+  random_bytes(1024, 0, buffer.data());
+
+  std::string path = TempFile("io-memory-map-read-async-test");
+  ASSERT_OK_AND_ASSIGN(auto mmap, InitMemoryMap(buffer_size, path));
+  ASSERT_OK(mmap->Write(buffer.data(), buffer_size));
+
+  auto fut1 = mmap->ReadAsync({}, 1, 1000);
+  auto fut2 = mmap->ReadAsync({}, 3, 4);
+  ASSERT_EQ(fut1.state(), FutureState::SUCCESS);
+  ASSERT_EQ(fut2.state(), FutureState::SUCCESS);
+  ASSERT_OK_AND_ASSIGN(auto buf1, fut1.result());
+  ASSERT_OK_AND_ASSIGN(auto buf2, fut2.result());
+
+  AssertBufferEqual(*buf1, Buffer(buffer.data() + 1, 1000));
+  AssertBufferEqual(*buf2, Buffer(buffer.data() + 3, 4));
+}
+
+TEST_F(TestMemoryMappedFile, WillNeed) {
+  const int64_t buffer_size = 1024;
+  std::vector<uint8_t> buffer(buffer_size);
+  random_bytes(1024, 0, buffer.data());
+
+  std::string path = TempFile("io-memory-map-will-need-test");
+  ASSERT_OK_AND_ASSIGN(auto mmap, InitMemoryMap(buffer_size, path));
+  ASSERT_OK(mmap->Write(buffer.data(), buffer_size));
+
+  ASSERT_OK(mmap->WillNeed({}));
+  ASSERT_OK(mmap->WillNeed({{0, 4}, {100, 924}}));
+  ASSERT_OK(mmap->WillNeed({{1024, 0}}));
+  ASSERT_RAISES(IOError, mmap->WillNeed({{1025, 1}}));  // Out of bounds
+}
+
+TEST_F(TestMemoryMappedFile, InvalidReads) {
+  std::string path = TempFile("io-memory-map-invalid-reads-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(4096, path));
+
+  uint8_t buffer[10];
+
+  ASSERT_RAISES(Invalid, result->ReadAt(-1, 1));
+  ASSERT_RAISES(Invalid, result->ReadAt(1, -1));
+  ASSERT_RAISES(Invalid, result->ReadAt(-1, 1, buffer));
+  ASSERT_RAISES(Invalid, result->ReadAt(1, -1, buffer));
 }
 
 TEST_F(TestMemoryMappedFile, WriteResizeRead) {
@@ -733,18 +737,16 @@ TEST_F(TestMemoryMappedFile, WriteResizeRead) {
     random_bytes(buffer_size, 0, b.data());
   }
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
   int64_t position = 0;
-  std::shared_ptr<Buffer> out_buffer;
   for (int i = 0; i < reps; ++i) {
     if (i != 0) {
       ASSERT_OK(result->Resize(buffer_size * (i + 1)));
     }
     ASSERT_OK(result->Write(buffers[i].data(), buffer_size));
-    ASSERT_OK(result->ReadAt(position, buffer_size, &out_buffer));
+    ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(position, buffer_size));
 
     ASSERT_EQ(out_buffer->size(), buffer_size);
     ASSERT_EQ(0, memcmp(out_buffer->data(), buffers[i].data(), buffer_size));
@@ -754,34 +756,17 @@ TEST_F(TestMemoryMappedFile, WriteResizeRead) {
   }
 }
 
-TEST_F(TestMemoryMappedFile, GetConstGetSize) {
-  const int64_t buffer_size = 1024;
-  std::vector<uint8_t> buffer(buffer_size);
-  random_bytes(buffer_size, 0, buffer.data());
-
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
-
-  const auto& const_result = *result;
-  int64_t out_size;
-  ASSERT_OK(const_result.GetSize(&out_size));
-  ASSERT_EQ(buffer_size, out_size);
-}
-
 TEST_F(TestMemoryMappedFile, ResizeRaisesOnExported) {
   const int64_t buffer_size = 1024;
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
-  std::shared_ptr<Buffer> out_buffer1, out_buffer2;
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer1));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer2));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer1, result->ReadAt(0, buffer_size));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer2, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer1->data(), buffer.data(), buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer2->data(), buffer.data(), buffer_size));
 
@@ -796,13 +781,8 @@ TEST_F(TestMemoryMappedFile, ResizeRaisesOnExported) {
 
   ASSERT_OK(result->Resize(2 * buffer_size));
 
-  int64_t map_size;
-  ASSERT_OK(result->GetSize(&map_size));
-  ASSERT_EQ(map_size, 2 * buffer_size);
-
-  int64_t file_size;
-  ASSERT_OK(FileGetSize(result->file_descriptor(), &file_size));
-  ASSERT_EQ(file_size, buffer_size * 2);
+  ASSERT_OK_AND_EQ(buffer_size * 2, result->GetSize());
+  ASSERT_OK_AND_EQ(buffer_size * 2, FileGetSize(result->file_descriptor()));
 }
 
 TEST_F(TestMemoryMappedFile, WriteReadZeroInitSize) {
@@ -810,19 +790,15 @@ TEST_F(TestMemoryMappedFile, WriteReadZeroInitSize) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(0, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(0, path));
 
-  std::shared_ptr<Buffer> out_buffer;
   ASSERT_OK(result->Resize(buffer_size));
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
 
-  int64_t map_size;
-  ASSERT_OK(result->GetSize(&map_size));
-  ASSERT_EQ(map_size, buffer_size);
+  ASSERT_OK_AND_EQ(buffer_size, result->GetSize());
 }
 
 TEST_F(TestMemoryMappedFile, WriteThenShrink) {
@@ -830,25 +806,18 @@ TEST_F(TestMemoryMappedFile, WriteThenShrink) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size * 2, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size * 2, path));
 
-  std::shared_ptr<Buffer> out_buffer;
   ASSERT_OK(result->Resize(buffer_size));
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
   ASSERT_OK(result->Resize(buffer_size / 2));
 
-  ASSERT_OK(result->ReadAt(0, buffer_size / 2, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size / 2));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size / 2));
 
-  int64_t map_size;
-  ASSERT_OK(result->GetSize(&map_size));
-  ASSERT_EQ(map_size, buffer_size / 2);
-
-  int64_t file_size;
-  ASSERT_OK(FileGetSize(result->file_descriptor(), &file_size));
-  ASSERT_EQ(file_size, buffer_size / 2);
+  ASSERT_OK_AND_EQ(buffer_size / 2, result->GetSize());
+  ASSERT_OK_AND_EQ(buffer_size / 2, FileGetSize(result->file_descriptor()));
 }
 
 TEST_F(TestMemoryMappedFile, WriteThenShrinkToHalfThenWrite) {
@@ -856,19 +825,15 @@ TEST_F(TestMemoryMappedFile, WriteThenShrinkToHalfThenWrite) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
-  std::shared_ptr<Buffer> out_buffer;
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
   ASSERT_OK(result->Resize(buffer_size / 2));
 
-  int64_t position;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, buffer_size / 2);
+  ASSERT_OK_AND_EQ(buffer_size / 2, result->Tell());
 
-  ASSERT_OK(result->ReadAt(0, buffer_size / 2, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size / 2));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size / 2));
   out_buffer.reset();
 
@@ -876,16 +841,11 @@ TEST_F(TestMemoryMappedFile, WriteThenShrinkToHalfThenWrite) {
   ASSERT_OK(result->Resize(buffer_size));
   ASSERT_OK(result->Write(buffer.data() + buffer_size / 2, buffer_size / 2));
 
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(out_buffer, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
 
-  int64_t map_size;
-  ASSERT_OK(result->GetSize(&map_size));
-  ASSERT_EQ(map_size, buffer_size);
-
-  int64_t file_size;
-  ASSERT_OK(FileGetSize(result->file_descriptor(), &file_size));
-  ASSERT_EQ(file_size, buffer_size);
+  ASSERT_OK_AND_EQ(buffer_size, result->GetSize());
+  ASSERT_OK_AND_EQ(buffer_size, FileGetSize(result->file_descriptor()));
 }
 
 TEST_F(TestMemoryMappedFile, ResizeToZeroThanWrite) {
@@ -893,42 +853,31 @@ TEST_F(TestMemoryMappedFile, ResizeToZeroThanWrite) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
-  std::shared_ptr<Buffer> out_buffer;
   // just a sanity check that writing works ook
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
   out_buffer.reset();
 
   ASSERT_OK(result->Resize(0));
-  int64_t mapped_size;
-  ASSERT_OK(result->GetSize(&mapped_size));
-  ASSERT_EQ(mapped_size, 0);
+  ASSERT_OK_AND_EQ(0, result->GetSize());
 
-  int64_t position;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, 0);
+  ASSERT_OK_AND_EQ(0, result->Tell());
 
-  int64_t file_size;
-  ASSERT_OK(FileGetSize(result->file_descriptor(), &file_size));
-  ASSERT_EQ(file_size, 0);
+  ASSERT_OK_AND_EQ(0, FileGetSize(result->file_descriptor()));
 
   // provision a vector to the buffer size in case ReadAt decides
   // to read even though it shouldn't
   std::vector<uint8_t> should_remain_empty(buffer_size);
-  int64_t bytes_read;
-  ASSERT_OK(result->ReadAt(0, 1, &bytes_read,
-                           reinterpret_cast<void*>(should_remain_empty.data())));
-  ASSERT_EQ(bytes_read, 0);
+  ASSERT_OK_AND_EQ(0, result->ReadAt(0, 1, should_remain_empty.data()));
 
   // just a sanity check that writing works ook
   ASSERT_OK(result->Resize(buffer_size));
   ASSERT_OK(result->Write(buffer.data(), buffer_size));
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(out_buffer, result->ReadAt(0, buffer_size));
   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
 }
 
@@ -937,17 +886,15 @@ TEST_F(TestMemoryMappedFile, WriteAt) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
   ASSERT_OK(result->WriteAt(0, buffer.data(), buffer_size / 2));
 
   ASSERT_OK(
       result->WriteAt(buffer_size / 2, buffer.data() + buffer_size / 2, buffer_size / 2));
 
-  std::shared_ptr<Buffer> out_buffer;
-  ASSERT_OK(result->ReadAt(0, buffer_size, &out_buffer));
+  ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size));
 
   ASSERT_EQ(memcmp(out_buffer->data(), buffer.data(), buffer_size), 0);
 }
@@ -957,17 +904,15 @@ TEST_F(TestMemoryMappedFile, WriteBeyondEnd) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
   ASSERT_OK(result->Seek(1));
-  ASSERT_RAISES(Invalid, result->Write(buffer.data(), buffer_size));
+  // Attempt to write beyond end of memory map
+  ASSERT_RAISES(IOError, result->Write(buffer.data(), buffer_size));
 
   // The position should remain unchanged afterwards
-  int64_t position;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, 1);
+  ASSERT_OK_AND_EQ(1, result->Tell());
 }
 
 TEST_F(TestMemoryMappedFile, WriteAtBeyondEnd) {
@@ -975,30 +920,23 @@ TEST_F(TestMemoryMappedFile, WriteAtBeyondEnd) {
   std::vector<uint8_t> buffer(buffer_size);
   random_bytes(buffer_size, 0, buffer.data());
 
-  std::string path = "io-memory-map-write-read-test";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(buffer_size, path, &result));
+  std::string path = TempFile("io-memory-map-write-read-test");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
 
-  ASSERT_RAISES(Invalid, result->WriteAt(1, buffer.data(), buffer_size));
+  // Attempt to write beyond end of memory map
+  ASSERT_RAISES(IOError, result->WriteAt(1, buffer.data(), buffer_size));
 
   // The position should remain unchanged afterwards
-  int64_t position;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(position, 0);
+  ASSERT_OK_AND_EQ(0, result->Tell());
 }
 
 TEST_F(TestMemoryMappedFile, GetSize) {
-  std::string path = "io-memory-map-get-size";
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_OK(InitMemoryMap(16384, path, &result));
+  std::string path = TempFile("io-memory-map-get-size");
+  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(16384, path));
 
-  int64_t size = -1;
-  ASSERT_OK(result->GetSize(&size));
-  ASSERT_EQ(16384, size);
+  ASSERT_OK_AND_EQ(16384, result->GetSize());
 
-  int64_t position = -1;
-  ASSERT_OK(result->Tell(&position));
-  ASSERT_EQ(0, position);
+  ASSERT_OK_AND_EQ(0, result->Tell());
 }
 
 TEST_F(TestMemoryMappedFile, ReadOnly) {
@@ -1009,9 +947,8 @@ TEST_F(TestMemoryMappedFile, ReadOnly) {
 
   const int reps = 5;
 
-  std::string path = "ipc-read-only-test";
-  std::shared_ptr<MemoryMappedFile> rwmmap;
-  ASSERT_OK(InitMemoryMap(reps * buffer_size, path, &rwmmap));
+  std::string path = TempFile("ipc-read-only-test");
+  ASSERT_OK_AND_ASSIGN(auto rwmmap, InitMemoryMap(reps * buffer_size, path));
 
   int64_t position = 0;
   for (int i = 0; i < reps; ++i) {
@@ -1020,13 +957,11 @@ TEST_F(TestMemoryMappedFile, ReadOnly) {
   }
   ASSERT_OK(rwmmap->Close());
 
-  std::shared_ptr<MemoryMappedFile> rommap;
-  ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READ, &rommap));
+  ASSERT_OK_AND_ASSIGN(auto rommap, MemoryMappedFile::Open(path, FileMode::READ));
 
   position = 0;
-  std::shared_ptr<Buffer> out_buffer;
   for (int i = 0; i < reps; ++i) {
-    ASSERT_OK(rommap->ReadAt(position, buffer_size, &out_buffer));
+    ASSERT_OK_AND_ASSIGN(auto out_buffer, rommap->ReadAt(position, buffer_size));
 
     ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
     position += buffer_size;
@@ -1043,9 +978,8 @@ TEST_F(TestMemoryMappedFile, LARGE_MEMORY_TEST(ReadWriteOver4GbFile)) {
 
   const int64_t reps = 5000;
 
-  std::string path = "ipc-read-over-4gb-file-test";
-  std::shared_ptr<MemoryMappedFile> rwmmap;
-  ASSERT_OK(InitMemoryMap(reps * buffer_size, path, &rwmmap));
+  std::string path = TempFile("ipc-read-over-4gb-file-test");
+  ASSERT_OK_AND_ASSIGN(auto rwmmap, InitMemoryMap(reps * buffer_size, path));
   AppendFile(path);
 
   int64_t position = 0;
@@ -1055,13 +989,11 @@ TEST_F(TestMemoryMappedFile, LARGE_MEMORY_TEST(ReadWriteOver4GbFile)) {
   }
   ASSERT_OK(rwmmap->Close());
 
-  std::shared_ptr<MemoryMappedFile> rommap;
-  ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READ, &rommap));
+  ASSERT_OK_AND_ASSIGN(auto rommap, MemoryMappedFile::Open(path, FileMode::READ));
 
   position = 0;
-  std::shared_ptr<Buffer> out_buffer;
   for (int i = 0; i < reps; ++i) {
-    ASSERT_OK(rommap->ReadAt(position, buffer_size, &out_buffer));
+    ASSERT_OK_AND_ASSIGN(auto out_buffer, rommap->ReadAt(position, buffer_size));
 
     ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
     position += buffer_size;
@@ -1077,12 +1009,11 @@ TEST_F(TestMemoryMappedFile, RetainMemoryMapReference) {
 
   random_bytes(1024, 0, buffer.data());
 
-  std::string path = "ipc-read-only-test";
+  std::string path = TempFile("ipc-read-only-test");
   CreateFile(path, buffer_size);
 
   {
-    std::shared_ptr<MemoryMappedFile> rwmmap;
-    ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READWRITE, &rwmmap));
+    ASSERT_OK_AND_ASSIGN(auto rwmmap, MemoryMappedFile::Open(path, FileMode::READWRITE));
     ASSERT_OK(rwmmap->Write(buffer.data(), buffer_size));
     ASSERT_FALSE(rwmmap->closed());
     ASSERT_OK(rwmmap->Close());
@@ -1092,9 +1023,8 @@ TEST_F(TestMemoryMappedFile, RetainMemoryMapReference) {
   std::shared_ptr<Buffer> out_buffer;
 
   {
-    std::shared_ptr<MemoryMappedFile> rommap;
-    ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READ, &rommap));
-    ASSERT_OK(rommap->Read(buffer_size, &out_buffer));
+    ASSERT_OK_AND_ASSIGN(auto rommap, MemoryMappedFile::Open(path, FileMode::READ));
+    ASSERT_OK_AND_ASSIGN(out_buffer, rommap->Read(buffer_size));
     ASSERT_FALSE(rommap->closed());
     ASSERT_OK(rommap->Close());
     ASSERT_TRUE(rommap->closed());
@@ -1110,21 +1040,17 @@ TEST_F(TestMemoryMappedFile, InvalidMode) {
 
   random_bytes(1024, 0, buffer.data());
 
-  std::string path = "ipc-invalid-mode-test";
+  std::string path = TempFile("ipc-invalid-mode-test");
   CreateFile(path, buffer_size);
 
-  std::shared_ptr<MemoryMappedFile> rommap;
-  ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READ, &rommap));
-
+  ASSERT_OK_AND_ASSIGN(auto rommap, MemoryMappedFile::Open(path, FileMode::READ));
   ASSERT_RAISES(IOError, rommap->Write(buffer.data(), buffer_size));
 }
 
 TEST_F(TestMemoryMappedFile, InvalidFile) {
-  std::string non_existent_path = "invalid-file-name-asfd";
+  std::string nonexistent_path = "invalid-file-name-asfd";
 
-  std::shared_ptr<MemoryMappedFile> result;
-  ASSERT_RAISES(IOError,
-                MemoryMappedFile::Open(non_existent_path, FileMode::READ, &result));
+  ASSERT_RAISES(IOError, MemoryMappedFile::Open(nonexistent_path, FileMode::READ));
 }
 
 TEST_F(TestMemoryMappedFile, CastableToFileInterface) {
@@ -1133,22 +1059,23 @@ TEST_F(TestMemoryMappedFile, CastableToFileInterface) {
 }
 
 TEST_F(TestMemoryMappedFile, ThreadSafety) {
+#ifndef ARROW_ENABLE_THREADING
+  GTEST_SKIP() << "Test requires threading support";
+#endif
+
   std::string data = "foobar";
-  std::string path = "ipc-multithreading-test";
+  std::string path = TempFile("ipc-multithreading-test");
   CreateFile(path, static_cast<int>(data.size()));
 
-  std::shared_ptr<MemoryMappedFile> file;
-  ASSERT_OK(MemoryMappedFile::Open(path, FileMode::READWRITE, &file));
+  ASSERT_OK_AND_ASSIGN(auto file, MemoryMappedFile::Open(path, FileMode::READWRITE));
   ASSERT_OK(file->Write(data.c_str(), static_cast<int64_t>(data.size())));
 
   std::atomic<int> correct_count(0);
   int niter = 10000;
 
   auto ReadData = [&correct_count, &data, &file, &niter]() {
-    std::shared_ptr<Buffer> buffer;
-
     for (int i = 0; i < niter; ++i) {
-      ASSERT_OK(file->ReadAt(0, 3, &buffer));
+      ASSERT_OK_AND_ASSIGN(auto buffer, file->ReadAt(0, 3));
       if (0 == memcmp(data.c_str(), buffer->data(), 3)) {
         correct_count += 1;
       }
@@ -1162,6 +1089,65 @@ TEST_F(TestMemoryMappedFile, ThreadSafety) {
   thread2.join();
 
   ASSERT_EQ(niter * 2, correct_count);
+}
+
+// ----------------------------------------------------------------------
+// Stdio tests
+
+class TestStdio : public FileTestFixture {
+ public:
+  void CreateStdinWithData(const char* data, size_t size) {
+    EnsureFileDeleted();
+
+    ASSERT_OK_AND_ASSIGN(auto file, FileOutputStream::Open(path_, false));
+    ASSERT_OK(file->Write(data, size));
+    ASSERT_OK(file->Close());
+    cin_.reset(new std::ifstream(path_));
+    std::cin.rdbuf(cin_->rdbuf());
+  }
+
+ protected:
+  std::shared_ptr<std::ifstream> cin_;
+};
+
+TEST_F(TestStdio, ReadStdinReadAtOnce) {
+  const char data[] = "testdata";
+  CreateStdinWithData(data, sizeof(data));
+
+  StdinStream input;
+  char buffer[sizeof(data)];
+  ASSERT_OK_AND_ASSIGN(auto res, input.Read(sizeof(buffer), buffer));
+  ASSERT_EQ(sizeof(data), res);
+  ASSERT_EQ(0, std::memcmp(buffer, data, sizeof(data)));
+  ASSERT_EQ(sizeof(data), input.Tell());
+}
+
+TEST_F(TestStdio, ReadStdinReadUnalignedBuffer) {
+  const char data[] = "testdata";
+  CreateStdinWithData(data, sizeof(data));
+
+  StdinStream input;
+  char buffer[sizeof(data) + 16];
+  ASSERT_OK_AND_ASSIGN(auto res, input.Read(sizeof(buffer), buffer));
+  ASSERT_EQ(sizeof(data), res);
+  ASSERT_EQ(0, std::memcmp(buffer, data, sizeof(data)));
+  ASSERT_EQ(sizeof(data), input.Tell());
+}
+
+TEST_F(TestStdio, ReadStdinReadAfterClose) {
+  const char data[] = "testdata";
+  CreateStdinWithData(data, sizeof(data));
+
+  StdinStream input;
+  char buffer[4];
+  ASSERT_OK_AND_ASSIGN(auto res, input.Read(sizeof(buffer), buffer));
+  ASSERT_EQ(sizeof(buffer), res);
+  ASSERT_EQ(0, std::memcmp(buffer, data, sizeof(buffer)));
+  ASSERT_EQ(sizeof(buffer), input.Tell());
+  cin_->close();
+  ASSERT_OK_AND_ASSIGN(res, input.Read(sizeof(buffer), buffer));
+  ASSERT_EQ(0, res);
+  ASSERT_EQ(sizeof(buffer), input.Tell());
 }
 
 }  // namespace io

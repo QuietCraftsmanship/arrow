@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 #include "arrow/io/memory.h"
 
@@ -27,15 +28,13 @@
 namespace parquet {
 
 std::shared_ptr<::arrow::io::BufferOutputStream> CreateOutputStream(MemoryPool* pool) {
-  std::shared_ptr<::arrow::io::BufferOutputStream> stream;
-  PARQUET_THROW_NOT_OK(
-      ::arrow::io::BufferOutputStream::Create(kDefaultOutputStreamSize, pool, &stream));
+  PARQUET_ASSIGN_OR_THROW(auto stream, ::arrow::io::BufferOutputStream::Create(
+                                           kDefaultOutputStreamSize, pool));
   return stream;
 }
 
 std::shared_ptr<ResizableBuffer> AllocateBuffer(MemoryPool* pool, int64_t size) {
-  std::shared_ptr<ResizableBuffer> result;
-  PARQUET_THROW_NOT_OK(arrow::AllocateResizableBuffer(pool, size, &result));
+  PARQUET_ASSIGN_OR_THROW(auto result, ::arrow::AllocateResizableBuffer(size, pool));
   return result;
 }
 

@@ -21,15 +21,16 @@
 Arrays and Scalars
 ==================
 
-Factory Function
-----------------
+Factory Functions
+-----------------
 
-This function is the main entry point to create an Arrow array from Python.
+These functions create new Arrow arrays:
 
 .. autosummary::
    :toctree: ../generated/
 
    array
+   nulls
 
 Array Types
 -----------
@@ -54,63 +55,106 @@ may expose data type-specific methods or properties.
    UInt16Array
    UInt32Array
    UInt64Array
+   HalfFloatArray
+   FloatArray
+   DoubleArray
    BinaryArray
    StringArray
    FixedSizeBinaryArray
    LargeBinaryArray
    LargeStringArray
+   BinaryViewArray
+   StringViewArray
    Time32Array
    Time64Array
    Date32Array
    Date64Array
    TimestampArray
+   DurationArray
+   MonthDayNanoIntervalArray
+   Decimal32Array
+   Decimal64Array
    Decimal128Array
+   Decimal256Array
    DictionaryArray
    ListArray
+   FixedSizeListArray
    LargeListArray
+   ListViewArray
+   LargeListViewArray
+   MapArray
+   RunEndEncodedArray
    StructArray
    UnionArray
    ExtensionArray
+   FixedShapeTensorArray
+   OpaqueArray
+   JsonArray
+   UuidArray
+   Bool8Array
 
 .. _api.scalar:
 
-Array Scalars
--------------
+Scalars
+-------
 
-Indexing an array wraps the represented value in a scalar object whose
-concrete type depends on the array data type.  You shouldn't instantiate
-any of those classes directly.
+This function constructs a new Arrow scalar:
+
+.. autosummary::
+   :toctree: ../generated/
+
+   scalar
+
+A scalar's python class depends on its data type.  Concrete scalar
+classes may expose data type-specific methods or properties.
 
 .. autosummary::
    :toctree: ../generated/
 
    NA
    Scalar
-   ArrayValue
-   BooleanValue
-   Int8Value
-   Int16Value
-   Int32Value
-   Int64Value
-   UInt8Value
-   UInt16Value
-   UInt32Value
-   UInt64Value
-   FloatValue
-   DoubleValue
-   BinaryValue
-   StringValue
-   FixedSizeBinaryValue
-   LargeBinaryValue
-   LargeStringValue
-   Time32Value
-   Time64Value
-   Date32Value
-   Date64Value
-   TimestampValue
-   DecimalValue
-   DictionaryValue
-   ListValue
-   LargeListValue
-   StructValue
-   UnionValue
+   BooleanScalar
+   Int8Scalar
+   Int16Scalar
+   Int32Scalar
+   Int64Scalar
+   NullScalar
+   UInt8Scalar
+   UInt16Scalar
+   UInt32Scalar
+   UInt64Scalar
+   HalfFloatScalar
+   FloatScalar
+   DoubleScalar
+   BinaryScalar
+   StringScalar
+   FixedSizeBinaryScalar
+   LargeBinaryScalar
+   LargeStringScalar
+   BinaryViewScalar
+   StringViewScalar
+   Time32Scalar
+   Time64Scalar
+   Date32Scalar
+   Date64Scalar
+   TimestampScalar
+   DurationScalar
+   MonthDayNanoIntervalScalar
+   Decimal128Scalar
+   Decimal256Scalar
+   DictionaryScalar
+   RunEndEncodedScalar
+   ListScalar
+   FixedSizeListScalar
+   LargeListScalar
+   ListViewScalar
+   LargeListViewScalar
+   MapScalar
+   StructScalar
+   UnionScalar
+   ExtensionScalar
+   FixedShapeTensorScalar
+   OpaqueScalar
+   JsonScalar
+   UuidScalar
+   Bool8Scalar

@@ -17,8 +17,7 @@
 
 // Compressed stream implementations
 
-#ifndef ARROW_IO_COMPRESSED_H
-#define ARROW_IO_COMPRESSED_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -45,11 +44,12 @@ class ARROW_EXPORT CompressedOutputStream : public OutputStream {
   ~CompressedOutputStream() override;
 
   /// \brief Create a compressed output stream wrapping the given output stream.
-  static Status Make(util::Codec* codec, const std::shared_ptr<OutputStream>& raw,
-                     std::shared_ptr<CompressedOutputStream>* out);
-  static Status Make(MemoryPool* pool, util::Codec* codec,
-                     const std::shared_ptr<OutputStream>& raw,
-                     std::shared_ptr<CompressedOutputStream>* out);
+  ///
+  /// The codec must be capable of streaming compression. Some codecs,
+  /// like Snappy, are not able to do so.
+  static Result<std::shared_ptr<CompressedOutputStream>> Make(
+      util::Codec* codec, const std::shared_ptr<OutputStream>& raw,
+      MemoryPool* pool = default_memory_pool());
 
   // OutputStream interface
 
@@ -59,9 +59,12 @@ class ARROW_EXPORT CompressedOutputStream : public OutputStream {
   Status Abort() override;
   bool closed() const override;
 
-  Status Tell(int64_t* position) const override;
+  Result<int64_t> Tell() const override;
 
   Status Write(const void* data, int64_t nbytes) override;
+  /// \cond FALSE
+  using Writable::Write;
+  /// \endcond
   Status Flush() override;
 
   /// \brief Return the underlying raw output stream.
@@ -82,15 +85,19 @@ class ARROW_EXPORT CompressedInputStream
   ~CompressedInputStream() override;
 
   /// \brief Create a compressed input stream wrapping the given input stream.
-  static Status Make(util::Codec* codec, const std::shared_ptr<InputStream>& raw,
-                     std::shared_ptr<CompressedInputStream>* out);
-  static Status Make(MemoryPool* pool, util::Codec* codec,
-                     const std::shared_ptr<InputStream>& raw,
-                     std::shared_ptr<CompressedInputStream>* out);
+  ///
+  /// The codec must be capable of streaming decompression. Some codecs,
+  /// like Snappy, are not able to do so.
+  static Result<std::shared_ptr<CompressedInputStream>> Make(
+      util::Codec* codec, const std::shared_ptr<InputStream>& raw,
+      MemoryPool* pool = default_memory_pool());
 
   // InputStream interface
 
   bool closed() const override;
+  Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata() override;
+  Future<std::shared_ptr<const KeyValueMetadata>> ReadMetadataAsync(
+      const IOContext& io_context) override;
 
   /// \brief Return the underlying raw input stream.
   std::shared_ptr<InputStream> raw() const;
@@ -105,9 +112,9 @@ class ARROW_EXPORT CompressedInputStream
   /// underlying raw input stream.
   Status DoClose();
   Status DoAbort() override;
-  Status DoTell(int64_t* position) const;
-  Status DoRead(int64_t nbytes, int64_t* bytes_read, void* out);
-  Status DoRead(int64_t nbytes, std::shared_ptr<Buffer>* out);
+  Result<int64_t> DoTell() const;
+  Result<int64_t> DoRead(int64_t nbytes, void* out);
+  Result<std::shared_ptr<Buffer>> DoRead(int64_t nbytes);
 
   class ARROW_NO_EXPORT Impl;
   std::unique_ptr<Impl> impl_;
@@ -115,5 +122,3 @@ class ARROW_EXPORT CompressedInputStream
 
 }  // namespace io
 }  // namespace arrow
-
-#endif  // ARROW_IO_COMPRESSED_H

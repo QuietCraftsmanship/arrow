@@ -15,50 +15,49 @@
 # specific language governing permissions and limitations
 # under the License.
 
-context("test-type")
-
 test_that("LocalFilesystem", {
   fs <- LocalFileSystem$create()
+  expect_identical(fs$type_name, "local")
   DESCRIPTION <- system.file("DESCRIPTION", package = "arrow")
-  stat <- fs$GetTargetStats(DESCRIPTION)[[1]]
-  expect_equal(stat$base_name(), "DESCRIPTION")
-  expect_equal(stat$extension(), "")
-  expect_equal(stat$type, FileType$File)
-  expect_equal(stat$path, DESCRIPTION)
+  info <- fs$GetFileInfo(DESCRIPTION)[[1]]
+  expect_equal(info$base_name(), "DESCRIPTION")
+  expect_equal(info$extension(), "")
+  expect_equal(info$type, FileType$File)
+  expect_equal(info$path, DESCRIPTION)
   info <- file.info(DESCRIPTION)
 
-  expect_equal(stat$size, info$size)
-  expect_equal(stat$mtime, info$mtime)
+  expect_equal(info$size, info$size)
+  expect_equal(info$mtime, info$mtime)
 
   tf <- tempfile(fileext = ".txt")
   fs$CopyFile(DESCRIPTION, tf)
-  stat <- fs$GetTargetStats(tf)[[1]]
-  expect_equal(stat$extension(), "txt")
-  expect_equal(stat$size, info$size)
+  info <- fs$GetFileInfo(tf)[[1]]
+  expect_equal(info$extension(), "txt")
+  expect_equal(info$size, info$size)
   expect_equal(readLines(DESCRIPTION), readLines(tf))
 
   tf2 <- tempfile(fileext = ".txt")
   fs$Move(tf, tf2)
-  stats <- fs$GetTargetStats(c(tf, tf2, dirname(tf)))
-  expect_equal(stats[[1]]$type, FileType$NonExistent)
-  expect_equal(stats[[2]]$type, FileType$File)
-  expect_equal(stats[[3]]$type, FileType$Directory)
+  infos <- fs$GetFileInfo(c(tf, tf2, dirname(tf)))
+  expect_equal(infos[[1]]$type, FileType$NotFound)
+  expect_equal(infos[[2]]$type, FileType$File)
+  expect_equal(infos[[3]]$type, FileType$Directory)
 
   fs$DeleteFile(tf2)
-  expect_equal(fs$GetTargetStats(tf2)[[1L]]$type, FileType$NonExistent)
+  expect_equal(fs$GetFileInfo(tf2)[[1L]]$type, FileType$NotFound)
   expect_true(!file.exists(tf2))
 
-  expect_equal(fs$GetTargetStats(tf)[[1L]]$type, FileType$NonExistent)
+  expect_equal(fs$GetFileInfo(tf)[[1L]]$type, FileType$NotFound)
   expect_true(!file.exists(tf))
 
   td <- tempfile()
   fs$CreateDir(td)
-  expect_equal(fs$GetTargetStats(td)[[1L]]$type, FileType$Directory)
+  expect_equal(fs$GetFileInfo(td)[[1L]]$type, FileType$Directory)
   fs$CopyFile(DESCRIPTION, file.path(td, "DESCRIPTION"))
   fs$DeleteDirContents(td)
   expect_equal(length(dir(td)), 0L)
   fs$DeleteDir(td)
-  expect_equal(fs$GetTargetStats(td)[[1L]]$type, FileType$NonExistent)
+  expect_equal(fs$GetFileInfo(td)[[1L]]$type, FileType$NotFound)
 
   tf3 <- tempfile()
   os <- fs$OpenOutputStream(path = tf3)
@@ -77,26 +76,34 @@ test_that("SubTreeFilesystem", {
   DESCRIPTION <- system.file("DESCRIPTION", package = "arrow")
   file.copy(DESCRIPTION, file.path(td, "DESCRIPTION"))
 
-  local_fs <- LocalFileSystem$create()
-  st_fs <- SubTreeFileSystem$create(td, local_fs)
-  expect_is(st_fs, "SubTreeFileSystem")
-  expect_is(st_fs, "FileSystem")
+  st_fs <- SubTreeFileSystem$create(td)
+  expect_r6_class(st_fs, "SubTreeFileSystem")
+  expect_r6_class(st_fs, "FileSystem")
+  expect_r6_class(st_fs$base_fs, "LocalFileSystem")
+  expect_identical(
+    capture.output(print(st_fs)),
+    paste0("SubTreeFileSystem: ", "file://", st_fs$base_path)
+  )
+
+  # FIXME windows has a trailing slash for one but not the other
+  # expect_identical(normalizePath(st_fs$base_path), normalizePath(td)) # nolint
+
   st_fs$CreateDir("test")
   st_fs$CopyFile("DESCRIPTION", "DESC.txt")
-  skip_on_os("windows") # See ARROW-6622
-  stats <- st_fs$GetTargetStats(c("DESCRIPTION", "test", "nope", "DESC.txt"))
-  expect_equal(stats[[1L]]$type, FileType$File)
-  expect_equal(stats[[2L]]$type, FileType$Directory)
-  expect_equal(stats[[3L]]$type, FileType$NonExistent)
-  expect_equal(stats[[4L]]$type, FileType$File)
-  expect_equal(stats[[4L]]$extension(), "txt")
+  infos <- st_fs$GetFileInfo(c("DESCRIPTION", "test", "nope", "DESC.txt"))
+  expect_equal(infos[[1L]]$type, FileType$File)
+  expect_equal(infos[[2L]]$type, FileType$Directory)
+  expect_equal(infos[[3L]]$type, FileType$NotFound)
+  expect_equal(infos[[4L]]$type, FileType$File)
+  expect_equal(infos[[4L]]$extension(), "txt")
 
+  local_fs <- LocalFileSystem$create()
   local_fs$DeleteDirContents(td)
-  stats <- st_fs$GetTargetStats(c("DESCRIPTION", "test", "nope", "DESC.txt"))
-  expect_equal(stats[[1L]]$type, FileType$NonExistent)
-  expect_equal(stats[[2L]]$type, FileType$NonExistent)
-  expect_equal(stats[[3L]]$type, FileType$NonExistent)
-  expect_equal(stats[[4L]]$type, FileType$NonExistent)
+  infos <- st_fs$GetFileInfo(c("DESCRIPTION", "test", "nope", "DESC.txt"))
+  expect_equal(infos[[1L]]$type, FileType$NotFound)
+  expect_equal(infos[[2L]]$type, FileType$NotFound)
+  expect_equal(infos[[3L]]$type, FileType$NotFound)
+  expect_equal(infos[[4L]]$type, FileType$NotFound)
 })
 
 test_that("LocalFileSystem + Selector", {
@@ -107,17 +114,91 @@ test_that("LocalFileSystem + Selector", {
   dir.create(file.path(td, "dir"))
   writeLines("...", file.path(td, "dir", "three.txt"))
 
-  selector <- Selector$create(td, recursive = TRUE)
-  stats <- fs$GetTargetStats(selector)
-  expect_equal(length(stats), 4L)
-  types <- sapply(stats, function(.x) .x$type)
+  selector <- FileSelector$create(td, recursive = TRUE)
+  infos <- fs$GetFileInfo(selector)
+  expect_equal(length(infos), 4L)
+  types <- sapply(infos, function(.x) .x$type)
   expect_equal(sum(types == FileType$File), 3L)
   expect_equal(sum(types == FileType$Directory), 1L)
 
-  selector <- Selector$create(td, recursive = FALSE)
-  stats <- fs$GetTargetStats(selector)
-  expect_equal(length(stats), 3L)
-  types <- sapply(stats, function(.x) .x$type)
+  selector <- FileSelector$create(td, recursive = FALSE)
+  infos <- fs$GetFileInfo(selector)
+  expect_equal(length(infos), 3L)
+  types <- sapply(infos, function(.x) .x$type)
   expect_equal(sum(types == FileType$File), 2L)
   expect_equal(sum(types == FileType$Directory), 1L)
+})
+
+# This test_that block must be above the two that follow it because S3FileSystem$create
+# uses a slightly different set of cpp code that is R-only, so if there are bugs
+# in the initialization of S3 (e.g. ARROW-14667) they will not be caught because
+# the blocks "FileSystem$from_uri" and "SubTreeFileSystem$create() with URI" actually
+# initialize it
+test_that("S3FileSystem", {
+  skip_on_cran()
+  skip_if_not_available("s3")
+  skip_if_offline()
+  s3fs <- S3FileSystem$create()
+  expect_r6_class(s3fs, "S3FileSystem")
+})
+
+test_that("FileSystem$from_uri", {
+  skip_on_cran()
+  skip_if_not_available("s3")
+  skip_if_offline()
+  fs_and_path <- FileSystem$from_uri("s3://voltrondata-labs-datasets")
+  expect_r6_class(fs_and_path$fs, "S3FileSystem")
+  expect_identical(fs_and_path$fs$region, "us-east-2")
+})
+
+test_that("SubTreeFileSystem$create() with URI", {
+  skip_on_cran()
+  skip_if_not_available("s3")
+  skip_if_offline()
+  fs <- SubTreeFileSystem$create("s3://voltrondata-labs-datasets")
+  expect_r6_class(fs, "SubTreeFileSystem")
+  expect_identical(
+    capture.output(print(fs)),
+    "SubTreeFileSystem: s3://voltrondata-labs-datasets/"
+  )
+})
+
+test_that("S3FileSystem$create() with proxy_options", {
+  skip_on_cran()
+  skip_if_not_available("s3")
+  skip_if_offline()
+
+  expect_error(
+    S3FileSystem$create(proxy_options = "definitely not a valid proxy URI"),
+    "Cannot parse URI"
+  )
+})
+
+test_that("s3_bucket", {
+  skip_on_cran()
+  skip_if_not_available("s3")
+  skip_if_offline()
+  bucket <- s3_bucket("ursa-labs-r-test")
+  expect_r6_class(bucket, "SubTreeFileSystem")
+  expect_r6_class(bucket$base_fs, "S3FileSystem")
+  expect_identical(bucket$region, "us-west-2")
+  expect_identical(
+    capture.output(print(bucket)),
+    "SubTreeFileSystem: s3://ursa-labs-r-test/"
+  )
+  expect_identical(bucket$base_path, "ursa-labs-r-test/")
+})
+
+test_that("gs_bucket", {
+  skip_on_cran()
+  skip_if_not_available("gcs")
+  skip_if_offline()
+  bucket <- gs_bucket("voltrondata-labs-datasets")
+  expect_r6_class(bucket, "SubTreeFileSystem")
+  expect_r6_class(bucket$base_fs, "GcsFileSystem")
+  expect_identical(
+    capture.output(print(bucket)),
+    "SubTreeFileSystem: gs://voltrondata-labs-datasets/"
+  )
+  expect_identical(bucket$base_path, "voltrondata-labs-datasets/")
 })

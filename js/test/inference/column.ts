@@ -15,50 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Data } from '../../src/data';
-import { Field } from '../../src/schema';
-import { Column } from '../../src/column';
-import { Vector } from '../../src/vector';
-import { Bool, Int8, Utf8, List, Dictionary, Struct, Map_ } from '../../src/type';
+/* eslint-disable jest/no-standalone-expect */
+
+import {
+    Bool,
+    Dictionary,
+    Field,
+    Int8,
+    List,
+    makeData,
+    Struct,
+    Utf8,
+    Vector
+} from 'apache-arrow';
 
 const boolType = new Bool();
-const boolVector = Vector.new(Data.Bool(boolType, 0, 10, 0, null, new Uint8Array(2)));
+const boolVector = new Vector([makeData({ type: boolType, length: 10, nullCount: 0, data: new Uint8Array(2) })]);
 
-const boolColumn = new Column(new Field('bool', boolType), [
-    Vector.new(Data.Bool(boolType, 0, 10, 0, null, new Uint8Array(2))),
-    Vector.new(Data.Bool(boolType, 0, 10, 0, null, new Uint8Array(2))),
-    Vector.new(Data.Bool(boolType, 0, 10, 0, null, new Uint8Array(2))),
+const boolColumn = new Vector([
+    new Vector([makeData({ type: boolType, length: 10, nullCount: 0, data: new Uint8Array(2) })]),
+    new Vector([makeData({ type: boolType, length: 10, nullCount: 0, data: new Uint8Array(2) })]),
+    new Vector([makeData({ type: boolType, length: 10, nullCount: 0, data: new Uint8Array(2) })]),
 ]);
 
 expect(typeof boolVector.get(0) === 'boolean').toBe(true);
 expect(typeof boolColumn.get(0) === 'boolean').toBe(true);
-
-type NamedSchema = {
-    a: Int8;
-    b: Utf8;
-    c: Dictionary<List<Bool>>;
-};
-
-const mapChildFields = [
-    { name: 'a', type: new Int8() },
-    { name: 'b', type: new Utf8() },
-    { name: 'c', type: new Dictionary<List<Bool>>(null!, null!) }
-].map(({ name, type }) => new Field(name, type));
-
-const mapType = new Map_<NamedSchema>(mapChildFields);
-
-const mapVector = Vector.new(Data.Map(mapType, 0, 0, 0, null, []));
-const mapColumn = new Column(new Field('map', mapType, false), [
-    Vector.new(Data.Map(mapType, 0, 0, 0, null, [])),
-    Vector.new(Data.Map(mapType, 0, 0, 0, null, [])),
-    Vector.new(Data.Map(mapType, 0, 0, 0, null, [])),
-]);
-
-const { a: a1, b: b1, c: c1 } = mapVector.get(0)!;
-const { a: a2, b: b2, c: c2 } = mapColumn.get(0)!;
-
-console.log(a1, b1, c1);
-console.log(a2, b2, c2);
 
 type IndexSchema = {
     0: Int8;
@@ -73,11 +54,11 @@ const structChildFields = [
 ].map(({ name, type }) => new Field('' + name, type));
 
 const structType = new Struct<IndexSchema>(structChildFields);
-const structVector = Vector.new(Data.Struct(structType, 0, 0, 0, null, []));
-const structColumn = new Column(new Field('struct', structType), [
-    Vector.new(Data.Struct(structType, 0, 0, 0, null, [])),
-    Vector.new(Data.Struct(structType, 0, 0, 0, null, [])),
-    Vector.new(Data.Struct(structType, 0, 0, 0, null, [])),
+const structVector = new Vector([makeData({ type: structType, length: 0, nullCount: 0, children: [] })]);
+const structColumn = new Vector([
+    new Vector([makeData({ type: structType, length: 0, nullCount: 0, children: [] })]),
+    new Vector([makeData({ type: structType, length: 0, nullCount: 0, children: [] })]),
+    new Vector([makeData({ type: structType, length: 0, nullCount: 0, children: [] })]),
 ]);
 
 const [x1, y1, z1] = structVector.get(0)!;

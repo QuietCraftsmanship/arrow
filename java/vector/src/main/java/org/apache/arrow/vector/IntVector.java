@@ -25,7 +25,6 @@ import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.IntHolder;
 import org.apache.arrow.vector.holders.NullableIntHolder;
 import org.apache.arrow.vector.types.Types.MinorType;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
@@ -36,7 +35,15 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
 public final class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 4;
   private final FieldReader reader;
 
@@ -60,18 +67,7 @@ public final class IntVector extends BaseFixedWidthVector implements BaseIntVect
    * @param allocator allocator for memory management.
    */
   public IntVector(String name, FieldType fieldType, BufferAllocator allocator) {
-    this(new Field(name, fieldType, null), allocator);
-  }
-
-  /**
-   * Instantiate a IntVector. This doesn't allocate any memory for
-   * the data in vector.
-   *
-   * @param field field materialized by this vector
-   * @param allocator allocator for memory management.
-   */
-  public IntVector(Field field, BufferAllocator allocator) {
-    super(field, allocator, TYPE_WIDTH);
+    super(name, allocator, fieldType, TYPE_WIDTH);
     reader = new IntReaderImpl(IntVector.this);
   }
 
@@ -146,6 +142,35 @@ public final class IntVector extends BaseFixedWidthVector implements BaseIntVect
       return valueBuffer.getInt(index * TYPE_WIDTH);
     }
   }
+
+  /**
+   * Copy a cell value from a particular index in source vector to a particular
+   * position in this vector.
+   *
+   * @param fromIndex position to copy from in source vector
+   * @param thisIndex position to copy to in this vector
+   * @param from      source vector
+   */
+  public void copyFrom(int fromIndex, int thisIndex, IntVector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final int value = from.valueBuffer.getInt(fromIndex * TYPE_WIDTH);
+    valueBuffer.setInt(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Same as {@link #copyFrom(int, int, IntVector)} except that
+   * it handles the case when the capacity of the vector needs to be expanded
+   * before copy.
+   *
+   * @param fromIndex position to copy from in source vector
+   * @param thisIndex position to copy to in this vector
+   * @param from      source vector
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, IntVector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
+  }
+
 
   /*----------------------------------------------------------------*
    |                                                                |
@@ -239,6 +264,18 @@ public final class IntVector extends BaseFixedWidthVector implements BaseIntVect
   }
 
   /**
+   * Set the element at the given index to null.
+   *
+   * @param index position of element
+   */
+  public void setNull(int index) {
+    handleSafe(index);
+    // not really needed to set the bit to 0 as long as
+    // the buffer always starts from 0.
+    BitVectorHelper.setValidityBit(validityBuffer, index, 0);
+  }
+
+  /**
    * Store the given value at a particular position in the vector. isSet indicates
    * whether the value is NULL or not.
    *
@@ -315,6 +352,8 @@ public final class IntVector extends BaseFixedWidthVector implements BaseIntVect
   }
 
   @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, (int) value);
   }
@@ -327,6 +366,14 @@ public final class IntVector extends BaseFixedWidthVector implements BaseIntVect
   @Override
   public long getValueAsLong(int index) {
     return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

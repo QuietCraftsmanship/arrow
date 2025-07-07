@@ -19,12 +19,12 @@ import os
 import re
 from shutil import rmtree, which
 
-from .command import Command
+from .command import Command, default_bin
 
 
 class CMake(Command):
     def __init__(self, cmake_bin=None):
-        self.bin = cmake_bin if cmake_bin else os.environ.get("CMAKE", "cmake")
+        self.bin = default_bin(cmake_bin, "cmake")
 
     @staticmethod
     def default_generator():
@@ -79,19 +79,19 @@ class CMakeDefinition:
     def arguments(self):
         """" Return the arguments to cmake invocation. """
         arguments = [
-            f"-G{self.generator}",
+            "-G{}".format(self.generator),
         ] + self.definitions + [
             self.source
         ]
         return arguments
 
-    def build(self, build_dir, force=False, **kwargs):
+    def build(self, build_dir, force=False, cmd_kwargs=None, **kwargs):
         """ Invoke cmake into a build directory.
 
         Parameters
         ----------
         build_dir : str
-                    Directory in which the CMake build will be instanciated.
+                    Directory in which the CMake build will be instantiated.
         force : bool
                 If the build folder exists, delete it before. Otherwise if it's
                 present, an error will be returned.
@@ -99,19 +99,24 @@ class CMakeDefinition:
         if os.path.exists(build_dir):
             # Extra safety to ensure we're deleting a build folder.
             if not CMakeBuild.is_build_dir(build_dir):
-                raise FileExistsError(f"{build_dir} is not a cmake build")
+                raise FileExistsError(
+                    "{} is not a cmake build".format(build_dir)
+                )
             if not force:
-                raise FileExistsError(f"{build_dir} exists use force=True")
+                raise FileExistsError(
+                    "{} exists use force=True".format(build_dir)
+                )
             rmtree(build_dir)
 
         os.mkdir(build_dir)
 
-        cmake(*self.arguments, cwd=build_dir, env=self.env)
+        cmd_kwargs = cmd_kwargs if cmd_kwargs else {}
+        cmake(*self.arguments, cwd=build_dir, env=self.env, **cmd_kwargs)
         return CMakeBuild(build_dir, self.build_type, definition=self,
                           **kwargs)
 
     def __repr__(self):
-        return f"CMakeDefinition[source={self.source}]"
+        return "CMakeDefinition[source={}]".format(self.source)
 
 
 CMAKE_BUILD_TYPE_RE = re.compile("CMAKE_BUILD_TYPE:STRING=([a-zA-Z]+)")
@@ -152,8 +157,8 @@ class CMakeBuild(CMake):
         if verbose:
             extra.append("-v" if self.bin.endswith("ninja") else "VERBOSE=1")
         # Commands must be ran under the build directory
-        super().run(*cmake_args, *extra, *argv, **kwargs, cwd=self.build_dir)
-        return self
+        return super().run(*cmake_args, *extra,
+                           *argv, **kwargs, cwd=self.build_dir)
 
     def all(self):
         return self.run("all")
@@ -189,7 +194,7 @@ class CMakeBuild(CMake):
         be lost. Only build_type is recovered.
         """
         if not CMakeBuild.is_build_dir(path):
-            raise ValueError(f"Not a valid CMakeBuild path: {path}")
+            raise ValueError("Not a valid CMakeBuild path: {}".format(path))
 
         build_type = None
         # Infer build_type by looking at CMakeCache.txt and looking for a magic

@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include "arrow/testing/gtest_util.h"
 #include "arrow/util/key_value_metadata.h"
 
 namespace arrow {
@@ -42,6 +43,10 @@ TEST(KeyValueMetadataTest, StringVectorConstruction) {
   ASSERT_EQ("bizz", metadata.value(0));
   ASSERT_EQ("buzz", metadata.value(1));
   ASSERT_EQ(2, metadata.size());
+
+  std::shared_ptr<KeyValueMetadata> metadata2 =
+      key_value_metadata({"foo", "bar"}, {"bizz", "buzz"});
+  ASSERT_TRUE(metadata.Equals(*metadata2));
 }
 
 TEST(KeyValueMetadataTest, StringMapConstruction) {
@@ -83,6 +88,23 @@ TEST(KeyValueMetadataTest, Copy) {
   KeyValueMetadata metadata(keys, values);
   auto metadata2 = metadata.Copy();
   ASSERT_TRUE(metadata.Equals(*metadata2));
+}
+
+TEST(KeyValueMetadataTest, Merge) {
+  std::vector<std::string> keys1 = {"foo", "bar"};
+  std::vector<std::string> values1 = {"bizz", "buzz"};
+  KeyValueMetadata metadata(keys1, values1);
+
+  std::vector<std::string> keys2 = {"bar", "baz"};
+  std::vector<std::string> values2 = {"bozz", "bezz"};
+  KeyValueMetadata metadata2(keys2, values2);
+
+  std::vector<std::string> keys3 = {"foo", "bar", "baz"};
+  std::vector<std::string> values3 = {"bizz", "bozz", "bezz"};
+  KeyValueMetadata expected(keys3, values3);
+
+  auto result = metadata.Merge(metadata2);
+  ASSERT_TRUE(result->Equals(expected));
 }
 
 TEST(KeyValueMetadataTest, FindKey) {
@@ -150,6 +172,40 @@ TEST(KeyValueMetadataTest, SortedPairs) {
   ASSERT_EQ(metadata3.sorted_pairs(), expected);
   expected = {{"bar", "bizz"}, {"foo", "buzz"}};
   ASSERT_EQ(metadata2.sorted_pairs(), expected);
+}
+
+TEST(KeyValueMetadataTest, Delete) {
+  std::vector<std::string> keys = {"aa", "bb", "cc", "dd", "ee", "ff", "gg"};
+  std::vector<std::string> values = {"1", "2", "3", "4", "5", "6", "7"};
+
+  {
+    KeyValueMetadata metadata(keys, values);
+    ASSERT_OK(metadata.Delete("cc"));
+    ASSERT_TRUE(metadata.Equals(KeyValueMetadata({"aa", "bb", "dd", "ee", "ff", "gg"},
+                                                 {"1", "2", "4", "5", "6", "7"})));
+
+    ASSERT_OK(metadata.Delete(3));
+    ASSERT_TRUE(metadata.Equals(
+        KeyValueMetadata({"aa", "bb", "dd", "ff", "gg"}, {"1", "2", "4", "6", "7"})));
+  }
+  {
+    KeyValueMetadata metadata(keys, values);
+    ASSERT_OK(metadata.DeleteMany({2, 5}));
+    ASSERT_TRUE(metadata.Equals(
+        KeyValueMetadata({"aa", "bb", "dd", "ee", "gg"}, {"1", "2", "4", "5", "7"})));
+
+    ASSERT_OK(metadata.DeleteMany({}));
+    ASSERT_TRUE(metadata.Equals(
+        KeyValueMetadata({"aa", "bb", "dd", "ee", "gg"}, {"1", "2", "4", "5", "7"})));
+  }
+  {
+    KeyValueMetadata metadata(keys, values);
+    ASSERT_OK(metadata.DeleteMany({0, 6, 5, 2}));
+    ASSERT_TRUE(metadata.Equals(KeyValueMetadata({"bb", "dd", "ee"}, {"2", "4", "5"})));
+
+    ASSERT_OK(metadata.DeleteMany({}));
+    ASSERT_TRUE(metadata.Equals(KeyValueMetadata({"bb", "dd", "ee"}, {"2", "4", "5"})));
+  }
 }
 
 }  // namespace arrow

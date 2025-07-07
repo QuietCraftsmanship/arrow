@@ -22,7 +22,7 @@ namespace Apache.Arrow
 {
     public static class BitUtility
     {
-        private static readonly byte[] PopcountTable = {
+        private static ReadOnlySpan<byte> PopcountTable => new byte[] {
             0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
             1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
             1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
@@ -33,7 +33,7 @@ namespace Apache.Arrow
             3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8,
         };
 
-        private static readonly byte[] BitMask = {
+        private static ReadOnlySpan<byte> BitMask => new byte[] {
             1, 2, 4, 8, 16, 32, 64, 128
         };
 
@@ -55,11 +55,72 @@ namespace Apache.Arrow
 
         public static void SetBit(Span<byte> data, int index, bool value)
         {
-            var idx = index / 8;
-            var mod = index % 8;
+            int idx = index / 8;
+            int mod = index % 8;
             data[idx] = value
                 ? (byte)(data[idx] | BitMask[mod])
                 : (byte)(data[idx] & ~BitMask[mod]);
+        }
+
+        /// <summary>
+        /// Set the number of bits in a span of bytes starting
+        /// at a specific index, and limiting to length.
+        /// </summary>
+        /// <param name="data">Span to set bits value.</param>
+        /// <param name="index">Bit index to start counting from.</param>
+        /// <param name="length">Maximum of bits in the span to consider.</param>
+        internal static void SetBits(Span<byte> data, int index, int length, bool value)
+        {
+            if (length == 0)
+                return;
+
+            int endBitIndex = checked(index + length - 1);
+                        
+            // Use simpler method if there aren't many values
+            if (length < 20)
+            {
+                for (int i = index; i <= endBitIndex; i++)
+                {
+                    SetBit(data, i, value);
+                }
+                return;
+            }
+            
+            // Otherwise do the work to figure out how to copy whole bytes
+            int startByteIndex = index / 8;
+            int startBitOffset = index % 8;
+            int endByteIndex = endBitIndex / 8;
+            int endBitOffset = endBitIndex % 8;
+                        
+            // If the starting index and ending index are not byte-aligned,
+            // we'll need to set bits the slow way. If they are
+            // byte-aligned, and for all other bytes in the 'middle', we
+            // can use a faster byte-aligned set.
+            int fullByteStartIndex = startBitOffset == 0 ? startByteIndex : startByteIndex + 1;
+            int fullByteEndIndex = endBitOffset == 7 ? endByteIndex : endByteIndex - 1;
+
+            // Bits we will be using to finish up the first byte
+            if (startBitOffset != 0)
+            {
+                Span<byte> slice = data.Slice(startByteIndex, 1);
+                for (int i = startBitOffset; i <= 7; i++)
+                    SetBit(slice, i, value);
+            }
+
+            if (fullByteEndIndex >= fullByteStartIndex)
+            {
+                Span<byte> slice = data.Slice(fullByteStartIndex, fullByteEndIndex - fullByteStartIndex + 1);
+                byte fill = (byte)(value ? 0xFF : 0x00);
+
+                slice.Fill(fill);
+            }
+
+            if (endBitOffset != 7)
+            {
+                Span<byte> slice = data.Slice(endByteIndex, 1);
+                for (int i = 0; i <= endBitOffset; i++)
+                    SetBit(slice, i, value);
+            }
         }
 
         public static void ToggleBit(Span<byte> data, int index)
@@ -69,27 +130,72 @@ namespace Apache.Arrow
 
         /// <summary>
         /// Counts the number of set bits in a span of bytes starting
-        /// at a specific bit offset.
+        /// at a specific bit index.
         /// </summary>
-        /// <param name="data">Span to count bits</param>
-        /// <param name="offset">Bit offset to start counting from</param>
-        /// <returns>Count of set (one) bits/returns>
-        public static int CountBits(ReadOnlySpan<byte> data, int offset)
+        /// <param name="data">Span to count bits.</param>
+        /// <param name="index">Bit index to start counting from.</param>
+        /// <returns>Count of set (one) bits.</returns>
+        public static int CountBits(ReadOnlySpan<byte> data, int index) =>
+            CountBits(data, index, data.Length * 8 - index);
+
+        /// <summary>
+        /// Counts the number of set bits in a span of bytes starting
+        /// at a specific bit index, and limiting to a certain number of bits
+        /// in the span.
+        /// </summary>
+        /// <param name="data">Span to count bits.</param>
+        /// <param name="index">Bit index to start counting from.</param>
+        /// <param name="length">Maximum of bits in the span to consider.</param>
+        /// <returns>Count of set (one) bits.</returns>
+        public static int CountBits(ReadOnlySpan<byte> data, int index, int length)
         {
-            var start = (offset / 8);
-            var startBit = offset % 8;
+            int startByteIndex = index / 8;
+            int startBitOffset = index % 8;
 
-            if (startBit < 0) return 0;
-            if (startBit == 0) return CountBits(data);
+            int endBitIndex = index + length - 1;
 
-            var count = 0;
+            int endByteIndex = endBitIndex / 8;
+            int endBitOffset = endBitIndex % 8;
 
-            count += CountBits(data.Slice(start + 1));
+            if (startBitOffset < 0)
+                return 0;
 
-            for (var i = startBit; i < 8; i++)
+            int count = 0;
+            if (startByteIndex == endByteIndex)
             {
-                if (GetBit(data.Slice(start, 1), i))
-                    count++;
+                // Range starts and ends within the same byte.
+                ReadOnlySpan<byte> slice = data.Slice(startByteIndex, 1);
+                for (int i = startBitOffset; i <= endBitOffset; i++)
+                    count += GetBit(slice, i) ? 1 : 0;
+
+                return count;
+            }
+
+            // If the starting index and ending index are not byte-aligned,
+            // we'll need to count bits the slow way. If they are
+            // byte-aligned, and for all other bytes in the 'middle', we
+            // can use a faster byte-aligned count.
+            int fullByteStartIndex = startBitOffset == 0 ? startByteIndex : startByteIndex + 1;
+            int fullByteEndIndex = endBitOffset == 7 ? endByteIndex : endByteIndex - 1;
+
+            if (startBitOffset != 0)
+            {
+                ReadOnlySpan<byte> slice = data.Slice(startByteIndex, 1);
+                for (int i = startBitOffset; i <= 7; i++)
+                    count += GetBit(slice, i) ? 1 : 0;
+            }
+
+            if (fullByteEndIndex >= fullByteStartIndex)
+            {
+                ReadOnlySpan<byte> slice = data.Slice(fullByteStartIndex, fullByteEndIndex - fullByteStartIndex + 1);
+                count += CountBits(slice);
+            }
+
+            if (endBitOffset != 7)
+            {
+                ReadOnlySpan<byte> slice = data.Slice(endByteIndex, 1);
+                for (int i = 0; i <= endBitOffset; i++)
+                    count += GetBit(slice, i) ? 1 : 0;
             }
 
             return count;
@@ -98,12 +204,12 @@ namespace Apache.Arrow
         /// <summary>
         /// Counts the number of set bits in a span of bytes.
         /// </summary>
-        /// <param name="data">Span to count bits</param>
+        /// <param name="data">Span to count bits.</param>
         /// <returns>Count of set (one) bits.</returns>
         public static int CountBits(ReadOnlySpan<byte> data)
         {
-            var count = 0;
-            foreach (var t in data)
+            int count = 0;
+            foreach (byte t in data)
                 count += PopcountTable[t];
             return count;
         }
@@ -127,7 +233,7 @@ namespace Apache.Arrow
         /// <summary>
         /// Rounds an integer up to the nearest multiple of factor, where
         /// factor must be a power of two.
-        /// 
+        ///
         /// This function does not throw when the factor is not a power of two.
         /// </summary>
         /// <param name="n">Integer to round up.</param>
@@ -140,17 +246,19 @@ namespace Apache.Arrow
             return (n + (factor - 1)) & ~(factor - 1);
         }
 
+        internal static bool IsMultipleOf8(long n) => n % 8 == 0;
+
         /// <summary>
         /// Calculates the number of bytes required to store n bits.
         /// </summary>
-        /// <param name="n">number of bits</param>
-        /// <returns>number of bytes</returns>
+        /// <param name="n">Number of bits</param>
+        /// <returns>Number of bytes</returns>
         public static int ByteCount(int n)
         {
             Debug.Assert(n >= 0);
             return n / 8 + (n % 8 != 0 ? 1 : 0); // ceil(n / 8)
         }
-            
+
         internal static int ReadInt32(ReadOnlyMemory<byte> value)
         {
             Debug.Assert(value.Length >= sizeof(int));

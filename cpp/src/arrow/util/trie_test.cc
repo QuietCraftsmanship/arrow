@@ -36,7 +36,7 @@ TEST(SmallString, Basics) {
   {
     SS s;
     ASSERT_EQ(s.length(), 0);
-    ASSERT_EQ(util::string_view(s), util::string_view(""));
+    ASSERT_EQ(std::string_view(s), std::string_view(""));
     ASSERT_EQ(s, "");
     ASSERT_NE(s, "x");
     ASSERT_EQ(sizeof(s), 6);
@@ -44,7 +44,7 @@ TEST(SmallString, Basics) {
   {
     SS s("abc");
     ASSERT_EQ(s.length(), 3);
-    ASSERT_EQ(util::string_view(s), util::string_view("abc"));
+    ASSERT_EQ(std::string_view(s), std::string_view("abc"));
     ASSERT_EQ(std::memcmp(s.data(), "abc", 3), 0);
     ASSERT_EQ(s, "abc");
     ASSERT_NE(s, "ab");
@@ -55,23 +55,23 @@ TEST(SmallString, Assign) {
   using SS = SmallString<5>;
   auto s = SS();
 
-  s = util::string_view("abc");
+  s = std::string_view("abc");
   ASSERT_EQ(s.length(), 3);
-  ASSERT_EQ(util::string_view(s), util::string_view("abc"));
+  ASSERT_EQ(std::string_view(s), std::string_view("abc"));
   ASSERT_EQ(std::memcmp(s.data(), "abc", 3), 0);
   ASSERT_EQ(s, "abc");
   ASSERT_NE(s, "ab");
 
   s = std::string("ghijk");
   ASSERT_EQ(s.length(), 5);
-  ASSERT_EQ(util::string_view(s), util::string_view("ghijk"));
+  ASSERT_EQ(std::string_view(s), std::string_view("ghijk"));
   ASSERT_EQ(std::memcmp(s.data(), "ghijk", 5), 0);
   ASSERT_EQ(s, "ghijk");
   ASSERT_NE(s, "");
 
   s = SS("xy");
   ASSERT_EQ(s.length(), 2);
-  ASSERT_EQ(util::string_view(s), util::string_view("xy"));
+  ASSERT_EQ(std::string_view(s), std::string_view("xy"));
   ASSERT_EQ(std::memcmp(s.data(), "xy", 2), 0);
   ASSERT_EQ(s, "xy");
   ASSERT_NE(s, "xyz");
@@ -126,12 +126,12 @@ static void TestTrieContents(const Trie& trie, const std::vector<std::string>& e
     }
   };
 
-  // Check potentially non-existing strings
+  // Check potentially nonexistent strings
   CheckNotExists("");
   CheckNotExists("X");
   CheckNotExists("abcdefxxxxxxxxxxxxxxx");
 
-  // Check potentially non-existing variations of existing entries
+  // Check potentially nonexistent variations of existing entries
   for (const auto& e : entries) {
     CheckNotExists(e + "X");
     if (e.size() > 0) {
@@ -173,6 +173,28 @@ TEST(Trie, EmptyString) {
 
   ASSERT_EQ(0, trie.Find(""));
   ASSERT_EQ(-1, trie.Find("x"));
+}
+
+TEST(Trie, LongString) {
+  auto maxlen = static_cast<size_t>(std::numeric_limits<int16_t>::max());
+  // Ensure we can insert strings with length up to maxlen
+  for (auto&& length : {maxlen, maxlen - 1, maxlen / 2}) {
+    TrieBuilder builder;
+    std::string long_string(length, 'x');
+    ASSERT_OK(builder.Append(""));
+    ASSERT_OK(builder.Append(long_string));
+    const Trie trie = builder.Finish();
+    ASSERT_EQ(1, trie.Find(long_string));
+  }
+
+  // Ensure that the trie always returns false for strings with length > maxlen
+  for (auto&& length : {maxlen, maxlen - 1, maxlen / 2, maxlen + 1, maxlen * 2}) {
+    TrieBuilder builder;
+    ASSERT_OK(builder.Append(""));
+    const Trie trie = builder.Finish();
+    std::string long_string(length, 'x');
+    ASSERT_EQ(-1, trie.Find(long_string));
+  }
 }
 
 TEST(Trie, Basics1) {

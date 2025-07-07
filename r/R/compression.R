@@ -16,7 +16,7 @@
 # under the License.
 
 #' @include enums.R
-#' @include arrow-package.R
+#' @include arrow-object.R
 #' @include io.R
 
 #' @title Compression Codec class
@@ -26,26 +26,52 @@
 #' @description Codecs allow you to create [compressed input and output
 #' streams][compression].
 #' @section Factory:
-#' The `Codec$create()` factory method takes the following argument:
-#' * `type`: string name of the compression method. See [CompressionType] for
-#'    a list of possible values. `type` may be upper- or lower-cased. Support
-#'    for compression methods depends on build-time flags for the C++ library.
-#'    Most builds support at least "gzip" and "snappy".
-#' * `compression_level`: compression level, the default value (`NA`) uses the default
-#'    compression level for the selected compression `type`.
+#' The `Codec$create()` factory method takes the following arguments:
+#' * `type`: string name of the compression method. Possible values are
+#'    "uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4", "lzo", or
+#'    "bz2". `type` may be upper- or lower-cased. Not all methods may be
+#'    available; support depends on build-time flags for the C++ library.
+#'    See [codec_is_available()]. Most builds support at least "snappy" and
+#'    "gzip". All support "uncompressed".
+#' * `compression_level`: compression level, the default value (`NA`) uses the
+#'    default compression level for the selected compression `type`.
 #' @rdname Codec
 #' @name Codec
 #' @export
-Codec <- R6Class("Codec", inherit = Object)
+Codec <- R6Class("Codec",
+  inherit = ArrowObject,
+  active = list(
+    name = function() util___Codec__name(self),
+    level = function() abort("Codec$level() not yet implemented")
+  )
+)
 Codec$create <- function(type = "gzip", compression_level = NA) {
-  if (is.character(type)) {
-    type <- unique_ptr(Codec, util___Codec__Create(
-      CompressionType[[match.arg(toupper(type), names(CompressionType))]],
-      compression_level
-    ))
+  if (is.string(type)) {
+    type <- util___Codec__Create(
+      compression_from_name(type), compression_level
+    )
   }
   assert_is(type, "Codec")
   type
+}
+
+#' Check whether a compression codec is available
+#'
+#' Support for compression libraries depends on the build-time settings of
+#' the Arrow C++ library. This function lets you know which are available for
+#' use.
+#' @param type A string, one of "uncompressed", "snappy", "gzip", "brotli",
+#' "zstd", "lz4", "lzo", or "bz2", case-insensitive.
+#' @return Logical: is `type` available?
+#' @export
+#' @examples
+#' codec_is_available("gzip")
+codec_is_available <- function(type) {
+  util___Codec__IsAvailable(compression_from_name(type))
+}
+
+compression_from_name <- function(name) {
+  map_int(name, ~ CompressionType[[match.arg(toupper(.x), names(CompressionType))]])
 }
 
 #' @title Compressed stream classes
@@ -72,15 +98,15 @@ Codec$create <- function(type = "gzip", compression_level = NA) {
 #'
 #' Methods are inherited from [InputStream] and [OutputStream], respectively
 #' @export
-#' @include arrow-package.R
+#' @include arrow-object.R
 CompressedOutputStream <- R6Class("CompressedOutputStream", inherit = OutputStream)
-CompressedOutputStream$create <- function(stream, codec = "gzip", compression_level = NA){
+CompressedOutputStream$create <- function(stream, codec = "gzip", compression_level = NA) {
   codec <- Codec$create(codec, compression_level = compression_level)
-  if (is.character(stream)) {
+  if (is.string(stream)) {
     stream <- FileOutputStream$create(stream)
   }
   assert_is(stream, "OutputStream")
-  shared_ptr(CompressedOutputStream, io___CompressedOutputStream__Make(codec, stream))
+  io___CompressedOutputStream__Make(codec, stream)
 }
 
 #' @rdname compression
@@ -88,11 +114,11 @@ CompressedOutputStream$create <- function(stream, codec = "gzip", compression_le
 #' @format NULL
 #' @export
 CompressedInputStream <- R6Class("CompressedInputStream", inherit = InputStream)
-CompressedInputStream$create <- function(stream, codec = "gzip", compression_level = NA){
+CompressedInputStream$create <- function(stream, codec = "gzip", compression_level = NA) {
   codec <- Codec$create(codec, compression_level = compression_level)
-  if (is.character(stream)) {
+  if (is.string(stream)) {
     stream <- ReadableFile$create(stream)
   }
   assert_is(stream, "InputStream")
-  shared_ptr(CompressedInputStream, io___CompressedInputStream__Make(codec, stream))
+  io___CompressedInputStream__Make(codec, stream)
 }

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef PARQUET_FILE_PRINTER_H
-#define PARQUET_FILE_PRINTER_H
+#pragma once
 
 #include <iosfwd>
 #include <list>
@@ -33,7 +32,7 @@ class PARQUET_EXPORT ParquetFilePrinter {
 
  public:
   explicit ParquetFilePrinter(ParquetFileReader* reader) : fileReader(reader) {}
-  ~ParquetFilePrinter() {}
+  ~ParquetFilePrinter() = default;
 
   void DebugPrint(std::ostream& stream, std::list<int> selected_columns,
                   bool print_values = false, bool format_dump = false,
@@ -45,5 +44,3 @@ class PARQUET_EXPORT ParquetFilePrinter {
 };
 
 }  // namespace parquet
-
-#endif  // PARQUET_FILE_PRINTER_H

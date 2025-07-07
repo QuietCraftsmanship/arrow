@@ -15,24 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { validateVector } from './utils';
-import { Vector, DateDay, DateMillisecond } from '../../Arrow';
+import 'web-streams-polyfill';
 import {
+    dateNoNulls,
+    dateWithNulls,
     encodeAll,
     encodeEach,
     encodeEachDOM,
     encodeEachNode,
-    date32sNoNulls,
-    date64sNoNulls,
-    date32sWithNulls,
-    date64sWithNulls
-} from './utils';
+    validateVector
+} from './utils.js';
+
+import { DateDay, DateMillisecond, Vector } from 'apache-arrow';
 
 const testDOMStreams = process.env.TEST_DOM_STREAMS === 'true';
 const testNodeStreams = process.env.TEST_NODE_STREAMS === 'true';
 
 describe('DateDayBuilder', () => {
-
     runTestsWithEncoder('encodeAll', encodeAll(() => new DateDay()));
     runTestsWithEncoder('encodeEach: 5', encodeEach(() => new DateDay(), 5));
     runTestsWithEncoder('encodeEach: 25', encodeEach(() => new DateDay(), 25));
@@ -40,14 +39,14 @@ describe('DateDayBuilder', () => {
     testDOMStreams && runTestsWithEncoder('encodeEachDOM: 25', encodeEachDOM(() => new DateDay(), 25));
     testNodeStreams && runTestsWithEncoder('encodeEachNode: 25', encodeEachNode(() => new DateDay(), 25));
 
-    function runTestsWithEncoder(name: string, encode: (vals: (Date | null)[], nullVals?: any[]) => Promise<Vector<DateDay>>) {
+    function runTestsWithEncoder(name: string, encode: (vals: (number | null)[], nullVals?: any[]) => Promise<Vector<DateDay>>) {
         describe(`${encode.name} ${name}`, () => {
             it(`encodes dates no nulls`, async () => {
-                const vals = date32sNoNulls(20);
+                const vals = dateNoNulls(20);
                 validateVector(vals, await encode(vals, []), []);
             });
             it(`encodes dates with nulls`, async () => {
-                const vals = date32sWithNulls(20);
+                const vals = dateWithNulls(20);
                 validateVector(vals, await encode(vals, [null]), [null]);
             });
         });
@@ -55,7 +54,6 @@ describe('DateDayBuilder', () => {
 });
 
 describe('DateMillisecondBuilder', () => {
-
     runTestsWithEncoder('encodeAll', encodeAll(() => new DateMillisecond()));
     runTestsWithEncoder('encodeEach: 5', encodeEach(() => new DateMillisecond(), 5));
     runTestsWithEncoder('encodeEach: 25', encodeEach(() => new DateMillisecond(), 25));
@@ -63,21 +61,21 @@ describe('DateMillisecondBuilder', () => {
     testDOMStreams && runTestsWithEncoder('encodeEachDOM: 25', encodeEachDOM(() => new DateMillisecond(), 25));
     testNodeStreams && runTestsWithEncoder('encodeEachNode: 25', encodeEachNode(() => new DateMillisecond(), 25));
 
-    function runTestsWithEncoder(name: string, encode: (vals: (Date | null)[], nullVals?: any[]) => Promise<Vector<DateMillisecond>>) {
+    function runTestsWithEncoder(name: string, encode: (vals: (number | null)[], nullVals?: any[]) => Promise<Vector<DateMillisecond>>) {
         describe(`${encode.name} ${name}`, () => {
             it(`encodes dates no nulls`, async () => {
-                const vals = date64sNoNulls(20);
+                const vals = dateNoNulls(20);
                 validateVector(vals, await encode(vals, []), []);
             });
             it(`encodes dates with nulls`, async () => {
-                const vals = date64sWithNulls(20);
+                const vals = dateWithNulls(20);
                 validateVector(vals, await encode(vals, [null]), [null]);
             });
         });
     }
 });
 
-describe('DateMillisecondBuilder', () => {
+describe('DateMillisecondBuilder with nulls', () => {
     const encode = encodeAll(() => new DateMillisecond());
     const dates = [
         null,
@@ -100,7 +98,7 @@ describe('DateMillisecondBuilder', () => {
         '2019-03-10T21:15:32.237Z',
         '2019-03-21T07:25:34.864Z',
         null
-    ].map((x) => x === null ? x : new Date(x));
+    ].map((x) => x === null ? x : new Date(x).getTime());
     it(`encodes dates with nulls`, async () => {
         const vals = dates.slice();
         validateVector(vals, await encode(vals, [null]), [null]);

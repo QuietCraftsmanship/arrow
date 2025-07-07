@@ -17,15 +17,18 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <new>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <boost/optional.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 
+#include "arrow/memory_pool.h"
 #include "arrow/stl.h"
+#include "arrow/stl_allocator.h"
 #include "arrow/table.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/type.h"
@@ -33,13 +36,6 @@
 
 using primitive_types_tuple = std::tuple<int8_t, int16_t, int32_t, int64_t, uint8_t,
                                          uint16_t, uint32_t, uint64_t, bool, std::string>;
-
-using boost_optional_types_tuple =
-    std::tuple<boost::optional<int8_t>, boost::optional<int16_t>,
-               boost::optional<int32_t>, boost::optional<int64_t>,
-               boost::optional<uint8_t>, boost::optional<uint16_t>,
-               boost::optional<uint32_t>, boost::optional<uint64_t>,
-               boost::optional<bool>, boost::optional<std::string>>;
 
 using raw_pointer_optional_types_tuple =
     std::tuple<int8_t*, int16_t*, int32_t*, int64_t*, uint8_t*, uint16_t*, uint32_t*,
@@ -104,6 +100,12 @@ struct TestInt32Type {
 
 namespace arrow {
 
+using optional_types_tuple =
+    std::tuple<std::optional<int8_t>, std::optional<int16_t>, std::optional<int32_t>,
+               std::optional<int64_t>, std::optional<uint8_t>, std::optional<uint16_t>,
+               std::optional<uint32_t>, std::optional<uint64_t>, std::optional<bool>,
+               std::optional<std::string>>;
+
 template <>
 struct CTypeTraits<CustomOptionalTypeMock> {
   using ArrowType = ::arrow::StringType;
@@ -123,8 +125,6 @@ namespace stl {
 template <>
 struct ConversionTraits<CustomOptionalTypeMock>
     : public CTypeTraits<CustomOptionalTypeMock> {
-  constexpr static bool nullable = true;
-
   static Status AppendRow(typename TypeTraits<ArrowType>::BuilderType& builder,
                           const CustomOptionalTypeMock& cell) {
     if (cell) {
@@ -137,9 +137,7 @@ struct ConversionTraits<CustomOptionalTypeMock>
 
 template <>
 struct ConversionTraits<TestInt32Type> : public CTypeTraits<TestInt32Type> {
-  constexpr static bool nullable = false;
-
-  // AppendRow is not needed, since it shouldn't be called.
+  // AppendRow is not needed, explicitly elide an implementation
 };
 
 template <>
@@ -233,7 +231,7 @@ TEST(TestTableFromTupleVector, ListType) {
   using tuple_type = std::tuple<std::vector<int64_t>>;
 
   auto expected_schema =
-      std::shared_ptr<Schema>(new Schema({field("column1", list(int64()), false)}));
+      std::make_shared<Schema>(FieldVector{field("column1", list(int64()), false)});
   std::shared_ptr<Array> expected_array =
       ArrayFromJSON(list(int64()), "[[1, 1, 2, 34], [2, -4]]");
   std::shared_ptr<Table> expected_table = Table::Make(expected_schema, {expected_array});
@@ -247,16 +245,36 @@ TEST(TestTableFromTupleVector, ListType) {
   ASSERT_TRUE(expected_table->Equals(*table));
 }
 
-TEST(TestTableFromTupleVector, ReferenceTuple) {
-  using boost::adaptors::transform;
+TEST(TestTableFromTupleVector, FixedSizeListType) {
+  using tuple_type = std::tuple<std::array<int64_t, 4>>;
 
+  auto expected_schema = std::make_shared<Schema>(
+      FieldVector{field("column1", fixed_size_list(int64(), 4), false)});
+  std::shared_ptr<Array> expected_array =
+      ArrayFromJSON(fixed_size_list(int64(), 4), "[[1, 1, 2, 34], [2, -4, 1, 1]]");
+  std::shared_ptr<Table> expected_table = Table::Make(expected_schema, {expected_array});
+
+  std::vector<tuple_type> rows{tuple_type(std::array<int64_t, 4>{1, 1, 2, 34}),
+                               tuple_type(std::array<int64_t, 4>{2, -4, 1, 1})};
+  std::vector<std::string> names{"column1"};
+
+  std::shared_ptr<Table> table;
+  ASSERT_OK(TableFromTupleRange(default_memory_pool(), rows, names, &table));
+  ASSERT_OK(table->ValidateFull());
+
+  AssertTablesEqual(*expected_table, *table);
+}
+
+TEST(TestTableFromTupleVector, ReferenceTuple) {
   std::vector<std::string> names{"column1", "column2", "column3", "column4", "column5",
                                  "column6", "column7", "column8", "column9", "column10"};
   std::vector<CustomType> rows{
       {-1, -2, -3, -4, 1, 2, 3, 4, true, std::string("Tests")},
       {-10, -20, -30, -40, 10, 20, 30, 40, false, std::string("Other")}};
-  auto rng_rows =
-      transform(rows, [](const CustomType& c) -> decltype(c.tie()) { return c.tie(); });
+  std::vector<decltype(rows[0].tie())> rng_rows{
+      rows[0].tie(),
+      rows[1].tie(),
+  };
   std::shared_ptr<Table> table;
   ASSERT_OK(TableFromTupleRange(default_memory_pool(), rng_rows, names, &table));
 
@@ -289,12 +307,12 @@ TEST(TestTableFromTupleVector, ReferenceTuple) {
 TEST(TestTableFromTupleVector, NullableTypesWithBoostOptional) {
   std::vector<std::string> names{"column1", "column2", "column3", "column4", "column5",
                                  "column6", "column7", "column8", "column9", "column10"};
-  using types_tuple = boost_optional_types_tuple;
+  using types_tuple = optional_types_tuple;
   std::vector<types_tuple> rows{
       types_tuple(-1, -2, -3, -4, 1, 2, 3, 4, true, std::string("Tests")),
       types_tuple(-10, -20, -30, -40, 10, 20, 30, 40, false, std::string("Other")),
-      types_tuple(boost::none, boost::none, boost::none, boost::none, boost::none,
-                  boost::none, boost::none, boost::none, boost::none, boost::none),
+      types_tuple(std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                  std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt),
   };
   std::shared_ptr<Table> table;
   ASSERT_OK(TableFromTupleRange(default_memory_pool(), rows, names, &table));
@@ -409,7 +427,7 @@ TEST(TestTableFromTupleVector, AppendingMultipleRows) {
 }
 
 TEST(TestTupleVectorFromTable, PrimitiveTypes) {
-  compute::FunctionContext ctx;
+  compute::ExecContext ctx;
   compute::CastOptions cast_options;
 
   std::vector<primitive_types_tuple> expected_rows{
@@ -424,26 +442,16 @@ TEST(TestTupleVectorFromTable, PrimitiveTypes) {
                   field("column9", boolean(), false), field("column10", utf8(), false)}));
 
   // Construct expected arrays
-  std::shared_ptr<Array> int8_array;
-  ArrayFromVector<Int8Type, int8_t>({-1, -10}, &int8_array);
-  std::shared_ptr<Array> int16_array;
-  ArrayFromVector<Int16Type, int16_t>({-2, -20}, &int16_array);
-  std::shared_ptr<Array> int32_array;
-  ArrayFromVector<Int32Type, int32_t>({-3, -30}, &int32_array);
-  std::shared_ptr<Array> int64_array;
-  ArrayFromVector<Int64Type, int64_t>({-4, -40}, &int64_array);
-  std::shared_ptr<Array> uint8_array;
-  ArrayFromVector<UInt8Type, uint8_t>({1, 10}, &uint8_array);
-  std::shared_ptr<Array> uint16_array;
-  ArrayFromVector<UInt16Type, uint16_t>({2, 20}, &uint16_array);
-  std::shared_ptr<Array> uint32_array;
-  ArrayFromVector<UInt32Type, uint32_t>({3, 30}, &uint32_array);
-  std::shared_ptr<Array> uint64_array;
-  ArrayFromVector<UInt64Type, uint64_t>({4, 40}, &uint64_array);
-  std::shared_ptr<Array> bool_array;
-  ArrayFromVector<BooleanType, bool>({true, false}, &bool_array);
-  std::shared_ptr<Array> string_array;
-  ArrayFromVector<StringType, std::string>({"Tests", "Other"}, &string_array);
+  auto int8_array = ArrayFromJSON(int8(), "[-1, -10]");
+  auto int16_array = ArrayFromJSON(int16(), "[-2, -20]");
+  auto int32_array = ArrayFromJSON(int32(), "[-3, -30]");
+  auto int64_array = ArrayFromJSON(int64(), "[-4, -40]");
+  auto uint8_array = ArrayFromJSON(uint8(), "[1, 10]");
+  auto uint16_array = ArrayFromJSON(uint16(), "[2, 20]");
+  auto uint32_array = ArrayFromJSON(uint32(), "[3, 30]");
+  auto uint64_array = ArrayFromJSON(uint64(), "[4, 40]");
+  auto bool_array = ArrayFromJSON(boolean(), "[true, false]");
+  auto string_array = ArrayFromJSON(utf8(), R"(["Tests", "Other"])");
   auto table = Table::Make(
       schema, {int8_array, int16_array, int32_array, int64_array, uint8_array,
                uint16_array, uint32_array, uint64_array, bool_array, string_array});
@@ -457,18 +465,17 @@ TEST(TestTupleVectorFromTable, PrimitiveTypes) {
   ASSERT_RAISES(Invalid, TupleRangeFromTable(*table, cast_options, &ctx, &too_few_rows));
 
   // The number of columns must match
-  std::shared_ptr<Table> corrupt_table;
-  ASSERT_OK(table->RemoveColumn(0, &corrupt_table));
+  ASSERT_OK_AND_ASSIGN(auto corrupt_table, table->RemoveColumn(0));
   ASSERT_RAISES(Invalid, TupleRangeFromTable(*corrupt_table, cast_options, &ctx, &rows));
 }
 
 TEST(TestTupleVectorFromTable, ListType) {
   using tuple_type = std::tuple<std::vector<int64_t>>;
 
-  compute::FunctionContext ctx;
+  compute::ExecContext ctx;
   compute::CastOptions cast_options;
   auto expected_schema =
-      std::shared_ptr<Schema>(new Schema({field("column1", list(int64()), false)}));
+      std::make_shared<Schema>(FieldVector{field("column1", list(int64()), false)});
   std::shared_ptr<Array> expected_array =
       ArrayFromJSON(list(int64()), "[[1, 1, 2, 34], [2, -4]]");
   std::shared_ptr<Table> table = Table::Make(expected_schema, {expected_array});
@@ -481,13 +488,33 @@ TEST(TestTupleVectorFromTable, ListType) {
   ASSERT_EQ(rows, expected_rows);
 }
 
+TEST(TestTupleVectorFromTable, FixedSizeListType) {
+  using tuple_type = std::tuple<std::array<int64_t, 4>>;
+
+  compute::ExecContext ctx;
+  compute::CastOptions cast_options;
+  auto expected_schema = std::make_shared<Schema>(
+      FieldVector{field("column1", fixed_size_list(int64(), 4), false)});
+  std::shared_ptr<Array> expected_array =
+      ArrayFromJSON(fixed_size_list(int64(), 4), "[[1, 1, 2, 34], [2, -4, 1, 1]]");
+  std::shared_ptr<Table> table = Table::Make(expected_schema, {expected_array});
+  ASSERT_OK(table->ValidateFull());
+
+  std::vector<tuple_type> expected_rows{tuple_type(std::array<int64_t, 4>{1, 1, 2, 34}),
+                                        tuple_type(std::array<int64_t, 4>{2, -4, 1, 1})};
+
+  std::vector<tuple_type> rows(2);
+  ASSERT_OK(TupleRangeFromTable(*table, cast_options, &ctx, &rows));
+  ASSERT_EQ(rows, expected_rows);
+}
+
 TEST(TestTupleVectorFromTable, CastingNeeded) {
   using tuple_type = std::tuple<std::vector<int64_t>>;
 
-  compute::FunctionContext ctx;
+  compute::ExecContext ctx;
   compute::CastOptions cast_options;
   auto expected_schema =
-      std::shared_ptr<Schema>(new Schema({field("column1", list(int16()), false)}));
+      std::make_shared<Schema>(FieldVector{field("column1", list(int16()), false)});
   std::shared_ptr<Array> expected_array =
       ArrayFromJSON(list(int16()), "[[1, 1, 2, 34], [2, -4]]");
   std::shared_ptr<Table> table = Table::Make(expected_schema, {expected_array});
@@ -499,6 +526,62 @@ TEST(TestTupleVectorFromTable, CastingNeeded) {
   ASSERT_OK(TupleRangeFromTable(*table, cast_options, &ctx, &rows));
   ASSERT_EQ(rows, expected_rows);
 }
+
+TEST(STLMemoryPool, Base) {
+  std::allocator<uint8_t> allocator;
+  STLMemoryPool<std::allocator<uint8_t>> pool(allocator);
+
+  uint8_t* data = nullptr;
+  ASSERT_OK(pool.Allocate(100, &data));
+  ASSERT_EQ(pool.max_memory(), 100);
+  ASSERT_EQ(pool.bytes_allocated(), 100);
+  ASSERT_NE(data, nullptr);
+
+  ASSERT_OK(pool.Reallocate(100, 150, &data));
+  ASSERT_EQ(pool.max_memory(), 150);
+  ASSERT_EQ(pool.bytes_allocated(), 150);
+
+  pool.Free(data, 150);
+
+  ASSERT_EQ(pool.max_memory(), 150);
+  ASSERT_EQ(pool.bytes_allocated(), 0);
+}
+
+TEST(allocator, MemoryTracking) {
+  auto pool = default_memory_pool();
+  allocator<uint64_t> alloc;
+  uint64_t* data = alloc.allocate(100);
+
+  ASSERT_EQ(100 * sizeof(uint64_t), pool->bytes_allocated());
+
+  alloc.deallocate(data, 100);
+  ASSERT_EQ(0, pool->bytes_allocated());
+}
+
+#if !(defined(ARROW_VALGRIND) || defined(ADDRESS_SANITIZER) || defined(ARROW_JEMALLOC))
+
+TEST(allocator, TestOOM) {
+  allocator<uint8_t> alloc;
+  size_t max_alloc = std::min<uint64_t>(std::numeric_limits<int64_t>::max(),
+                                        std::numeric_limits<size_t>::max());
+  ASSERT_THROW(alloc.allocate(max_alloc), std::bad_alloc);
+}
+
+TEST(stl_allocator, MaxMemory) {
+  auto pool = MemoryPool::CreateDefault();
+
+  allocator<uint8_t> alloc(pool.get());
+  uint8_t* data = alloc.allocate(1000);
+  uint8_t* data2 = alloc.allocate(1000);
+
+  alloc.deallocate(data, 1000);
+  alloc.deallocate(data2, 1000);
+
+  ASSERT_EQ(2000, pool->max_memory());
+}
+
+#endif  // !(defined(ARROW_VALGRIND) || defined(ADDRESS_SANITIZER)
+        // || defined(ARROW_JEMALLOC))
 
 }  // namespace stl
 }  // namespace arrow

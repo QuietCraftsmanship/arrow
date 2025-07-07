@@ -18,6 +18,22 @@
 class TestDecimal128 < Test::Unit::TestCase
   include Helper::Omittable
 
+  def test_new_string_invalid
+    message =
+      "[decimal128][new][string]: Invalid: " +
+      "The string '1,1' is not a valid decimal128 number"
+    error = assert_raise(Arrow::Error::Invalid) do
+      Arrow::Decimal128.new("1,1")
+    end
+    assert_equal(message,
+                 error.message.lines.first.chomp)
+  end
+
+  def test_copy
+    decimal = Arrow::Decimal128.new("234.23445")
+    assert_equal(decimal, decimal.copy)
+  end
+
   def test_to_string_scale
     integer_data = 23423445
     string_data = "234.23445"
@@ -29,6 +45,12 @@ class TestDecimal128 < Test::Unit::TestCase
     string_data = "99999999999999999999999999999999999999"
     decimal = Arrow::Decimal128.new(string_data)
     assert_equal(string_data, decimal.to_s)
+  end
+
+  def test_to_bytes
+    decimal = Arrow::Decimal128.new("12.3")
+    assert_equal([123, 0].pack("q*"),
+                 decimal.to_bytes.to_s)
   end
 
   def test_abs
@@ -214,7 +236,7 @@ class TestDecimal128 < Test::Unit::TestCase
     decimal = Arrow::Decimal128.new(10)
     message =
       "[decimal128][rescale]: Invalid: " +
-      "Rescaling decimal value would cause data loss"
+      "Rescaling Decimal128 value would cause data loss"
     assert_raise(Arrow::Error::Invalid.new(message)) do
       decimal.rescale(1, -1)
     end

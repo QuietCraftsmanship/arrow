@@ -21,30 +21,39 @@
 
 ## Did you find a bug?
 
-The Arrow project uses JIRA as a bug tracker.  To report a bug, you'll have
-to first create an account on the
-[Apache Foundation JIRA](https://issues.apache.org/jira/).  The JIRA server
-hosts bugs and issues for multiple Apache projects.  The JIRA project name
-for Arrow is "ARROW".
+The Arrow project uses GitHub as a bug tracker.  To report a bug, sign in to
+your GitHub account, navigate to [GitHub issues](https://github.com/apache/arrow/issues)
+and click on **New issue** .
 
-Before you create a new bug entry, we recommend you first
-[search](https://issues.apache.org/jira/projects/ARROW/issues/ARROW-5140?filter=allopenissues)
-among existing Arrow issues.
+To be assigned to an issue, add a comment "take" to that issue.
 
-When you create a new JIRA entry, please don't forget to fill the "Component"
-field.  Arrow has many subcomponents and this helps triaging and filtering
-tremendously.  Also, we conventionally prefix the issue title with the component
-name in brackets, such as "[C++] Crash in Array::Frobnicate()", so as to make
-lists more easy to navigate, and we'd be grateful if you did the same.
+Before you create a new bug entry, we recommend you first search among existing
+Arrow issues in
+[GitHub](https://github.com/apache/arrow/issues).
+
+We conventionally prefix the issue title with the component
+name in brackets, such as "[C++][Python] Ensure no validity bitmap in
+UnionArray::SetData", so as to make lists more easy to navigate, and
+we'd be grateful if you did the same.
 
 ## Did you write a patch that fixes a bug or brings an improvement?
 
-First create a JIRA entry as described above.  Then, submit your changes
-as a Github Pull Request.  We'll ask you to prefix the pull request title
-with the JIRA issue number and the component name in brackets.
-(for example: "ARROW-2345: [C++] Fix crash in Array::Frobnicate()").
-Respecting this convention makes it easier for us to process the backlog
-of submitted Pull Requests.
+First create a GitHub issue as described above, selecting **Bug Report** or
+**Enhancement Request**. Then, submit your changes as a GitHub Pull Request.
+We'll ask you to prefix the pull request title with the GitHub issue number
+and the component name in brackets. (for example: "GH-14736: [C++][Python]
+Ensure no validity bitmap in UnionArray::SetData"). Respecting this convention
+makes it easier for us to process the backlog of submitted Pull Requests.
+
+### Minor Fixes
+
+Any functionality change should have a GitHub issue opened. For minor changes that
+affect documentation, you do not need to open up a GitHub issue. Instead you can
+prefix the title of your PR with "MINOR: " if meets one of the following:
+
+*  Grammar, usage and spelling fixes that affect no more than 2 files
+*  Documentation updates affecting no more than 2 files and not more
+   than 500 words.
 
 ## Do you want to propose a significant new feature or an important refactoring?
 
@@ -57,4 +66,5 @@ You can also ask on the mailing-list, see above.
 
 ## Further information
 
-Please read our [development documentation](https://arrow.apache.org/docs/developers/contributing.html).
+Please read our [development documentation](https://arrow.apache.org/docs/developers/index.html)
+or look through the [New Contributor's Guide](https://arrow.apache.org/docs/developers/guide/index.html).

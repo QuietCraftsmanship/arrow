@@ -15,42 +15,48 @@
 // specific language governing permissions and limitations
 // under the License.
 
-module.exports = {
-    "verbose": false,
-    "reporters": [
-      "jest-silent-reporter"
+export default {
+    verbose: false,
+    testEnvironment: "node",
+    rootDir: ".",
+    roots: [
+        "<rootDir>/test/",
     ],
-    "testEnvironment": "node",
-    "globals": {
-      "ts-jest": {
-        "diagnostics": false,
-        "tsConfig": "test/tsconfig.json"
-      }
+    cacheDirectory: ".jest-cache",
+    extensionsToTreatAsEsm: [".ts"],
+    moduleFileExtensions: ["js", "mjs", "ts"],
+    coverageReporters: ["lcov", "json",],
+    coveragePathIgnorePatterns: [
+        "fb\\/.*\\.(js|ts)$",
+        "test\\/.*\\.(ts|js)$",
+        "/node_modules/",
+    ],
+    moduleNameMapper: {
+        "^apache-arrow$": "<rootDir>/src/Arrow.node",
+        "^apache-arrow(.*)": "<rootDir>/src$1",
+        "^(\\.{1,2}/.*)\\.js$": "$1",
     },
-    "roots": [
-      "<rootDir>/test/"
-    ],
-    "moduleFileExtensions": [
-      "js",
-      "ts",
-      "tsx"
-    ],
-    "coverageReporters": [
-      "lcov"
-    ],
-    "coveragePathIgnorePatterns": [
-      "fb\\/(File|Message|Schema|Tensor)\\.(js|ts)$",
-      "test\\/.*\\.(ts|tsx|js)$",
-      "/node_modules/"
-    ],
-    "transform": {
-      "^.+\\.jsx?$": "ts-jest",
-      "^.+\\.tsx?$": "ts-jest"
+    testRegex: "(.*(-|\\.)(test|spec)s?)\\.(ts|js)$",
+    transform: {
+        "^.+\\.js$": [
+            "ts-jest",
+            {
+                diagnostics: false,
+                tsconfig: "test/tsconfig.json",
+                useESM: true,
+            },
+        ],
+        "^.+\\.ts$": [
+            "ts-jest",
+            {
+                diagnostics: false,
+                tsconfig: "test/tsconfig.json",
+                useESM: true,
+            },
+        ],
     },
-    "transformIgnorePatterns": [
-      "/node_modules/(?!web-stream-tools).+\\.js$"
+    transformIgnorePatterns: [
+        "/targets/(es5|es2015|esnext|apache-arrow)/",
+        "/node_modules/(?!@openpgp/web-stream-tools)/",
     ],
-    "testRegex": "(.*(-|\\.)(test|spec)s?)\\.(ts|tsx|js)$",
-    "preset": "ts-jest",
-    "testMatch": null
 };

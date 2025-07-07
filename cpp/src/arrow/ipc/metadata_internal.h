@@ -17,57 +17,66 @@
 
 // Internal metadata serialization matters
 
-#ifndef ARROW_IPC_METADATA_INTERNAL_H
-#define ARROW_IPC_METADATA_INTERNAL_H
+#pragma once
 
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <flatbuffers/flatbuffers.h>
 
 #include "arrow/buffer.h"
-#include "arrow/ipc/Message_generated.h"
-#include "arrow/ipc/Schema_generated.h"
-#include "arrow/ipc/dictionary.h"  // IYWU pragma: keep
+#include "arrow/io/type_fwd.h"
 #include "arrow/ipc/message.h"
-#include "arrow/memory_pool.h"
+#include "arrow/result.h"
 #include "arrow/sparse_tensor.h"
 #include "arrow/status.h"
+#include "arrow/type_fwd.h"
+#include "arrow/util/macros.h"
+#include "arrow/util/visibility.h"
+
+#include "generated/Message_generated.h"
+#include "generated/Schema_generated.h"
+#include "generated/SparseTensor_generated.h"  // IWYU pragma: keep
 
 namespace arrow {
 
-class DataType;
-class Schema;
-class Tensor;
-class SparseTensor;
-
 namespace flatbuf = org::apache::arrow::flatbuf;
-
-namespace io {
-
-class OutputStream;
-
-}  // namespace io
 
 namespace ipc {
 
+class DictionaryFieldMapper;
 class DictionaryMemo;
 
 namespace internal {
+
+using KeyValueOffset = flatbuffers::Offset<flatbuf::KeyValue>;
+using KVVector = flatbuffers::Vector<KeyValueOffset>;
 
 // This 0xFFFFFFFF value is the first 4 bytes of a valid IPC message
 constexpr int32_t kIpcContinuationToken = -1;
 
 static constexpr flatbuf::MetadataVersion kCurrentMetadataVersion =
-    flatbuf::MetadataVersion_V4;
+    flatbuf::MetadataVersion::MetadataVersion_V5;
+
+static constexpr flatbuf::MetadataVersion kLatestMetadataVersion =
+    flatbuf::MetadataVersion::MetadataVersion_V5;
 
 static constexpr flatbuf::MetadataVersion kMinMetadataVersion =
-    flatbuf::MetadataVersion_V4;
+    flatbuf::MetadataVersion::MetadataVersion_V4;
 
+// These functions are used in unit tests
+ARROW_EXPORT
 MetadataVersion GetMetadataVersion(flatbuf::MetadataVersion version);
+
+ARROW_EXPORT
+flatbuf::MetadataVersion MetadataVersionToFlatbuffer(MetadataVersion version);
+
+// Whether the type has a validity bitmap in the given IPC version
+bool HasValidityBitmap(Type::type type_id, MetadataVersion version);
 
 static constexpr const char* kArrowMagicBytes = "ARROW1";
 
@@ -91,40 +100,90 @@ struct FileBlock {
   int64_t body_length;
 };
 
+// Low-level utilities to help with reading Flatbuffers data.
+
+#define CHECK_FLATBUFFERS_NOT_NULL(fb_value, name)             \
+  if ((fb_value) == NULLPTR) {                                 \
+    return Status::IOError("Unexpected null field ", name,     \
+                           " in flatbuffer-encoded metadata"); \
+  }
+
+template <typename T>
+inline uint32_t FlatBuffersVectorSize(const flatbuffers::Vector<T>* vec) {
+  return (vec == NULLPTR) ? 0 : vec->size();
+}
+
+inline std::string StringFromFlatbuffers(const flatbuffers::String* s) {
+  return (s == NULLPTR) ? "" : s->str();
+}
+
 // Read interface classes. We do not fully deserialize the flatbuffers so that
 // individual fields metadata can be retrieved from very large schema without
 //
 
 // Construct a complete Schema from the message and add
-// dictinory-encoded fields to a DictionaryMemo instance. May be
+// dictionary-encoded fields to a DictionaryMemo instance. May be
 // expensive for very large schemas if you are only interested in a
 // few fields
+ARROW_EXPORT
 Status GetSchema(const void* opaque_schema, DictionaryMemo* dictionary_memo,
                  std::shared_ptr<Schema>* out);
 
+ARROW_EXPORT
 Status GetTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type,
                          std::vector<int64_t>* shape, std::vector<int64_t>* strides,
                          std::vector<std::string>* dim_names);
 
 // EXPERIMENTAL: Extracting metadata of a SparseCOOIndex from the message
+ARROW_EXPORT
 Status GetSparseCOOIndexMetadata(const flatbuf::SparseTensorIndexCOO* sparse_index,
                                  std::shared_ptr<DataType>* indices_type);
 
-// EXPERIMENTAL: Extracting metadata of a SparseCSRIndex from the message
-Status GetSparseCSRIndexMetadata(const flatbuf::SparseMatrixIndexCSR* sparse_index,
+// EXPERIMENTAL: Extracting metadata of a SparseCSXIndex from the message
+ARROW_EXPORT
+Status GetSparseCSXIndexMetadata(const flatbuf::SparseMatrixIndexCSX* sparse_index,
+                                 std::shared_ptr<DataType>* indptr_type,
+                                 std::shared_ptr<DataType>* indices_type);
+
+// EXPERIMENTAL: Extracting metadata of a SparseCSFIndex from the message
+ARROW_EXPORT
+Status GetSparseCSFIndexMetadata(const flatbuf::SparseTensorIndexCSF* sparse_index,
+                                 std::vector<int64_t>* axis_order,
+                                 std::vector<int64_t>* indices_size,
                                  std::shared_ptr<DataType>* indptr_type,
                                  std::shared_ptr<DataType>* indices_type);
 
 // EXPERIMENTAL: Extracting metadata of a sparse tensor from the message
+ARROW_EXPORT
 Status GetSparseTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type,
                                std::vector<int64_t>* shape,
                                std::vector<std::string>* dim_names, int64_t* length,
                                SparseTensorFormat::type* sparse_tensor_format_id);
 
+ARROW_EXPORT
+Status GetKeyValueMetadata(const KVVector* fb_metadata,
+                           std::shared_ptr<KeyValueMetadata>* out);
+
+ARROW_EXPORT
+Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
+                                  FieldVector children, std::shared_ptr<DataType>* out);
+
+template <typename RootType>
+bool VerifyFlatbuffers(const uint8_t* data, int64_t size) {
+  // Heuristic: tables in a Arrow flatbuffers buffer must take at least 1 bit
+  // each in average (ARROW-11559).
+  // Especially, the only recursive table (the `Field` table in Schema.fbs)
+  // must have a non-empty `type` member.
+  flatbuffers::Verifier verifier(
+      data, static_cast<size_t>(size),
+      /*max_depth=*/128,
+      /*max_tables=*/static_cast<flatbuffers::uoffset_t>(8 * size));
+  return verifier.VerifyBuffer<RootType>(nullptr);
+}
+
 static inline Status VerifyMessage(const uint8_t* data, int64_t size,
                                    const flatbuf::Message** out) {
-  flatbuffers::Verifier verifier(data, size, /*max_depth=*/128);
-  if (!flatbuf::VerifyMessageBuffer(verifier)) {
+  if (!VerifyFlatbuffers<flatbuf::Message>(data, size)) {
     return Status::IOError("Invalid flatbuffers message.");
   }
   *out = flatbuf::GetMessage(data);
@@ -132,52 +191,63 @@ static inline Status VerifyMessage(const uint8_t* data, int64_t size,
 }
 
 // Serialize arrow::Schema as a Flatbuffer
-//
-// \param[in] schema a Schema instance
-// \param[in,out] dictionary_memo class for tracking dictionaries and assigning
-// dictionary ids
-// \param[out] out the serialized arrow::Buffer
-// \return Status outcome
-Status WriteSchemaMessage(const Schema& schema, DictionaryMemo* dictionary_memo,
-                          std::shared_ptr<Buffer>* out);
+ARROW_EXPORT
+Status WriteSchemaMessage(const Schema& schema, const DictionaryFieldMapper& mapper,
+                          const IpcWriteOptions& options, std::shared_ptr<Buffer>* out);
 
-Status WriteRecordBatchMessage(const int64_t length, const int64_t body_length,
-                               const std::vector<FieldMetadata>& nodes,
-                               const std::vector<BufferMetadata>& buffers,
-                               std::shared_ptr<Buffer>* out);
+// This function is used in a unit test
+ARROW_EXPORT
+Status WriteRecordBatchMessage(
+    const int64_t length, const int64_t body_length,
+    const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
+    const std::vector<FieldMetadata>& nodes, const std::vector<BufferMetadata>& buffers,
+    const std::vector<int64_t>& variadic_counts, const IpcWriteOptions& options,
+    std::shared_ptr<Buffer>* out);
 
-Status WriteTensorMessage(const Tensor& tensor, const int64_t buffer_start_offset,
-                          std::shared_ptr<Buffer>* out);
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> WriteTensorMessage(const Tensor& tensor,
+                                                   const int64_t buffer_start_offset,
+                                                   const IpcWriteOptions& options);
 
-Status WriteSparseTensorMessage(const SparseTensor& sparse_tensor, int64_t body_length,
-                                const std::vector<BufferMetadata>& buffers,
-                                std::shared_ptr<Buffer>* out);
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> WriteSparseTensorMessage(
+    const SparseTensor& sparse_tensor, int64_t body_length,
+    const std::vector<BufferMetadata>& buffers, const IpcWriteOptions& options);
 
+ARROW_EXPORT
 Status WriteFileFooter(const Schema& schema, const std::vector<FileBlock>& dictionaries,
                        const std::vector<FileBlock>& record_batches,
+                       const std::shared_ptr<const KeyValueMetadata>& metadata,
                        io::OutputStream* out);
 
-Status WriteDictionaryMessage(const int64_t id, const int64_t length,
-                              const int64_t body_length,
-                              const std::vector<FieldMetadata>& nodes,
-                              const std::vector<BufferMetadata>& buffers,
-                              std::shared_ptr<Buffer>* out);
+ARROW_EXPORT
+Status WriteDictionaryMessage(
+    const int64_t id, const bool is_delta, const int64_t length,
+    const int64_t body_length,
+    const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
+    const std::vector<FieldMetadata>& nodes, const std::vector<BufferMetadata>& buffers,
+    const std::vector<int64_t>& variadic_counts, const IpcWriteOptions& options,
+    std::shared_ptr<Buffer>* out);
 
-static inline Status WriteFlatbufferBuilder(flatbuffers::FlatBufferBuilder& fbb,
-                                            std::shared_ptr<Buffer>* out) {
+static inline Result<std::shared_ptr<Buffer>> WriteFlatbufferBuilder(
+    flatbuffers::FlatBufferBuilder& fbb,  // NOLINT non-const reference
+    MemoryPool* pool = default_memory_pool()) {
   int32_t size = fbb.GetSize();
 
-  std::shared_ptr<Buffer> result;
-  RETURN_NOT_OK(AllocateBuffer(default_memory_pool(), size, &result));
+  ARROW_ASSIGN_OR_RAISE(auto result, AllocateBuffer(size, pool));
 
   uint8_t* dst = result->mutable_data();
   memcpy(dst, fbb.GetBufferPointer(), size);
-  *out = result;
-  return Status::OK();
+  // R build with openSUSE155 requires an explicit shared_ptr construction
+  return std::shared_ptr<Buffer>(std::move(result));
 }
+
+ARROW_EXPORT
+flatbuf::TimeUnit ToFlatbufferUnit(TimeUnit::type unit);
+
+ARROW_EXPORT
+TimeUnit::type FromFlatbufferUnit(flatbuf::TimeUnit unit);
 
 }  // namespace internal
 }  // namespace ipc
 }  // namespace arrow
-
-#endif  // ARROW_IPC_METADATA_H

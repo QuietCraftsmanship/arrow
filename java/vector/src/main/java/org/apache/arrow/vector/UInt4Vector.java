@@ -25,7 +25,6 @@ import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableUInt4Holder;
 import org.apache.arrow.vector.holders.UInt4Holder;
 import org.apache.arrow.vector.types.Types.MinorType;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
@@ -36,7 +35,15 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
 public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class UInt4Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class UInt4Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private static final byte TYPE_WIDTH = 4;
   private final FieldReader reader;
 
@@ -45,11 +52,7 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   public UInt4Vector(String name, FieldType fieldType, BufferAllocator allocator) {
-    this(new Field(name, fieldType, null), allocator);
-  }
-
-  public UInt4Vector(Field field, BufferAllocator allocator) {
-    super(field, allocator, TYPE_WIDTH);
+    super(name, allocator, fieldType, TYPE_WIDTH);
     reader = new UInt4ReaderImpl(UInt4Vector.this);
   }
 
@@ -84,7 +87,7 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
    */
   public static long getNoOverflow(final ArrowBuf buffer, final int index) {
     long l =  buffer.getInt(index * TYPE_WIDTH);
-    return (0x00000000FFFFFFFFL) & l;
+    return ((long)0xFFFFFFFF) & l;
   }
 
   /**
@@ -142,6 +145,25 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
     } else {
       return getNoOverflow(valueBuffer, index);
     }
+  }
+
+  /**
+   * Copies a value and validity setting to the thisIndex position from the given vector
+   * at fromIndex.
+   */
+  public void copyFrom(int fromIndex, int thisIndex, UInt4Vector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final int value = from.valueBuffer.getInt(fromIndex * TYPE_WIDTH);
+    valueBuffer.setInt(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Same as {@link #copyFrom(int, int, UInt4Vector)} but will allocate additional space
+   * if fromIndex is larger than current capacity.
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, UInt4Vector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
   }
 
 
@@ -237,6 +259,18 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   /**
+   * Set the element at the given index to null.
+   *
+   * @param index   position of element
+   */
+  public void setNull(int index) {
+    handleSafe(index);
+    // not really needed to set the bit to 0 as long as
+    // the buffer always starts from 0.
+    BitVectorHelper.setValidityBit(validityBuffer, index, 0);
+  }
+
+  /**
    * Sets the value at index to value isSet > 0, otherwise sets the index position
    * to invalid/null.
    */
@@ -276,6 +310,8 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, (int) value);
   }
@@ -288,6 +324,14 @@ public final class UInt4Vector extends BaseFixedWidthVector implements BaseIntVe
   @Override
   public long getValueAsLong(int index) {
     return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

@@ -19,37 +19,34 @@
 Arrays
 ======
 
+Base classes
+============
+
+.. doxygenclass:: arrow::ArrayStatistics
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::ArrayData
+   :project: arrow_cpp
+   :members:
+
 .. doxygenclass:: arrow::Array
    :project: arrow_cpp
    :members:
 
+Factory functions
+=================
+
+.. doxygengroup:: array-factories
+   :content-only:
+
 Concrete array subclasses
 =========================
 
-.. doxygenclass:: arrow::DictionaryArray
-   :project: arrow_cpp
-   :members:
-
-Non-nested
-----------
-
-.. doxygenclass:: arrow::FlatArray
-   :project: arrow_cpp
-   :members:
+Primitive and temporal
+----------------------
 
 .. doxygenclass:: arrow::NullArray
-   :project: arrow_cpp
-   :members:
-
-.. doxygenclass:: arrow::BinaryArray
-   :project: arrow_cpp
-   :members:
-
-.. doxygenclass:: arrow::StringArray
-   :project: arrow_cpp
-   :members:
-
-.. doxygenclass:: arrow::PrimitiveArray
    :project: arrow_cpp
    :members:
 
@@ -57,32 +54,36 @@ Non-nested
    :project: arrow_cpp
    :members:
 
-.. doxygenclass:: arrow::FixedSizeBinaryArray
-   :project: arrow_cpp
+.. doxygengroup:: numeric-arrays
+   :content-only:
    :members:
 
-.. doxygenclass:: arrow::Decimal128Array
-   :project: arrow_cpp
-   :members:
+Binary-like
+-----------
 
-.. doxygenclass:: arrow::NumericArray
-   :project: arrow_cpp
+.. doxygengroup:: binary-arrays
+   :content-only:
    :members:
 
 Nested
 ------
 
-.. doxygenclass:: arrow::UnionArray
-   :project: arrow_cpp
+.. doxygengroup:: nested-arrays
+   :content-only:
    :members:
 
-.. doxygenclass:: arrow::ListArray
-   :project: arrow_cpp
+Dictionary-encoded
+------------------
+
+.. doxygenclass:: arrow::DictionaryArray
    :members:
 
-.. doxygenclass:: arrow::StructArray
-   :project: arrow_cpp
+Extension arrays
+----------------
+
+.. doxygenclass:: arrow::ExtensionArray
    :members:
+
 
 Chunked Arrays
 ==============
@@ -90,3 +91,22 @@ Chunked Arrays
 .. doxygenclass:: arrow::ChunkedArray
    :project: arrow_cpp
    :members:
+
+.. doxygentypedef:: arrow::ChunkLocation
+   :project: arrow_cpp
+
+.. doxygenstruct:: arrow::TypedChunkLocation
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::ChunkResolver
+   :project: arrow_cpp
+   :members:
+
+Utilities
+=========
+
+.. doxygenclass:: arrow::ArrayVisitor
+   :project: arrow_cpp
+   :members:
+   :undoc-members:

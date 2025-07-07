@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include arrow-package.R
+#' @include arrow-object.R
 #'
-#' @title class arrow::MemoryPool
+#' @title MemoryPool class
 #'
 #' @usage NULL
 #' @format NULL
@@ -25,25 +25,37 @@
 #'
 #' @section Methods:
 #'
-#' TODO
+#' - `backend_name`: one of "jemalloc", "mimalloc", or "system". Alternative
+#'   memory allocators are optionally enabled at build time. Windows builds
+#'   generally have `mimalloc`, and most others have both `jemalloc` (used by
+#'   default) and `mimalloc`. To change memory allocators at runtime, set the
+#'   environment variable `ARROW_DEFAULT_MEMORY_POOL` to one of those strings
+#'   prior to loading the `arrow` library.
+#' - `bytes_allocated`
+#' - `max_memory`
 #'
 #' @rdname MemoryPool
 #' @name MemoryPool
+#' @keywords internal
 MemoryPool <- R6Class("MemoryPool",
-  inherit = Object,
+  inherit = ArrowObject,
   public = list(
     # TODO: Allocate
     # TODO: Reallocate
     # TODO: Free
+  ),
+  active = list(
+    backend_name = function() MemoryPool__backend_name(self),
     bytes_allocated = function() MemoryPool__bytes_allocated(self),
     max_memory = function() MemoryPool__max_memory(self)
   )
 )
 
-#' default [arrow::MemoryPool][MemoryPool]
+#' Arrow's default [MemoryPool]
 #'
-#' @return the default [arrow::MemoryPool][MemoryPool]
+#' @return the default [MemoryPool]
 #' @export
+#' @keywords internal
 default_memory_pool <- function() {
-  shared_ptr(MemoryPool, MemoryPool__default())
+  MemoryPool__default()
 }

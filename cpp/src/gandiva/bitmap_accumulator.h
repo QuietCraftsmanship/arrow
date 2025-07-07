@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_BITMAP_ACCUMULATOR_H
-#define GANDIVA_BITMAP_ACCUMULATOR_H
+#pragma once
 
 #include <vector>
 
@@ -66,17 +65,16 @@ class GANDIVA_EXPORT BitMapAccumulator : public DexDefaultVisitor {
 
   /// Compute the intersection of the accumulated bitmaps (with offsets) and save the
   /// result in dst_bmap.
-  static void IntersectBitMaps(uint8_t* dst_map, const std::vector<uint8_t*>& src_maps,
+  static void IntersectBitMaps(uint8_t* dst_map,
+                               const std::vector<const uint8_t*>& src_maps,
                                const std::vector<int64_t>& src_maps_offsets,
                                int64_t num_records);
 
  private:
   const EvalBatch& eval_batch_;
-  std::vector<uint8_t*> src_maps_;
+  std::vector<const uint8_t*> src_maps_;
   std::vector<int64_t> src_map_offsets_;
   bool all_invalid_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_BITMAP_ACCUMULATOR_H

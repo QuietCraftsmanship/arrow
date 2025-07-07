@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include arrow-package.R
+#' @include arrow-object.R
 #' @title Field class
 #' @usage NULL
 #' @format NULL
@@ -28,19 +28,20 @@
 #' - `f$ToString()`: convert to a string
 #' - `f$Equals(other)`: test for equality. More naturally called as `f == other`
 #'
-#' @rdname Field
 #' @name Field
+#' @rdname Field-class
 #' @export
-Field <- R6Class("Field", inherit = Object,
+Field <- R6Class("Field",
+  inherit = ArrowObject,
   public = list(
     ToString = function() {
-      Field__ToString(self)
+      prettier_dictionary_type(Field__ToString(self))
     },
-    Equals = function(other) {
+    Equals = function(other, ...) {
       inherits(other, "Field") && Field__Equals(self, other)
-    }
+    },
+    export_to_c = function(ptr) ExportField(self, ptr)
   ),
-
   active = list(
     name = function() {
       Field__name(self)
@@ -49,42 +50,38 @@ Field <- R6Class("Field", inherit = Object,
       Field__nullable(self)
     },
     type = function() {
-      DataType$create(Field__type(self))
+      Field__type(self)
     }
   )
 )
-Field$create <- function(name, type, metadata) {
+Field$create <- function(name, type, metadata, nullable = TRUE) {
   assert_that(inherits(name, "character"), length(name) == 1L)
-  if (!inherits(type, "DataType")) {
-    if (identical(type, double())) {
-      # Magic so that we don't have to mask this base function
-      type <- float64()
-    } else {
-      stop(name, " must be arrow::DataType, not ", class(type), call. = FALSE)
-    }
-  }
+  type <- as_type(type, name)
   assert_that(missing(metadata), msg = "metadata= is currently ignored")
-  shared_ptr(Field, Field__initialize(name, type, TRUE))
+  Field__initialize(enc2utf8(name), type, nullable)
 }
+#' @include arrowExports.R
+Field$import_from_c <- ImportField
 
-#' @export
-`==.Field` <- function(lhs, rhs){
-  lhs$Equals(rhs)
-}
-
+#' Create a Field
+#'
 #' @param name field name
 #' @param type logical type, instance of [DataType]
 #' @param metadata currently ignored
+#' @param nullable TRUE if field is nullable
 #'
 #' @examples
-#' \donttest{
 #' field("x", int32())
-#' }
 #' @rdname Field
+#' @seealso [Field]
 #' @export
 field <- Field$create
 
-.fields <- function(.list){
-  assert_that(!is.null(nms <- names(.list)))
-  map2(nms, .list, field)
+.fields <- function(.list, nullable = TRUE) {
+  if (length(.list)) {
+    assert_that(!is.null(nms <- names(.list)))
+    map2(nms, .list, field)
+  } else {
+    list()
+  }
 }

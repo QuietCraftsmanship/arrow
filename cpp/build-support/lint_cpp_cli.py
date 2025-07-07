@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -31,6 +31,7 @@ _STRIP_COMMENT_REGEX = re.compile('(.+)?(?=//)')
 _NULLPTR_REGEX = re.compile(r'.*\bnullptr\b.*')
 _RETURN_NOT_OK_REGEX = re.compile(r'.*\sRETURN_NOT_OK.*')
 _ASSIGN_OR_RAISE_REGEX = re.compile(r'.*\sASSIGN_OR_RAISE.*')
+_DCHECK_REGEX = re.compile(r'.*\sDCHECK.*')
 
 
 def _paths(paths):
@@ -54,14 +55,12 @@ def lint_file(path):
         (lambda x: re.match(_RETURN_NOT_OK_REGEX, x),
          'Use ARROW_RETURN_NOT_OK in header files', _paths('''\
          arrow/status.h
-         test
-         arrow/util/hash.h
          arrow/python/util''')),
         (lambda x: re.match(_ASSIGN_OR_RAISE_REGEX, x),
-         'Use ARROW_ASSIGN_OR_RAISE in header files', _paths('''\
-         arrow/result_internal.h
-         test
-         '''))
+         'Use ARROW_ASSIGN_OR_RAISE in header files', []),
+        (lambda x: re.match(_DCHECK_REGEX, x),
+         'Use ARROW_DCHECK in header files', _paths('''\
+         arrow/util/logging.h'''))
 
     ]
 
@@ -77,6 +76,7 @@ def lint_file(path):
 
 
 EXCLUSIONS = _paths('''\
+    arrow/arrow-config.cmake
     arrow/python/iterators.h
     arrow/util/hashing.h
     arrow/util/macros.h
@@ -87,7 +87,8 @@ EXCLUSIONS = _paths('''\
     gandiva/jni
     jni/
     test
-    internal''')
+    internal
+    _generated''')
 
 
 def lint_files():
@@ -104,10 +105,10 @@ def lint_files():
             if exclude:
                 continue
 
-            # Lint file name, except for pkgconfig templates
+            # Lint file name, except for pkg-config templates
             if not filename.endswith('.pc.in'):
                 if '-' in filename:
-                    why = ("Please user underscores, not hyphens, "
+                    why = ("Please use underscores, not hyphens, "
                            "in source file names")
                     yield full_path, why, 0, full_path
 

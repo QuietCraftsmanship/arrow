@@ -25,9 +25,7 @@ use std::sync::Arc;
 use chrono::prelude::*;
 
 use super::*;
-use crate::array::equal::JsonEqual;
 use crate::buffer::{Buffer, MutableBuffer};
-use crate::datatypes::DataType::Struct;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use crate::memory;
@@ -43,9 +41,46 @@ const MICROSECONDS: i64 = 1_000_000;
 const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Trait for dealing with different types of array at runtime when the type of the
-/// array is not known in advance
+<<<<<<< HEAD
+<<<<<<< HEAD
+/// array is not known in advance.
 pub trait Array: fmt::Debug + Send + Sync + ArrayEqual + JsonEqual {
+    /// Returns the array as [`Any`](std::any::Any) so that it can be
+    /// downcasted to a specific implementation.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::Int32Array;
+    /// use arrow::datatypes::{Schema, Field, DataType};
+    /// use arrow::record_batch::RecordBatch;
+    ///
+    /// # fn main() -> arrow::error::Result<()> {
+    /// let id = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    /// let batch = RecordBatch::try_new(
+    ///     Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+    ///     vec![Arc::new(id)]
+    /// )?;
+    ///
+    /// let int32array = batch
+    ///     .column(0)
+    ///     .as_any()
+    ///     .downcast_ref::<Int32Array>()
+    ///     .expect("Failed to downcast");
+    /// # Ok(())
+    /// # }
+    /// ```
+=======
+/// array is not known in advance
+pub trait Array: Send + Sync + ArrayEqual {
     /// Returns the array as `Any` so that it can be downcast to a specific implementation
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+/// array is not known in advance
+pub trait Array: Send + Sync + ArrayEqual {
+    /// Returns the array as `Any` so that it can be downcast to a specific implementation
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     fn as_any(&self) -> &Any;
 
     /// Returns a reference-counted pointer to the data of this array
@@ -424,22 +459,16 @@ where
     }
 }
 
-impl<T: ArrowPrimitiveType> fmt::Debug for PrimitiveArray<T> {
-    default fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "PrimitiveArray<{:?}>\n[\n", T::get_data_type())?;
-        print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
-        })?;
-        write!(f, "]")
-    }
-}
-
 impl<T: ArrowNumericType> fmt::Debug for PrimitiveArray<T> {
     default fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "PrimitiveArray<{:?}>\n[\n", T::get_data_type())?;
-        print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
-        })?;
+        for i in 0..self.len() {
+            if self.is_null(i) {
+                write!(f, "  null,\n")?;
+            } else {
+                write!(f, "  {:?},\n", self.value(i))?;
+            }
+        }
         write!(f, "]")
     }
 }
@@ -450,25 +479,31 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "PrimitiveArray<{:?}>\n[\n", T::get_data_type())?;
-        print_long_array(self, f, |array, index, f| match T::get_data_type() {
-            DataType::Date32(_) | DataType::Date64(_) => {
-                match array.value_as_date(index) {
-                    Some(date) => write!(f, "{:?}", date),
-                    None => write!(f, "null"),
+        for i in 0..self.len() {
+            if self.is_null(i) {
+                write!(f, "  null,\n")?;
+            } else {
+                match T::get_data_type() {
+                    DataType::Date32(_) | DataType::Date64(_) => {
+                        match self.value_as_date(i) {
+                            Some(date) => write!(f, "  {:?},\n", date)?,
+                            None => write!(f, "  null,\n")?,
+                        }
+                    }
+                    DataType::Time32(_) | DataType::Time64(_) => {
+                        match self.value_as_time(i) {
+                            Some(time) => write!(f, "  {:?},\n", time)?,
+                            None => write!(f, "  null,\n")?,
+                        }
+                    }
+                    DataType::Timestamp(_) => match self.value_as_datetime(i) {
+                        Some(datetime) => write!(f, "  {:?},\n", datetime)?,
+                        None => write!(f, "  null,\n")?,
+                    },
+                    _ => write!(f, "  {:?},\n", "null,\n")?,
                 }
             }
-            DataType::Time32(_) | DataType::Time64(_) => {
-                match array.value_as_time(index) {
-                    Some(time) => write!(f, "{:?}", time),
-                    None => write!(f, "null"),
-                }
-            }
-            DataType::Timestamp(_) => match array.value_as_datetime(index) {
-                Some(datetime) => write!(f, "{:?}", datetime),
-                None => write!(f, "null"),
-            },
-            _ => write!(f, "null"),
-        })?;
+        }
         write!(f, "]")
     }
 }
@@ -508,9 +543,13 @@ impl PrimitiveArray<BooleanType> {
 impl fmt::Debug for PrimitiveArray<BooleanType> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "PrimitiveArray<{:?}>\n[\n", BooleanType::get_data_type())?;
-        print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
-        })?;
+        for i in 0..self.len() {
+            if self.is_null(i) {
+                write!(f, "  null,\n")?
+            } else {
+                write!(f, "  {:?},\n", self.value(i))?
+            }
+        }
         write!(f, "]")
     }
 }
@@ -688,7 +727,16 @@ impl<T: ArrowPrimitiveType> From<ArrayDataRef> for PrimitiveArray<T> {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+/// Common operations for List types, currently `ListArray`, `FixedSizeListArray`, `BinaryArray`
+/// `StringArray` and `DictionaryArray`
+=======
 /// Common operations for List types, currently `ListArray` and `BinaryArray`.
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+/// Common operations for List types, currently `ListArray` and `BinaryArray`.
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 pub trait ListArrayOps {
     fn value_offset_at(&self, i: usize) -> i32;
 }
@@ -699,12 +747,42 @@ impl ListArrayOps for ListArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl ListArrayOps for FixedSizeListArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl ListArrayOps for BinaryArray {
     fn value_offset_at(&self, i: usize) -> i32 {
         self.value_offset_at(i)
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl ListArrayOps for StringArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+impl ListArrayOps for FixedSizeBinaryArray {
+    fn value_offset_at(&self, i: usize) -> i32 {
+        self.value_offset_at(i)
+    }
+}
+
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type.
 pub struct ListArray {
@@ -722,12 +800,6 @@ impl ListArray {
     /// Returns a clone of the value type of this list.
     pub fn value_type(&self) -> DataType {
         self.values.data().data_type().clone()
-    }
-
-    /// Returns ith value of this list array.
-    pub fn value(&self, i: usize) -> ArrayRef {
-        self.values
-            .slice(self.value_offset(i) as usize, self.value_length(i) as usize)
     }
 
     /// Returns the offset for value at index `i`.
@@ -795,48 +867,6 @@ impl Array for ListArray {
 
     fn data_ref(&self) -> &ArrayDataRef {
         &self.data
-    }
-}
-
-// Helper function for printing potentially long arrays.
-fn print_long_array<A, F>(array: &A, f: &mut fmt::Formatter, print_item: F) -> fmt::Result
-where
-    A: Array,
-    F: Fn(&A, usize, &mut fmt::Formatter) -> fmt::Result,
-{
-    for i in 0..std::cmp::min(10, array.len()) {
-        if array.is_null(i) {
-            write!(f, "  null,\n")?;
-        } else {
-            write!(f, "  ")?;
-            print_item(&array, i, f)?;
-            write!(f, ",\n")?;
-        }
-    }
-    if array.len() > 10 {
-        if array.len() > 20 {
-            write!(f, "  ...{} elements...,\n", array.len() - 20)?;
-        }
-        for i in array.len() - 10..array.len() {
-            if array.is_null(i) {
-                write!(f, "  null,\n")?;
-            } else {
-                write!(f, "  ")?;
-                print_item(&array, i, f)?;
-                write!(f, ",\n")?;
-            }
-        }
-    }
-    Ok(())
-}
-
-impl fmt::Debug for ListArray {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ListArray\n[\n")?;
-        print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
-        })?;
-        write!(f, "]")
     }
 }
 
@@ -963,6 +993,19 @@ impl From<Vec<&[u8]>> for BinaryArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+impl<'a> TryFrom<Vec<Option<&'a str>>> for StringArray {
+    type Error = ArrowError;
+
+    fn try_from(v: Vec<Option<&'a str>>) -> Result<Self> {
+        let mut builder = StringBuilder::new(v.len());
+        for val in v {
+            if let Some(s) = val {
+                builder.append_value(s)?;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl<'a> TryFrom<Vec<Option<&'a str>>> for BinaryArray {
     type Error = ArrowError;
 
@@ -971,6 +1014,10 @@ impl<'a> TryFrom<Vec<Option<&'a str>>> for BinaryArray {
         for val in v {
             if let Some(s) = val {
                 builder.append_string(s)?;
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             } else {
                 builder.append(false)?;
             }
@@ -1009,16 +1056,6 @@ impl From<ListArray> for BinaryArray {
     }
 }
 
-impl fmt::Debug for BinaryArray {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "BinaryArray\n[\n")?;
-        print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
-        })?;
-        write!(f, "]")
-    }
-}
-
 impl Array for BinaryArray {
     fn as_any(&self) -> &Any {
         self
@@ -1050,10 +1087,17 @@ impl StructArray {
     pub fn num_columns(&self) -> usize {
         self.boxed_fields.len()
     }
+<<<<<<< HEAD
+<<<<<<< HEAD
 
     /// Returns the fields of the struct array
     pub fn columns(&self) -> Vec<&ArrayRef> {
         self.boxed_fields.iter().collect()
+    }
+
+    /// Returns child array refs of the struct array
+    pub fn columns_ref(&self) -> Vec<ArrayRef> {
+        self.boxed_fields.clone()
     }
 
     /// Return field names in this struct array
@@ -1074,6 +1118,10 @@ impl StructArray {
             .position(|c| c == &column_name)
             .map(|pos| self.column(pos))
     }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 impl From<ArrayDataRef> for StructArray {
@@ -1134,25 +1182,6 @@ impl From<Vec<(Field, ArrayRef)>> for StructArray {
             .len(length)
             .build();
         Self::from(data)
-    }
-}
-
-impl fmt::Debug for StructArray {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "StructArray\n[\n")?;
-        for (child_index, name) in self.column_names().iter().enumerate() {
-            let column = self.column(child_index);
-            write!(
-                f,
-                "-- child {}: \"{}\" ({:?})\n",
-                child_index,
-                name,
-                column.data_type()
-            )?;
-            fmt::Debug::fmt(column, f)?;
-            write!(f, "\n")?;
-        }
-        write!(f, "]")
     }
 }
 

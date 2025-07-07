@@ -17,14 +17,13 @@
  * under the License.
  */
 
-#ifdef HAVE_CONFIG_H
-#  include <config.h>
-#endif
-
 #include <arrow-glib/basic-data-type.hpp>
 #include <arrow-glib/error.hpp>
 #include <arrow-glib/field.hpp>
+#include <arrow-glib/internal-hash-table.hpp>
 #include <arrow-glib/schema.hpp>
+
+#include <arrow/c/bridge.h>
 
 G_BEGIN_DECLS
 
@@ -36,7 +35,8 @@ G_BEGIN_DECLS
  * table. It has zero or more #GArrowFields.
  */
 
-typedef struct GArrowSchemaPrivate_ {
+typedef struct GArrowSchemaPrivate_
+{
   std::shared_ptr<arrow::Schema> schema;
 } GArrowSchemaPrivate;
 
@@ -45,23 +45,18 @@ enum {
   PROP_SCHEMA
 };
 
-G_DEFINE_TYPE_WITH_PRIVATE(GArrowSchema,
-                           garrow_schema,
-                           G_TYPE_OBJECT)
+G_DEFINE_TYPE_WITH_PRIVATE(GArrowSchema, garrow_schema, G_TYPE_OBJECT)
 
-#define GARROW_SCHEMA_GET_PRIVATE(obj)         \
-  static_cast<GArrowSchemaPrivate *>(          \
-     garrow_schema_get_instance_private(       \
-       GARROW_SCHEMA(obj)))
+#define GARROW_SCHEMA_GET_PRIVATE(obj)                                                   \
+  static_cast<GArrowSchemaPrivate *>(                                                    \
+    garrow_schema_get_instance_private(GARROW_SCHEMA(obj)))
 
 static void
 garrow_schema_finalize(GObject *object)
 {
-  GArrowSchemaPrivate *priv;
+  auto priv = GARROW_SCHEMA_GET_PRIVATE(object);
 
-  priv = GARROW_SCHEMA_GET_PRIVATE(object);
-
-  priv->schema = nullptr;
+  priv->schema.~shared_ptr();
 
   G_OBJECT_CLASS(garrow_schema_parent_class)->finalize(object);
 }
@@ -72,9 +67,7 @@ garrow_schema_set_property(GObject *object,
                            const GValue *value,
                            GParamSpec *pspec)
 {
-  GArrowSchemaPrivate *priv;
-
-  priv = GARROW_SCHEMA_GET_PRIVATE(object);
+  auto priv = GARROW_SCHEMA_GET_PRIVATE(object);
 
   switch (prop_id) {
   case PROP_SCHEMA:
@@ -103,6 +96,8 @@ garrow_schema_get_property(GObject *object,
 static void
 garrow_schema_init(GArrowSchema *object)
 {
+  auto priv = GARROW_SCHEMA_GET_PRIVATE(object);
+  new (&priv->schema) std::shared_ptr<arrow::Schema>;
 }
 
 static void
@@ -113,16 +108,41 @@ garrow_schema_class_init(GArrowSchemaClass *klass)
 
   gobject_class = G_OBJECT_CLASS(klass);
 
-  gobject_class->finalize     = garrow_schema_finalize;
+  gobject_class->finalize = garrow_schema_finalize;
   gobject_class->set_property = garrow_schema_set_property;
   gobject_class->get_property = garrow_schema_get_property;
 
-  spec = g_param_spec_pointer("schema",
-                              "Schema",
-                              "The raw std::shared<arrow::Schema> *",
-                              static_cast<GParamFlags>(G_PARAM_WRITABLE |
-                                                       G_PARAM_CONSTRUCT_ONLY));
+  spec = g_param_spec_pointer(
+    "schema",
+    "Schema",
+    "The raw std::shared<arrow::Schema> *",
+    static_cast<GParamFlags>(G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY));
   g_object_class_install_property(gobject_class, PROP_SCHEMA, spec);
+}
+
+/**
+ * garrow_schema_import:
+ * @c_abi_schema: (not nullable): A `struct ArrowSchema *`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (transfer full) (nullable): An imported #GArrowSchema on success,
+ *   %NULL on error.
+ *
+ *   You don't need to release the passed `struct ArrowSchema *`,
+ *   even if this function reports an error.
+ *
+ * Since: 6.0.0
+ */
+GArrowSchema *
+garrow_schema_import(gpointer c_abi_schema, GError **error)
+{
+  auto arrow_schema_result =
+    arrow::ImportSchema(static_cast<ArrowSchema *>(c_abi_schema));
+  if (garrow::check(error, arrow_schema_result, "[schema][import]")) {
+    return garrow_schema_new_raw(&(*arrow_schema_result));
+  } else {
+    return NULL;
+  }
 }
 
 /**
@@ -142,6 +162,33 @@ garrow_schema_new(GList *fields)
 
   auto arrow_schema = std::make_shared<arrow::Schema>(arrow_fields);
   return garrow_schema_new_raw(&arrow_schema);
+}
+
+/**
+ * garrow_schema_export:
+ * @schema: A #GArrowSchema.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (transfer full) (nullable): An exported #GArrowSchema as
+ *   `struct ArrowStruct *` on success, %NULL on error.
+ *
+ *   It should be freed with the `ArrowSchema::release` callback then
+ *   g_free() when no longer needed.
+ *
+ * Since: 6.0.0
+ */
+gpointer
+garrow_schema_export(GArrowSchema *schema, GError **error)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  auto c_abi_schema = g_new(ArrowSchema, 1);
+  auto status = arrow::ExportSchema(*arrow_schema, c_abi_schema);
+  if (garrow::check(error, status, "[schema][export]")) {
+    return c_abi_schema;
+  } else {
+    g_free(c_abi_schema);
+    return NULL;
+  }
 }
 
 /**
@@ -185,8 +232,7 @@ garrow_schema_get_field(GArrowSchema *schema, guint i)
  * Returns: (transfer full): The found field or %NULL.
  */
 GArrowField *
-garrow_schema_get_field_by_name(GArrowSchema *schema,
-                                const gchar *name)
+garrow_schema_get_field_by_name(GArrowSchema *schema, const gchar *name)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
   auto arrow_field = arrow_schema->GetFieldByName(std::string(name));
@@ -205,11 +251,10 @@ garrow_schema_get_field_by_name(GArrowSchema *schema,
  *
  * Returns: The index of the found field, -1 on not found.
  *
- * Since: 1.0.0
+ * Since: 0.15.0
  */
 gint
-garrow_schema_get_field_index(GArrowSchema *schema,
-                              const gchar *name)
+garrow_schema_get_field_index(GArrowSchema *schema, const gchar *name)
 {
   const auto &arrow_schema = garrow_schema_get_raw(schema);
   return arrow_schema->GetFieldIndex(std::string(name));
@@ -259,7 +304,27 @@ gchar *
 garrow_schema_to_string(GArrowSchema *schema)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
-  return g_strdup(arrow_schema->ToString().c_str());
+  const auto string = arrow_schema->ToString();
+  return g_strdup(string.c_str());
+}
+
+/**
+ * garrow_schema_to_string_metadata:
+ * @schema: A #GArrowSchema.
+ * @show_metadata: Whether include metadata or not.
+ *
+ * Returns: The string representation of the schema.
+ *
+ *   It should be freed with g_free() when no longer needed.
+ *
+ * Since: 0.17.0
+ */
+gchar *
+garrow_schema_to_string_metadata(GArrowSchema *schema, gboolean show_metadata)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  const auto string = arrow_schema->ToString(show_metadata);
+  return g_strdup(string.c_str());
 }
 
 /**
@@ -275,17 +340,13 @@ garrow_schema_to_string(GArrowSchema *schema)
  * Since: 0.10.0
  */
 GArrowSchema *
-garrow_schema_add_field(GArrowSchema *schema,
-                        guint i,
-                        GArrowField *field,
-                        GError **error)
+garrow_schema_add_field(GArrowSchema *schema, guint i, GArrowField *field, GError **error)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
   const auto arrow_field = garrow_field_get_raw(field);
-  std::shared_ptr<arrow::Schema> arrow_new_schema;
-  auto status = arrow_schema->AddField(i, arrow_field, &arrow_new_schema);
-  if (garrow_error_check(error, status, "[schema][add-field]")) {
-    return garrow_schema_new_raw(&arrow_new_schema);
+  auto maybe_new_schema = arrow_schema->AddField(i, arrow_field);
+  if (garrow::check(error, maybe_new_schema, "[schema][add-field]")) {
+    return garrow_schema_new_raw(&(*maybe_new_schema));
   } else {
     return NULL;
   }
@@ -303,15 +364,12 @@ garrow_schema_add_field(GArrowSchema *schema,
  * Since: 0.10.0
  */
 GArrowSchema *
-garrow_schema_remove_field(GArrowSchema *schema,
-                           guint i,
-                           GError **error)
+garrow_schema_remove_field(GArrowSchema *schema, guint i, GError **error)
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
-  std::shared_ptr<arrow::Schema> arrow_new_schema;
-  auto status = arrow_schema->RemoveField(i, &arrow_new_schema);
-  if (garrow_error_check(error, status, "[schema][remove-field]")) {
-    return garrow_schema_new_raw(&arrow_new_schema);
+  auto maybe_new_schema = arrow_schema->RemoveField(i);
+  if (garrow::check(error, maybe_new_schema, "[schema][remove-field]")) {
+    return garrow_schema_new_raw(&(*maybe_new_schema));
   } else {
     return NULL;
   }
@@ -337,13 +395,75 @@ garrow_schema_replace_field(GArrowSchema *schema,
 {
   const auto arrow_schema = garrow_schema_get_raw(schema);
   const auto arrow_field = garrow_field_get_raw(field);
-  std::shared_ptr<arrow::Schema> arrow_new_schema;
-  auto status = arrow_schema->SetField(i, arrow_field, &arrow_new_schema);
-  if (garrow_error_check(error, status, "[schema][replace-field]")) {
-    return garrow_schema_new_raw(&arrow_new_schema);
+  auto maybe_new_schema = arrow_schema->SetField(i, arrow_field);
+  if (garrow::check(error, maybe_new_schema, "[schema][replace-field]")) {
+    return garrow_schema_new_raw(&(*maybe_new_schema));
   } else {
     return NULL;
   }
+}
+
+/**
+ * garrow_schema_has_metadata:
+ * @schema: A #GArrowSchema.
+ *
+ * Returns: %TRUE if the schema has metadata, %FALSE otherwise.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_schema_has_metadata(GArrowSchema *schema)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  return arrow_schema->HasMetadata();
+}
+
+/**
+ * garrow_schema_get_metadata:
+ * @schema: A #GArrowSchema.
+ *
+ * Returns: (element-type utf8 utf8) (nullable) (transfer full): The
+ *   metadata in the schema.
+ *
+ *   It should be freed with g_hash_table_unref() when no longer needed.
+ *
+ * Since: 0.17.0
+ */
+GHashTable *
+garrow_schema_get_metadata(GArrowSchema *schema)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  if (!arrow_schema->HasMetadata()) {
+    return NULL;
+  }
+
+  auto arrow_metadata = arrow_schema->metadata();
+  auto metadata = g_hash_table_new(g_str_hash, g_str_equal);
+  const auto n = arrow_metadata->size();
+  for (int64_t i = 0; i < n; ++i) {
+    g_hash_table_insert(metadata,
+                        const_cast<gchar *>(arrow_metadata->key(i).c_str()),
+                        const_cast<gchar *>(arrow_metadata->value(i).c_str()));
+  }
+  return metadata;
+}
+
+/**
+ * garrow_schema_with_metadata:
+ * @schema: A #GArrowSchema.
+ * @metadata: (element-type utf8 utf8): A new associated metadata.
+ *
+ * Returns: (transfer full): The new schema with the given metadata.
+ *
+ * Since: 0.17.0
+ */
+GArrowSchema *
+garrow_schema_with_metadata(GArrowSchema *schema, GHashTable *metadata)
+{
+  const auto arrow_schema = garrow_schema_get_raw(schema);
+  auto arrow_metadata = garrow_internal_hash_table_to_metadata(metadata);
+  auto arrow_new_schema = arrow_schema->WithMetadata(arrow_metadata);
+  return garrow_schema_new_raw(&arrow_new_schema);
 }
 
 G_END_DECLS
@@ -351,17 +471,14 @@ G_END_DECLS
 GArrowSchema *
 garrow_schema_new_raw(std::shared_ptr<arrow::Schema> *arrow_schema)
 {
-  auto schema = GARROW_SCHEMA(g_object_new(GARROW_TYPE_SCHEMA,
-                                           "schema", arrow_schema,
-                                           NULL));
+  auto schema =
+    GARROW_SCHEMA(g_object_new(GARROW_TYPE_SCHEMA, "schema", arrow_schema, NULL));
   return schema;
 }
 
 std::shared_ptr<arrow::Schema>
 garrow_schema_get_raw(GArrowSchema *schema)
 {
-  GArrowSchemaPrivate *priv;
-
-  priv = GARROW_SCHEMA_GET_PRIVATE(schema);
+  auto priv = GARROW_SCHEMA_GET_PRIVATE(schema);
   return priv->schema;
 }

@@ -18,10 +18,10 @@
 Other Data Structures
 =====================
 
-Our Flatbuffers protocol files have metadata for some other data
-structures defined to allow other kinds of applications to take
-advantage of common interprocess communication machinery. These data
-structures are not considered to be part of the columnar format.
+Our `Flatbuffers protocol definition files`_ have metadata for some other data
+structures defined to allow other kinds of applications to take advantage of
+common interprocess communication machinery. These data structures are not
+considered to be part of the columnar format.
 
 An Arrow columnar implementation is not required to implement these
 types.
@@ -33,9 +33,9 @@ The ``Tensor`` message types provides a way to write a
 multidimensional array of fixed-size values (such as a NumPy ndarray).
 
 When writing a standalone encapsulated tensor message, we use the
-encapulated IPC format defined in the :ref:`Columnar Specification
+encapsulated IPC format defined in the :ref:`Columnar Specification
 <format_columnar>`, but additionally align the starting offset of the
-tensor body to be a multiple of 64 bytes.::
+tensor body to be a multiple of 64 bytes: ::
 
     <metadata prefix and metadata>
     <PADDING>
@@ -48,7 +48,7 @@ Sparse Tensor
 are generally almost all zeros.
 
 When writing a standalone encapsulated sparse tensor message, we use
-the encapulated IPC format defined in the :ref:`Columnar Specification
+the encapsulated IPC format defined in the :ref:`Columnar Specification
 <format_columnar>`, but additionally align the starting offsets of the
 sparse index and the sparse tensor body (if writing to a shared memory
 region) to be multiples of 64 bytes: ::
@@ -61,3 +61,5 @@ region) to be multiples of 64 bytes: ::
 
 The contents of the sparse tensor index depends on what kind of sparse
 format is used.
+
+.. _Flatbuffers protocol definition files: https://github.com/apache/arrow/tree/main/format

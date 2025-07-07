@@ -2,15 +2,18 @@
 % Please edit documentation in R/schema.R
 \name{read_schema}
 \alias{read_schema}
-\title{read a Schema from a stream}
+\title{Read a Schema from a stream}
 \usage{
 read_schema(stream, ...)
 }
 \arguments{
-\item{stream}{a stream}
+\item{stream}{a \code{Message}, \code{InputStream}, or \code{Buffer}}
 
 \item{...}{currently ignored}
 }
+\value{
+A \link{Schema}
+}
 \description{
-read a Schema from a stream
+Read a Schema from a stream
 }

@@ -19,28 +19,90 @@
 Filesystems
 ===========
 
+.. _cpp-api-filesystems:
+
 Interface
 =========
 
 .. doxygenenum:: arrow::fs::FileType
 
-.. doxygenstruct:: arrow::fs::FileStats
+.. doxygenstruct:: arrow::fs::FileInfo
+   :members:
+
+.. doxygenstruct:: arrow::fs::FileSelector
    :members:
 
 .. doxygenclass:: arrow::fs::FileSystem
    :members:
 
+.. doxygenfunction:: arrow::fs::EnsureFinalized()
+
+.. _filesystem-factory-functions:
+
+High-level factory functions
+============================
+
+.. doxygengroup:: filesystem-factories
+   :content-only:
+
+Factory registration functions
+==============================
+
+.. doxygengroup:: filesystem-factory-registration
+   :content-only:
+
 Concrete implementations
 ========================
 
+"Subtree" filesystem wrapper
+----------------------------
+
 .. doxygenclass:: arrow::fs::SubTreeFileSystem
+   :members:
+
+Local filesystem
+----------------
+
+.. doxygenstruct:: arrow::fs::LocalFileSystemOptions
    :members:
 
 .. doxygenclass:: arrow::fs::LocalFileSystem
    :members:
 
+S3 filesystem
+-------------
+
 .. doxygenstruct:: arrow::fs::S3Options
    :members:
 
 .. doxygenclass:: arrow::fs::S3FileSystem
+   :members:
+
+.. doxygenfunction:: arrow::fs::InitializeS3(const S3GlobalOptions& options)
+
+Hadoop filesystem
+-----------------
+
+.. doxygenstruct:: arrow::fs::HdfsOptions
+   :members:
+
+.. doxygenclass:: arrow::fs::HadoopFileSystem
+   :members:
+
+Google Cloud Storage filesystem
+-------------------------------
+
+.. doxygenstruct:: arrow::fs::GcsOptions
+   :members:
+
+.. doxygenclass:: arrow::fs::GcsFileSystem
+   :members:
+
+Azure filesystem
+----------------
+
+.. doxygenstruct:: arrow::fs::AzureOptions
+   :members:
+
+.. doxygenclass:: arrow::fs::AzureFileSystem
    :members:

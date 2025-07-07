@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include "arrow/testing/gtest_compat.h"
+#include "arrow/util/config.h"
 
 #include "parquet/column_reader.h"
 #include "parquet/column_writer.h"
@@ -30,14 +34,13 @@ namespace parquet {
 using schema::GroupNode;
 using schema::NodePtr;
 using schema::PrimitiveNode;
+using ::testing::ElementsAre;
 
 namespace test {
 
 template <typename TestType>
 class TestSerialize : public PrimitiveTypedTest<TestType> {
  public:
-  typedef typename TestType::c_type T;
-
   void SetUp() {
     num_columns_ = 4;
     num_rowgroups_ = 4;
@@ -53,6 +56,11 @@ class TestSerialize : public PrimitiveTypedTest<TestType> {
   int rows_per_batch_;
 
   void FileSerializeTest(Compression::type codec_type) {
+    FileSerializeTest(codec_type, codec_type);
+  }
+
+  void FileSerializeTest(Compression::type codec_type,
+                         Compression::type expected_codec_type) {
     auto sink = CreateOutputStream();
     auto gnode = std::static_pointer_cast<GroupNode>(this->node_);
 
@@ -77,8 +85,13 @@ class TestSerialize : public PrimitiveTypedTest<TestType> {
         // Ensure column() API which is specific to BufferedRowGroup cannot be called
         ASSERT_THROW(row_group_writer->column(col), ParquetException);
       }
-
+      EXPECT_EQ(0, row_group_writer->total_compressed_bytes());
+      EXPECT_NE(0, row_group_writer->total_bytes_written());
+      EXPECT_NE(0, row_group_writer->total_compressed_bytes_written());
       row_group_writer->Close();
+      EXPECT_EQ(0, row_group_writer->total_compressed_bytes());
+      EXPECT_NE(0, row_group_writer->total_bytes_written());
+      EXPECT_NE(0, row_group_writer->total_compressed_bytes_written());
     }
     // Write half BufferedRowGroups
     for (int rg = 0; rg < num_rowgroups_ / 2; ++rg) {
@@ -95,17 +108,23 @@ class TestSerialize : public PrimitiveTypedTest<TestType> {
           ASSERT_THROW(row_group_writer->NextColumn(), ParquetException);
         }
       }
+      // total_compressed_bytes() may equal to 0 if no dictionary enabled and no buffered
+      // values.
+      EXPECT_EQ(0, row_group_writer->total_bytes_written());
+      EXPECT_EQ(0, row_group_writer->total_compressed_bytes_written());
       for (int col = 0; col < num_columns_; ++col) {
         auto column_writer =
             static_cast<TypedColumnWriter<TestType>*>(row_group_writer->column(col));
         column_writer->Close();
       }
       row_group_writer->Close();
+      EXPECT_EQ(0, row_group_writer->total_compressed_bytes());
+      EXPECT_NE(0, row_group_writer->total_bytes_written());
+      EXPECT_NE(0, row_group_writer->total_compressed_bytes_written());
     }
     file_writer->Close();
 
-    std::shared_ptr<Buffer> buffer;
-    PARQUET_THROW_NOT_OK(sink->Finish(&buffer));
+    PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
 
     int num_rows_ = num_rowgroups_ * rows_per_rowgroup_;
 
@@ -117,15 +136,30 @@ class TestSerialize : public PrimitiveTypedTest<TestType> {
 
     for (int rg = 0; rg < num_rowgroups_; ++rg) {
       auto rg_reader = file_reader->RowGroup(rg);
-      ASSERT_EQ(num_columns_, rg_reader->metadata()->num_columns());
-      ASSERT_EQ(rows_per_rowgroup_, rg_reader->metadata()->num_rows());
+      auto rg_metadata = rg_reader->metadata();
+      ASSERT_EQ(num_columns_, rg_metadata->num_columns());
+      ASSERT_EQ(rows_per_rowgroup_, rg_metadata->num_rows());
       // Check that the specified compression was actually used.
-      ASSERT_EQ(codec_type, rg_reader->metadata()->ColumnChunk(0)->compression());
+      ASSERT_EQ(expected_codec_type, rg_metadata->ColumnChunk(0)->compression());
 
-      int64_t values_read;
+      const int64_t total_byte_size = rg_metadata->total_byte_size();
+      const int64_t total_compressed_size = rg_metadata->total_compressed_size();
+      if (expected_codec_type == Compression::UNCOMPRESSED) {
+        ASSERT_EQ(total_byte_size, total_compressed_size);
+      } else {
+        ASSERT_NE(total_byte_size, total_compressed_size);
+      }
+
+      int64_t total_column_byte_size = 0;
+      int64_t total_column_compressed_size = 0;
 
       for (int i = 0; i < num_columns_; ++i) {
-        ASSERT_FALSE(rg_reader->metadata()->ColumnChunk(i)->has_index_page());
+        int64_t values_read;
+        ASSERT_FALSE(rg_metadata->ColumnChunk(i)->has_index_page());
+        total_column_byte_size += rg_metadata->ColumnChunk(i)->total_uncompressed_size();
+        total_column_compressed_size +=
+            rg_metadata->ColumnChunk(i)->total_compressed_size();
+
         std::vector<int16_t> def_levels_out(rows_per_rowgroup_);
         std::vector<int16_t> rep_levels_out(rows_per_rowgroup_);
         auto col_reader =
@@ -138,6 +172,9 @@ class TestSerialize : public PrimitiveTypedTest<TestType> {
         ASSERT_EQ(this->values_, this->values_out_);
         ASSERT_EQ(this->def_levels_, def_levels_out);
       }
+
+      ASSERT_EQ(total_byte_size, total_column_byte_size);
+      ASSERT_EQ(total_compressed_size, total_column_compressed_size);
     }
   }
 
@@ -262,7 +299,7 @@ typedef ::testing::Types<Int32Type, Int64Type, Int96Type, FloatType, DoubleType,
                          BooleanType, ByteArrayType, FLBAType>
     TestTypes;
 
-TYPED_TEST_CASE(TestSerialize, TestTypes);
+TYPED_TEST_SUITE(TestSerialize, TestTypes);
 
 TYPED_TEST(TestSerialize, SmallFileUncompressed) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::UNCOMPRESSED));
@@ -286,27 +323,160 @@ TYPED_TEST(TestSerialize, RepeatedTooFewRows) {
   ASSERT_THROW(this->RepeatedUnequalRows(), ParquetException);
 }
 
+#ifdef ARROW_WITH_SNAPPY
 TYPED_TEST(TestSerialize, SmallFileSnappy) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::SNAPPY));
 }
+#endif
 
+#ifdef ARROW_WITH_BROTLI
 TYPED_TEST(TestSerialize, SmallFileBrotli) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::BROTLI));
 }
+#endif
 
+#ifdef ARROW_WITH_ZLIB
 TYPED_TEST(TestSerialize, SmallFileGzip) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::GZIP));
 }
+#endif
 
+#ifdef ARROW_WITH_LZ4
 TYPED_TEST(TestSerialize, SmallFileLz4) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::LZ4));
 }
+
+TYPED_TEST(TestSerialize, SmallFileLz4Hadoop) {
+  ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::LZ4_HADOOP));
+}
+#endif
 
 #ifdef ARROW_WITH_ZSTD
 TYPED_TEST(TestSerialize, SmallFileZstd) {
   ASSERT_NO_FATAL_FAILURE(this->FileSerializeTest(Compression::ZSTD));
 }
 #endif
+
+TEST(TestBufferedRowGroupWriter, DisabledDictionary) {
+  // PARQUET-1706:
+  // Wrong dictionary_page_offset when writing only data pages via BufferedPageWriter
+  auto sink = CreateOutputStream();
+  auto writer_props = parquet::WriterProperties::Builder().disable_dictionary()->build();
+  schema::NodeVector fields;
+  fields.push_back(
+      PrimitiveNode::Make("col", parquet::Repetition::REQUIRED, parquet::Type::INT32));
+  auto schema = std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", Repetition::REQUIRED, fields));
+  auto file_writer = parquet::ParquetFileWriter::Open(sink, schema, writer_props);
+  auto rg_writer = file_writer->AppendBufferedRowGroup();
+  auto col_writer = static_cast<Int32Writer*>(rg_writer->column(0));
+  int value = 0;
+  col_writer->WriteBatch(1, nullptr, nullptr, &value);
+  rg_writer->Close();
+  file_writer->Close();
+  PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
+
+  auto source = std::make_shared<::arrow::io::BufferReader>(buffer);
+  auto file_reader = ParquetFileReader::Open(source);
+  ASSERT_EQ(1, file_reader->metadata()->num_row_groups());
+  auto rg_reader = file_reader->RowGroup(0);
+  ASSERT_EQ(1, rg_reader->metadata()->num_columns());
+  ASSERT_EQ(1, rg_reader->metadata()->num_rows());
+  ASSERT_FALSE(rg_reader->metadata()->ColumnChunk(0)->has_dictionary_page());
+}
+
+TEST(TestBufferedRowGroupWriter, MultiPageDisabledDictionary) {
+  constexpr int kValueCount = 10000;
+  constexpr int kPageSize = 16384;
+  auto sink = CreateOutputStream();
+  auto writer_props = parquet::WriterProperties::Builder()
+                          .disable_dictionary()
+                          ->data_pagesize(kPageSize)
+                          ->build();
+  schema::NodeVector fields;
+  fields.push_back(
+      PrimitiveNode::Make("col", parquet::Repetition::REQUIRED, parquet::Type::INT32));
+  auto schema = std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", Repetition::REQUIRED, fields));
+  auto file_writer = parquet::ParquetFileWriter::Open(sink, schema, writer_props);
+  auto rg_writer = file_writer->AppendBufferedRowGroup();
+  auto col_writer = static_cast<Int32Writer*>(rg_writer->column(0));
+  std::vector<int32_t> values_in;
+  for (int i = 0; i < kValueCount; ++i) {
+    values_in.push_back((i % 100) + 1);
+  }
+  col_writer->WriteBatch(kValueCount, nullptr, nullptr, values_in.data());
+  rg_writer->Close();
+  file_writer->Close();
+  PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
+
+  auto source = std::make_shared<::arrow::io::BufferReader>(buffer);
+  auto file_reader = ParquetFileReader::Open(source);
+  auto file_metadata = file_reader->metadata();
+  ASSERT_EQ(1, file_reader->metadata()->num_row_groups());
+  std::vector<int32_t> values_out(kValueCount);
+  for (int r = 0; r < file_metadata->num_row_groups(); ++r) {
+    auto rg_reader = file_reader->RowGroup(r);
+    ASSERT_EQ(1, rg_reader->metadata()->num_columns());
+    ASSERT_EQ(kValueCount, rg_reader->metadata()->num_rows());
+    int64_t total_values_read = 0;
+    std::shared_ptr<parquet::ColumnReader> col_reader;
+    ASSERT_NO_THROW(col_reader = rg_reader->Column(0));
+    parquet::Int32Reader* int32_reader =
+        static_cast<parquet::Int32Reader*>(col_reader.get());
+    int64_t vn = kValueCount;
+    int32_t* vx = values_out.data();
+    while (int32_reader->HasNext()) {
+      int64_t values_read;
+      int32_reader->ReadBatch(vn, nullptr, nullptr, vx, &values_read);
+      vn -= values_read;
+      vx += values_read;
+      total_values_read += values_read;
+    }
+    ASSERT_EQ(kValueCount, total_values_read);
+    ASSERT_EQ(values_in, values_out);
+  }
+}
+
+TEST(ParquetRoundtrip, AllNulls) {
+  auto primitive_node =
+      PrimitiveNode::Make("nulls", Repetition::OPTIONAL, nullptr, Type::INT32);
+  schema::NodeVector columns({primitive_node});
+
+  auto root_node = GroupNode::Make("root", Repetition::REQUIRED, columns, nullptr);
+
+  auto sink = CreateOutputStream();
+
+  auto file_writer =
+      ParquetFileWriter::Open(sink, std::static_pointer_cast<GroupNode>(root_node));
+  auto row_group_writer = file_writer->AppendRowGroup();
+  auto column_writer = static_cast<Int32Writer*>(row_group_writer->NextColumn());
+
+  int32_t values[3];
+  int16_t def_levels[] = {0, 0, 0};
+
+  column_writer->WriteBatch(3, def_levels, nullptr, values);
+
+  column_writer->Close();
+  row_group_writer->Close();
+  file_writer->Close();
+
+  ReaderProperties props = default_reader_properties();
+  props.enable_buffered_stream();
+  PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
+
+  auto source = std::make_shared<::arrow::io::BufferReader>(buffer);
+  auto file_reader = ParquetFileReader::Open(source, props);
+  auto row_group_reader = file_reader->RowGroup(0);
+  auto column_reader = std::static_pointer_cast<Int32Reader>(row_group_reader->Column(0));
+
+  int64_t values_read;
+  def_levels[0] = -1;
+  def_levels[1] = -1;
+  def_levels[2] = -1;
+  column_reader->ReadBatch(3, def_levels, nullptr, values, &values_read);
+  EXPECT_THAT(def_levels, ElementsAre(0, 0, 0));
+}
 
 }  // namespace test
 

@@ -15,12 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-add_arrow_test(chunker_test PREFIX "arrow-csv")
-add_arrow_test(column_builder_test PREFIX "arrow-csv")
-add_arrow_test(converter_test PREFIX "arrow-csv")
-add_arrow_test(parser_test PREFIX "arrow-csv")
+set(CSV_TEST_SRCS
+    chunker_test.cc
+    column_builder_test.cc
+    column_decoder_test.cc
+    converter_test.cc
+    parser_test.cc
+    reader_test.cc
+    writer_test.cc)
+
+add_arrow_test(csv-test SOURCES ${CSV_TEST_SRCS})
 
 add_arrow_benchmark(converter_benchmark PREFIX "arrow-csv")
 add_arrow_benchmark(parser_benchmark PREFIX "arrow-csv")
+add_arrow_benchmark(writer_benchmark PREFIX "arrow-csv")
 
 arrow_install_all_headers("arrow/csv")
+
+# pkg-config support
+arrow_add_pkg_config("arrow-csv")

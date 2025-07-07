@@ -15,94 +15,260 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' Help installing the Arrow C++ library
+#' Install or upgrade the Arrow library
 #'
-#' Binary package installations should come with a working Arrow C++ library,
-#' but when installing from source, you'll need to obtain the C++ library
-#' first. This function offers guidance on how to get the C++ library depending
-#' on your operating system and package version.
+#' Use this function to install the latest release of `arrow`, to switch to or
+#' from a nightly development version, or on Linux to try reinstalling with
+#' all necessary C++ dependencies.
+#'
+#' Note that, unlike packages like `tensorflow`, `blogdown`, and others that
+#' require external dependencies, you do not need to run `install_arrow()`
+#' after a successful `arrow` installation.
+#'
+#' @param nightly logical: Should we install a development version of the
+#' package, or should we install from CRAN (the default).
+#' @param binary On Linux, value to set for the environment variable
+#' `LIBARROW_BINARY`, which governs how C++ binaries are used, if at all.
+#' The default value, `TRUE`, tells the installation script to detect the
+#' Linux distribution and version and find an appropriate C++ library. `FALSE`
+#' would tell the script not to retrieve a binary and instead build Arrow C++
+#' from source. Other valid values are strings corresponding to a Linux
+#' distribution-version, to override the value that would be detected. See the
+#' \href{https://arrow.apache.org/docs/r/articles/install.html}{install guide}
+#' for further details.
+#' @param use_system logical: Should we use `pkg-config` to look for Arrow
+#' system packages? Default is `FALSE`. If `TRUE`, source installation may be
+#' faster, but there is a risk of version mismatch. This sets the
+#' `ARROW_USE_PKG_CONFIG` environment variable.
+#' @param minimal logical: If building from source, should we build without
+#' optional dependencies (compression libraries, for example)? Default is
+#' `FALSE`. This sets the `LIBARROW_MINIMAL` environment variable.
+#' @param verbose logical: Print more debugging output when installing? Default
+#' is `FALSE`. This sets the `ARROW_R_DEV` environment variable.
+#' @param repos character vector of base URLs of the repositories to install
+#' from (passed to `install.packages()`)
+#' @param ... Additional arguments passed to `install.packages()`
 #' @export
-#' @importFrom utils packageVersion
-#' @examples
-#' install_arrow()
-install_arrow <- function() {
-  os <- tolower(Sys.info()[["sysname"]])
-  # c("windows", "darwin", "linux", "sunos") # win/mac/linux/solaris
-  version <- packageVersion("arrow")
-  message(install_arrow_msg(arrow_available(), version, os))
-}
+#' @importFrom utils install.packages
+#' @seealso [arrow_info()] to see if the package was configured with
+#' necessary C++ dependencies.
+#' \href{https://arrow.apache.org/docs/r/articles/install.html}{install guide}
+#' for more ways to tune installation on Linux.
+install_arrow <- function(nightly = FALSE,
+                          binary = Sys.getenv("LIBARROW_BINARY", TRUE),
+                          use_system = Sys.getenv("ARROW_USE_PKG_CONFIG", FALSE),
+                          minimal = Sys.getenv("LIBARROW_MINIMAL", FALSE),
+                          verbose = Sys.getenv("ARROW_R_DEV", FALSE),
+                          repos = getOption("repos"),
+                          ...) {
+  conda <- isTRUE(grepl("conda", R.Version()$platform))
 
-install_arrow_msg <- function(has_arrow, version, os) {
-  # TODO: check if there is a newer version on CRAN?
-
-  # install_arrow() sends "version" as a "package_version" class, but for
-  # convenience, this also accepts a string like "0.13.0". Calling
-  # `package_version` is idempotent so do it again, and then `unclass` to get
-  # the integers. Then see how many there are.
-  dev_version <- length(unclass(package_version(version))[[1]]) > 3
-  # Based on these parameters, assemble a string with installation advice
-  if (has_arrow) {
-    # Respond that you already have it
-    msg <- ALREADY_HAVE
-  } else if (os == "sunos") {
-    # Good luck with that.
-    msg <- c(SEE_DEV_GUIDE, THEN_REINSTALL)
-  } else if (os == "linux") {
-    if (dev_version) {
-      # Point to compilation instructions on readme
-      msg <- c(SEE_DEV_GUIDE, THEN_REINSTALL)
+  if (conda) {
+    if (nightly) {
+      system("conda install -y -c arrow-nightlies -c conda-forge --strict-channel-priority r-arrow")
     } else {
-      # Suggest arrow.apache.org/install, or compilation instructions
-      msg <- c(paste(SEE_ARROW_INSTALL, OR_SEE_DEV_GUIDE), THEN_REINSTALL)
+      system("conda install -y -c conda-forge --strict-channel-priority r-arrow")
     }
   } else {
-    # We no longer allow builds without libarrow on macOS or Windows so this
-    # case shouldn't happen
-    msg <- ""
+    Sys.setenv(
+      LIBARROW_BINARY = binary,
+      LIBARROW_MINIMAL = minimal,
+      ARROW_R_DEV = verbose,
+      ARROW_USE_PKG_CONFIG = use_system
+    )
+    # On Rosetta, we have to build without JEMALLOC
+    if (on_rosetta()) {
+      Sys.setenv(ARROW_JEMALLOC = "OFF")
+      Sys.setenv(FORCE_BUNDLED_BUILD = "true")
+    }
+
+    opts <- list()
+    if (isTRUE(binary)) {
+      # Unless otherwise directed, don't consider newer source packages when
+      # options(pkgType) == "both" (default on win/mac)
+      opts$install.packages.check.source <- "no"
+      opts$install.packages.compile.from.source <- "never"
+    }
+    if (length(opts)) {
+      old <- options(opts)
+      on.exit(options(old))
+    }
+    install.packages("arrow", repos = arrow_repos(repos, nightly), ...)
   }
-  # Common postscript
-  msg <- c(msg, SEE_README, REPORT_ISSUE)
-  paste(msg, collapse="\n\n")
+  if ("arrow" %in% loadedNamespaces()) {
+    # If you've just sourced this file, "arrow" won't be (re)loaded
+    reload_arrow()
+  }
 }
 
-ALREADY_HAVE <- paste(
-  "It appears you already have Arrow installed successfully:",
-  "are you trying to install a different version of the library?"
-)
+arrow_repos <- function(repos = getOption("repos"), nightly = FALSE) {
+  if (length(repos) == 0 || identical(repos, c(CRAN = "@CRAN@"))) {
+    # Set the default/CDN
+    repos <- "https://cloud.r-project.org/"
+  }
+  dev_repo <- getOption("arrow.dev_repo", "https://nightlies.apache.org/arrow/r")
+  # Remove it if it's there (so nightly=FALSE won't accidentally pull from it)
+  repos <- setdiff(repos, dev_repo)
+  if (nightly) {
+    # Add it first
+    repos <- c(dev_repo, repos)
+  }
+  repos
+}
 
-SEE_DEV_GUIDE <- paste(
-  "See the Arrow C++ developer guide",
-  "<https://arrow.apache.org/docs/developers/cpp.html>",
-  "for instructions on building the library from source."
-)
-# Variation of that
-OR_SEE_DEV_GUIDE <- paste0(
-  "Or, s",
-  substr(SEE_DEV_GUIDE, 2, nchar(SEE_DEV_GUIDE))
-)
+reload_arrow <- function() {
+  if (requireNamespace("pkgload", quietly = TRUE)) {
+    is_attached <- "package:arrow" %in% search()
+    pkgload::unload("arrow")
+    if (is_attached) {
+      require("arrow", character.only = TRUE, quietly = TRUE)
+    } else {
+      requireNamespace("arrow", quietly = TRUE)
+    }
+  } else {
+    message("Please restart R to use the 'arrow' package.")
+  }
+}
 
-SEE_ARROW_INSTALL <- paste(
-  "See the Apache Arrow project installation page",
-  "<https://arrow.apache.org/install/>",
-  "to find pre-compiled binary packages for some common Linux distributions,",
-  "including Debian, Ubuntu, and CentOS. You'll need to install",
-  "'libparquet-dev' on Debian and Ubuntu, or 'parquet-devel' on CentOS. This",
-  "will also automatically install the Arrow C++ library as a dependency."
-)
 
-THEN_REINSTALL <- paste(
-  "After you've installed the C++ library,",
-  "you'll need to reinstall the R package from source to find it."
-)
+#' Create a source bundle that includes all thirdparty dependencies
+#'
+#' @param dest_file File path for the new tar.gz package. Defaults to
+#' `arrow_V.V.V_with_deps.tar.gz` in the current directory (`V.V.V` is the version)
+#' @param source_file File path for the input tar.gz package. Defaults to
+#' downloading the package from CRAN (or whatever you have set as the first in
+#' `getOption("repos")`)
+#' @return The full path to `dest_file`, invisibly
+#'
+#' This function is used for setting up an offline build. If it's possible to
+#' download at build time, don't use this function. Instead, let `cmake`
+#' download the required dependencies for you.
+#' These downloaded dependencies are only used in the build if
+#' `ARROW_DEPENDENCY_SOURCE` is unset, `BUNDLED`, or `AUTO`.
+#' https://arrow.apache.org/docs/developers/cpp/building.html#offline-builds
+#'
+#' If you're using binary packages you shouldn't need to use this function. You
+#' should download the appropriate binary from your package repository, transfer
+#' that to the offline computer, and install that. Any OS can create the source
+#' bundle, but it cannot be installed on Windows. (Instead, use a standard
+#' Windows binary package.)
+#'
+#' Note if you're using RStudio Package Manager on Linux: If you still want to
+#' make a source bundle with this function, make sure to set the first repo in
+#' `options("repos")` to be a mirror that contains source packages (that is:
+#' something other than the RSPM binary mirror URLs).
+#'
+#' ## Steps for an offline install with optional dependencies:
+#'
+#' ### Using a computer with internet access, pre-download the dependencies:
+#' * Install the `arrow` package _or_ run
+#'   `source("https://raw.githubusercontent.com/apache/arrow/main/r/R/install-arrow.R")`
+#' * Run `create_package_with_all_dependencies("my_arrow_pkg.tar.gz")`
+#' * Copy the newly created `my_arrow_pkg.tar.gz` to the computer without internet access
+#'
+#' ### On the computer without internet access, install the prepared package:
+#' * Install the `arrow` package from the copied file
+#'   * `install.packages("my_arrow_pkg.tar.gz", dependencies = c("Depends", "Imports", "LinkingTo"))`
+#'   * This installation will build from source, so `cmake` must be available
+#' * Run [arrow_info()] to check installed capabilities
+#'
+#'
+#' @examples
+#' \dontrun{
+#' new_pkg <- create_package_with_all_dependencies()
+#' # Note: this works when run in the same R session, but it's meant to be
+#' # copied to a different computer.
+#' install.packages(new_pkg, dependencies = c("Depends", "Imports", "LinkingTo"))
+#' }
+#' @export
+create_package_with_all_dependencies <- function(dest_file = NULL, source_file = NULL) {
+  if (Sys.which("bash") == "") {
+    stop("
+    This function requires bash to be installed and available in your PATH.
+    If using RTools, it may be useful to run this code as:
+    pkgbuild::with_build_tools(create_package_with_all_dependencies())
+    ")
+  }
+  if (is.null(source_file)) {
+    pkg_download_dir <- tempfile()
+    dir.create(pkg_download_dir)
+    on.exit(unlink(pkg_download_dir, recursive = TRUE), add = TRUE)
+    message("Downloading Arrow source file")
+    downloaded <- utils::download.packages("arrow", destdir = pkg_download_dir, type = "source")
+    source_file <- downloaded[1, 2, drop = TRUE]
+  }
+  if (!file.exists(source_file) || !endsWith(source_file, "tar.gz")) {
+    stop("Arrow package .tar.gz file not found")
+  }
+  if (is.null(dest_file)) {
+    # e.g. convert /path/to/arrow_5.0.0.tar.gz to ./arrow_5.0.0_with_deps.tar.gz
+    # (add 'with_deps' for clarity if the file was downloaded locally)
+    dest_file <- paste0(gsub(".tar.gz$", "", basename(source_file)), "_with_deps.tar.gz")
+  }
+  untar_dir <- tempfile()
+  on.exit(unlink(untar_dir, recursive = TRUE), add = TRUE)
+  utils::untar(source_file, exdir = untar_dir)
+  tools_dir <- file.path(normalizePath(untar_dir, winslash = "/"), "arrow/tools")
+  download_dependencies_sh <- file.path(tools_dir, "download_dependencies_R.sh")
+  # If you change this path, also need to edit nixlibs.R
+  download_dir <- file.path(tools_dir, "thirdparty_dependencies")
+  dir.create(download_dir)
+  download_script <- tempfile(fileext = ".R")
 
-SEE_README <- paste(
-  "Refer to the R package README",
-  "<https://github.com/apache/arrow/blob/master/r/README.md>",
-  "for further details."
-)
+  if (isTRUE(Sys.info()["sysname"] == "Windows")) {
+    download_dependencies_sh <- wslify_path(download_dependencies_sh)
+  }
 
-REPORT_ISSUE <- paste(
-  "If you have other trouble, or if you think this message could be improved,",
-  "please report an issue here:",
-  "<https://issues.apache.org/jira/projects/ARROW/issues>"
-)
+  parse_versions_success <- system2(
+    "bash", c(download_dependencies_sh, download_dir),
+    stdout = download_script,
+    stderr = FALSE
+  ) == 0
+
+  if (!parse_versions_success) {
+    stop(paste("Failed to parse versions.txt; view ", download_script, "for more information", collapse = ""))
+  }
+  # `source` the download_script to use R to download all the dependency bundles
+  source(download_script)
+
+  # Need to change directory to untar_dir so tar() will use relative paths. That
+  # means we'll need a full, non-relative path for dest_file. (extra_flags="-C"
+  # doesn't work with R's internal tar)
+  orig_wd <- getwd()
+  on.exit(setwd(orig_wd), add = TRUE)
+  # normalizePath() may return the input unchanged if dest_file doesn't exist,
+  # so create it first.
+  file.create(dest_file)
+  dest_file <- normalizePath(dest_file, mustWork = TRUE)
+  setwd(untar_dir)
+
+  message("Repacking tar.gz file to ", dest_file)
+  tar_successful <- utils::tar(dest_file, compression = "gz", extra_flags = NULL) == 0
+  if (!tar_successful) {
+    stop("Failed to create new tar.gz file")
+  }
+  invisible(dest_file)
+}
+
+# Convert a Windows path to a WSL path
+# e.g. wslify_path("C:/Users/user/AppData/") returns "/mnt/c/Users/user/AppData"
+wslify_path <- function(path) {
+  m <- regexpr("[A-Z]:/", path)
+  drive_expr <- regmatches(path, m)
+  drive_letter <- strsplit(drive_expr, ":/")[[1]]
+  wslified_drive <- paste0("/mnt/", tolower(drive_letter))
+  end_path <- strsplit(path, drive_expr)[[1]][-1]
+  file.path(wslified_drive, end_path)
+}
+
+on_rosetta <- function() {
+  # make sure to suppress warnings and ignore the stderr so that this is silent where proc_translated doesn't exist
+  sysctl_out <- tryCatch(
+    suppressWarnings(system("sysctl -n sysctl.proc_translated", intern = TRUE, ignore.stderr = TRUE)),
+    error = function(e) {
+      # If this has errored, we assume that this is not on rosetta
+      return("0")
+    }
+  )
+  identical(tolower(Sys.info()[["sysname"]]), "darwin") && identical(sysctl_out, "1")
+}

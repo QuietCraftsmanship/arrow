@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/testing/gtest_compat.h"
+
 #include "parquet/column_page.h"
 #include "parquet/column_scanner.h"
 #include "parquet/schema.h"
@@ -37,16 +39,10 @@ using schema::NodePtr;
 
 namespace test {
 
-template <>
-void InitDictValues<bool>(int num_values, int dict_per_page, std::vector<bool>& values,
-                          std::vector<uint8_t>& buffer) {
-  // No op for bool
-}
-
 template <typename Type>
 class TestFlatScanner : public ::testing::Test {
  public:
-  typedef typename Type::c_type T;
+  using c_type = typename Type::c_type;
 
   void InitScanner(const ColumnDescriptor* d) {
     std::unique_ptr<PageReader> pager(new test::MockPageReader(pages_));
@@ -55,7 +51,7 @@ class TestFlatScanner : public ::testing::Test {
 
   void CheckResults(int batch_size, const ColumnDescriptor* d) {
     TypedScanner<Type>* scanner = reinterpret_cast<TypedScanner<Type>*>(scanner_.get());
-    T val;
+    c_type val;
     bool is_null = false;
     int16_t def_level;
     int16_t rep_level;
@@ -129,7 +125,7 @@ class TestFlatScanner : public ::testing::Test {
   int num_values_;
   std::vector<std::shared_ptr<Page>> pages_;
   std::shared_ptr<Scanner> scanner_;
-  std::vector<T> values_;
+  std::vector<c_type> values_;
   std::vector<int16_t> def_levels_;
   std::vector<int16_t> rep_levels_;
   std::vector<uint8_t> data_buffer_;  // For BA and FLBA
@@ -146,7 +142,7 @@ typedef ::testing::Types<Int32Type, Int64Type, Int96Type, FloatType, DoubleType,
 using TestBooleanFlatScanner = TestFlatScanner<BooleanType>;
 using TestFLBAFlatScanner = TestFlatScanner<FLBAType>;
 
-TYPED_TEST_CASE(TestFlatScanner, TestTypes);
+TYPED_TEST_SUITE(TestFlatScanner, TestTypes);
 
 TYPED_TEST(TestFlatScanner, TestPlainScanner) {
   ASSERT_NO_FATAL_FAILURE(

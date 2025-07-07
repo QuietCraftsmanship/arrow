@@ -28,10 +28,13 @@
 #include "arrow/filesystem/s3fs.h"
 #include "arrow/filesystem/test_util.h"
 #include "arrow/io/interfaces.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/util/logging.h"
 
 DEFINE_bool(clear, false, "delete all bucket contents");
+DEFINE_bool(create, false, "create test bucket");
 DEFINE_bool(test, false, "run narrative test against bucket");
 
 DEFINE_bool(verbose, false, "be more verbose (includes AWS warnings)");
@@ -41,22 +44,20 @@ DEFINE_string(access_key, "", "S3 access key");
 DEFINE_string(secret_key, "", "S3 secret key");
 
 DEFINE_string(bucket, "", "bucket name");
-DEFINE_string(region, arrow::fs::kS3DefaultRegion, "AWS region");
+DEFINE_string(region, "", "AWS region");
 DEFINE_string(endpoint, "", "Endpoint override (e.g. '127.0.0.1:9000')");
 DEFINE_string(scheme, "https", "Connection scheme");
 
-namespace arrow {
-namespace fs {
+namespace arrow::fs {
 
 #define ASSERT_RAISES_PRINT(context_msg, error_type, expr) \
   do {                                                     \
-    Status _st;                                            \
-    ASSERT_RAISES(error_type, (_st = (expr)));             \
-    PrintError(context_msg, _st);                          \
+    auto _status_or_result = (expr);                       \
+    ASSERT_RAISES(error_type, _status_or_result);          \
+    PrintError(context_msg, _status_or_result);            \
   } while (0)
 
-std::shared_ptr<FileSystem> MakeFileSystem() {
-  std::shared_ptr<S3FileSystem> s3fs;
+Result<std::shared_ptr<FileSystem>> MakeRootFileSystem() {
   S3Options options;
   if (!FLAGS_access_key.empty()) {
     options = S3Options::FromAccessKey(FLAGS_access_key, FLAGS_secret_key);
@@ -66,8 +67,13 @@ std::shared_ptr<FileSystem> MakeFileSystem() {
   options.endpoint_override = FLAGS_endpoint;
   options.scheme = FLAGS_scheme;
   options.region = FLAGS_region;
-  ABORT_NOT_OK(S3FileSystem::Make(options, &s3fs));
-  return std::make_shared<SubTreeFileSystem>(FLAGS_bucket, s3fs);
+  options.allow_bucket_creation = FLAGS_create;
+  return S3FileSystem::Make(options);
+}
+
+Result<std::shared_ptr<FileSystem>> MakeFileSystem() {
+  ARROW_ASSIGN_OR_RAISE(auto fs, MakeRootFileSystem());
+  return std::make_shared<SubTreeFileSystem>(FLAGS_bucket, fs);
 }
 
 void PrintError(const std::string& context_msg, const Status& st) {
@@ -77,118 +83,142 @@ void PrintError(const std::string& context_msg, const Status& st) {
   }
 }
 
-void ClearBucket(int argc, char** argv) {
-  auto fs = MakeFileSystem();
+template <typename T>
+void PrintError(const std::string& context_msg, const Result<T>& result) {
+  PrintError(context_msg, result.status());
+}
 
-  ASSERT_OK(fs->DeleteDirContents(""));
+void CheckDirectory(FileSystem* fs, const std::string& path) {
+  ASSERT_OK_AND_ASSIGN(auto info, fs->GetFileInfo(path));
+  AssertFileInfo(info, path, FileType::Directory);
+}
+
+void ClearBucket(int argc, char** argv) {
+  ASSERT_OK_AND_ASSIGN(auto fs, MakeFileSystem());
+  ASSERT_OK(fs->DeleteRootDirContents());
+}
+
+void CreateBucket(int argc, char** argv) {
+  ASSERT_OK_AND_ASSIGN(auto fs, MakeRootFileSystem());
+  ASSERT_OK(fs->CreateDir(FLAGS_bucket));
 }
 
 void TestBucket(int argc, char** argv) {
-  auto fs = MakeFileSystem();
-  FileStats st;
-  std::vector<FileStats> stats;
-  Selector select;
+  ASSERT_OK_AND_ASSIGN(auto fs, MakeFileSystem());
+  std::vector<FileInfo> infos;
+  FileSelector select;
   std::shared_ptr<io::InputStream> is;
   std::shared_ptr<io::RandomAccessFile> file;
   std::shared_ptr<Buffer> buf;
-  int64_t pos;
   Status status;
 
   // Check bucket exists and is empty
   select.base_dir = "";
-  select.allow_non_existent = false;
+  select.allow_not_found = false;
   select.recursive = false;
-  ASSERT_OK(fs->GetTargetStats(select, &stats));
-  ASSERT_EQ(stats.size(), 0) << "Bucket should be empty, perhaps use --clear?";
+  ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
+  ASSERT_EQ(infos.size(), 0) << "Bucket should be empty, perhaps use --clear?";
 
   // Create directory structure
   ASSERT_OK(fs->CreateDir("EmptyDir", /*recursive=*/false));
   ASSERT_OK(fs->CreateDir("Dir1", /*recursive=*/false));
   ASSERT_OK(fs->CreateDir("Dir1/Subdir", /*recursive=*/false));
-  ASSERT_RAISES_PRINT("CreateDir in non-existing parent", IOError,
+  ASSERT_RAISES_PRINT("CreateDir in nonexistent parent", IOError,
                       fs->CreateDir("Dir2/Subdir", /*recursive=*/false));
   ASSERT_OK(fs->CreateDir("Dir2/Subdir", /*recursive=*/true));
+  ASSERT_OK(fs->CreateDir("Nested/1/2/3/4", /*recursive=*/true));
   CreateFile(fs.get(), "File1", "first data");
   CreateFile(fs.get(), "Dir1/File2", "second data");
   CreateFile(fs.get(), "Dir2/Subdir/File3", "third data");
+  CreateFile(fs.get(), "Nested/1/2/3/4/File4", "fourth data");
 
-  // GetTargetStats(Selector)
+  // GetFileInfo(Selector)
   select.base_dir = "";
-  ASSERT_OK(fs->GetTargetStats(select, &stats));
-  ASSERT_EQ(stats.size(), 4);
-  SortStats(&stats);
-  AssertFileStats(stats[0], "Dir1", FileType::Directory);
-  AssertFileStats(stats[1], "Dir2", FileType::Directory);
-  AssertFileStats(stats[2], "EmptyDir", FileType::Directory);
-  AssertFileStats(stats[3], "File1", FileType::File, 10);
+  ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
+  ASSERT_EQ(infos.size(), 5);
+  SortInfos(&infos);
+  AssertFileInfo(infos[0], "Dir1", FileType::Directory);
+  AssertFileInfo(infos[1], "Dir2", FileType::Directory);
+  AssertFileInfo(infos[2], "EmptyDir", FileType::Directory);
+  AssertFileInfo(infos[3], "File1", FileType::File, 10);
+  AssertFileInfo(infos[4], "Nested", FileType::Directory);
 
   select.base_dir = "zzzz";
-  ASSERT_RAISES_PRINT("GetTargetStats(Selector) with non-existing base_dir", IOError,
-                      fs->GetTargetStats(select, &stats));
-  select.allow_non_existent = true;
-  ASSERT_OK(fs->GetTargetStats(select, &stats));
-  ASSERT_EQ(stats.size(), 0);
+  ASSERT_RAISES_PRINT("GetFileInfo(Selector) with nonexisting base_dir", IOError,
+                      fs->GetFileInfo(select));
+  select.allow_not_found = true;
+  ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
+  ASSERT_EQ(infos.size(), 0);
 
   select.base_dir = "Dir1";
-  select.allow_non_existent = false;
-  ASSERT_OK(fs->GetTargetStats(select, &stats));
-  ASSERT_EQ(stats.size(), 2);
-  AssertFileStats(stats[0], "Dir1/File2", FileType::File, 11);
-  AssertFileStats(stats[1], "Dir1/Subdir", FileType::Directory);
+  select.allow_not_found = false;
+  ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
+  ASSERT_EQ(infos.size(), 2);
+  SortInfos(&infos);
+  AssertFileInfo(infos[0], "Dir1/File2", FileType::File, 11);
+  AssertFileInfo(infos[1], "Dir1/Subdir", FileType::Directory);
 
   select.base_dir = "Dir2";
   select.recursive = true;
-  ASSERT_OK(fs->GetTargetStats(select, &stats));
-  ASSERT_EQ(stats.size(), 2);
-  AssertFileStats(stats[0], "Dir2/Subdir", FileType::Directory);
-  AssertFileStats(stats[1], "Dir2/Subdir/File3", FileType::File, 10);
+  ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
+  ASSERT_EQ(infos.size(), 2);
+  SortInfos(&infos);
+  AssertFileInfo(infos[0], "Dir2/Subdir", FileType::Directory);
+  AssertFileInfo(infos[1], "Dir2/Subdir/File3", FileType::File, 10);
+
+  // GetFileInfo(single entry)
+  CheckDirectory(fs.get(), "EmptyDir");
+  CheckDirectory(fs.get(), "Dir1");
+  CheckDirectory(fs.get(), "Nested");
+  CheckDirectory(fs.get(), "Nested/1");
+  CheckDirectory(fs.get(), "Nested/1/2");
+  CheckDirectory(fs.get(), "Nested/1/2/3");
+  CheckDirectory(fs.get(), "Nested/1/2/3/4");
+  AssertFileInfo(fs.get(), "Nest", FileType::NotFound);
 
   // Read a file
-  ASSERT_RAISES_PRINT("OpenInputStream with non-existing file", IOError,
-                      fs->OpenInputStream("zzz", &is));
-  ASSERT_OK(fs->OpenInputStream("File1", &is));
-  ASSERT_OK(is->Read(5, &buf));
+  ASSERT_RAISES_PRINT("OpenInputStream with nonexistent file", IOError,
+                      fs->OpenInputStream("zzz"));
+  ASSERT_OK_AND_ASSIGN(is, fs->OpenInputStream("File1"));
+  ASSERT_OK_AND_ASSIGN(buf, is->Read(5));
   AssertBufferEqual(*buf, "first");
-  ASSERT_OK(is->Read(10, &buf));
+  ASSERT_OK_AND_ASSIGN(buf, is->Read(10));
   AssertBufferEqual(*buf, " data");
-  ASSERT_OK(is->Read(10, &buf));
+  ASSERT_OK_AND_ASSIGN(buf, is->Read(10));
   AssertBufferEqual(*buf, "");
   ASSERT_OK(is->Close());
 
-  ASSERT_OK(fs->OpenInputFile("Dir1/File2", &file));
-  ASSERT_OK(file->Tell(&pos));
-  ASSERT_EQ(pos, 0);
+  ASSERT_OK_AND_ASSIGN(file, fs->OpenInputFile("Dir1/File2"));
+  ASSERT_OK_AND_EQ(0, file->Tell());
   ASSERT_OK(file->Seek(7));
-  ASSERT_OK(file->Tell(&pos));
-  ASSERT_EQ(pos, 7);
-  ASSERT_OK(file->Read(2, &buf));
+  ASSERT_OK_AND_EQ(7, file->Tell());
+  ASSERT_OK_AND_ASSIGN(buf, file->Read(2));
   AssertBufferEqual(*buf, "da");
-  ASSERT_OK(file->Tell(&pos));
-  ASSERT_EQ(pos, 9);
-  ASSERT_OK(file->ReadAt(2, 4, &buf));
+  ASSERT_OK_AND_EQ(9, file->Tell());
+  ASSERT_OK_AND_ASSIGN(buf, file->ReadAt(2, 4));
   AssertBufferEqual(*buf, "cond");
   ASSERT_OK(file->Close());
 
   // Copy a file
   ASSERT_OK(fs->CopyFile("File1", "Dir2/File4"));
-  AssertFileStats(fs.get(), "File1", FileType::File, 10);
-  AssertFileStats(fs.get(), "Dir2/File4", FileType::File, 10);
+  AssertFileInfo(fs.get(), "File1", FileType::File, 10);
+  AssertFileInfo(fs.get(), "Dir2/File4", FileType::File, 10);
   AssertFileContents(fs.get(), "Dir2/File4", "first data");
 
   // Copy a file over itself
   ASSERT_OK(fs->CopyFile("File1", "File1"));
-  AssertFileStats(fs.get(), "File1", FileType::File, 10);
+  AssertFileInfo(fs.get(), "File1", FileType::File, 10);
   AssertFileContents(fs.get(), "File1", "first data");
 
   // Move a file
   ASSERT_OK(fs->Move("Dir2/File4", "File5"));
-  AssertFileStats(fs.get(), "Dir2/File4", FileType::NonExistent);
-  AssertFileStats(fs.get(), "File5", FileType::File, 10);
+  AssertFileInfo(fs.get(), "Dir2/File4", FileType::NotFound);
+  AssertFileInfo(fs.get(), "File5", FileType::File, 10);
   AssertFileContents(fs.get(), "File5", "first data");
 
   // Move a file over itself
   ASSERT_OK(fs->Move("File5", "File5"));
-  AssertFileStats(fs.get(), "File5", FileType::File, 10);
+  AssertFileInfo(fs.get(), "File5", FileType::File, 10);
   AssertFileContents(fs.get(), "File5", "first data");
 }
 
@@ -199,17 +229,24 @@ void TestMain(int argc, char** argv) {
                           : (FLAGS_verbose ? S3LogLevel::Warn : S3LogLevel::Fatal);
   ASSERT_OK(InitializeS3(options));
 
+  if (FLAGS_region.empty() && FLAGS_endpoint.empty()) {
+    ASSERT_OK_AND_ASSIGN(FLAGS_region, ResolveS3BucketRegion(FLAGS_bucket));
+  }
+
+  if (FLAGS_create) {
+    CreateBucket(argc, argv);
+  }
   if (FLAGS_clear) {
     ClearBucket(argc, argv);
-  } else if (FLAGS_test) {
+  }
+  if (FLAGS_test) {
     TestBucket(argc, argv);
   }
 
   ASSERT_OK(FinalizeS3());
 }
 
-}  // namespace fs
-}  // namespace arrow
+}  // namespace arrow::fs
 
 int main(int argc, char** argv) {
   std::stringstream ss;
@@ -218,8 +255,8 @@ int main(int argc, char** argv) {
   gflags::SetUsageMessage(ss.str());
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_clear + FLAGS_test != 1) {
-    ARROW_LOG(ERROR) << "Need exactly one of --test and --clear";
+  if (FLAGS_clear + FLAGS_test + FLAGS_create != 1) {
+    ARROW_LOG(ERROR) << "Need exactly one of --test, --clear and --create";
     return 2;
   }
   if (FLAGS_bucket.empty()) {

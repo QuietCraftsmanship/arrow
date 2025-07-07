@@ -15,7 +15,48 @@
 // specific language governing permissions and limitations
 // under the License.
 
+<<<<<<< HEAD
+// Kitchen-sink public API for arrow::Array data structures. C++ library code
+// (especially header files) in Apache Arrow should use more specific headers
+// unless it's a file that uses most or all Array types in which case using
+// arrow/array.h is fine.
+
 #pragma once
+
+<<<<<<< HEAD
+=======
+/// \defgroup numeric-arrays Concrete classes for numeric arrays
+/// @{
+/// @}
+
+/// \defgroup binary-arrays Concrete classes for binary/string arrays
+/// @{
+/// @}
+
+/// \defgroup nested-arrays Concrete classes for nested arrays
+/// @{
+/// @}
+
+/// \defgroup run-end-encoded-arrays Concrete classes for run-end encoded arrays
+/// @{
+/// @}
+
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+#include "arrow/array/array_base.h"       // IWYU pragma: keep
+#include "arrow/array/array_binary.h"     // IWYU pragma: keep
+#include "arrow/array/array_decimal.h"    // IWYU pragma: keep
+#include "arrow/array/array_dict.h"       // IWYU pragma: keep
+#include "arrow/array/array_nested.h"     // IWYU pragma: keep
+#include "arrow/array/array_primitive.h"  // IWYU pragma: keep
+<<<<<<< HEAD
+=======
+#include "arrow/array/array_run_end.h"    // IWYU pragma: keep
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+#include "arrow/array/data.h"             // IWYU pragma: keep
+#include "arrow/array/util.h"             // IWYU pragma: keep
+=======
+#ifndef ARROW_ARRAY_H
+#define ARROW_ARRAY_H
 
 #include <cstdint>
 #include <iosfwd>
@@ -30,7 +71,7 @@
 #include "arrow/result.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/bit_util.h"
+#include "arrow/util/bit-util.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/string_view.h"  // IWYU pragma: export
@@ -228,32 +269,6 @@ ARROW_EXPORT
 Status MakeArrayOfNull(const std::shared_ptr<DataType>& type, int64_t length,
                        std::shared_ptr<Array>* out);
 
-/// \brief Create a strongly-typed Array instance with all elements null
-/// \param[in] pool the pool from which memory for this array will be allocated
-/// \param[in] type the array type
-/// \param[in] length the array length
-/// \param[out] out resulting Array instance
-ARROW_EXPORT
-Status MakeArrayOfNull(MemoryPool* pool, const std::shared_ptr<DataType>& type,
-                       int64_t length, std::shared_ptr<Array>* out);
-
-/// \brief Create an Array instance whose slots are the given scalar
-/// \param[in] scalar the value with which to fill the array
-/// \param[in] length the array length
-/// \param[out] out resulting Array instance
-ARROW_EXPORT
-Status MakeArrayFromScalar(const Scalar& scalar, int64_t length,
-                           std::shared_ptr<Array>* out);
-
-/// \brief Create a strongly-typed Array instance with all elements null
-/// \param[in] pool the pool from which memory for this array will be allocated
-/// \param[in] scalar the value with which to fill the array
-/// \param[in] length the array length
-/// \param[out] out resulting Array instance
-ARROW_EXPORT
-Status MakeArrayFromScalar(MemoryPool* pool, const Scalar& scalar, int64_t length,
-                           std::shared_ptr<Array>* out);
-
 // ----------------------------------------------------------------------
 // User array accessor types
 
@@ -318,10 +333,6 @@ class ARROW_EXPORT Array {
   bool Equals(const std::shared_ptr<Array>& arr,
               const EqualOptions& = EqualOptions::Defaults()) const;
 
-  /// \brief Return the formatted unified diff of arrow::Diff between this
-  /// Array and another Array
-  std::string Diff(const Array& other) const;
-
   /// Approximate equality comparison with another array
   ///
   /// epsilon is only used if this is FloatArray or DoubleArray
@@ -349,7 +360,7 @@ class ARROW_EXPORT Array {
   /// Nested types are traversed in depth-first order. Data buffers must have
   /// the same item sizes, even though the logical types may be different.
   /// An error is returned if the types are not layout-compatible.
-  Status View(const std::shared_ptr<DataType>& type, std::shared_ptr<Array>* out) const;
+  Status View(const std::shared_ptr<DataType>& type, std::shared_ptr<Array>* out);
 
   /// Construct a zero-copy slice of the array with the indicated offset and
   /// length
@@ -371,14 +382,6 @@ class ARROW_EXPORT Array {
 
   /// \return PrettyPrint representation of array suitable for debugging
   std::string ToString() const;
-
-  /// \brief Perform any validation checks to determine obvious inconsistencies
-  /// within the array's internal data.
-  ///
-  /// This can be an expensive check, potentially O(length).
-  ///
-  /// \return Status
-  Status Validate() const;
 
  protected:
   Array() : null_bitmap_data_(NULLPTR) {}
@@ -525,49 +528,11 @@ class ARROW_EXPORT BooleanArray : public PrimitiveArray {
 // ----------------------------------------------------------------------
 // ListArray
 
-/// Base class for variable-sized list arrays, regardless of offset size.
-template <typename TYPE>
-class BaseListArray : public Array {
- public:
-  using TypeClass = TYPE;
-  using offset_type = typename TypeClass::offset_type;
-
-  const TypeClass* list_type() const { return list_type_; }
-
-  /// \brief Return array object containing the list's values
-  std::shared_ptr<Array> values() const { return values_; }
-
-  /// Note that this buffer does not account for any slice offset
-  std::shared_ptr<Buffer> value_offsets() const { return data_->buffers[1]; }
-
-  std::shared_ptr<DataType> value_type() const { return list_type_->value_type(); }
-
-  /// Return pointer to raw value offsets accounting for any slice offset
-  const offset_type* raw_value_offsets() const {
-    return raw_value_offsets_ + data_->offset;
-  }
-
-  // The following functions will not perform boundschecking
-  offset_type value_offset(int64_t i) const {
-    return raw_value_offsets_[i + data_->offset];
-  }
-  offset_type value_length(int64_t i) const {
-    i += data_->offset;
-    return raw_value_offsets_[i + 1] - raw_value_offsets_[i];
-  }
-  std::shared_ptr<Array> value_slice(int64_t i) const {
-    return values_->Slice(value_offset(i), value_length(i));
-  }
-
- protected:
-  const TypeClass* list_type_ = NULLPTR;
-  std::shared_ptr<Array> values_;
-  const offset_type* raw_value_offsets_ = NULLPTR;
-};
-
 /// Concrete Array class for list data
-class ARROW_EXPORT ListArray : public BaseListArray<ListType> {
+class ARROW_EXPORT ListArray : public Array {
  public:
+  using TypeClass = ListType;
+
   explicit ListArray(const std::shared_ptr<ArrayData>& data);
 
   ListArray(const std::shared_ptr<DataType>& type, int64_t length,
@@ -585,48 +550,46 @@ class ARROW_EXPORT ListArray : public BaseListArray<ListType> {
   ///
   /// \param[in] offsets Array containing n + 1 offsets encoding length and
   /// size. Must be of int32 type
-  /// \param[in] values Array containing list values
+  /// \param[in] values Array containing
   /// \param[in] pool MemoryPool in case new offsets array needs to be
   /// allocated because of null values
   /// \param[out] out Will have length equal to offsets.length() - 1
   static Status FromArrays(const Array& offsets, const Array& values, MemoryPool* pool,
                            std::shared_ptr<Array>* out);
+
+  const ListType* list_type() const { return list_type_; }
+
+  /// \brief Return array object containing the list's values
+  std::shared_ptr<Array> values() const;
+
+  /// Note that this buffer does not account for any slice offset
+  std::shared_ptr<Buffer> value_offsets() const { return data_->buffers[1]; }
+
+  std::shared_ptr<DataType> value_type() const;
+
+  /// Return pointer to raw value offsets accounting for any slice offset
+  const int32_t* raw_value_offsets() const { return raw_value_offsets_ + data_->offset; }
+
+  // The following functions will not perform boundschecking
+  int32_t value_offset(int64_t i) const { return raw_value_offsets_[i + data_->offset]; }
+  int32_t value_length(int64_t i) const {
+    i += data_->offset;
+    return raw_value_offsets_[i + 1] - raw_value_offsets_[i];
+  }
+  std::shared_ptr<Array> value_slice(int64_t i) const {
+    return values_->Slice(value_offset(i), value_length(i));
+  }
 
  protected:
   // This constructor defers SetData to a derived array class
   ListArray() = default;
   void SetData(const std::shared_ptr<ArrayData>& data);
-};
 
-/// Concrete Array class for large list data (with 64-bit offsets)
-class ARROW_EXPORT LargeListArray : public BaseListArray<LargeListType> {
- public:
-  explicit LargeListArray(const std::shared_ptr<ArrayData>& data);
+  const int32_t* raw_value_offsets_ = NULLPTR;
 
-  LargeListArray(const std::shared_ptr<DataType>& type, int64_t length,
-                 const std::shared_ptr<Buffer>& value_offsets,
-                 const std::shared_ptr<Array>& values,
-                 const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
-                 int64_t null_count = kUnknownNullCount, int64_t offset = 0);
-
-  /// \brief Construct LargeListArray from array of offsets and child value array
-  ///
-  /// This function does the bare minimum of validation of the offsets and
-  /// input types, and will allocate a new offsets array if necessary (i.e. if
-  /// the offsets contain any nulls). If the offsets do not have nulls, they
-  /// are assumed to be well-formed
-  ///
-  /// \param[in] offsets Array containing n + 1 offsets encoding length and
-  /// size. Must be of int64 type
-  /// \param[in] values Array containing list values
-  /// \param[in] pool MemoryPool in case new offsets array needs to be
-  /// allocated because of null values
-  /// \param[out] out Will have length equal to offsets.length() - 1
-  static Status FromArrays(const Array& offsets, const Array& values, MemoryPool* pool,
-                           std::shared_ptr<Array>* out);
-
- protected:
-  void SetData(const std::shared_ptr<ArrayData>& data);
+ private:
+  const ListType* list_type_ = NULLPTR;
+  std::shared_ptr<Array> values_;
 };
 
 // ----------------------------------------------------------------------
@@ -676,7 +639,6 @@ class ARROW_EXPORT MapArray : public ListArray {
 class ARROW_EXPORT FixedSizeListArray : public Array {
  public:
   using TypeClass = FixedSizeListType;
-  using offset_type = TypeClass::offset_type;
 
   explicit FixedSizeListArray(const std::shared_ptr<ArrayData>& data);
 
@@ -713,20 +675,24 @@ class ARROW_EXPORT FixedSizeListArray : public Array {
 // ----------------------------------------------------------------------
 // Binary and String
 
-/// Base class for variable-sized binary arrays, regardless of offset size
-/// and logical interpretation.
-template <typename TYPE>
-class BaseBinaryArray : public FlatArray {
+/// Concrete Array class for variable-size binary data
+class ARROW_EXPORT BinaryArray : public FlatArray {
  public:
-  using TypeClass = TYPE;
-  using offset_type = typename TypeClass::offset_type;
+  using TypeClass = BinaryType;
+
+  explicit BinaryArray(const std::shared_ptr<ArrayData>& data);
+
+  BinaryArray(int64_t length, const std::shared_ptr<Buffer>& value_offsets,
+              const std::shared_ptr<Buffer>& data,
+              const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+              int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 
   /// Return the pointer to the given elements bytes
   // XXX should GetValue(int64_t i) return a string_view?
-  const uint8_t* GetValue(int64_t i, offset_type* out_length) const {
+  const uint8_t* GetValue(int64_t i, int32_t* out_length) const {
     // Account for base offset
     i += data_->offset;
-    const offset_type pos = raw_value_offsets_[i];
+    const int32_t pos = raw_value_offsets_[i];
     *out_length = raw_value_offsets_[i + 1] - pos;
     return raw_data_ + pos;
   }
@@ -738,7 +704,7 @@ class BaseBinaryArray : public FlatArray {
   util::string_view GetView(int64_t i) const {
     // Account for base offset
     i += data_->offset;
-    const offset_type pos = raw_value_offsets_[i];
+    const int32_t pos = raw_value_offsets_[i];
     return util::string_view(reinterpret_cast<const char*>(raw_data_ + pos),
                              raw_value_offsets_[i + 1] - pos);
   }
@@ -755,52 +721,31 @@ class BaseBinaryArray : public FlatArray {
   /// Note that this buffer does not account for any slice offset
   std::shared_ptr<Buffer> value_data() const { return data_->buffers[2]; }
 
-  const offset_type* raw_value_offsets() const {
-    return raw_value_offsets_ + data_->offset;
-  }
+  const int32_t* raw_value_offsets() const { return raw_value_offsets_ + data_->offset; }
 
   // Neither of these functions will perform boundschecking
-  offset_type value_offset(int64_t i) const {
-    return raw_value_offsets_[i + data_->offset];
-  }
-  offset_type value_length(int64_t i) const {
+  int32_t value_offset(int64_t i) const { return raw_value_offsets_[i + data_->offset]; }
+  int32_t value_length(int64_t i) const {
     i += data_->offset;
     return raw_value_offsets_[i + 1] - raw_value_offsets_[i];
   }
 
  protected:
   // For subclasses
-  BaseBinaryArray() : raw_value_offsets_(NULLPTR), raw_data_(NULLPTR) {}
+  BinaryArray() : raw_value_offsets_(NULLPTR), raw_data_(NULLPTR) {}
 
-  // Protected method for constructors
-  void SetData(const std::shared_ptr<ArrayData>& data) {
-    auto value_offsets = data->buffers[1];
-    auto value_data = data->buffers[2];
-    this->Array::SetData(data);
-    raw_data_ = value_data == NULLPTR ? NULLPTR : value_data->data();
-    raw_value_offsets_ =
-        value_offsets == NULLPTR
-            ? NULLPTR
-            : reinterpret_cast<const offset_type*>(value_offsets->data());
-  }
+  /// Protected method for constructors
+  void SetData(const std::shared_ptr<ArrayData>& data);
 
-  const offset_type* raw_value_offsets_;
-  const uint8_t* raw_data_;
-};
-
-/// Concrete Array class for variable-size binary data
-class ARROW_EXPORT BinaryArray : public BaseBinaryArray<BinaryType> {
- public:
-  explicit BinaryArray(const std::shared_ptr<ArrayData>& data);
-
-  BinaryArray(int64_t length, const std::shared_ptr<Buffer>& value_offsets,
+  // Constructor to allow sub-classes/builders to substitute their own logical type
+  BinaryArray(const std::shared_ptr<DataType>& type, int64_t length,
+              const std::shared_ptr<Buffer>& value_offsets,
               const std::shared_ptr<Buffer>& data,
               const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
               int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 
- protected:
-  // For subclasses such as StringArray
-  BinaryArray() : BaseBinaryArray() {}
+  const int32_t* raw_value_offsets_;
+  const uint8_t* raw_data_;
 };
 
 /// Concrete Array class for variable-size string (utf-8) data
@@ -814,34 +759,6 @@ class ARROW_EXPORT StringArray : public BinaryArray {
               const std::shared_ptr<Buffer>& data,
               const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
               int64_t null_count = kUnknownNullCount, int64_t offset = 0);
-};
-
-/// Concrete Array class for large variable-size binary data
-class ARROW_EXPORT LargeBinaryArray : public BaseBinaryArray<LargeBinaryType> {
- public:
-  explicit LargeBinaryArray(const std::shared_ptr<ArrayData>& data);
-
-  LargeBinaryArray(int64_t length, const std::shared_ptr<Buffer>& value_offsets,
-                   const std::shared_ptr<Buffer>& data,
-                   const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
-                   int64_t null_count = kUnknownNullCount, int64_t offset = 0);
-
- protected:
-  // For subclasses such as LargeStringArray
-  LargeBinaryArray() : BaseBinaryArray() {}
-};
-
-/// Concrete Array class for large variable-size string (utf-8) data
-class ARROW_EXPORT LargeStringArray : public LargeBinaryArray {
- public:
-  using TypeClass = LargeStringType;
-
-  explicit LargeStringArray(const std::shared_ptr<ArrayData>& data);
-
-  LargeStringArray(int64_t length, const std::shared_ptr<Buffer>& value_offsets,
-                   const std::shared_ptr<Buffer>& data,
-                   const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
-                   int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 };
 
 // ----------------------------------------------------------------------
@@ -950,20 +867,9 @@ class ARROW_EXPORT StructArray : public Array {
   ///
   /// The length and data type are automatically inferred from the arguments.
   /// There should be at least one child array.
-  static Result<std::shared_ptr<StructArray>> Make(
+  static Result<std::shared_ptr<Array>> Make(
       const std::vector<std::shared_ptr<Array>>& children,
       const std::vector<std::string>& field_names,
-      std::shared_ptr<Buffer> null_bitmap = NULLPTR,
-      int64_t null_count = kUnknownNullCount, int64_t offset = 0);
-
-  /// \brief Return a StructArray from child arrays and fields.
-  ///
-  /// The length is automatically inferred from the arguments.
-  /// There should be at least one child array.  This method does not
-  /// check that field types and child array types are consistent.
-  static Result<std::shared_ptr<StructArray>> Make(
-      const std::vector<std::shared_ptr<Array>>& children,
-      const std::vector<std::shared_ptr<Field>>& fields,
       std::shared_ptr<Buffer> null_bitmap = NULLPTR,
       int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 
@@ -1176,6 +1082,9 @@ class ARROW_EXPORT UnionArray : public Array {
   // For dense unions, the returned array is unchanged.
   std::shared_ptr<Array> child(int pos) const;
 
+  /// Only use this while the UnionArray is in scope
+  const Array* UnsafeChild(int pos) const;
+
  protected:
   void SetData(const std::shared_ptr<ArrayData>& data);
 
@@ -1240,20 +1149,18 @@ class ARROW_EXPORT DictionaryArray : public Array {
   /// This method constructs a new dictionary array with the given dictionary type,
   /// transposing indices using the transpose map.
   /// The type and the transpose map are typically computed using
-  /// DictionaryUnifier.
+  /// DictionaryType::Unify.
   ///
   /// \param[in] pool a pool to allocate the array data from
   /// \param[in] type the new type object
   /// \param[in] dictionary the new dictionary
-  /// \param[in] transpose_map transposition array of this array's indices
+  /// \param[in] transpose_map a vector transposing this array's indices
   /// into the target array's indices
   /// \param[out] out the resulting DictionaryArray instance
   Status Transpose(MemoryPool* pool, const std::shared_ptr<DataType>& type,
-                   const std::shared_ptr<Array>& dictionary, const int32_t* transpose_map,
+                   const std::shared_ptr<Array>& dictionary,
+                   const std::vector<int32_t>& transpose_map,
                    std::shared_ptr<Array>* out) const;
-
-  /// \brief Determine whether dictionary arrays may be compared without unification
-  bool CanCompareIndices(const DictionaryArray& other) const;
 
   /// \brief Return the dictionary for this array, which is stored as
   /// a member of the ArrayData internal structure
@@ -1268,12 +1175,17 @@ class ARROW_EXPORT DictionaryArray : public Array {
   std::shared_ptr<Array> indices_;
 };
 
-/// \brief Alias of Array::Validate().
+/// \brief Perform any validation checks to determine obvious inconsistencies
+/// with the array's internal data
+///
+/// This can be an expensive check.
 ///
 /// \param array an Array instance
 /// \return Status
-ARROW_DEPRECATED("Use Array::Validate instead")
 ARROW_EXPORT
 Status ValidateArray(const Array& array);
 
 }  // namespace arrow
+
+#endif  // ARROW_ARRAY_H
+>>>>>>> 5588-Better-support-for-building-UnionArrays

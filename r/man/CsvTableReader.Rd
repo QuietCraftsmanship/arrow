@@ -16,7 +16,7 @@ and JSON table readers. See their usage in \code{\link[=read_csv_arrow]{read_csv
 The \code{CsvTableReader$create()} and \code{JsonTableReader$create()} factory methods
 take the following arguments:
 \itemize{
-\item \code{file} A character path to a local file, or an Arrow input stream
+\item \code{file} An Arrow \link{InputStream}
 \item \code{convert_options} (CSV only), \code{parse_options}, \code{read_options}: see
 \link{CsvReadOptions}
 \item \code{...} additional parameters.
@@ -26,8 +26,7 @@ take the following arguments:
 \section{Methods}{
 
 \itemize{
-\item \code{$Read()}: returns an Arrow Table.
+\item \verb{$Read()}: returns an Arrow Table.
 }
 }
 
-\keyword{datasets}

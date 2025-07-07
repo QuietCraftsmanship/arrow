@@ -19,6 +19,8 @@
 
 #include <signal.h>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -31,14 +33,26 @@
 #include "arrow/record_batch.h"
 #include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
+#include "arrow/util/config.h"
 #include "arrow/util/logging.h"
 
 #include "arrow/flight/api.h"
-#include "arrow/flight/internal.h"
 #include "arrow/flight/perf.pb.h"
+#include "arrow/flight/protocol_internal.h"
 #include "arrow/flight/test_util.h"
 
+#ifdef ARROW_CUDA
+#  include "arrow/gpu/cuda_api.h"
+#endif
+
+DEFINE_bool(cuda, false, "Allocate results in CUDA memory");
+DEFINE_string(transport, "grpc",
+              "The network transport to use. Supported: \"grpc\" (default).");
+DEFINE_string(server_host, "localhost", "Host where the server is running on");
 DEFINE_int32(port, 31337, "Server port to listen on");
+DEFINE_string(server_unix, "", "Unix socket path where the server is running on");
+DEFINE_string(cert_file, "", "Path to TLS certificate");
+DEFINE_string(key_file, "", "Path to TLS private key");
 
 namespace perf = arrow::flight::perf;
 namespace proto = arrow::flight::protocol;
@@ -53,8 +67,6 @@ namespace flight {
     }                                                  \
   } while (0)
 
-using ArrayVector = std::vector<std::shared_ptr<Array>>;
-
 // Create record batches with a unique "a" column so we can verify on the
 // client side that the results are correct
 class PerfDataStream : public FlightDataStream {
@@ -67,22 +79,26 @@ class PerfDataStream : public FlightDataStream {
         total_records_(total_records),
         records_sent_(0),
         schema_(schema),
+        mapper_(*schema),
         arrays_(arrays) {
     batch_ = RecordBatch::Make(schema, batch_length_, arrays_);
   }
 
   std::shared_ptr<Schema> schema() override { return schema_; }
 
-  Status GetSchemaPayload(FlightPayload* payload) override {
-    return ipc::internal::GetSchemaPayload(*schema_, ipc_options_, &dictionary_memo_,
-                                           &payload->ipc_message);
+  arrow::Result<FlightPayload> GetSchemaPayload() override {
+    FlightPayload payload;
+    RETURN_NOT_OK(
+        ipc::GetSchemaPayload(*schema_, ipc_options_, mapper_, &payload.ipc_message));
+    return payload;
   }
 
-  Status Next(FlightPayload* payload) override {
+  arrow::Result<FlightPayload> Next() override {
+    FlightPayload payload;
     if (records_sent_ >= total_records_) {
       // Signal that iteration is over
-      payload->ipc_message.metadata = nullptr;
-      return Status::OK();
+      payload.ipc_message.metadata = nullptr;
+      return payload;
     }
 
     if (verify_) {
@@ -103,8 +119,8 @@ class PerfDataStream : public FlightDataStream {
     } else {
       records_sent_ += batch_length_;
     }
-    return ipc::internal::GetRecordBatchPayload(
-        *batch, ipc_options_, default_memory_pool(), &payload->ipc_message);
+    RETURN_NOT_OK(ipc::GetRecordBatchPayload(*batch, ipc_options_, &payload.ipc_message));
+    return payload;
   }
 
  private:
@@ -114,8 +130,8 @@ class PerfDataStream : public FlightDataStream {
   const int64_t total_records_;
   int64_t records_sent_;
   std::shared_ptr<Schema> schema_;
-  ipc::DictionaryMemo dictionary_memo_;
-  ipc::IpcOptions ipc_options_;
+  ipc::DictionaryFieldMapper mapper_;
+  ipc::IpcWriteOptions ipc_options_;
   std::shared_ptr<RecordBatch> batch_;
   ArrayVector arrays_;
 };
@@ -143,10 +159,11 @@ Status GetPerfBatches(const perf::Token& token, const std::shared_ptr<Schema>& s
 class FlightPerfServer : public FlightServerBase {
  public:
   FlightPerfServer() : location_() {
-    DCHECK_OK(Location::ForGrpcTcp("localhost", FLAGS_port, &location_));
     perf_schema_ = schema({field("a", int64()), field("b", int64()), field("c", int64()),
                            field("d", int64())});
   }
+
+  void SetLocation(Location location) { location_ = location; }
 
   Status GetFlightInfo(const ServerCallContext& context, const FlightDescriptor& request,
                        std::unique_ptr<FlightInfo>* info) override {
@@ -165,16 +182,14 @@ class FlightPerfServer : public FlightServerBase {
       (void)token.SerializeToString(&tmp_ticket.ticket);
 
       // All endpoints same location for now
-      endpoints.push_back(FlightEndpoint{tmp_ticket, {location_}});
+      endpoints.push_back(FlightEndpoint{tmp_ticket, {location_}, std::nullopt, ""});
     }
 
     uint64_t total_records =
         perf_request.stream_count() * perf_request.records_per_stream();
 
-    FlightInfo::Data data;
-    RETURN_NOT_OK(
-        MakeFlightInfo(*perf_schema_, request, endpoints, total_records, -1, &data));
-    *info = std::unique_ptr<FlightInfo>(new FlightInfo(data));
+    *info = std::make_unique<FlightInfo>(
+        MakeFlightInfo(*perf_schema_, request, endpoints, total_records, -1, false, ""));
     return Status::OK();
   }
 
@@ -182,7 +197,8 @@ class FlightPerfServer : public FlightServerBase {
                std::unique_ptr<FlightDataStream>* data_stream) override {
     perf::Token token;
     CHECK_PARSE(token.ParseFromString(request.ticket));
-    return GetPerfBatches(token, perf_schema_, false, data_stream);
+    // This must also be set in flight_benchmark.cc
+    return GetPerfBatches(token, perf_schema_, /*verify=*/false, data_stream);
   }
 
   Status DoPut(const ServerCallContext& context,
@@ -190,7 +206,7 @@ class FlightPerfServer : public FlightServerBase {
                std::unique_ptr<FlightMetadataWriter> writer) override {
     FlightStreamChunk chunk;
     while (true) {
-      RETURN_NOT_OK(reader->Next(&chunk));
+      ARROW_ASSIGN_OR_RAISE(chunk, reader->Next());
       if (!chunk.data) break;
       if (chunk.app_metadata) {
         RETURN_NOT_OK(writer->WriteMetadata(*chunk.app_metadata));
@@ -203,7 +219,7 @@ class FlightPerfServer : public FlightServerBase {
                   std::unique_ptr<ResultStream>* result) override {
     if (action.type == "ping") {
       std::shared_ptr<Buffer> buf = Buffer::FromString("ok");
-      *result = std::unique_ptr<ResultStream>(new SimpleResultStream({Result{buf}}));
+      *result = std::make_unique<SimpleResultStream>(std::vector<Result>{Result{buf}});
       return Status::OK();
     }
     return Status::NotImplemented(action.type);
@@ -230,14 +246,75 @@ int main(int argc, char** argv) {
 
   g_server.reset(new arrow::flight::FlightPerfServer);
 
-  arrow::flight::Location location;
-  ARROW_CHECK_OK(arrow::flight::Location::ForGrpcTcp("0.0.0.0", FLAGS_port, &location));
-  arrow::flight::FlightServerOptions options(location);
+  arrow::flight::Location bind_location;
+  arrow::flight::Location connect_location;
+  if (FLAGS_transport == "grpc") {
+    if (FLAGS_server_unix.empty()) {
+      if (!FLAGS_cert_file.empty() || !FLAGS_key_file.empty()) {
+        if (!FLAGS_cert_file.empty() && !FLAGS_key_file.empty()) {
+          ARROW_CHECK_OK(arrow::flight::Location::ForGrpcTls("0.0.0.0", FLAGS_port)
+                             .Value(&bind_location));
+          ARROW_CHECK_OK(
+              arrow::flight::Location::ForGrpcTls(FLAGS_server_host, FLAGS_port)
+                  .Value(&connect_location));
+        } else {
+          std::cerr << "If providing TLS cert/key, must provide both" << std::endl;
+          return EXIT_FAILURE;
+        }
+      } else {
+        ARROW_CHECK_OK(arrow::flight::Location::ForGrpcTcp("0.0.0.0", FLAGS_port)
+                           .Value(&bind_location));
+        ARROW_CHECK_OK(arrow::flight::Location::ForGrpcTcp(FLAGS_server_host, FLAGS_port)
+                           .Value(&connect_location));
+      }
+    } else {
+      ARROW_CHECK_OK(
+          arrow::flight::Location::ForGrpcUnix(FLAGS_server_unix).Value(&bind_location));
+      ARROW_CHECK_OK(arrow::flight::Location::ForGrpcUnix(FLAGS_server_unix)
+                         .Value(&connect_location));
+    }
+  } else {
+    std::cerr << "Unknown transport: " << FLAGS_transport << std::endl;
+    return EXIT_FAILURE;
+  }
+  arrow::flight::FlightServerOptions options(bind_location);
+  if (!FLAGS_cert_file.empty() && !FLAGS_key_file.empty()) {
+    std::cout << "Enabling TLS" << std::endl;
+    std::ifstream cert_file(FLAGS_cert_file);
+    std::string cert((std::istreambuf_iterator<char>(cert_file)),
+                     (std::istreambuf_iterator<char>()));
+    std::ifstream key_file(FLAGS_key_file);
+    std::string key((std::istreambuf_iterator<char>(key_file)),
+                    (std::istreambuf_iterator<char>()));
+    options.tls_certificates.push_back(arrow::flight::CertKeyPair{cert, key});
+  }
+
+  if (FLAGS_cuda) {
+#ifdef ARROW_CUDA
+    arrow::cuda::CudaDeviceManager* manager = nullptr;
+    std::shared_ptr<arrow::cuda::CudaDevice> device;
+
+    ARROW_CHECK_OK(arrow::cuda::CudaDeviceManager::Instance().Value(&manager));
+    ARROW_CHECK_OK(manager->GetDevice(0).Value(&device));
+    options.memory_manager = device->default_memory_manager();
+#else
+    std::cerr << "-cuda requires that Arrow is built with ARROW_CUDA" << std::endl;
+    return EXIT_FAILURE;
+#endif
+  }
 
   ARROW_CHECK_OK(g_server->Init(options));
   // Exit with a clean error code (0) on SIGTERM
   ARROW_CHECK_OK(g_server->SetShutdownOnSignals({SIGTERM}));
-  std::cout << "Server port: " << FLAGS_port << std::endl;
+  std::cout << "Server transport: " << FLAGS_transport << std::endl;
+  std::cout << "Server location: " << connect_location.ToString() << std::endl;
+  if (FLAGS_server_unix.empty()) {
+    std::cout << "Server host: " << FLAGS_server_host << std::endl;
+    std::cout << "Server port: " << FLAGS_port << std::endl;
+  } else {
+    std::cout << "Server unix socket: " << FLAGS_server_unix << std::endl;
+  }
+  g_server->SetLocation(connect_location);
   ARROW_CHECK_OK(g_server->Serve());
-  return 0;
+  return EXIT_SUCCESS;
 }

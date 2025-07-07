@@ -99,30 +99,28 @@ class TestTable < Test::Unit::TestCase
 
   sub_test_case("instance methods") do
     def setup
-      fields = [
+      @fields = [
         Arrow::Field.new("visible", Arrow::BooleanDataType.new),
         Arrow::Field.new("valid", Arrow::BooleanDataType.new),
       ]
-      schema = Arrow::Schema.new(fields)
-      columns = [
+      @schema = Arrow::Schema.new(@fields)
+      @columns = [
         build_boolean_array([true]),
         build_boolean_array([false]),
       ]
-      @table = Arrow::Table.new(schema, columns)
+      @table = Arrow::Table.new(@schema, @columns)
     end
 
     def test_equal
-      fields = [
-        Arrow::Field.new("visible", Arrow::BooleanDataType.new),
-        Arrow::Field.new("valid", Arrow::BooleanDataType.new),
-      ]
-      schema = Arrow::Schema.new(fields)
-      columns = [
-        build_boolean_array([true]),
-        build_boolean_array([false]),
-      ]
-      other_table = Arrow::Table.new(schema, columns)
+      other_table = Arrow::Table.new(@schema, @columns)
       assert_equal(@table, other_table)
+    end
+
+    def test_equal_metadata
+      other_table = Arrow::Table.new(@schema, @columns)
+      assert do
+        @table.equal_metadata(other_table, true)
+      end
     end
 
     def test_schema
@@ -187,12 +185,29 @@ valid:
       TABLE
     end
 
-    def test_concatenate
-      table = build_table("visible" => build_boolean_array([true, false, true, false]))
-      table1 = build_table("visible" => build_boolean_array([true]))
-      table2 = build_table("visible" => build_boolean_array([false, true]))
-      table3 = build_table("visible" => build_boolean_array([false]))
-      assert_equal(table, table1.concatenate([table2, table3]))
+    sub_test_case("#concatenate") do
+      def test_without_options
+        table = build_table("visible" =>
+                            build_boolean_array([true, false, true, false]))
+        table1 = build_table("visible" => build_boolean_array([true]))
+        table2 = build_table("visible" => build_boolean_array([false, true]))
+        table3 = build_table("visible" => build_boolean_array([false]))
+        assert_equal(table, table1.concatenate([table2, table3]))
+      end
+
+      def test_with_options
+        options = Arrow::TableConcatenateOptions.new
+        options.unify_schemas = true
+        table = build_table("a" => build_int32_array([1, nil, 3]),
+                            "b" => build_int32_array([10, nil, 30]),
+                            "c" => build_int32_array([nil, 200, nil]))
+        table1 = build_table("a" => build_int32_array([1]),
+                             "b" => build_int32_array([10]))
+        table2 = build_table("c" => build_int32_array([200]))
+        table3 = build_table("a" => build_int32_array([3]),
+                             "b" => build_int32_array([30]))
+        assert_equal(table, table1.concatenate([table2, table3], options))
+      end
     end
 
     sub_test_case("#slice") do
@@ -208,6 +223,142 @@ valid:
         table = build_table("visible" => build_boolean_array(visibles))
         assert_equal(build_table("visible" => build_boolean_array([false, true])),
                      table.slice(-2, 2))
+      end
+    end
+
+    def test_combine_chunks
+      table = build_table(
+        "visible" => Arrow::ChunkedArray::new([build_boolean_array([true, false, true]),
+                                               build_boolean_array([false, true]),
+                                               build_boolean_array([false])])
+      )
+      combined_table = table.combine_chunks
+      all_values = combined_table.n_columns.times.collect do |i|
+        column = combined_table.get_column_data(i)
+        column.n_chunks.times.collect do |j|
+          column.get_chunk(j).values
+        end
+      end
+      assert_equal([[[true, false, true, false, true, false]]],
+                   all_values)
+    end
+
+    sub_test_case("#validate") do
+      def setup
+        @id_field = Arrow::Field.new("id", Arrow::UInt8DataType.new)
+        @name_field = Arrow::Field.new("name", Arrow::StringDataType.new)
+        @schema = Arrow::Schema.new([@id_field, @name_field])
+
+        @id_array = build_uint_array([1])
+        @name_array = build_string_array(["abc"])
+        @arrays = [@id_array, @name_array]
+      end
+
+      def test_valid
+        table = Arrow::Table.new(@schema, @arrays)
+
+        assert do
+          table.validate
+        end
+      end
+
+      def test_invalid
+        message = "[table][validate]: Invalid: " +
+          "Column 1 named name expected length 1 but got length 2"
+
+        invalid_values = [@id_array, build_string_array(["abc", "def"])]
+        table = Arrow::Table.new(@schema, invalid_values)
+        error = assert_raise(Arrow::Error::Invalid) do
+          table.validate
+        end
+        assert_equal(message,
+                     error.message.lines.first.chomp)
+      end
+    end
+
+    sub_test_case("#validate_full") do
+      def setup
+        @id_field = Arrow::Field.new("uint8", Arrow::UInt8DataType.new)
+        @name_field = Arrow::Field.new("string", Arrow::StringDataType.new)
+        @schema = Arrow::Schema.new([@id_field, @name_field])
+
+        @id_values = build_uint_array([1])
+        @valid_name_values = build_string_array(["abc"])
+
+        # U+3042 HIRAGANA LETTER A, U+3044 HIRAGANA LETTER I
+        data = "\u3042\u3044".b[0..-2]
+        value_offsets = Arrow::Buffer.new([0, data.size].pack("l*"))
+        @invalid_name_values = Arrow::StringArray.new(1,
+                                                      value_offsets,
+                                                      Arrow::Buffer.new(data),
+                                                      nil,
+                                                      -1)
+      end
+
+      def test_valid
+        columns = [@id_values, @valid_name_values]
+        table = Arrow::Table.new(@schema, columns)
+
+        assert do
+          table.validate_full
+        end
+      end
+
+      def test_invalid
+        message = "[table][validate-full]: Invalid: " +
+          "Column 1: In chunk 0: Invalid: Invalid UTF8 sequence at string index 0"
+        columns = [@id_values, @invalid_name_values]
+        table = Arrow::Table.new(@schema, columns)
+
+        error = assert_raise(Arrow::Error::Invalid) do
+          table.validate_full
+        end
+        assert_equal(message,
+                     error.message.lines.first.chomp)
+      end
+    end
+
+    sub_test_case("#write_as_feather") do
+      def setup
+        super
+        @tempfile = Tempfile.open("arrow-table-write-as-feather")
+        begin
+          yield
+        ensure
+          @tempfile.close!
+        end
+      end
+
+      def read_feather
+        input = Arrow::MemoryMappedInputStream.new(@tempfile.path)
+        reader = Arrow::FeatherFileReader.new(input)
+        begin
+          yield(reader.read)
+        ensure
+          input.close
+        end
+      end
+
+      test("default") do
+        output = Arrow::FileOutputStream.new(@tempfile.path, false)
+        @table.write_as_feather(output)
+        output.close
+
+        read_feather do |read_table|
+          assert_equal(@table, read_table)
+        end
+      end
+
+      test("compression") do
+        output = Arrow::FileOutputStream.new(@tempfile.path, false)
+        properties = Arrow::FeatherWriteProperties.new
+        properties.compression = :zstd
+        @table.write_as_feather(output, properties)
+        output.close
+
+        read_feather do |read_table|
+          assert_equal(@table, read_table)
+        end
       end
     end
   end

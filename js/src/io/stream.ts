@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import streamAdapters from './adapters';
-import { decodeUtf8 } from '../util/utf8';
-import { ITERATOR_DONE, Readable, Writable, AsyncQueue } from './interfaces';
-import { toUint8Array, joinUint8Arrays, ArrayBufferViewInput } from '../util/buffer';
+import streamAdapters from './adapters.js';
+import { decodeUtf8 } from '../util/utf8.js';
+import { ITERATOR_DONE, Readable, Writable, AsyncQueue } from './interfaces.js';
+import { toUint8Array, joinUint8Arrays, ArrayBufferViewInput } from '../util/buffer.js';
 
 import {
     isPromise, isFetchResponse,
     isIterable, isAsyncIterable,
     isReadableDOMStream, isReadableNodeStream
-} from '../util/compat';
+} from '../util/compat.js';
 
 /** @ignore */
 export type WritableSink<T> = Writable<T> | WritableStream<T> | NodeJS.WritableStream | null;
@@ -49,7 +49,8 @@ export class AsyncByteQueue<T extends ArrayBufferViewInput = Uint8Array> extends
     public toUint8Array(sync?: false): Promise<Uint8Array>;
     public toUint8Array(sync = false) {
         return sync ? joinUint8Arrays(this._values as any[])[0] : (async () => {
-            let buffers = [], byteLength = 0;
+            const buffers = [];
+            let byteLength = 0;
             for await (const chunk of this) {
                 buffers.push(chunk);
                 byteLength += chunk.byteLength;
@@ -61,8 +62,7 @@ export class AsyncByteQueue<T extends ArrayBufferViewInput = Uint8Array> extends
 
 /** @ignore */
 export class ByteStream implements IterableIterator<Uint8Array> {
-    // @ts-ignore
-    private source: ByteStreamSource<Uint8Array>;
+    declare private source: ByteStreamSource<Uint8Array>;
     constructor(source?: Iterable<ArrayBufferViewInput> | ArrayBufferViewInput) {
         if (source) {
             this.source = new ByteStreamSource(streamAdapters.fromIterable(source));
@@ -78,8 +78,7 @@ export class ByteStream implements IterableIterator<Uint8Array> {
 
 /** @ignore */
 export class AsyncByteStream implements Readable<Uint8Array>, AsyncIterableIterator<Uint8Array> {
-    // @ts-ignore
-    private source: AsyncByteStreamSource<Uint8Array>;
+    declare private source: AsyncByteStreamSource<Uint8Array>;
     constructor(source?: PromiseLike<ArrayBufferViewInput> | Response | ReadableStream<ArrayBufferViewInput> | NodeJS.ReadableStream | AsyncIterable<ArrayBufferViewInput> | Iterable<ArrayBufferViewInput>) {
         if (source instanceof AsyncByteStream) {
             this.source = (source as AsyncByteStream).source;
@@ -110,18 +109,13 @@ export class AsyncByteStream implements Readable<Uint8Array>, AsyncIterableItera
 }
 
 /** @ignore */
-interface ByteStreamSourceIterator<T> extends IterableIterator<T> {
-    next(value?: { cmd: 'peek' | 'read', size?: number | null }): IteratorResult<T>;
-}
-
+type ByteStreamSourceIterator<T> = Generator<T, null, { cmd: 'peek' | 'read'; size?: number | null }>;
 /** @ignore */
-interface AsyncByteStreamSourceIterator<T> extends AsyncIterableIterator<T> {
-    next(value?: { cmd: 'peek' | 'read', size?: number | null }): Promise<IteratorResult<T>>;
-}
+type AsyncByteStreamSourceIterator<T> = AsyncGenerator<T, null, { cmd: 'peek' | 'read'; size?: number | null }>;
 
 /** @ignore */
 class ByteStreamSource<T> {
-    constructor(protected source: ByteStreamSourceIterator<T>) {}
+    constructor(protected source: ByteStreamSourceIterator<T>) { }
     public cancel(reason?: any) { this.return(reason); }
     public peek(size?: number | null): T | null { return this.next(size, 'peek').value; }
     public read(size?: number | null): T | null { return this.next(size, 'read').value; }
@@ -135,7 +129,7 @@ class AsyncByteStreamSource<T> implements Readable<T> {
 
     private _closedPromise: Promise<void>;
     private _closedPromiseResolve?: (value?: any) => void;
-    constructor (protected source: ByteStreamSourceIterator<T> | AsyncByteStreamSourceIterator<T>) {
+    constructor(protected source: ByteStreamSourceIterator<T> | AsyncByteStreamSourceIterator<T>) {
         this._closedPromise = new Promise((r) => this._closedPromiseResolve = r);
     }
     public async cancel(reason?: any) { await this.return(reason); }

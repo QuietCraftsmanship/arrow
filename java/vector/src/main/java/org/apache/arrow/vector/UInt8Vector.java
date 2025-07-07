@@ -27,7 +27,6 @@ import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableUInt8Holder;
 import org.apache.arrow.vector.holders.UInt8Holder;
 import org.apache.arrow.vector.types.Types.MinorType;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
@@ -38,7 +37,15 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
 public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class UInt8Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class UInt8Vector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private static final byte TYPE_WIDTH = 8;
   private final FieldReader reader;
 
@@ -47,11 +54,7 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   public UInt8Vector(String name, FieldType fieldType, BufferAllocator allocator) {
-    this(new Field(name, fieldType, null), allocator);
-  }
-
-  public UInt8Vector(Field field, BufferAllocator allocator) {
-    super(field, allocator, TYPE_WIDTH);
+    super(name, allocator, fieldType, TYPE_WIDTH);
     reader = new UInt8ReaderImpl(UInt8Vector.this);
   }
 
@@ -149,6 +152,25 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
     }
   }
 
+  /**
+   * Copy a value and validity setting from fromIndex in <code>from</code> to this
+   * Vector at thisIndex.
+   */
+  public void copyFrom(int fromIndex, int thisIndex, UInt8Vector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final long value = from.valueBuffer.getLong(fromIndex * TYPE_WIDTH);
+    valueBuffer.setLong(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Same as {@link #copyFrom(int, int, UInt8Vector)} but reallocates if thisIndex is
+   * larger then current capacity.
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, UInt8Vector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
+  }
+
 
   /*----------------------------------------------------------------*
    |                                                                |
@@ -241,6 +263,18 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
     set(index, holder);
   }
 
+  /**
+   * Set the element at the given index to null.
+   *
+   * @param index   position of element
+   */
+  public void setNull(int index) {
+    handleSafe(index);
+    // not really needed to set the bit to 0 as long as
+    // the buffer always starts from 0.
+    BitVectorHelper.setValidityBit(validityBuffer, index, 0);
+  }
+
   /** Sets value at index is isSet is positive otherwise sets the index to invalid/null. */
   public void set(int index, int isSet, long value) {
     if (isSet > 0) {
@@ -277,6 +311,8 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, value);
   }
@@ -291,6 +327,17 @@ public final class UInt8Vector extends BaseFixedWidthVector implements BaseIntVe
     return this.get(index);
   }
 
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+  }
+
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private class TransferImpl implements TransferPair {
     UInt8Vector to;
 

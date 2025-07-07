@@ -28,8 +28,6 @@
 
 #include <gtest/gtest.h>
 
-#include <boost/filesystem.hpp>  // NOLINT
-
 #include "arrow/buffer.h"
 #include "arrow/io/hdfs.h"
 #include "arrow/io/hdfs_internal.h"
@@ -37,6 +35,11 @@
 #include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
+
+// boost/filesystem.hpp should be included after
+// arrow/util/windows_compatibility.h because boost/filesystem.hpp
+// includes windows.h implicitly.
+#include <boost/filesystem.hpp>  // NOLINT
 
 namespace arrow {
 namespace io {
@@ -47,15 +50,6 @@ std::vector<uint8_t> RandomData(int64_t size) {
   return buffer;
 }
 
-struct JNIDriver {
-  static HdfsDriver type;
-};
-
-struct PivotalDriver {
-  static HdfsDriver type;
-};
-
-template <typename DRIVER>
 class TestHadoopFileSystem : public ::testing::Test {
  public:
   Status MakeScratchDir() {
@@ -102,21 +96,15 @@ class TestHadoopFileSystem : public ::testing::Test {
 
     loaded_driver_ = false;
 
-    Status msg;
-
-    if (DRIVER::type == HdfsDriver::LIBHDFS) {
-      msg = ConnectLibHdfs(&driver_shim);
-      if (!msg.ok()) {
-        std::cout << "Loading libhdfs failed, skipping tests gracefully" << std::endl;
-        return;
-      }
-    } else {
-      msg = ConnectLibHdfs3(&driver_shim);
-      if (!msg.ok()) {
-        std::cout << "Loading libhdfs3 failed, skipping tests gracefully. "
+    Status msg = ConnectLibHdfs(&driver_shim);
+    if (!msg.ok()) {
+      if (std::getenv("ARROW_HDFS_TEST_LIBHDFS_REQUIRE")) {
+        FAIL() << "Loading libhdfs failed: " << msg.ToString();
+      } else {
+        std::cout << "Loading libhdfs failed, skipping tests gracefully: "
                   << msg.ToString() << std::endl;
-        return;
       }
+      return;
     }
 
     loaded_driver_ = true;
@@ -130,7 +118,6 @@ class TestHadoopFileSystem : public ::testing::Test {
     conf_.host = host == nullptr ? "localhost" : host;
     conf_.user = user;
     conf_.port = port == nullptr ? 20500 : atoi(port);
-    conf_.driver = DRIVER::type;
 
     ASSERT_OK(HadoopFileSystem::Connect(&conf_, &client_));
   }
@@ -152,26 +139,12 @@ class TestHadoopFileSystem : public ::testing::Test {
   std::shared_ptr<HadoopFileSystem> client_;
 };
 
-template <>
-std::string TestHadoopFileSystem<PivotalDriver>::HdfsAbsPath(const std::string& relpath) {
-  std::stringstream ss;
-  ss << relpath;
-  return ss.str();
-}
-
-#define SKIP_IF_NO_DRIVER()                                  \
-  if (!this->loaded_driver_) {                               \
-    std::cout << "Driver not loaded, skipping" << std::endl; \
-    return;                                                  \
+#define SKIP_IF_NO_DRIVER()                        \
+  if (!this->loaded_driver_) {                     \
+    GTEST_SKIP() << "Driver not loaded, skipping"; \
   }
 
-HdfsDriver JNIDriver::type = HdfsDriver::LIBHDFS;
-HdfsDriver PivotalDriver::type = HdfsDriver::LIBHDFS3;
-
-typedef ::testing::Types<JNIDriver, PivotalDriver> DriverTypes;
-TYPED_TEST_CASE(TestHadoopFileSystem, DriverTypes);
-
-TYPED_TEST(TestHadoopFileSystem, ConnectsAgain) {
+TEST_F(TestHadoopFileSystem, ConnectsAgain) {
   SKIP_IF_NO_DRIVER();
 
   std::shared_ptr<HadoopFileSystem> client;
@@ -179,7 +152,7 @@ TYPED_TEST(TestHadoopFileSystem, ConnectsAgain) {
   ASSERT_OK(client->Disconnect());
 }
 
-TYPED_TEST(TestHadoopFileSystem, MultipleClients) {
+TEST_F(TestHadoopFileSystem, MultipleClients) {
   SKIP_IF_NO_DRIVER();
 
   ASSERT_OK(this->MakeScratchDir());
@@ -196,7 +169,7 @@ TYPED_TEST(TestHadoopFileSystem, MultipleClients) {
   ASSERT_OK(client2->Disconnect());
 }
 
-TYPED_TEST(TestHadoopFileSystem, MakeDirectory) {
+TEST_F(TestHadoopFileSystem, MakeDirectory) {
   SKIP_IF_NO_DRIVER();
 
   std::string path = this->ScratchPath("create-directory");
@@ -215,7 +188,7 @@ TYPED_TEST(TestHadoopFileSystem, MakeDirectory) {
   ASSERT_RAISES(IOError, this->client_->ListDirectory(path, &listing));
 }
 
-TYPED_TEST(TestHadoopFileSystem, GetCapacityUsed) {
+TEST_F(TestHadoopFileSystem, GetCapacityUsed) {
   SKIP_IF_NO_DRIVER();
 
   // Who knows what is actually in your DFS cluster, but expect it to have
@@ -228,7 +201,7 @@ TYPED_TEST(TestHadoopFileSystem, GetCapacityUsed) {
   ASSERT_LT(0, nbytes);
 }
 
-TYPED_TEST(TestHadoopFileSystem, GetPathInfo) {
+TEST_F(TestHadoopFileSystem, GetPathInfo) {
   SKIP_IF_NO_DRIVER();
 
   HdfsPathInfo info;
@@ -258,7 +231,7 @@ TYPED_TEST(TestHadoopFileSystem, GetPathInfo) {
   ASSERT_EQ(size, info.size);
 }
 
-TYPED_TEST(TestHadoopFileSystem, GetPathInfoNotExist) {
+TEST_F(TestHadoopFileSystem, GetPathInfoNotExist) {
   // ARROW-2919: Test that the error message is reasonable
   SKIP_IF_NO_DRIVER();
 
@@ -275,7 +248,7 @@ TYPED_TEST(TestHadoopFileSystem, GetPathInfoNotExist) {
   ASSERT_LT(error_message.find(path), std::string::npos);
 }
 
-TYPED_TEST(TestHadoopFileSystem, AppendToFile) {
+TEST_F(TestHadoopFileSystem, AppendToFile) {
   SKIP_IF_NO_DRIVER();
 
   ASSERT_OK(this->MakeScratchDir());
@@ -294,7 +267,7 @@ TYPED_TEST(TestHadoopFileSystem, AppendToFile) {
   ASSERT_EQ(size * 2, info.size);
 }
 
-TYPED_TEST(TestHadoopFileSystem, ListDirectory) {
+TEST_F(TestHadoopFileSystem, ListDirectory) {
   SKIP_IF_NO_DRIVER();
 
   const int size = 100;
@@ -334,7 +307,7 @@ TYPED_TEST(TestHadoopFileSystem, ListDirectory) {
   }
 }
 
-TYPED_TEST(TestHadoopFileSystem, ReadableMethods) {
+TEST_F(TestHadoopFileSystem, ReadableMethods) {
   SKIP_IF_NO_DRIVER();
 
   ASSERT_OK(this->MakeScratchDir());
@@ -349,39 +322,29 @@ TYPED_TEST(TestHadoopFileSystem, ReadableMethods) {
   ASSERT_OK(this->client_->OpenReadable(path, &file));
 
   // Test GetSize -- move this into its own unit test if ever needed
-  int64_t file_size;
-  ASSERT_OK(file->GetSize(&file_size));
-  ASSERT_EQ(size, file_size);
+  ASSERT_OK_AND_EQ(size, file->GetSize());
 
   uint8_t buffer[50];
-  int64_t bytes_read = 0;
 
-  ASSERT_OK(file->Read(50, &bytes_read, buffer));
+  ASSERT_OK_AND_EQ(50, file->Read(50, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, data.data(), 50));
-  ASSERT_EQ(50, bytes_read);
 
-  ASSERT_OK(file->Read(50, &bytes_read, buffer));
+  ASSERT_OK_AND_EQ(50, file->Read(50, buffer));
   ASSERT_EQ(0, std::memcmp(buffer, data.data() + 50, 50));
-  ASSERT_EQ(50, bytes_read);
 
   // EOF
-  ASSERT_OK(file->Read(1, &bytes_read, buffer));
-  ASSERT_EQ(0, bytes_read);
+  ASSERT_OK_AND_EQ(0, file->Read(1, buffer));
 
   // ReadAt to EOF
-  ASSERT_OK(file->ReadAt(60, 100, &bytes_read, buffer));
-  ASSERT_EQ(40, bytes_read);
-  ASSERT_EQ(0, std::memcmp(buffer, data.data() + 60, bytes_read));
+  ASSERT_OK_AND_EQ(40, file->ReadAt(60, 100, buffer));
+  ASSERT_EQ(0, std::memcmp(buffer, data.data() + 60, 40));
 
   // Seek, Tell
   ASSERT_OK(file->Seek(60));
-
-  int64_t position;
-  ASSERT_OK(file->Tell(&position));
-  ASSERT_EQ(60, position);
+  ASSERT_OK_AND_EQ(60, file->Tell());
 }
 
-TYPED_TEST(TestHadoopFileSystem, LargeFile) {
+TEST_F(TestHadoopFileSystem, LargeFile) {
   SKIP_IF_NO_DRIVER();
 
   ASSERT_OK(this->MakeScratchDir());
@@ -397,28 +360,22 @@ TYPED_TEST(TestHadoopFileSystem, LargeFile) {
 
   ASSERT_FALSE(file->closed());
 
-  std::shared_ptr<Buffer> buffer;
-  ASSERT_OK(AllocateBuffer(nullptr, size, &buffer));
+  ASSERT_OK_AND_ASSIGN(auto buffer, AllocateBuffer(size));
 
-  int64_t bytes_read = 0;
-
-  ASSERT_OK(file->Read(size, &bytes_read, buffer->mutable_data()));
+  ASSERT_OK_AND_EQ(size, file->Read(size, buffer->mutable_data()));
   ASSERT_EQ(0, std::memcmp(buffer->data(), data.data(), size));
-  ASSERT_EQ(size, bytes_read);
 
   // explicit buffer size
   std::shared_ptr<HdfsReadableFile> file2;
   ASSERT_OK(this->client_->OpenReadable(path, 1 << 18, &file2));
 
-  std::shared_ptr<Buffer> buffer2;
-  ASSERT_OK(AllocateBuffer(nullptr, size, &buffer2));
+  ASSERT_OK_AND_ASSIGN(auto buffer2, AllocateBuffer(size));
 
-  ASSERT_OK(file2->Read(size, &bytes_read, buffer2->mutable_data()));
+  ASSERT_OK_AND_EQ(size, file2->Read(size, buffer2->mutable_data()));
   ASSERT_EQ(0, std::memcmp(buffer2->data(), data.data(), size));
-  ASSERT_EQ(size, bytes_read);
 }
 
-TYPED_TEST(TestHadoopFileSystem, RenameFile) {
+TEST_F(TestHadoopFileSystem, RenameFile) {
   SKIP_IF_NO_DRIVER();
   ASSERT_OK(this->MakeScratchDir());
 
@@ -435,7 +392,7 @@ TYPED_TEST(TestHadoopFileSystem, RenameFile) {
   ASSERT_TRUE(this->client_->Exists(dst_path));
 }
 
-TYPED_TEST(TestHadoopFileSystem, ChmodChown) {
+TEST_F(TestHadoopFileSystem, ChmodChown) {
   SKIP_IF_NO_DRIVER();
   ASSERT_OK(this->MakeScratchDir());
 
@@ -460,7 +417,7 @@ TYPED_TEST(TestHadoopFileSystem, ChmodChown) {
   ASSERT_EQ("hadoop", info.group);
 }
 
-TYPED_TEST(TestHadoopFileSystem, ThreadSafety) {
+TEST_F(TestHadoopFileSystem, ThreadSafety) {
   SKIP_IF_NO_DRIVER();
   ASSERT_OK(this->MakeScratchDir());
 
@@ -480,12 +437,12 @@ TYPED_TEST(TestHadoopFileSystem, ThreadSafety) {
     for (int i = 0; i < niter; ++i) {
       std::shared_ptr<Buffer> buffer;
       if (i % 2 == 0) {
-        ASSERT_OK(file->ReadAt(3, 3, &buffer));
+        ASSERT_OK_AND_ASSIGN(buffer, file->ReadAt(3, 3));
         if (0 == memcmp(data.c_str() + 3, buffer->data(), 3)) {
           correct_count += 1;
         }
       } else {
-        ASSERT_OK(file->ReadAt(0, 4, &buffer));
+        ASSERT_OK_AND_ASSIGN(buffer, file->ReadAt(0, 4));
         if (0 == memcmp(data.c_str() + 0, buffer->data(), 4)) {
           correct_count += 1;
         }

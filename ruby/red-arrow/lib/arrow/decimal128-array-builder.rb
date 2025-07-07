@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-require "arrow/bigdecimal-extension"
-
 module Arrow
   class Decimal128ArrayBuilder
     class << self
@@ -28,36 +26,42 @@ module Arrow
 
     alias_method :append_value_raw, :append_value
     def append_value(value)
-      case value
-      when nil
-        return append_null
-      when String
-        value = Decimal128.new(value)
-      when Float
-        value = Decimal128.new(value.to_s)
-      when BigDecimal
-        value = value.to_arrow
-      end
-      append_value_raw(value)
+      append_value_raw(normalize_value(value))
     end
 
+    alias_method :append_values_raw, :append_values
     def append_values(values, is_valids=nil)
-      if is_valids
-        is_valids.each_with_index do |is_valid, i|
-          if is_valid
-            append_value(values[i])
-          else
-            append_null
-          end
+      if values.is_a?(::Array)
+        values = values.collect do |value|
+          normalize_value(value)
         end
+        append_values_raw(values, is_valids)
       else
-        values.each do |value|
-          if value.nil?
-            append_null
-          else
-            append_value(value)
-          end
+        append_values_packed(values, is_valids)
+      end
+    end
+
+    private
+    def precision
+      @precision ||= value_data_type.precision
+    end
+
+    def scale
+      @scale ||= value_data_type.scale
+    end
+
+    def normalize_value(value)
+      case value
+      when BigDecimal
+        if value.nan? or value.infinite?
+          message = "can't use #{value} as an Arrow::Decimal128Array value"
+          raise FloatDomainError, message
         end
+        integer, decimal = value.to_s("f").split(".", 2)
+        decimal = decimal[0, scale].ljust(scale, "0")
+        Decimal128.new("#{integer}.#{decimal}")
+      else
+        Decimal128.try_convert(value) || value
       end
     end
   end

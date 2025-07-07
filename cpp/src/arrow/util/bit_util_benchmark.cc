@@ -17,18 +17,44 @@
 
 #include "benchmark/benchmark.h"
 
-#include <vector>
+#include <array>
+#include <bitset>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <utility>
 
+#include "arrow/array/array_base.h"
+#include "arrow/array/array_primitive.h"
 #include "arrow/buffer.h"
-#include "arrow/builder.h"
-#include "arrow/memory_pool.h"
-#include "arrow/testing/gtest_util.h"
+#include "arrow/result.h"
+<<<<<<< HEAD
+#include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
+=======
+#include "arrow/testing/gtest_util.h"
+#include "arrow/testing/random.h"
+#include "arrow/testing/util.h"
+#include "arrow/type_fwd.h"
+#include "arrow/util/bit_run_reader.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/util/bit_util.h"
+#include "arrow/util/bitmap.h"
+#include "arrow/util/bitmap_generate.h"
+#include "arrow/util/bitmap_ops.h"
+#include "arrow/util/bitmap_reader.h"
+#include "arrow/util/bitmap_visit.h"
+#include "arrow/util/bitmap_writer.h"
 
+<<<<<<< HEAD
 namespace arrow {
-
 namespace BitUtil {
+=======
+namespace arrow::bit_util::benchmarks {
+
+constexpr int64_t kBufferSize = 1024 * 8;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
 
@@ -40,7 +66,7 @@ class NaiveBitmapReader {
   NaiveBitmapReader(const uint8_t* bitmap, int64_t start_offset, int64_t length)
       : bitmap_(bitmap), position_(0) {}
 
-  bool IsSet() const { return BitUtil::GetBit(bitmap_, position_); }
+  bool IsSet() const { return bit_util::GetBit(bitmap_, position_); }
 
   bool IsNotSet() const { return !IsSet(); }
 
@@ -87,11 +113,88 @@ class NaiveBitmapWriter {
 #endif
 
 static std::shared_ptr<Buffer> CreateRandomBuffer(int64_t nbytes) {
-  std::shared_ptr<Buffer> buffer;
-  ABORT_NOT_OK(AllocateBuffer(nbytes, &buffer));
+  auto buffer = *AllocateBuffer(nbytes);
   memset(buffer->mutable_data(), 0, nbytes);
-  random_bytes(nbytes, 0, buffer->mutable_data());
+  random_bytes(nbytes, /*seed=*/0, buffer->mutable_data());
   return buffer;
+}
+
+static std::shared_ptr<Buffer> CreateRandomBitsBuffer(int64_t nbits,
+                                                      int64_t set_percentage) {
+  ::arrow::random::RandomArrayGenerator rag(/*seed=*/23);
+  double set_probability =
+      static_cast<double>(set_percentage == -1 ? 0 : set_percentage) / 100.0;
+  std::shared_ptr<Buffer> buffer =
+      rag.Boolean(nbits, set_probability)->data()->buffers[1];
+
+  if (set_percentage == -1) {
+    internal::BitmapWriter writer(buffer->mutable_data(), /*start_offset=*/0,
+                                  /*length=*/nbits);
+    for (int x = 0; x < nbits; x++) {
+      if (x % 2 == 0) {
+        writer.Set();
+      } else {
+        writer.Clear();
+      }
+      writer.Next();
+    }
+  }
+  return buffer;
+}
+
+template <typename DoAnd>
+static void BenchmarkAndImpl(benchmark::State& state, DoAnd&& do_and) {
+  int64_t nbytes = state.range(0);
+  int64_t offset = state.range(1);
+
+  std::shared_ptr<Buffer> buffer_1 = CreateRandomBuffer(nbytes);
+  std::shared_ptr<Buffer> buffer_2 = CreateRandomBuffer(nbytes);
+  std::shared_ptr<Buffer> buffer_3 = CreateRandomBuffer(nbytes);
+
+  const int64_t num_bits = nbytes * 8 - offset;
+
+  internal::Bitmap bitmap_1{buffer_1, 0, num_bits};
+  internal::Bitmap bitmap_2{buffer_2, offset, num_bits};
+  internal::Bitmap bitmap_3{buffer_3, 0, num_bits};
+
+  for (auto _ : state) {
+    do_and({bitmap_1, bitmap_2}, &bitmap_3);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() * nbytes);
+}
+
+static void BenchmarkBitmapAnd(benchmark::State& state) {
+  BenchmarkAndImpl(state, [](const internal::Bitmap(&bitmaps)[2], internal::Bitmap* out) {
+    internal::BitmapAnd(bitmaps[0].data(), bitmaps[0].offset(), bitmaps[1].data(),
+                        bitmaps[1].offset(), bitmaps[0].length(), 0, out->mutable_data());
+  });
+}
+
+static void BenchmarkBitmapVisitBitsetAnd(benchmark::State& state) {
+  BenchmarkAndImpl(state, [](const internal::Bitmap(&bitmaps)[2], internal::Bitmap* out) {
+    int64_t i = 0;
+    internal::Bitmap::VisitBits(
+        bitmaps, [&](std::bitset<2> bits) { out->SetBitTo(i++, bits[0] && bits[1]); });
+  });
+}
+
+static void BenchmarkBitmapVisitUInt8And(benchmark::State& state) {
+  BenchmarkAndImpl(state, [](const internal::Bitmap(&bitmaps)[2], internal::Bitmap* out) {
+    int64_t i = 0;
+    internal::Bitmap::VisitWords(bitmaps, [&](std::array<uint8_t, 2> uint8s) {
+      reinterpret_cast<uint8_t*>(out->mutable_data())[i++] = uint8s[0] & uint8s[1];
+    });
+  });
+}
+
+static void BenchmarkBitmapVisitUInt64And(benchmark::State& state) {
+  BenchmarkAndImpl(state, [](const internal::Bitmap(&bitmaps)[2], internal::Bitmap* out) {
+    int64_t i = 0;
+    internal::Bitmap::VisitWords(bitmaps, [&](std::array<uint64_t, 2> uint64s) {
+      reinterpret_cast<uint64_t*>(out->mutable_data())[i++] = uint64s[0] & uint64s[1];
+    });
+  });
 }
 
 template <typename BitmapReaderType>
@@ -122,6 +225,46 @@ static void BenchmarkBitmapReader(benchmark::State& state, int64_t nbytes) {
     }
   }
   state.SetBytesProcessed(2LL * state.iterations() * nbytes);
+}
+
+template <typename BitRunReaderType>
+static void BenchmarkBitRunReader(benchmark::State& state, int64_t set_percentage) {
+  constexpr int64_t kNumBits = 4096;
+  auto buffer = CreateRandomBitsBuffer(kNumBits, set_percentage);
+
+  for (auto _ : state) {
+    {
+      BitRunReaderType reader(buffer->data(), 0, kNumBits);
+      int64_t set_total = 0;
+      internal::BitRun br;
+      do {
+        br = reader.NextRun();
+        set_total += br.set ? br.length : 0;
+      } while (br.length != 0);
+      benchmark::DoNotOptimize(set_total);
+    }
+  }
+  state.SetBytesProcessed(state.iterations() * (kNumBits / 8));
+}
+
+template <typename SetBitRunReaderType>
+static void BenchmarkSetBitRunReader(benchmark::State& state, int64_t set_percentage) {
+  constexpr int64_t kNumBits = 4096;
+  auto buffer = CreateRandomBitsBuffer(kNumBits, set_percentage);
+
+  for (auto _ : state) {
+    {
+      SetBitRunReaderType reader(buffer->data(), 0, kNumBits);
+      int64_t set_total = 0;
+      internal::SetBitRun br;
+      do {
+        br = reader.NextRun();
+        set_total += br.length;
+      } while (br.length != 0);
+      benchmark::DoNotOptimize(set_total);
+    }
+  }
+  state.SetBytesProcessed(state.iterations() * (kNumBits / 8));
 }
 
 template <typename VisitBitsFunctorType>
@@ -206,6 +349,42 @@ static void BitmapReader(benchmark::State& state) {
   BenchmarkBitmapReader<internal::BitmapReader>(state, state.range(0));
 }
 
+static void BitmapUInt64Reader(benchmark::State& state) {
+  const int64_t nbytes = state.range(0);
+  std::shared_ptr<Buffer> buffer = CreateRandomBuffer(nbytes);
+
+  const int64_t num_bits = nbytes * 8;
+  const uint8_t* bitmap = buffer->data();
+
+  for (auto _ : state) {
+    {
+      internal::BitmapUInt64Reader reader(bitmap, 0, num_bits);
+      uint64_t total = 0;
+      for (int64_t i = 0; i < num_bits; i += 64) {
+        total += reader.NextWord();
+      }
+      benchmark::DoNotOptimize(total);
+    }
+  }
+  state.SetBytesProcessed(state.iterations() * nbytes);
+}
+
+static void BitRunReader(benchmark::State& state) {
+  BenchmarkBitRunReader<internal::BitRunReader>(state, state.range(0));
+}
+
+static void BitRunReaderLinear(benchmark::State& state) {
+  BenchmarkBitRunReader<internal::BitRunReaderLinear>(state, state.range(0));
+}
+
+static void SetBitRunReader(benchmark::State& state) {
+  BenchmarkSetBitRunReader<internal::SetBitRunReader>(state, state.range(0));
+}
+
+static void ReverseSetBitRunReader(benchmark::State& state) {
+  BenchmarkSetBitRunReader<internal::ReverseSetBitRunReader>(state, state.range(0));
+}
+
 static void BitmapWriter(benchmark::State& state) {
   BenchmarkBitmapWriter<internal::BitmapWriter>(state, state.range(0));
 }
@@ -260,24 +439,29 @@ static void VisitBitsUnrolled(benchmark::State& state) {
   BenchmarkVisitBits<VisitBitsUnrolledFunctor>(state, state.range(0));
 }
 
-constexpr int64_t kBufferSize = 1024 * 8;
+static void SetBitsTo(benchmark::State& state) {
+  int64_t nbytes = state.range(0);
+  std::shared_ptr<Buffer> buffer = CreateRandomBuffer(nbytes);
 
-template <int64_t Offset = 0>
+  for (auto _ : state) {
+    ::arrow::bit_util::SetBitsTo(buffer->mutable_data(), /*offset=*/0, nbytes * 8, true);
+  }
+  state.SetBytesProcessed(state.iterations() * nbytes);
+}
+
+template <int64_t OffsetSrc, int64_t OffsetDest = 0>
 static void CopyBitmap(benchmark::State& state) {  // NOLINT non-const reference
   const int64_t buffer_size = state.range(0);
   const int64_t bits_size = buffer_size * 8;
   std::shared_ptr<Buffer> buffer = CreateRandomBuffer(buffer_size);
 
   const uint8_t* src = buffer->data();
-  const int64_t offset = Offset;
-  const int64_t length = bits_size - offset;
+  const int64_t length = bits_size - OffsetSrc;
 
-  std::shared_ptr<Buffer> copy;
-  auto pool = default_memory_pool();
-  ABORT_NOT_OK(AllocateEmptyBitmap(pool, length, &copy));
+  auto copy = *AllocateEmptyBitmap(length + OffsetDest);
 
   for (auto _ : state) {
-    internal::CopyBitmap(src, offset, length, copy->mutable_data(), 0, false);
+    internal::CopyBitmap(src, OffsetSrc, length, copy->mutable_data(), OffsetDest);
   }
 
   state.SetBytesProcessed(state.iterations() * buffer_size);
@@ -288,10 +472,39 @@ static void CopyBitmapWithoutOffset(
   CopyBitmap<0>(state);
 }
 
-// Trigger the slow path where the buffer is not byte aligned.
+// Trigger the slow path where the source buffer is not byte aligned.
 static void CopyBitmapWithOffset(benchmark::State& state) {  // NOLINT non-const reference
   CopyBitmap<4>(state);
 }
+
+// Trigger the slow path where both source and dest buffer are not byte aligned.
+static void CopyBitmapWithOffsetBoth(benchmark::State& state) { CopyBitmap<3, 7>(state); }
+
+// Benchmark the worst case of comparing two identical bitmap
+template <int64_t Offset = 0>
+static void BitmapEquals(benchmark::State& state) {
+  const int64_t buffer_size = state.range(0);
+  const int64_t bits_size = buffer_size * 8;
+  std::shared_ptr<Buffer> buffer = CreateRandomBuffer(buffer_size);
+
+  const uint8_t* src = buffer->data();
+  const int64_t offset = Offset;
+  const int64_t length = bits_size - offset;
+
+  auto copy = *AllocateEmptyBitmap(length + offset);
+  internal::CopyBitmap(src, 0, length, copy->mutable_data(), offset);
+
+  for (auto _ : state) {
+    auto is_same = internal::BitmapEquals(src, 0, copy->data(), offset, length);
+    benchmark::DoNotOptimize(is_same);
+  }
+
+  state.SetBytesProcessed(state.iterations() * buffer_size);
+}
+
+static void BitmapEqualsWithoutOffset(benchmark::State& state) { BitmapEquals<0>(state); }
+
+static void BitmapEqualsWithOffset(benchmark::State& state) { BitmapEquals<4>(state); }
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
 static void ReferenceNaiveBitmapReader(benchmark::State& state) {
@@ -301,9 +514,21 @@ static void ReferenceNaiveBitmapReader(benchmark::State& state) {
 BENCHMARK(ReferenceNaiveBitmapReader)->Arg(kBufferSize);
 #endif
 
+void SetBitRunReaderPercentageArg(benchmark::internal::Benchmark* bench) {
+  bench->Arg(-1)->Arg(0)->Arg(10)->Arg(25)->Arg(50)->Arg(60)->Arg(75)->Arg(99);
+}
+
 BENCHMARK(BitmapReader)->Arg(kBufferSize);
+BENCHMARK(BitmapUInt64Reader)->Arg(kBufferSize);
+
+BENCHMARK(BitRunReader)->Apply(SetBitRunReaderPercentageArg);
+BENCHMARK(BitRunReaderLinear)->Apply(SetBitRunReaderPercentageArg);
+BENCHMARK(SetBitRunReader)->Apply(SetBitRunReaderPercentageArg);
+BENCHMARK(ReverseSetBitRunReader)->Apply(SetBitRunReaderPercentageArg);
+
 BENCHMARK(VisitBits)->Arg(kBufferSize);
 BENCHMARK(VisitBitsUnrolled)->Arg(kBufferSize);
+BENCHMARK(SetBitsTo)->Arg(2)->Arg(1 << 4)->Arg(1 << 10)->Arg(1 << 17);
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
 static void ReferenceNaiveBitmapWriter(benchmark::State& state) {
@@ -315,11 +540,24 @@ BENCHMARK(ReferenceNaiveBitmapWriter)->Arg(kBufferSize);
 
 BENCHMARK(BitmapWriter)->Arg(kBufferSize);
 BENCHMARK(FirstTimeBitmapWriter)->Arg(kBufferSize);
+
 BENCHMARK(GenerateBits)->Arg(kBufferSize);
 BENCHMARK(GenerateBitsUnrolled)->Arg(kBufferSize);
 
 BENCHMARK(CopyBitmapWithoutOffset)->Arg(kBufferSize);
 BENCHMARK(CopyBitmapWithOffset)->Arg(kBufferSize);
+BENCHMARK(CopyBitmapWithOffsetBoth)->Arg(kBufferSize);
 
-}  // namespace BitUtil
-}  // namespace arrow
+BENCHMARK(BitmapEqualsWithoutOffset)->Arg(kBufferSize);
+BENCHMARK(BitmapEqualsWithOffset)->Arg(kBufferSize);
+
+#define AND_BENCHMARK_RANGES                      \
+  {                                               \
+    {kBufferSize * 4, kBufferSize * 16}, { 0, 2 } \
+  }
+BENCHMARK(BenchmarkBitmapAnd)->Ranges(AND_BENCHMARK_RANGES);
+BENCHMARK(BenchmarkBitmapVisitBitsetAnd)->Ranges(AND_BENCHMARK_RANGES);
+BENCHMARK(BenchmarkBitmapVisitUInt8And)->Ranges(AND_BENCHMARK_RANGES);
+BENCHMARK(BenchmarkBitmapVisitUInt64And)->Ranges(AND_BENCHMARK_RANGES);
+
+}  // namespace arrow::bit_util::benchmarks

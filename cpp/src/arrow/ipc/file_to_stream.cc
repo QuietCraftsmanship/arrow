@@ -20,11 +20,11 @@
 #include <string>
 
 #include "arrow/io/file.h"
+#include "arrow/io/stdio.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
-
-#include "arrow/util/io_util.h"
 
 namespace arrow {
 
@@ -34,18 +34,14 @@ namespace ipc {
 
 // Reads a file on the file system and prints to stdout the stream version of it.
 Status ConvertToStream(const char* path) {
-  std::shared_ptr<io::ReadableFile> in_file;
-  std::shared_ptr<RecordBatchFileReader> reader;
-
-  RETURN_NOT_OK(io::ReadableFile::Open(path, &in_file));
-  RETURN_NOT_OK(ipc::RecordBatchFileReader::Open(in_file.get(), &reader));
-
   io::StdoutStream sink;
-  std::shared_ptr<RecordBatchWriter> writer;
-  RETURN_NOT_OK(RecordBatchStreamWriter::Open(&sink, reader->schema(), &writer));
+
+  ARROW_ASSIGN_OR_RAISE(auto in_file, io::ReadableFile::Open(path));
+  ARROW_ASSIGN_OR_RAISE(auto reader, ipc::RecordBatchFileReader::Open(in_file.get()));
+  ARROW_ASSIGN_OR_RAISE(auto writer, ipc::MakeStreamWriter(&sink, reader->schema(),
+                                                           IpcWriteOptions::Defaults()));
   for (int i = 0; i < reader->num_record_batches(); ++i) {
-    std::shared_ptr<RecordBatch> chunk;
-    RETURN_NOT_OK(reader->ReadRecordBatch(i, &chunk));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<RecordBatch> chunk, reader->ReadRecordBatch(i));
     RETURN_NOT_OK(writer->WriteRecordBatch(*chunk));
   }
   return writer->Close();

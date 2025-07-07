@@ -21,7 +21,7 @@
 
 #include <gtest/gtest.h>
 
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 // This code is adapted from
 // https://github.com/ray-project/ray/blob/master/src/ray/util/logging_test.cc.
@@ -68,39 +68,31 @@ TEST(PrintLogTest, LogTestWithInit) {
   ArrowLog::ShutDownArrowLog();
 }
 
-// This test will output large amount of logs to stderr, should be disabled in travis.
-TEST(LogPerfTest, PerfTest) {
-  ArrowLog::StartArrowLog("/fake/path/to/appdire/LogPerfTest", ArrowLogLevel::ARROW_ERROR,
-                          "/tmp/");
-  int rounds = 10000;
+struct LoggingTracer {
+  mutable bool was_printed = false;
 
-  int64_t start_time = current_time_ms();
-  for (int i = 0; i < rounds; ++i) {
-    ARROW_LOG(DEBUG) << "This is the "
-                     << "ARROW_DEBUG message";
+  friend std::ostream& operator<<(std::ostream& os, const LoggingTracer& x) {
+    x.was_printed = true;
+    return os;
   }
-  int64_t elapsed = current_time_ms() - start_time;
-  std::cout << "Testing DEBUG log for " << rounds << " rounds takes " << elapsed << " ms."
-            << std::endl;
+};
 
-  start_time = current_time_ms();
-  for (int i = 0; i < rounds; ++i) {
-    ARROW_LOG(ERROR) << "This is the "
-                     << "RARROW_ERROR message";
-  }
-  elapsed = current_time_ms() - start_time;
-  std::cout << "Testing ARROW_ERROR log for " << rounds << " rounds takes " << elapsed
-            << " ms." << std::endl;
+TEST(ArrowCheck, PayloadNotEvaluatedOnSuccess) {
+  volatile bool cond = true;
+  LoggingTracer tracer;
 
-  start_time = current_time_ms();
-  for (int i = 0; i < rounds; ++i) {
-    ARROW_CHECK(i >= 0) << "This is a ARROW_CHECK "
-                        << "message but it won't show up";
-  }
-  elapsed = current_time_ms() - start_time;
-  std::cout << "Testing ARROW_CHECK(true) for " << rounds << " rounds takes " << elapsed
-            << " ms." << std::endl;
-  ArrowLog::ShutDownArrowLog();
+  ARROW_CHECK_OR_LOG(cond, WARNING) << "Some message" << tracer;
+  ASSERT_FALSE(tracer.was_printed);
+}
+
+TEST(ArrowCheck, PayloadEvaluatedOnFailure) {
+  volatile bool cond = false;
+  LoggingTracer tracer;
+
+  // Have to use a log level that actually gets printed, otherwise `operator<<`
+  // isn't called (which is good except for this test).
+  ARROW_CHECK_OR_LOG(cond, WARNING) << "Some message" << tracer;
+  ASSERT_TRUE(tracer.was_printed);
 }
 
 }  // namespace util

@@ -22,10 +22,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
+#include "arrow/array.h"
+#include "arrow/buffer.h"
+#include "arrow/memory_pool.h"
+#include "arrow/testing/builder.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/type_traits.h"
+#include "arrow/util/bit_util.h"
+#include "arrow/util/bitmap_ops.h"
+#include "arrow/util/float16.h"
+#include "arrow/util/logging_internal.h"
+#include "arrow/util/ubsan.h"
 
 #include "parquet/column_reader.h"
 #include "parquet/column_writer.h"
@@ -40,6 +51,10 @@
 
 using arrow::default_memory_pool;
 using arrow::MemoryPool;
+using arrow::util::Float16;
+using arrow::util::SafeCopy;
+
+namespace bit_util = arrow::bit_util;
 
 namespace parquet {
 
@@ -63,21 +78,51 @@ static FLBA FLBAFromString(const std::string& s) {
 }
 
 TEST(Comparison, SignedByteArray) {
+  // Signed byte array comparison is only used for Decimal comparison. When
+  // decimals are encoded as byte arrays they use twos complement big-endian
+  // encoded values. Comparisons of byte arrays of unequal types need to handle
+  // sign extension.
   auto comparator = MakeComparator<ByteArrayType>(Type::BYTE_ARRAY, SortOrder::SIGNED);
+  struct Case {
+    std::vector<uint8_t> bytes;
+    int order;
+    ByteArray ToByteArray() const {
+      return ByteArray(static_cast<int>(bytes.size()), bytes.data());
+    }
+  };
 
-  std::string s1 = "12345";
-  std::string s2 = "12345678";
-  ByteArray s1ba = ByteArrayFromString(s1);
-  ByteArray s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  // Test a mix of big-endian comparison values that are both equal and
+  // unequal after sign extension.
+  std::vector<Case> cases = {
+      {{0x80, 0x80, 0, 0}, 0},           {{/*0xFF,*/ 0x80, 0, 0}, 1},
+      {{0xFF, 0x80, 0, 0}, 1},           {{/*0xFF,*/ 0xFF, 0x01, 0}, 2},
+      {{/*0xFF,  0xFF,*/ 0x80, 0}, 3},   {{/*0xFF,*/ 0xFF, 0x80, 0}, 3},
+      {{0xFF, 0xFF, 0x80, 0}, 3},        {{/*0xFF,0xFF,0xFF,*/ 0x80}, 4},
+      {{/*0xFF, 0xFF, 0xFF,*/ 0xFF}, 5}, {{/*0, 0,*/ 0x01, 0x01}, 6},
+      {{/*0,*/ 0, 0x01, 0x01}, 6},       {{0, 0, 0x01, 0x01}, 6},
+      {{/*0,*/ 0x01, 0x01, 0}, 7},       {{0x01, 0x01, 0, 0}, 8}};
 
-  // This is case where signed comparision UTF-8 (PARQUET-686) is incorrect
-  // This example is to only check signed comparison and not UTF-8.
-  s1 = u8"bügeln";
-  s2 = u8"braten";
-  s1ba = ByteArrayFromString(s1);
-  s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  for (size_t x = 0; x < cases.size(); x++) {
+    const auto& case1 = cases[x];
+    // Empty array is always the smallest values
+    EXPECT_TRUE(comparator->Compare(ByteArray(), case1.ToByteArray())) << x;
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), ByteArray())) << x;
+    // Equals is always false.
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case1.ToByteArray())) << x;
+
+    for (size_t y = 0; y < cases.size(); y++) {
+      const auto& case2 = cases[y];
+      if (case1.order < case2.order) {
+        EXPECT_TRUE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      } else {
+        EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      }
+    }
+  }
 }
 
 TEST(Comparison, UnsignedByteArray) {
@@ -91,35 +136,42 @@ TEST(Comparison, UnsignedByteArray) {
   ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
 
   // Multi-byte UTF-8 characters
-  s1 = u8"braten";
-  s2 = u8"bügeln";
+  s1 = "braten";
+  s2 = "bügeln";
   s1ba = ByteArrayFromString(s1);
   s2ba = ByteArrayFromString(s2);
   ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
 
-  s1 = u8"ünk123456";  // ü = 252
-  s2 = u8"ănk123456";  // ă = 259
+  s1 = "ünk123456";  // ü = 252
+  s2 = "ănk123456";  // ă = 259
   s1ba = ByteArrayFromString(s1);
   s2ba = ByteArrayFromString(s2);
   ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
 }
 
 TEST(Comparison, SignedFLBA) {
-  int size = 10;
+  int size = 4;
   auto comparator =
       MakeComparator<FLBAType>(Type::FIXED_LEN_BYTE_ARRAY, SortOrder::SIGNED, size);
 
-  std::string s1 = "Anti123456";
-  std::string s2 = "Bunkd123456";
-  FLBA s1flba = FLBAFromString(s1);
-  FLBA s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  std::vector<uint8_t> byte_values[] = {
+      {0x80, 0, 0, 0},          {0xFF, 0xFF, 0x01, 0},    {0xFF, 0xFF, 0x80, 0},
+      {0xFF, 0xFF, 0xFF, 0x80}, {0xFF, 0xFF, 0xFF, 0xFF}, {0, 0, 0x01, 0x01},
+      {0, 0x01, 0x01, 0},       {0x01, 0x01, 0, 0}};
+  std::vector<FLBA> values_to_compare;
+  for (auto& bytes : byte_values) {
+    values_to_compare.emplace_back(FLBA(bytes.data()));
+  }
 
-  s1 = "Bünk123456";
-  s2 = "Bunk123456";
-  s1flba = FLBAFromString(s1);
-  s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  for (size_t x = 0; x < values_to_compare.size(); x++) {
+    EXPECT_FALSE(comparator->Compare(values_to_compare[x], values_to_compare[x])) << x;
+    for (size_t y = x + 1; y < values_to_compare.size(); y++) {
+      EXPECT_TRUE(comparator->Compare(values_to_compare[x], values_to_compare[y]))
+          << x << " " << y;
+      EXPECT_FALSE(comparator->Compare(values_to_compare[y], values_to_compare[x]))
+          << y << " " << x;
+    }
+  }
 }
 
 TEST(Comparison, UnsignedFLBA) {
@@ -251,13 +303,13 @@ TEST(Comparison, UnknownSortOrder) {
 template <typename TestType>
 class TestStatistics : public PrimitiveTypedTest<TestType> {
  public:
-  using T = typename TestType::c_type;
+  using c_type = typename TestType::c_type;
 
-  std::vector<T> GetDeepCopy(
-      const std::vector<T>&);  // allocates new memory for FLBA/ByteArray
+  std::vector<c_type> GetDeepCopy(
+      const std::vector<c_type>&);  // allocates new memory for FLBA/ByteArray
 
-  T* GetValuesPointer(std::vector<T>&);
-  void DeepFree(std::vector<T>&);
+  c_type* GetValuesPointer(std::vector<c_type>&);
+  void DeepFree(std::vector<c_type>&);
 
   void TestMinMaxEncode() {
     this->GenerateData(1000);
@@ -269,13 +321,13 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
 
     auto statistics2 =
         MakeStatistics<TestType>(this->schema_.Column(0), encoded_min, encoded_max,
-                                 this->values_.size(), 0, 0, true);
+                                 this->values_.size(), 0, 0, true, true, true);
 
     auto statistics3 = MakeStatistics<TestType>(this->schema_.Column(0));
     std::vector<uint8_t> valid_bits(
-        BitUtil::BytesForBits(static_cast<uint32_t>(this->values_.size())) + 1, 255);
+        bit_util::BytesForBits(static_cast<uint32_t>(this->values_.size())) + 1, 255);
     statistics3->UpdateSpaced(this->values_ptr_, valid_bits.data(), 0,
-                              this->values_.size(), 0);
+                              this->values_.size(), this->values_.size(), 0);
     std::string encoded_min_spaced = statistics3->EncodeMin();
     std::string encoded_max_spaced = statistics3->EncodeMax();
 
@@ -297,8 +349,12 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
     ASSERT_EQ(this->values_.size(), statistics->num_values());
 
     statistics->Reset();
+    ASSERT_TRUE(statistics->HasNullCount());
+    ASSERT_FALSE(statistics->HasMinMax());
+    ASSERT_FALSE(statistics->HasDistinctCount());
     ASSERT_EQ(0, statistics->null_count());
     ASSERT_EQ(0, statistics->num_values());
+    ASSERT_EQ(0, statistics->distinct_count());
     ASSERT_EQ("", statistics->EncodeMin());
     ASSERT_EQ("", statistics->EncodeMax());
   }
@@ -325,6 +381,24 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
     ASSERT_EQ(this->values_.size() * 2 - num_null[0] - num_null[1], total->num_values());
     ASSERT_EQ(total->min(), std::min(statistics1->min(), statistics2->min()));
     ASSERT_EQ(total->max(), std::max(statistics1->max(), statistics2->max()));
+  }
+
+  void TestEquals() {
+    const auto n_values = 1;
+    auto statistics_have_minmax1 = MakeStatistics<TestType>(this->schema_.Column(0));
+    const auto seed1 = 1;
+    this->GenerateData(n_values, seed1);
+    statistics_have_minmax1->Update(this->values_ptr_, this->values_.size(), 0);
+    auto statistics_have_minmax2 = MakeStatistics<TestType>(this->schema_.Column(0));
+    const auto seed2 = 9999;
+    this->GenerateData(n_values, seed2);
+    statistics_have_minmax2->Update(this->values_ptr_, this->values_.size(), 0);
+    auto statistics_no_minmax = MakeStatistics<TestType>(this->schema_.Column(0));
+
+    ASSERT_EQ(true, statistics_have_minmax1->Equals(*statistics_have_minmax1));
+    ASSERT_EQ(true, statistics_no_minmax->Equals(*statistics_no_minmax));
+    ASSERT_EQ(false, statistics_have_minmax1->Equals(*statistics_have_minmax2));
+    ASSERT_EQ(false, statistics_have_minmax1->Equals(*statistics_no_minmax));
   }
 
   void TestFullRoundtrip(int64_t num_values, int64_t null_count) {
@@ -354,8 +428,8 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
                                batch_num_values - batch_null_count, 1);
       auto beg = this->values_.begin() + i * num_values / 2;
       auto end = beg + batch_num_values;
-      std::vector<T> batch = GetDeepCopy(std::vector<T>(beg, end));
-      T* batch_values_ptr = GetValuesPointer(batch);
+      std::vector<c_type> batch = GetDeepCopy(std::vector<c_type>(beg, end));
+      c_type* batch_values_ptr = GetValuesPointer(batch);
       column_writer->WriteBatch(batch_num_values, definition_levels.data(), nullptr,
                                 batch_values_ptr);
       DeepFree(batch);
@@ -364,8 +438,7 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
     row_group_writer->Close();
     file_writer->Close();
 
-    std::shared_ptr<Buffer> buffer;
-    ASSERT_OK(sink->Finish(&buffer));
+    ASSERT_OK_AND_ASSIGN(auto buffer, sink->Finish());
     auto source = std::make_shared<::arrow::io::BufferReader>(buffer);
     auto file_reader = ParquetFileReader::Open(source);
     auto rg_reader = file_reader->RowGroup(0);
@@ -373,10 +446,11 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
     if (!column_chunk->is_stats_set()) return;
     std::shared_ptr<Statistics> stats = column_chunk->statistics();
     // check values after serialization + deserialization
-    ASSERT_EQ(null_count, stats->null_count());
-    ASSERT_EQ(num_values - null_count, stats->num_values());
-    ASSERT_EQ(expected_stats->EncodeMin(), stats->EncodeMin());
-    ASSERT_EQ(expected_stats->EncodeMax(), stats->EncodeMax());
+    EXPECT_EQ(null_count, stats->null_count());
+    EXPECT_EQ(num_values - null_count, stats->num_values());
+    EXPECT_TRUE(expected_stats->HasMinMax());
+    EXPECT_EQ(expected_stats->EncodeMin(), stats->EncodeMin());
+    EXPECT_EQ(expected_stats->EncodeMax(), stats->EncodeMax());
   }
 };
 
@@ -470,7 +544,7 @@ void TestStatistics<ByteArrayType>::TestMinMaxEncode() {
 
   auto statistics2 =
       MakeStatistics<ByteArrayType>(this->schema_.Column(0), encoded_min, encoded_max,
-                                    this->values_.size(), 0, 0, true);
+                                    this->values_.size(), 0, 0, true, true, true);
 
   ASSERT_EQ(encoded_min, statistics2->EncodeMin());
   ASSERT_EQ(encoded_max, statistics2->EncodeMax());
@@ -478,10 +552,10 @@ void TestStatistics<ByteArrayType>::TestMinMaxEncode() {
   ASSERT_EQ(statistics1->max(), statistics2->max());
 }
 
-using TestTypes = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType,
-                                   ByteArrayType, FLBAType, BooleanType>;
+using Types = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType, ByteArrayType,
+                               FLBAType, BooleanType>;
 
-TYPED_TEST_CASE(TestStatistics, TestTypes);
+TYPED_TEST_SUITE(TestStatistics, Types);
 
 TYPED_TEST(TestStatistics, MinMaxEncode) {
   this->SetUpSchema(Repetition::REQUIRED);
@@ -491,6 +565,11 @@ TYPED_TEST(TestStatistics, MinMaxEncode) {
 TYPED_TEST(TestStatistics, Reset) {
   this->SetUpSchema(Repetition::OPTIONAL);
   ASSERT_NO_FATAL_FAILURE(this->TestReset());
+}
+
+TYPED_TEST(TestStatistics, Equals) {
+  this->SetUpSchema(Repetition::OPTIONAL);
+  ASSERT_NO_FATAL_FAILURE(this->TestEquals());
 }
 
 TYPED_TEST(TestStatistics, FullRoundtrip) {
@@ -505,11 +584,208 @@ class TestNumericStatistics : public TestStatistics<TestType> {};
 
 using NumericTypes = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType>;
 
-TYPED_TEST_CASE(TestNumericStatistics, NumericTypes);
+TYPED_TEST_SUITE(TestNumericStatistics, NumericTypes);
 
 TYPED_TEST(TestNumericStatistics, Merge) {
   this->SetUpSchema(Repetition::OPTIONAL);
   ASSERT_NO_FATAL_FAILURE(this->TestMerge());
+}
+
+TYPED_TEST(TestNumericStatistics, Equals) {
+  this->SetUpSchema(Repetition::OPTIONAL);
+  ASSERT_NO_FATAL_FAILURE(this->TestEquals());
+}
+
+template <typename TestType>
+class TestStatisticsHasFlag : public TestStatistics<TestType> {
+ public:
+  void SetUp() override {
+    TestStatistics<TestType>::SetUp();
+    this->SetUpSchema(Repetition::OPTIONAL);
+  }
+
+  std::optional<int64_t> MergeDistinctCount(
+      std::optional<int64_t> initial,
+      const std::vector<std::optional<int64_t>>& subsequent) {
+    EncodedStatistics encoded_statistics;
+    if (initial) {
+      encoded_statistics.has_distinct_count = true;
+      encoded_statistics.distinct_count = *initial;
+    }
+    std::shared_ptr<TypedStatistics<TestType>> statistics =
+        std::dynamic_pointer_cast<TypedStatistics<TestType>>(
+            Statistics::Make(this->schema_.Column(0), &encoded_statistics,
+                             /*num_values=*/1000));
+    for (const auto& distinct_count : subsequent) {
+      EncodedStatistics next_encoded_statistics;
+      if (distinct_count) {
+        next_encoded_statistics.has_distinct_count = true;
+        next_encoded_statistics.distinct_count = *distinct_count;
+      }
+      std::shared_ptr<TypedStatistics<TestType>> next_statistics =
+          std::dynamic_pointer_cast<TypedStatistics<TestType>>(
+              Statistics::Make(this->schema_.Column(0), &next_encoded_statistics,
+                               /*num_values=*/1000));
+      statistics->Merge(*next_statistics);
+    }
+    EncodedStatistics final_statistics = statistics->Encode();
+    EXPECT_EQ(statistics->HasDistinctCount(), final_statistics.has_distinct_count);
+    if (statistics->HasDistinctCount()) {
+      EXPECT_EQ(statistics->distinct_count(), final_statistics.distinct_count);
+      return statistics->distinct_count();
+    }
+    return std::nullopt;
+  }
+
+  std::shared_ptr<TypedStatistics<TestType>> MergedStatistics(
+      const TypedStatistics<TestType>& stats1, const TypedStatistics<TestType>& stats2) {
+    auto chunk_statistics = MakeStatistics<TestType>(this->schema_.Column(0));
+    chunk_statistics->Merge(stats1);
+    chunk_statistics->Merge(stats2);
+    return chunk_statistics;
+  }
+
+  void VerifyMergedStatistics(
+      const TypedStatistics<TestType>& stats1, const TypedStatistics<TestType>& stats2,
+      const std::function<void(TypedStatistics<TestType>*)>& test_fn) {
+    ASSERT_NO_FATAL_FAILURE(test_fn(MergedStatistics(stats1, stats2).get()));
+    ASSERT_NO_FATAL_FAILURE(test_fn(MergedStatistics(stats2, stats1).get()));
+  }
+
+  // Distinct count should set to false when Merge is called, unless one of the statistics
+  // has a zero count.
+  void TestMergeDistinctCount() {
+    // Sanity tests.
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(std::nullopt, {}));
+    ASSERT_EQ(10, MergeDistinctCount(10, {}));
+
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(std::nullopt, {0}));
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(std::nullopt, {10, 0}));
+    ASSERT_EQ(10, MergeDistinctCount(10, {0, 0}));
+    ASSERT_EQ(10, MergeDistinctCount(0, {10, 0}));
+    ASSERT_EQ(10, MergeDistinctCount(0, {0, 10}));
+    ASSERT_EQ(10, MergeDistinctCount(0, {0, 10, 0}));
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(10, {0, 10}));
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(10, {0, std::nullopt}));
+    ASSERT_EQ(std::nullopt, MergeDistinctCount(0, {std::nullopt, 0}));
+  }
+
+  // If all values in a page are null or nan, its stats should not set min-max.
+  // Merging its stats with another page having good min-max stats should not
+  // drop the valid min-max from the latter page.
+  void TestMergeMinMax() {
+    this->GenerateData(1000);
+    // Create a statistics object without min-max.
+    std::shared_ptr<TypedStatistics<TestType>> statistics1;
+    {
+      statistics1 = MakeStatistics<TestType>(this->schema_.Column(0));
+      statistics1->Update(this->values_ptr_, /*num_values=*/0,
+                          /*null_count=*/this->values_.size());
+      auto encoded_stats1 = statistics1->Encode();
+      EXPECT_FALSE(statistics1->HasMinMax());
+      EXPECT_FALSE(encoded_stats1.has_min);
+      EXPECT_FALSE(encoded_stats1.has_max);
+    }
+    // Create a statistics object with min-max.
+    std::shared_ptr<TypedStatistics<TestType>> statistics2;
+    {
+      statistics2 = MakeStatistics<TestType>(this->schema_.Column(0));
+      statistics2->Update(this->values_ptr_, this->values_.size(), 0);
+      auto encoded_stats2 = statistics2->Encode();
+      EXPECT_TRUE(statistics2->HasMinMax());
+      EXPECT_TRUE(encoded_stats2.has_min);
+      EXPECT_TRUE(encoded_stats2.has_max);
+    }
+    VerifyMergedStatistics(*statistics1, *statistics2,
+                           [](TypedStatistics<TestType>* merged_statistics) {
+                             EXPECT_TRUE(merged_statistics->HasMinMax());
+                             EXPECT_TRUE(merged_statistics->Encode().has_min);
+                             EXPECT_TRUE(merged_statistics->Encode().has_max);
+                           });
+  }
+
+  // Default statistics should have null_count even if no nulls is written.
+  // However, if statistics is created from thrift message, it might not
+  // have null_count. Merging statistics from such page will result in an
+  // invalid null_count as well.
+  void TestMergeNullCount() {
+    this->GenerateData(/*num_values=*/1000);
+
+    // Page should have null-count even if no nulls
+    std::shared_ptr<TypedStatistics<TestType>> statistics1;
+    {
+      statistics1 = MakeStatistics<TestType>(this->schema_.Column(0));
+      statistics1->Update(this->values_ptr_, /*num_values=*/this->values_.size(),
+                          /*null_count=*/0);
+      auto encoded_stats1 = statistics1->Encode();
+      EXPECT_TRUE(statistics1->HasNullCount());
+      EXPECT_EQ(0, statistics1->null_count());
+      EXPECT_TRUE(statistics1->Encode().has_null_count);
+    }
+    // Merge with null-count should also have null count
+    VerifyMergedStatistics(*statistics1, *statistics1,
+                           [](TypedStatistics<TestType>* merged_statistics) {
+                             EXPECT_TRUE(merged_statistics->HasNullCount());
+                             EXPECT_EQ(0, merged_statistics->null_count());
+                             auto encoded = merged_statistics->Encode();
+                             EXPECT_TRUE(encoded.has_null_count);
+                             EXPECT_EQ(0, encoded.null_count);
+                           });
+
+    // When loaded from thrift, might not have null count.
+    std::shared_ptr<TypedStatistics<TestType>> statistics2;
+    {
+      EncodedStatistics encoded_statistics2;
+      encoded_statistics2.has_null_count = false;
+      statistics2 = std::dynamic_pointer_cast<TypedStatistics<TestType>>(
+          Statistics::Make(this->schema_.Column(0), &encoded_statistics2,
+                           /*num_values=*/1000));
+      EXPECT_FALSE(statistics2->Encode().has_null_count);
+      EXPECT_FALSE(statistics2->HasNullCount());
+    }
+
+    // Merge without null-count should not have null count
+    VerifyMergedStatistics(*statistics1, *statistics2,
+                           [](TypedStatistics<TestType>* merged_statistics) {
+                             EXPECT_FALSE(merged_statistics->HasNullCount());
+                             EXPECT_FALSE(merged_statistics->Encode().has_null_count);
+                           });
+  }
+
+  // statistics.all_null_value is used to build the page index.
+  // If statistics doesn't have null count, all_null_value should be false.
+  void TestMissingNullCount() {
+    EncodedStatistics encoded_statistics;
+    encoded_statistics.has_null_count = false;
+    auto statistics = Statistics::Make(this->schema_.Column(0), &encoded_statistics,
+                                       /*num_values=*/1000);
+    auto typed_stats = std::dynamic_pointer_cast<TypedStatistics<TestType>>(statistics);
+    EXPECT_FALSE(typed_stats->HasNullCount());
+    auto encoded = typed_stats->Encode();
+    EXPECT_FALSE(encoded.all_null_value);
+    EXPECT_FALSE(encoded.has_null_count);
+    EXPECT_FALSE(encoded.has_distinct_count);
+    EXPECT_FALSE(encoded.has_min);
+    EXPECT_FALSE(encoded.has_max);
+  }
+};
+
+TYPED_TEST_SUITE(TestStatisticsHasFlag, Types);
+
+TYPED_TEST(TestStatisticsHasFlag, MergeDistinctCount) {
+  ASSERT_NO_FATAL_FAILURE(this->TestMergeDistinctCount());
+}
+
+TYPED_TEST(TestStatisticsHasFlag, MergeNullCount) {
+  ASSERT_NO_FATAL_FAILURE(this->TestMergeNullCount());
+}
+
+TYPED_TEST(TestStatisticsHasFlag, MergeMinMax) {
+  ASSERT_NO_FATAL_FAILURE(this->TestMergeMinMax());
+}
+
+TYPED_TEST(TestStatisticsHasFlag, MissingNullCount) {
+  ASSERT_NO_FATAL_FAILURE(this->TestMissingNullCount());
 }
 
 // Helper for basic statistics tests below
@@ -517,8 +793,8 @@ void AssertStatsSet(const ApplicationVersion& version,
                     std::shared_ptr<parquet::WriterProperties> props,
                     const ColumnDescriptor* column, bool expected_is_set) {
   auto metadata_builder = ColumnChunkMetaDataBuilder::Make(props, column);
-  auto column_chunk =
-      ColumnChunkMetaData::Make(metadata_builder->contents(), column, &version);
+  auto column_chunk = ColumnChunkMetaData::Make(metadata_builder->contents(), column,
+                                                default_reader_properties(), &version);
   EncodedStatistics stats;
   stats.set_is_signed(false);
   metadata_builder->SetStatistics(stats);
@@ -602,10 +878,29 @@ TEST(CorrectStatistics, Basics) {
 // Test SortOrder class
 static const int NUM_VALUES = 10;
 
-template <typename TestType>
+template <typename T>
+struct RebindLogical {
+  using ParquetType = T;
+  using CType = typename T::c_type;
+};
+
+template <>
+struct RebindLogical<Float16LogicalType> {
+  using ParquetType = FLBAType;
+  using CType = ParquetType::c_type;
+};
+
+template <typename T>
 class TestStatisticsSortOrder : public ::testing::Test {
  public:
-  typedef typename TestType::c_type T;
+  using TestType = typename RebindLogical<T>::ParquetType;
+  using c_type = typename TestType::c_type;
+
+  void SetUp() override {
+#ifndef ARROW_WITH_SNAPPY
+    GTEST_SKIP() << "Test requires Snappy compression";
+#endif
+  }
 
   void AddNodes(std::string name) {
     fields_.push_back(schema::PrimitiveNode::Make(
@@ -647,27 +942,27 @@ class TestStatisticsSortOrder : public ::testing::Test {
   }
 
   void VerifyParquetStats() {
-    std::shared_ptr<Buffer> pbuffer;
-    ASSERT_OK(parquet_sink_->Finish(&pbuffer));
+    ASSERT_OK_AND_ASSIGN(auto pbuffer, parquet_sink_->Finish());
 
     // Create a ParquetReader instance
     std::unique_ptr<parquet::ParquetFileReader> parquet_reader =
         parquet::ParquetFileReader::Open(
-            std::make_shared<arrow::io::BufferReader>(pbuffer));
+            std::make_shared<::arrow::io::BufferReader>(pbuffer));
 
     // Get the File MetaData
     std::shared_ptr<parquet::FileMetaData> file_metadata = parquet_reader->metadata();
     std::shared_ptr<parquet::RowGroupMetaData> rg_metadata = file_metadata->RowGroup(0);
     for (int i = 0; i < static_cast<int>(fields_.size()); i++) {
+      ARROW_SCOPED_TRACE("Statistics for field #", i);
       std::shared_ptr<parquet::ColumnChunkMetaData> cc_metadata =
           rg_metadata->ColumnChunk(i);
-      ASSERT_EQ(stats_[i].min(), cc_metadata->statistics()->EncodeMin());
-      ASSERT_EQ(stats_[i].max(), cc_metadata->statistics()->EncodeMax());
+      EXPECT_EQ(stats_[i].min(), cc_metadata->statistics()->EncodeMin());
+      EXPECT_EQ(stats_[i].max(), cc_metadata->statistics()->EncodeMax());
     }
   }
 
  protected:
-  std::vector<T> values_;
+  std::vector<c_type> values_;
   std::vector<uint8_t> values_buf_;
   std::vector<schema::NodePtr> fields_;
   std::shared_ptr<schema::GroupNode> schema_;
@@ -676,7 +971,7 @@ class TestStatisticsSortOrder : public ::testing::Test {
 };
 
 using CompareTestTypes = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType,
-                                          ByteArrayType, FLBAType>;
+                                          ByteArrayType, FLBAType, Float16LogicalType>;
 
 // TYPE::INT32
 template <>
@@ -697,13 +992,13 @@ void TestStatisticsSortOrder<Int32Type>::SetValues() {
 
   // Write UINT32 min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(c_type)));
 
   // Write INT32 min/max values
   stats_[1]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::INT64
@@ -725,13 +1020,13 @@ void TestStatisticsSortOrder<Int64Type>::SetValues() {
 
   // Write UINT64 min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(c_type)));
 
   // Write INT64 min/max values
   stats_[1]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::FLOAT
@@ -744,8 +1039,8 @@ void TestStatisticsSortOrder<FloatType>::SetValues() {
 
   // Write Float min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::DOUBLE
@@ -758,8 +1053,8 @@ void TestStatisticsSortOrder<DoubleType>::SetValues() {
 
   // Write Double min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::ByteArray
@@ -775,8 +1070,8 @@ void TestStatisticsSortOrder<ByteArrayType>::SetValues() {
   int max_byte_array_len = 10;
   size_t nbytes = NUM_VALUES * max_byte_array_len;
   values_buf_.resize(nbytes);
-  std::vector<std::string> vals = {u8"c123", u8"b123", u8"a123", u8"d123", u8"e123",
-                                   u8"f123", u8"g123", u8"h123", u8"i123", u8"ü123"};
+  std::vector<std::string> vals = {"c123", "b123", "a123", "d123", "e123",
+                                   "f123", "g123", "h123", "i123", "ü123"};
 
   uint8_t* base = &values_buf_.data()[0];
   for (int i = 0; i < NUM_VALUES; i++) {
@@ -823,7 +1118,40 @@ void TestStatisticsSortOrder<FLBAType>::SetValues() {
       .set_max(std::string(reinterpret_cast<const char*>(&vals[8][0]), FLBA_LENGTH));
 }
 
-TYPED_TEST_CASE(TestStatisticsSortOrder, CompareTestTypes);
+template <>
+void TestStatisticsSortOrder<Float16LogicalType>::AddNodes(std::string name) {
+  auto node =
+      schema::PrimitiveNode::Make(name, Repetition::REQUIRED, LogicalType::Float16(),
+                                  Type::FIXED_LEN_BYTE_ARRAY, sizeof(uint16_t));
+  fields_.push_back(std::move(node));
+}
+
+template <>
+void TestStatisticsSortOrder<Float16LogicalType>::SetValues() {
+  constexpr int kValueLen = 2;
+  constexpr int kNumBytes = NUM_VALUES * kValueLen;
+
+  const Float16 f16_vals[NUM_VALUES] = {
+      Float16::FromFloat(+2.0f), Float16::FromFloat(-4.0f), Float16::FromFloat(+4.0f),
+      Float16::FromFloat(-2.0f), Float16::FromFloat(-1.0f), Float16::FromFloat(+3.0f),
+      Float16::FromFloat(+1.0f), Float16::FromFloat(-5.0f), Float16::FromFloat(+0.0f),
+      Float16::FromFloat(-3.0f),
+  };
+
+  values_buf_.resize(kNumBytes);
+  uint8_t* ptr = values_buf_.data();
+  for (int i = 0; i < NUM_VALUES; ++i) {
+    f16_vals[i].ToLittleEndian(ptr);
+    values_[i].ptr = ptr;
+    ptr += kValueLen;
+  }
+
+  stats_[0]
+      .set_min(std::string(reinterpret_cast<const char*>(values_[7].ptr), kValueLen))
+      .set_max(std::string(reinterpret_cast<const char*>(values_[2].ptr), kValueLen));
+}
+
+TYPED_TEST_SUITE(TestStatisticsSortOrder, CompareTestTypes);
 
 TYPED_TEST(TestStatisticsSortOrder, MinMax) {
   this->AddNodes("Column ");
@@ -832,14 +1160,16 @@ TYPED_TEST(TestStatisticsSortOrder, MinMax) {
   ASSERT_NO_FATAL_FAILURE(this->VerifyParquetStats());
 }
 
-TEST(TestByteArrayStatisticsFromArrow, Basics) {
-  // Part of ARROW-3246. Replicating TestStatisticsSortOrder test but via Arrow
+template <typename ArrowType>
+void TestByteArrayStatisticsFromArrow() {
+  using TypeTraits = ::arrow::TypeTraits<ArrowType>;
+  using ArrayType = typename TypeTraits::ArrayType;
 
-  auto values = ArrayFromJSON(::arrow::utf8(),
-                              u8"[\"c123\", \"b123\", \"a123\", null, "
+  auto values = ArrayFromJSON(TypeTraits::type_singleton(),
+                              "[\"c123\", \"b123\", \"a123\", null, "
                               "null, \"f123\", \"g123\", \"h123\", \"i123\", \"ü123\"]");
 
-  const auto& typed_values = static_cast<const ::arrow::BinaryArray&>(*values);
+  const auto& typed_values = static_cast<const ArrayType&>(*values);
 
   NodePtr node = PrimitiveNode::Make("field", Repetition::REQUIRED, Type::BYTE_ARRAY,
                                      ConvertedType::UTF8);
@@ -849,6 +1179,16 @@ TEST(TestByteArrayStatisticsFromArrow, Basics) {
 
   ASSERT_EQ(ByteArray(typed_values.GetView(2)), stats->min());
   ASSERT_EQ(ByteArray(typed_values.GetView(9)), stats->max());
+  ASSERT_EQ(2, stats->null_count());
+}
+
+TEST(TestByteArrayStatisticsFromArrow, StringType) {
+  // Part of ARROW-3246. Replicating TestStatisticsSortOrder test but via Arrow
+  TestByteArrayStatisticsFromArrow<::arrow::StringType>();
+}
+
+TEST(TestByteArrayStatisticsFromArrow, LargeStringType) {
+  TestByteArrayStatisticsFromArrow<::arrow::LargeStringType>();
 }
 
 // Ensure UNKNOWN sort order is handled properly
@@ -861,13 +1201,12 @@ TEST_F(TestStatisticsSortOrderFLBA, UnknownSortOrder) {
   this->SetUpSchema();
   this->WriteParquet();
 
-  std::shared_ptr<Buffer> pbuffer;
-  PARQUET_THROW_NOT_OK(parquet_sink_->Finish(&pbuffer));
+  ASSERT_OK_AND_ASSIGN(auto pbuffer, parquet_sink_->Finish());
 
   // Create a ParquetReader instance
   std::unique_ptr<parquet::ParquetFileReader> parquet_reader =
       parquet::ParquetFileReader::Open(
-          std::make_shared<arrow::io::BufferReader>(pbuffer));
+          std::make_shared<::arrow::io::BufferReader>(pbuffer));
   // Get the File MetaData
   std::shared_ptr<parquet::FileMetaData> file_metadata = parquet_reader->metadata();
   std::shared_ptr<parquet::RowGroupMetaData> rg_metadata = file_metadata->RowGroup(0);
@@ -877,158 +1216,347 @@ TEST_F(TestStatisticsSortOrderFLBA, UnknownSortOrder) {
   ASSERT_FALSE(cc_metadata->is_stats_set());
 }
 
-// PARQUET-1225: Float NaN values may lead to incorrect filtering under certain
-// circumstances
-TEST(TestStatisticsSortOrderFloatNaN, NaNValues) {
-  constexpr int NUM_VALUES = 10;
-  NodePtr node = PrimitiveNode::Make("nan_float", Repetition::OPTIONAL, Type::FLOAT);
-  ColumnDescriptor descr(node, 1, 1);
-  float values[NUM_VALUES] = {std::nanf(""), -4.0f, -3.0f, -2.0f, -1.0f,
-                              std::nanf(""), 1.0f,  2.0f,  3.0f,  std::nanf("")};
-  float nan_values[NUM_VALUES];
-  for (int i = 0; i < NUM_VALUES; i++) {
-    nan_values[i] = std::nanf("");
-  }
-
-  // Test values
-  auto nan_stats = MakeStatistics<FloatType>(&descr);
-  nan_stats->Update(&values[0], NUM_VALUES, 0);
-  float min = nan_stats->min();
-  float max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test all NaNs
-  auto all_nan_stats = MakeStatistics<FloatType>(&descr);
-  all_nan_stats->Update(&nan_values[0], NUM_VALUES, 0);
-  min = all_nan_stats->min();
-  max = all_nan_stats->max();
-  ASSERT_TRUE(std::isnan(min));
-  ASSERT_TRUE(std::isnan(max));
-
-  // Test values followed by all NaNs
-  nan_stats->Update(&nan_values[0], NUM_VALUES, 0);
-  min = nan_stats->min();
-  max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test all NaNs followed by values
-  all_nan_stats->Update(&values[0], NUM_VALUES, 0);
-  min = all_nan_stats->min();
-  max = all_nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test values followed by all NaNs followed by values
-  nan_stats->Update(&values[0], NUM_VALUES, 0);
-  min = nan_stats->min();
-  max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
+template <typename T>
+static std::string EncodeValue(const T& val) {
+  return std::string(reinterpret_cast<const char*>(&val), sizeof(val));
+}
+static std::string EncodeValue(const FLBA& val, int length = sizeof(uint16_t)) {
+  return std::string(reinterpret_cast<const char*>(val.ptr), length);
 }
 
-// PARQUET-1225: Float NaN values may lead to incorrect filtering under certain
-// circumstances
-TEST(TestStatisticsSortOrderFloatNaN, NaNValuesSpaced) {
-  constexpr int NUM_VALUES = 10;
-  NodePtr node = PrimitiveNode::Make("nan_float", Repetition::OPTIONAL, Type::FLOAT);
-  ColumnDescriptor descr(node, 1, 1);
-  float values[NUM_VALUES] = {std::nanf(""), -4.0f, -3.0f, -2.0f, -1.0f,
-                              std::nanf(""), 1.0f,  2.0f,  3.0f,  std::nanf("")};
-  float nan_values[NUM_VALUES];
-  for (int i = 0; i < NUM_VALUES; i++) {
-    nan_values[i] = std::nanf("");
-  }
-  std::vector<uint8_t> valid_bits(BitUtil::BytesForBits(NUM_VALUES) + 1, 255);
-
-  // Test values
-  auto nan_stats = MakeStatistics<FloatType>(&descr);
-  nan_stats->UpdateSpaced(&values[0], valid_bits.data(), 0, NUM_VALUES, 0);
-  float min = nan_stats->min();
-  float max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test all NaNs
-  auto all_nan_stats = MakeStatistics<FloatType>(&descr);
-  all_nan_stats->UpdateSpaced(&nan_values[0], valid_bits.data(), 0, NUM_VALUES, 0);
-  min = all_nan_stats->min();
-  max = all_nan_stats->max();
-  ASSERT_TRUE(std::isnan(min));
-  ASSERT_TRUE(std::isnan(max));
-
-  // Test values followed by all NaNs
-  nan_stats->UpdateSpaced(&nan_values[0], valid_bits.data(), 0, NUM_VALUES, 0);
-  min = nan_stats->min();
-  max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test all NaNs followed by values
-  all_nan_stats->UpdateSpaced(&values[0], valid_bits.data(), 0, NUM_VALUES, 0);
-  min = all_nan_stats->min();
-  max = all_nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
-
-  // Test values followed by all NaNs followed by values
-  nan_stats->UpdateSpaced(&values[0], valid_bits.data(), 0, NUM_VALUES, 0);
-  min = nan_stats->min();
-  max = nan_stats->max();
-  ASSERT_EQ(min, -4.0f);
-  ASSERT_EQ(max, 3.0f);
+template <typename Stats, typename Array, typename T = typename Array::value_type>
+void AssertMinMaxAre(Stats stats, const Array& values, T expected_min, T expected_max) {
+  stats->Update(values.data(), values.size(), 0);
+  ASSERT_TRUE(stats->HasMinMax());
+  EXPECT_EQ(stats->EncodeMin(), EncodeValue(expected_min));
+  EXPECT_EQ(stats->EncodeMax(), EncodeValue(expected_max));
 }
 
-// NaN double values may lead to incorrect filtering under certain circumstances
-TEST(TestStatisticsSortOrderDoubleNaN, NaNValues) {
-  constexpr int NUM_VALUES = 10;
-  NodePtr node = PrimitiveNode::Make("nan_double", Repetition::OPTIONAL, Type::DOUBLE);
-  ColumnDescriptor descr(node, 1, 1);
-
-  auto nan_stats = MakeStatistics<DoubleType>(&descr);
-  double values[NUM_VALUES] = {std::nan(""), std::nan(""), -3.0, -2.0, -1.0,
-                               0.0,          1.0,          2.0,  3.0,  4.0};
-  nan_stats->Update(values, NUM_VALUES, 0);
-  ASSERT_EQ(nan_stats->min(), -3.0);
-  ASSERT_EQ(nan_stats->max(), 4.0);
+template <typename Stats, typename Array, typename T = typename Stats::T>
+void AssertMinMaxAre(Stats stats, const Array& values, const uint8_t* valid_bitmap,
+                     T expected_min, T expected_max) {
+  auto n_values = values.size();
+  auto null_count = ::arrow::internal::CountSetBits(valid_bitmap, n_values, 0);
+  auto non_null_count = n_values - null_count;
+  stats->UpdateSpaced(values.data(), valid_bitmap, 0, non_null_count + null_count,
+                      non_null_count, null_count);
+  ASSERT_TRUE(stats->HasMinMax());
+  EXPECT_EQ(stats->EncodeMin(), EncodeValue(expected_min));
+  EXPECT_EQ(stats->EncodeMax(), EncodeValue(expected_max));
 }
 
-template <typename ParquetType>
-void CheckNegativeZeroStats() {
-  using T = typename ParquetType::c_type;
+template <typename Stats, typename Array>
+void AssertUnsetMinMax(Stats stats, const Array& values) {
+  stats->Update(values.data(), values.size(), 0);
+  ASSERT_FALSE(stats->HasMinMax());
+}
 
-  constexpr int NUM_VALUES = 2;
-  NodePtr node = PrimitiveNode::Make("f", Repetition::OPTIONAL, ParquetType::type_num);
-  ColumnDescriptor descr(node, 1, 1);
-  T zero = 0;
+template <typename Stats, typename Array>
+void AssertUnsetMinMax(Stats stats, const Array& values, const uint8_t* valid_bitmap) {
+  auto n_values = values.size();
+  auto null_count = ::arrow::internal::CountSetBits(valid_bitmap, n_values, 0);
+  auto non_null_count = n_values - null_count;
+  stats->UpdateSpaced(values.data(), valid_bitmap, 0, non_null_count + null_count,
+                      non_null_count, null_count);
+  ASSERT_FALSE(stats->HasMinMax());
+}
 
-  // Test that the min and max are always unsigned
-  {
-    T values[NUM_VALUES] = {-zero, zero};
-    auto stats = MakeStatistics<ParquetType>(&descr);
-    stats->Update(values, NUM_VALUES, 0);
-    // The min and max are unsigned
-    ASSERT_FALSE(std::signbit(stats->min()));
-    ASSERT_FALSE(std::signbit(stats->max()));
-  }
+template <typename ParquetType, typename T = typename ParquetType::c_type>
+void CheckExtrema() {
+  using UT = typename std::make_unsigned<T>::type;
+
+  const T smin = std::numeric_limits<T>::min();
+  const T smax = std::numeric_limits<T>::max();
+  const T umin = SafeCopy<T>(std::numeric_limits<UT>::min());
+  const T umax = SafeCopy<T>(std::numeric_limits<UT>::max());
+
+  constexpr int kNumValues = 8;
+  std::array<T, kNumValues> values{0,    smin,     smax,     umin,
+                                   umax, smin + 1, smax - 1, umax - 1};
+
+  NodePtr unsigned_node = PrimitiveNode::Make(
+      "uint", Repetition::OPTIONAL,
+      LogicalType::Int(sizeof(T) * CHAR_BIT, false /*signed*/), ParquetType::type_num);
+  ColumnDescriptor unsigned_descr(unsigned_node, 1, 1);
+  NodePtr signed_node = PrimitiveNode::Make(
+      "int", Repetition::OPTIONAL,
+      LogicalType::Int(sizeof(T) * CHAR_BIT, true /*signed*/), ParquetType::type_num);
+  ColumnDescriptor signed_descr(signed_node, 1, 1);
 
   {
-    T values[NUM_VALUES] = {zero, -zero};
-    auto stats = MakeStatistics<ParquetType>(&descr);
-    stats->Update(values, NUM_VALUES, 0);
-    ASSERT_FALSE(std::signbit(stats->min()));
-    ASSERT_FALSE(std::signbit(stats->max()));
+    ARROW_SCOPED_TRACE("unsigned statistics: umin = ", umin, ", umax = ", umax,
+                       ", node type = ", unsigned_node->logical_type()->ToString(),
+                       ", physical type = ", unsigned_descr.physical_type(),
+                       ", sort order = ", unsigned_descr.sort_order());
+    auto unsigned_stats = MakeStatistics<ParquetType>(&unsigned_descr);
+    AssertMinMaxAre(unsigned_stats, values, umin, umax);
+  }
+  {
+    ARROW_SCOPED_TRACE("signed statistics: smin = ", smin, ", smax = ", smax,
+                       ", node type = ", signed_node->logical_type()->ToString(),
+                       ", physical type = ", signed_descr.physical_type(),
+                       ", sort order = ", signed_descr.sort_order());
+    auto signed_stats = MakeStatistics<ParquetType>(&signed_descr);
+    AssertMinMaxAre(signed_stats, values, smin, smax);
+  }
+
+  // With validity bitmap
+  std::vector<bool> is_valid = {true, false, false, false, false, true, true, true};
+  std::shared_ptr<Buffer> valid_bitmap;
+  ::arrow::BitmapFromVector(is_valid, &valid_bitmap);
+  {
+    ARROW_SCOPED_TRACE("spaced unsigned statistics: umin = ", umin, ", umax = ", umax,
+                       ", node type = ", unsigned_node->logical_type()->ToString(),
+                       ", physical type = ", unsigned_descr.physical_type(),
+                       ", sort order = ", unsigned_descr.sort_order());
+    auto unsigned_stats = MakeStatistics<ParquetType>(&unsigned_descr);
+    AssertMinMaxAre(unsigned_stats, values, valid_bitmap->data(), T{0}, umax - 1);
+  }
+  {
+    ARROW_SCOPED_TRACE("spaced signed statistics: smin = ", smin, ", smax = ", smax,
+                       ", node type = ", signed_node->logical_type()->ToString(),
+                       ", physical type = ", signed_descr.physical_type(),
+                       ", sort order = ", signed_descr.sort_order());
+    auto signed_stats = MakeStatistics<ParquetType>(&signed_descr);
+    AssertMinMaxAre(signed_stats, values, valid_bitmap->data(), smin + 1, smax - 1);
   }
 }
 
-TEST(TestStatistics, NegativeZero) {
-  // ARROW-5562
-  CheckNegativeZeroStats<FloatType>();
-  CheckNegativeZeroStats<DoubleType>();
+TEST(TestStatistic, Int32Extrema) { CheckExtrema<Int32Type>(); }
+TEST(TestStatistic, Int64Extrema) { CheckExtrema<Int64Type>(); }
 
-  // Modern computers use two's complement encoding of integers which does not
-  // allow for negative zero
+template <typename T>
+class TestFloatStatistics : public ::testing::Test {
+ public:
+  using ParquetType = typename RebindLogical<T>::ParquetType;
+  using c_type = typename ParquetType::c_type;
+
+  void Init();
+  void SetUp() override {
+    this->Init();
+    ASSERT_NE(EncodeValue(negative_zero_), EncodeValue(positive_zero_));
+  }
+
+  bool signbit(c_type val);
+  void CheckEq(const c_type& l, const c_type& r);
+  NodePtr MakeNode(const std::string& name, Repetition::type rep);
+
+  template <typename Stats, typename Values>
+  void CheckMinMaxZeroesSign(Stats stats, const Values& values) {
+    stats->Update(values.data(), values.size(), /*null_count=*/0);
+    ASSERT_TRUE(stats->HasMinMax());
+
+    this->CheckEq(stats->min(), positive_zero_);
+    ASSERT_TRUE(this->signbit(stats->min()));
+    ASSERT_EQ(stats->EncodeMin(), EncodeValue(negative_zero_));
+
+    this->CheckEq(stats->max(), positive_zero_);
+    ASSERT_FALSE(this->signbit(stats->max()));
+    ASSERT_EQ(stats->EncodeMax(), EncodeValue(positive_zero_));
+  }
+
+  // ARROW-5562: Ensure that -0.0f and 0.0f values are properly handled like in
+  // parquet-mr
+  void TestNegativeZeroes() {
+    NodePtr node = this->MakeNode("f", Repetition::OPTIONAL);
+    ColumnDescriptor descr(node, 1, 1);
+
+    {
+      std::array<c_type, 2> values{negative_zero_, positive_zero_};
+      auto stats = MakeStatistics<ParquetType>(&descr);
+      CheckMinMaxZeroesSign(stats, values);
+    }
+
+    {
+      std::array<c_type, 2> values{positive_zero_, negative_zero_};
+      auto stats = MakeStatistics<ParquetType>(&descr);
+      CheckMinMaxZeroesSign(stats, values);
+    }
+
+    {
+      std::array<c_type, 2> values{negative_zero_, negative_zero_};
+      auto stats = MakeStatistics<ParquetType>(&descr);
+      CheckMinMaxZeroesSign(stats, values);
+    }
+
+    {
+      std::array<c_type, 2> values{positive_zero_, positive_zero_};
+      auto stats = MakeStatistics<ParquetType>(&descr);
+      CheckMinMaxZeroesSign(stats, values);
+    }
+  }
+
+  // PARQUET-1225: Float NaN values may lead to incorrect min-max
+  template <typename Values>
+  void CheckNaNs(ColumnDescriptor* descr, const Values& all_nans, const Values& some_nans,
+                 const Values& other_nans, c_type min, c_type max, uint8_t valid_bitmap,
+                 uint8_t valid_bitmap_no_nans) {
+    auto some_nan_stats = MakeStatistics<ParquetType>(descr);
+    // Ingesting only nans should not yield valid min max
+    AssertUnsetMinMax(some_nan_stats, all_nans);
+    // Ingesting a mix of NaNs and non-NaNs should yield a valid min max.
+    AssertMinMaxAre(some_nan_stats, some_nans, min, max);
+    // Ingesting only nans after a valid min/max, should have no effect
+    AssertMinMaxAre(some_nan_stats, all_nans, min, max);
+
+    some_nan_stats = MakeStatistics<ParquetType>(descr);
+    AssertUnsetMinMax(some_nan_stats, all_nans, &valid_bitmap);
+    // NaNs should not pollute min max when excluded via null bitmap.
+    AssertMinMaxAre(some_nan_stats, some_nans, &valid_bitmap_no_nans, min, max);
+    // Ingesting NaNs with a null bitmap should not change the result.
+    AssertMinMaxAre(some_nan_stats, some_nans, &valid_bitmap, min, max);
+
+    // An array that doesn't start with NaN
+    auto other_stats = MakeStatistics<ParquetType>(descr);
+    AssertMinMaxAre(other_stats, other_nans, min, max);
+  }
+
+  void TestNaNs();
+
+ protected:
+  std::vector<uint8_t> data_buf_;
+  c_type positive_zero_;
+  c_type negative_zero_;
+};
+
+template <typename T>
+void TestFloatStatistics<T>::Init() {
+  positive_zero_ = c_type{};
+  negative_zero_ = -positive_zero_;
+}
+template <>
+void TestFloatStatistics<Float16LogicalType>::Init() {
+  data_buf_.resize(4);
+  (+Float16(0)).ToLittleEndian(&data_buf_[0]);
+  positive_zero_ = FLBA{&data_buf_[0]};
+  (-Float16(0)).ToLittleEndian(&data_buf_[2]);
+  negative_zero_ = FLBA{&data_buf_[2]};
+}
+
+template <typename T>
+NodePtr TestFloatStatistics<T>::MakeNode(const std::string& name, Repetition::type rep) {
+  return PrimitiveNode::Make(name, rep, ParquetType::type_num);
+}
+template <>
+NodePtr TestFloatStatistics<Float16LogicalType>::MakeNode(const std::string& name,
+                                                          Repetition::type rep) {
+  return PrimitiveNode::Make(name, rep, LogicalType::Float16(),
+                             Type::FIXED_LEN_BYTE_ARRAY, 2);
+}
+
+template <typename T>
+void TestFloatStatistics<T>::CheckEq(const c_type& l, const c_type& r) {
+  ASSERT_EQ(l, r);
+}
+template <>
+void TestFloatStatistics<Float16LogicalType>::CheckEq(const c_type& a, const c_type& b) {
+  auto l = Float16::FromLittleEndian(a.ptr);
+  auto r = Float16::FromLittleEndian(b.ptr);
+  ASSERT_EQ(l, r);
+}
+
+template <typename T>
+bool TestFloatStatistics<T>::signbit(c_type val) {
+  return std::signbit(val);
+}
+template <>
+bool TestFloatStatistics<Float16LogicalType>::signbit(c_type val) {
+  return Float16::FromLittleEndian(val.ptr).signbit();
+}
+
+template <typename T>
+void TestFloatStatistics<T>::TestNaNs() {
+  constexpr int kNumValues = 8;
+  NodePtr node = this->MakeNode("f", Repetition::OPTIONAL);
+  ColumnDescriptor descr(node, 1, 1);
+
+  constexpr c_type nan = std::numeric_limits<c_type>::quiet_NaN();
+  constexpr c_type min = -4.0f;
+  constexpr c_type max = 3.0f;
+
+  std::array<c_type, kNumValues> all_nans{nan, nan, nan, nan, nan, nan, nan, nan};
+  std::array<c_type, kNumValues> some_nans{nan, max, -3.0f, -1.0f, nan, 2.0f, min, nan};
+  std::array<c_type, kNumValues> other_nans{1.5f, max, -3.0f, -1.0f, nan, 2.0f, min, nan};
+
+  uint8_t valid_bitmap = 0x7F;  // 0b01111111
+  // NaNs excluded
+  uint8_t valid_bitmap_no_nans = 0x6E;  // 0b01101110
+
+  this->CheckNaNs(&descr, all_nans, some_nans, other_nans, min, max, valid_bitmap,
+                  valid_bitmap_no_nans);
+}
+
+struct BufferedFloat16 {
+  explicit BufferedFloat16(Float16 f16) : f16(f16) {
+    this->f16.ToLittleEndian(bytes_.data());
+  }
+  explicit BufferedFloat16(float f) : BufferedFloat16(Float16::FromFloat(f)) {}
+  const uint8_t* bytes() const { return bytes_.data(); }
+
+  Float16 f16;
+  std::array<uint8_t, 2> bytes_;
+};
+
+template <>
+void TestFloatStatistics<Float16LogicalType>::TestNaNs() {
+  constexpr int kNumValues = 8;
+
+  NodePtr node = this->MakeNode("f", Repetition::OPTIONAL);
+  ColumnDescriptor descr(node, 1, 1);
+
+  using F16 = BufferedFloat16;
+  const auto nan_f16 = F16(std::numeric_limits<Float16>::quiet_NaN());
+  const auto min_f16 = F16(-4.0f);
+  const auto max_f16 = F16(+3.0f);
+
+  const auto min = FLBA{min_f16.bytes()};
+  const auto max = FLBA{max_f16.bytes()};
+
+  std::array<F16, kNumValues> all_nans_f16 = {nan_f16, nan_f16, nan_f16, nan_f16,
+                                              nan_f16, nan_f16, nan_f16, nan_f16};
+  std::array<F16, kNumValues> some_nans_f16 = {
+      nan_f16, max_f16, F16(-3.0f), F16(-1.0f), nan_f16, F16(+2.0f), min_f16, nan_f16};
+  std::array<F16, kNumValues> other_nans_f16 = some_nans_f16;
+  other_nans_f16[0] = F16(+1.5f);  // +1.5
+
+  auto prepare_values = [](const auto& values) -> std::vector<FLBA> {
+    std::vector<FLBA> out(values.size());
+    std::transform(values.begin(), values.end(), out.begin(),
+                   [](const F16& f16) { return FLBA{f16.bytes()}; });
+    return out;
+  };
+
+  auto all_nans = prepare_values(all_nans_f16);
+  auto some_nans = prepare_values(some_nans_f16);
+  auto other_nans = prepare_values(other_nans_f16);
+
+  uint8_t valid_bitmap = 0x7F;  // 0b01111111
+  // NaNs excluded
+  uint8_t valid_bitmap_no_nans = 0x6E;  // 0b01101110
+
+  this->CheckNaNs(&descr, all_nans, some_nans, other_nans, min, max, valid_bitmap,
+                  valid_bitmap_no_nans);
+}
+
+using FloatingPointTypes = ::testing::Types<FloatType, DoubleType, Float16LogicalType>;
+
+TYPED_TEST_SUITE(TestFloatStatistics, FloatingPointTypes);
+
+TYPED_TEST(TestFloatStatistics, NegativeZeros) { this->TestNegativeZeroes(); }
+TYPED_TEST(TestFloatStatistics, NaNs) { this->TestNaNs(); }
+
+// ARROW-7376
+TEST(TestStatisticsSortOrderFloatNaN, NaNAndNullsInfiniteLoop) {
+  constexpr int kNumValues = 8;
+  NodePtr node = PrimitiveNode::Make("nan_float", Repetition::OPTIONAL, Type::FLOAT);
+  ColumnDescriptor descr(node, 1, 1);
+
+  constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+  std::array<float, kNumValues> nans_but_last{nan, nan, nan, nan, nan, nan, nan, 0.0f};
+
+  uint8_t all_but_last_valid = 0x7F;  // 0b01111111
+  auto stats = MakeStatistics<FloatType>(&descr);
+  AssertUnsetMinMax(stats, nans_but_last, &all_but_last_valid);
 }
 
 // Test statistics for binary column with UNSIGNED sort order
@@ -1058,5 +1586,47 @@ TEST(TestStatisticsSortOrderMinMax, Unsigned) {
   ASSERT_EQ(0x00, stats->EncodeMin()[0]);
   ASSERT_EQ(0x0b, stats->EncodeMax()[0]);
 }
+
+TEST(TestEncodedStatistics, CopySafe) {
+  EncodedStatistics encoded_statistics;
+  encoded_statistics.set_max("abc");
+  encoded_statistics.has_max = true;
+
+  encoded_statistics.set_min("abc");
+  encoded_statistics.has_min = true;
+
+  EncodedStatistics copy_statistics = encoded_statistics;
+  copy_statistics.set_max("abcd");
+  copy_statistics.set_min("a");
+
+  EXPECT_EQ("abc", encoded_statistics.min());
+  EXPECT_EQ("abc", encoded_statistics.max());
+}
+
+TEST(TestEncodedStatistics, ApplyStatSizeLimits) {
+  EncodedStatistics encoded_statistics;
+  encoded_statistics.set_min("a");
+  encoded_statistics.has_min = true;
+
+  encoded_statistics.set_max("abc");
+  encoded_statistics.has_max = true;
+
+  encoded_statistics.ApplyStatSizeLimits(2);
+
+  ASSERT_TRUE(encoded_statistics.has_min);
+  ASSERT_EQ("a", encoded_statistics.min());
+  ASSERT_FALSE(encoded_statistics.has_max);
+
+  NodePtr node =
+      PrimitiveNode::Make("StringColumn", Repetition::REQUIRED, Type::BYTE_ARRAY);
+  ColumnDescriptor descr(node, 0, 0);
+  std::shared_ptr<TypedStatistics<::parquet::ByteArrayType>> statistics =
+      std::dynamic_pointer_cast<TypedStatistics<::parquet::ByteArrayType>>(
+          Statistics::Make(&descr, &encoded_statistics,
+                           /*num_values=*/1000));
+  // GH-43382: HasMinMax should be false if one of min/max is not set.
+  EXPECT_FALSE(statistics->HasMinMax());
+}
+
 }  // namespace test
 }  // namespace parquet

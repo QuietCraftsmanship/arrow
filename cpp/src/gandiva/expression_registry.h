@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_TYPES_H
-#define GANDIVA_TYPES_H
+#pragma once
 
 #include <memory>
 #include <vector>
 
 #include "gandiva/arrow.h"
+#include "gandiva/function_registry.h"
 #include "gandiva/function_signature.h"
 #include "gandiva/gandiva_aliases.h"
 #include "gandiva/visibility.h"
@@ -32,13 +32,14 @@ class NativeFunction;
 class FunctionRegistry;
 /// \brief Exports types supported by Gandiva for processing.
 ///
-/// Has helper methods for clients to programatically discover
+/// Has helper methods for clients to programmatically discover
 /// data types and functions supported by Gandiva.
 class GANDIVA_EXPORT ExpressionRegistry {
  public:
   using native_func_iterator_type = const NativeFunction*;
   using func_sig_iterator_type = const FunctionSignature*;
-  ExpressionRegistry();
+  explicit ExpressionRegistry(std::shared_ptr<FunctionRegistry> function_registry =
+                                  gandiva::default_function_registry());
   ~ExpressionRegistry();
   static DataTypeVector supported_types() { return supported_types_; }
   class GANDIVA_EXPORT FunctionSignatureIterator {
@@ -63,13 +64,11 @@ class GANDIVA_EXPORT ExpressionRegistry {
 
  private:
   static DataTypeVector supported_types_;
-  static DataTypeVector InitSupportedTypes();
-  static void AddArrowTypesToVector(arrow::Type::type& type, DataTypeVector& vector);
-  std::unique_ptr<FunctionRegistry> function_registry_;
+  std::shared_ptr<FunctionRegistry> function_registry_;
 };
 
+/// \brief Get the list of all function signatures.
 GANDIVA_EXPORT
 std::vector<std::shared_ptr<FunctionSignature>> GetRegisteredFunctionSignatures();
 
 }  // namespace gandiva
-#endif  // GANDIVA_TYPES_H

@@ -21,21 +21,22 @@
 
 An implementation of Arrow targeting .NET Standard.
 
-This implementation is under development and may not be suitable for use in production environments.
+See our current [feature matrix](https://github.com/apache/arrow/blob/main/docs/source/status.rst)
+for currently available features.
 
 # Implementation
 
-- Arrow 0.11 (specification)
-- C# 7.2
-- .NET Standard 1.3
+- Arrow specification 1.0.0. (Support for reading 0.11+.)
+- C# 11
+- .NET Standard 2.0 and .NET 6.0
 - Asynchronous I/O
 - Uses modern .NET runtime features such as **Span&lt;T&gt;**, **Memory&lt;T&gt;**, **MemoryManager&lt;T&gt;**, and **System.Buffers** primitives for memory allocation, memory storage, and fast serialization.
 - Uses **Acyclic Visitor Pattern** for array types and arrays to facilitate serialization, record batch traversal, and format growth.
 
 # Known Issues
 
-- Can not read Arrow files containing dictionary batches, tensors, or tables.
-- Can not easily modify allocation strategy without implementing a custom memory pool. All allocations are currently 64-byte aligned and padded to 8-bytes.
+- Cannot read Arrow files containing tensors.
+- Cannot easily modify allocation strategy without implementing a custom memory pool. All allocations are currently 64-byte aligned and padded to 8-bytes.
 - Default memory allocation strategy uses an over-allocation strategy with pointer fixing, which results in significant memory overhead for small buffers. A buffer that requires a single byte for storage may be backed by an allocation of up to 64-bytes to satisfy alignment requirements.
 - There are currently few builder APIs available for specific array types. Arrays must be built manually with an arrow buffer builder abstraction.
 - FlatBuffer code generation is not included in the build process.
@@ -44,8 +45,6 @@ This implementation is under development and may not be suitable for use in prod
 - Throws exceptions that are non-specific to the Arrow implementation in some circumstances where it probably should (eg. does not throw ArrowException exceptions)
 - Lack of code documentation
 - Lack of usage examples
-- Lack of comprehensive unit tests
-- Lack of comprehensive benchmarks
 
 # Usage
 
@@ -57,7 +56,7 @@ This implementation is under development and may not be suitable for use in prod
 
     public static async Task<RecordBatch> ReadArrowAsync(string filename)
     {
-        using (var stream = File.OpenRead("test.arrow"))
+        using (var stream = File.OpenRead(filename))
         using (var reader = new ArrowFileReader(stream))
         {
             var recordBatch = await reader.ReadNextRecordBatchAsync();
@@ -80,7 +79,7 @@ This implementation is under development and may not be suitable for use in prod
 
 - Int8, Int16, Int32, Int64
 - UInt8, UInt16, UInt32, UInt64
-- Float, Double
+- Float, Double, Half-float (.NET 6+)
 - Binary (variable-length)
 - String (utf-8)
 - Null
@@ -90,10 +89,16 @@ This implementation is under development and may not be suitable for use in prod
 - Timestamp
 - Date32
 - Date64
+- Decimal
 - Time32
 - Time64
 - Binary (fixed-length)
 - List
+- Struct
+- Union
+- Map
+- Duration
+- Interval
 
 ### Type Metadata
 
@@ -106,30 +111,39 @@ This implementation is under development and may not be suitable for use in prod
 - File
 - Stream
 
+## IPC Format
+
+### Compression
+
+- Buffer compression and decompression is supported, but requires installing the `Apache.Arrow.Compression` package.
+  When reading compressed data, you must pass an `Apache.Arrow.Compression.CompressionCodecFactory` instance to the
+  `ArrowFileReader` or `ArrowStreamReader` constructor, and when writing compressed data a
+  `CompressionCodecFactory` must be set in the `IpcOptions`.
+  Alternatively, a custom implementation of `ICompressionCodecFactory` can be used.
+
 ## Not Implemented
 
 - Serialization
     - Exhaustive validation
-    - Dictionary Batch
-        - Can not serialize or deserialize files or streams containing dictionary batches
-    - Dictionary Encoding
-	- Schema Metadata
-	- Schema Field Metadata
+    - Run End Encoding
 - Types
     - Tensor
-    - Table
 - Arrays
-    - Struct
-    - Union
-        - Dense
-        - Sparse
-    - Half-Float
-    - Decimal
-    - Dictionary
+    - Large Arrays. There are large array types provided to help with interoperability with other libraries,
+      but these do not support buffers larger than 2 GiB and an exception will be raised if trying to import an array that is too large.
+        - Large Binary
+        - Large List
+        - Large String
+    - Views
+        - Binary
+        - List
+        - String
+        - Large Binary
+        - Large List
+        - Large String
 - Array Operations
 	- Equality / Comparison
 	- Casting
-	- Builders
 - Compute
     - There is currently no API available for a compute / kernel abstraction.
 
@@ -151,10 +165,10 @@ When building the officially released version run: (see Note below about current
 
 Which will build the final/stable package.
 
-NOTE: When building the officially released version, ensure that your `git` repository has the `origin` remote set to `https://github.com/apache/arrow.git`, which will ensure Source Link is set correctly. See https://github.com/dotnet/sourcelink/blob/master/docs/README.md for more information.
+NOTE: When building the officially released version, ensure that your `git` repository has the `origin` remote set to `https://github.com/apache/arrow.git`, which will ensure Source Link is set correctly. See https://github.com/dotnet/sourcelink/blob/main/docs/README.md for more information.
 
 There are two output artifacts:
-1. `Apache.Arrow.<version>.nupkg` - this contains the exectuable assemblies
+1. `Apache.Arrow.<version>.nupkg` - this contains the executable assemblies
 2. `Apache.Arrow.<version>.snupkg` - this contains the debug symbols files
 
 Both of these artifacts can then be uploaded to https://www.nuget.org/packages/manage/upload.
@@ -170,6 +184,10 @@ Build from the Apache Arrow project root.
 	dotnet test
 
 All build artifacts are placed in the **artifacts** folder in the project root.
+
+# Coding Style
+
+This project follows the coding style specified in [Coding Style](https://github.com/dotnet/runtime/blob/main/docs/coding-guidelines/coding-style.md).
 
 # Updating FlatBuffers code
 

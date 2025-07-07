@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_UTIL_PARALLEL_H
-#define ARROW_UTIL_PARALLEL_H
+#pragma once
 
-#include <atomic>
-#include <mutex>
-#include <thread>
+#include <utility>
 #include <vector>
 
 #include "arrow/status.h"
+#include "arrow/util/functional.h"
 #include "arrow/util/thread_pool.h"
+#include "arrow/util/vector.h"
 
 namespace arrow {
 namespace internal {
@@ -33,63 +32,73 @@ namespace internal {
 // arguments between 0 and `num_tasks - 1`, on an arbitrary number of threads.
 
 template <class FUNCTION>
-Status ParallelFor(int num_tasks, FUNCTION&& func) {
-  auto pool = internal::GetCpuThreadPool();
-  std::vector<std::future<Status>> futures(num_tasks);
+Status ParallelFor(int num_tasks, FUNCTION&& func,
+                   Executor* executor = internal::GetCpuThreadPool()) {
+  std::vector<Future<>> futures(num_tasks);
 
   for (int i = 0; i < num_tasks; ++i) {
-    futures[i] = pool->Submit(func, i);
+    ARROW_ASSIGN_OR_RAISE(futures[i], executor->Submit(func, i));
   }
   auto st = Status::OK();
   for (auto& fut : futures) {
-    st &= fut.get();
+    st &= fut.status();
   }
   return st;
 }
 
-// A variant of ParallelFor() with an explicit number of dedicated threads.
-// In most cases it's more appropriate to use the 2-argument ParallelFor (above),
-// or directly the global CPU thread pool (arrow/util/thread-pool.h).
+template <class FUNCTION, typename T,
+          typename R = typename internal::call_traits::return_type<FUNCTION>::ValueType>
+Future<std::vector<R>> ParallelForAsync(std::vector<T> inputs, FUNCTION&& func,
+                                        Executor* executor = internal::GetCpuThreadPool(),
+                                        TaskHints hints = TaskHints{}) {
+  std::vector<Future<R>> futures(inputs.size());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    ARROW_ASSIGN_OR_RAISE(futures[i],
+                          executor->Submit(hints, func, i, std::move(inputs[i])));
+  }
+  return All(std::move(futures))
+      .Then([](const std::vector<Result<R>>& results) -> Result<std::vector<R>> {
+        return UnwrapOrRaise(results);
+      });
+}
+
+// A parallelizer that takes a `Status(int)` function and calls it with
+// arguments between 0 and `num_tasks - 1`, in sequence or in parallel,
+// depending on the input boolean.
 
 template <class FUNCTION>
-Status ParallelFor(int nthreads, int num_tasks, FUNCTION&& func) {
-  std::vector<std::thread> thread_pool;
-  thread_pool.reserve(nthreads);
-  std::atomic<int> task_counter(0);
+Status OptionalParallelFor(bool use_threads, int num_tasks, FUNCTION&& func,
+                           Executor* executor = internal::GetCpuThreadPool()) {
+  if (use_threads) {
+    return ParallelFor(num_tasks, std::forward<FUNCTION>(func), executor);
+  } else {
+    for (int i = 0; i < num_tasks; ++i) {
+      RETURN_NOT_OK(func(i));
+    }
+    return Status::OK();
+  }
+}
 
-  std::mutex error_mtx;
-  bool error_occurred = false;
-  Status error;
+// A parallelizer that takes a `Result<R>(int index, T item)` function and
+// calls it with each item from the input array, in sequence or in parallel,
+// depending on the input boolean.
 
-  for (int thread_id = 0; thread_id < nthreads; ++thread_id) {
-    thread_pool.emplace_back(
-        [&num_tasks, &task_counter, &error, &error_occurred, &error_mtx, &func]() {
-          int task_id;
-          while (!error_occurred) {
-            task_id = task_counter.fetch_add(1);
-            if (task_id >= num_tasks) {
-              break;
-            }
-            Status s = func(task_id);
-            if (!s.ok()) {
-              std::lock_guard<std::mutex> lock(error_mtx);
-              error_occurred = true;
-              error = s;
-              break;
-            }
-          }
-        });
+template <class FUNCTION, typename T,
+          typename R = typename internal::call_traits::return_type<FUNCTION>::ValueType>
+Future<std::vector<R>> OptionalParallelForAsync(
+    bool use_threads, std::vector<T> inputs, FUNCTION&& func,
+    Executor* executor = internal::GetCpuThreadPool(), TaskHints hints = TaskHints{}) {
+  if (use_threads) {
+    return ParallelForAsync(std::move(inputs), std::forward<FUNCTION>(func), executor,
+                            hints);
+  } else {
+    std::vector<R> result(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      ARROW_ASSIGN_OR_RAISE(result[i], func(i, inputs[i]));
+    }
+    return result;
   }
-  for (auto&& thread : thread_pool) {
-    thread.join();
-  }
-  if (error_occurred) {
-    return error;
-  }
-  return Status::OK();
 }
 
 }  // namespace internal
 }  // namespace arrow
-
-#endif

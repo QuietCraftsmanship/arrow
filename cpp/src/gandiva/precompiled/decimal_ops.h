@@ -62,10 +62,10 @@ BasicDecimal128 FromDouble(double in, int32_t precision, int32_t scale, bool* ov
 /// Convert from decimal to double.
 double ToDouble(const BasicDecimalScalar128& in, bool* overflow);
 
-/// Convert to decimal from int64.
+/// Convert to decimal from gdv_int64.
 BasicDecimal128 FromInt64(int64_t in, int32_t precision, int32_t scale, bool* overflow);
 
-/// Convert from decimal to int64
+/// Convert from decimal to gdv_int64
 int64_t ToInt64(const BasicDecimalScalar128& in, bool* overflow);
 
 /// Convert from one decimal scale/precision to another.
@@ -73,11 +73,12 @@ BasicDecimal128 Convert(const BasicDecimalScalar128& x, int32_t out_precision,
                         int32_t out_scale, bool* overflow);
 
 /// round decimal.
-BasicDecimal128 Round(const BasicDecimalScalar128& x, int32_t out_scale, bool* overflow);
+BasicDecimal128 Round(const BasicDecimalScalar128& x, int32_t out_precision,
+                      int32_t out_scale, int32_t rounding_scale, bool* overflow);
 
 /// truncate decimal.
-BasicDecimal128 Truncate(const BasicDecimalScalar128& x, int32_t out_scale,
-                         bool* overflow);
+BasicDecimal128 Truncate(const BasicDecimalScalar128& x, int32_t out_precision,
+                         int32_t out_scale, int32_t rounding_scale, bool* overflow);
 
 /// ceil decimal
 BasicDecimal128 Ceil(const BasicDecimalScalar128& x, bool* overflow);

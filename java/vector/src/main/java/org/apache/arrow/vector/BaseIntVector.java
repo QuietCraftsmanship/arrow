@@ -20,6 +20,8 @@ package org.apache.arrow.vector;
 /**
  * Interface for all int type vectors.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
 public interface BaseIntVector extends FieldVector {
 
   /**
@@ -40,4 +42,17 @@ public interface BaseIntVector extends FieldVector {
    * if the value is null. Note null check could be turned off via {@link NullCheckingForGet}.
    */
   long getValueAsLong(int index);
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+public interface BaseIntVector extends ValueVector {
+
+  /**
+   * set the encoded value from a {@link org.apache.arrow.vector.dictionary.Dictionary}.
+   */
+  void setEncodedValue(int index, int value);
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }

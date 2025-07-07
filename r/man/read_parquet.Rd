@@ -4,35 +4,50 @@
 \alias{read_parquet}
 \title{Read a Parquet file}
 \usage{
-read_parquet(file, col_select = NULL, as_data_frame = TRUE,
-  props = ParquetReaderProperties$create(), ...)
+read_parquet(
+  file,
+  col_select = NULL,
+  as_data_frame = TRUE,
+  props = ParquetArrowReaderProperties$create(),
+  mmap = TRUE,
+  ...
+)
 }
 \arguments{
-\item{file}{A character file name, raw vector, or an Arrow input stream}
+\item{file}{A character file name or URI, connection, \code{raw} vector, an
+Arrow input stream, or a \code{FileSystem} with path (\code{SubTreeFileSystem}).
+If a file name or URI, an Arrow \link{InputStream} will be opened and
+closed when finished. If an input stream is provided, it will be left
+open.}
 
 \item{col_select}{A character vector of column names to keep, as in the
 "select" argument to \code{data.table::fread()}, or a
-\link[tidyselect:vars_select]{tidy selection specification}
+\link[tidyselect:eval_select]{tidy selection specification}
 of columns, as used in \code{dplyr::select()}.}
 
-\item{as_data_frame}{Should the function return a \code{data.frame} or an
-\link[=Table]{arrow::Table}?}
+\item{as_data_frame}{Should the function return a \code{tibble} (default) or
+an Arrow \link{Table}?}
 
-\item{props}{\link{ParquetReaderProperties}}
+\item{props}{\link{ParquetArrowReaderProperties}}
+
+\item{mmap}{Use TRUE to use memory mapping where possible}
 
 \item{...}{Additional arguments passed to \code{ParquetFileReader$create()}}
 }
 \value{
-A \link[=Table]{arrow::Table}, or a \code{data.frame} if \code{as_data_frame} is
-\code{TRUE}.
+A \code{tibble} if \code{as_data_frame} is \code{TRUE} (the default), or an
+Arrow \link{Table} otherwise.
 }
 \description{
 '\href{https://parquet.apache.org/}{Parquet}' is a columnar storage file format.
 This function enables you to read Parquet files into R.
 }
 \examples{
-\donttest{
-df <- read_parquet(system.file("v0.7.1.parquet", package="arrow"))
+\dontshow{if (arrow_with_parquet() && !getFromNamespace("on_linux_dev", "arrow")()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
+tf <- tempfile()
+on.exit(unlink(tf))
+write_parquet(mtcars, tf)
+df <- read_parquet(tf, col_select = starts_with("d"))
 head(df)
-}
+\dontshow{\}) # examplesIf}
 }

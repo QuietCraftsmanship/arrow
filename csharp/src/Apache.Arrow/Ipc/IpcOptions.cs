@@ -17,13 +17,30 @@ namespace Apache.Arrow.Ipc
 {
     public class IpcOptions
     {
-        internal static readonly IpcOptions Default = new IpcOptions();
+        internal static IpcOptions Default { get; } = new IpcOptions();
 
         /// <summary>
         /// Write the pre-0.15.0 encapsulated IPC message format
         /// consisting of a 4-byte prefix instead of 8 byte.
         /// </summary>
         public bool WriteLegacyIpcFormat { get; set; }
+
+        /// <summary>
+        /// The compression codec to use to compress data buffers.
+        /// If null (the default value), no compression is used.
+        /// </summary>
+        public CompressionCodecType? CompressionCodec { get; set; }
+
+        /// <summary>
+        /// The compression codec factory used to create compression codecs.
+        /// Must be provided if a CompressionCodec is specified.
+        /// </summary>
+        public ICompressionCodecFactory CompressionCodecFactory { get; set; }
+
+        /// <summary>
+        /// Sets the compression level to use for codecs that support this.
+        /// </summary>
+        public int? CompressionLevel { get; set; }
 
         public IpcOptions()
         {

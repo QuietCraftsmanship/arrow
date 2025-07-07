@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-require "arrow/column-containable"
-require "arrow/group"
-require "arrow/record-containable"
+require "arrow/raw-table-converter"
 
 module Arrow
   class Table
     include ColumnContainable
+    include GenericFilterable
+    include GenericTakeable
+    include InputReferable
     include RecordContainable
 
     class << self
@@ -83,14 +84,6 @@ module Arrow
     #     `Array`.
     #
     #   @example Create a table from column name and values
-    #     count_chunks = [
-    #       Arrow::UInt32Array.new([0, 2]),
-    #       Arrow::UInt32Array.new([nil, 4]),
-    #     ]
-    #     visible_chunks = [
-    #       Arrow::BooleanArray.new([true]),
-    #       Arrow::BooleanArray.new([nil, nil, false]),
-    #     ]
     #     Arrow::Table.new("count" => [0, 2, nil, 4],
     #                      "visible" => [true, nil, nil, false])
     #
@@ -134,7 +127,7 @@ module Arrow
     #     You can also specify schema as primitive Ruby objects.
     #     See {Arrow::Schema#initialize} for details.
     #
-    #   @param arrays [::Array<Arrow::RecordBatch>] The data of the table.
+    #   @param record_batches [::Array<Arrow::RecordBatch>] The data of the table.
     #
     #   @example Create a table from schema and record batches
     #     count_field = Arrow::Field.new("count", :uint32)
@@ -152,7 +145,7 @@ module Arrow
     #     You can also specify schema as primitive Ruby objects.
     #     See {Arrow::Schema#initialize} for details.
     #
-    #   @param arrays [::Array<::Array>] The data of the table as primitive
+    #   @param raw_records [::Array<::Array>] The data of the table as primitive
     #     Ruby objects.
     #
     #   @example Create a table from schema and raw records
@@ -171,22 +164,9 @@ module Arrow
       n_args = args.size
       case n_args
       when 1
-        if args[0][0].is_a?(Column)
-          columns = args[0]
-          fields = columns.collect(&:field)
-          values = columns.collect(&:data)
-          schema = Schema.new(fields)
-        else
-          raw_table = args[0]
-          fields = []
-          values = []
-          raw_table.each do |name, array|
-            array = ArrayBuilder.build(array) if array.is_a?(::Array)
-            fields << Field.new(name.to_s, array.value_data_type)
-            values << array
-          end
-          schema = Schema.new(fields)
-        end
+        raw_table_converter = RawTableConverter.new(args[0])
+        schema = raw_table_converter.schema
+        values = raw_table_converter.values
       when 2
         schema = args[0]
         schema = Schema.new(schema) unless schema.is_a?(Schema)
@@ -209,14 +189,13 @@ module Arrow
 
       reader = TableBatchReader.new(self)
       while record_batch = reader.read_next
+        share_input(record_batch)
         yield(record_batch)
       end
     end
 
     alias_method :size, :n_rows
     alias_method :length, :n_rows
-
-    alias_method :[], :find_column
 
     alias_method :slice_raw, :slice
 
@@ -257,6 +236,12 @@ module Arrow
     #   @return [Arrow::Table]
     #     The sub `Arrow::Table` that covers only rows of the range of indices.
     #
+    # @overload slice(conditions)
+    #
+    #   @param conditions [Hash] The conditions to select records.
+    #   @return [Arrow::Table]
+    #     The sub `Arrow::Table` that covers only rows matched by condition
+    #
     # @overload slice
     #
     #   @yield [slicer] Gives slicer that constructs condition to select records.
@@ -284,12 +269,37 @@ module Arrow
         expected_n_args = nil
         case args.size
         when 1
-          if args[0].is_a?(Integer)
+          case args[0]
+          when Integer
             index = args[0]
             index += n_rows if index < 0
             return nil if index < 0
             return nil if index >= n_rows
             return Record.new(self, index)
+          when Hash
+            condition_pairs = args[0]
+            slicer = Slicer.new(self)
+            conditions = []
+            condition_pairs.each do |key, value|
+              case value
+              when Range
+                # TODO: Optimize "begin <= key <= end" case by missing "between" kernel
+                # https://issues.apache.org/jira/browse/ARROW-9843
+                unless value.begin.nil?
+                  conditions << (slicer[key] >= value.begin)
+                end
+                unless value.end.nil?
+                  if value.exclude_end?
+                    conditions << (slicer[key] < value.end)
+                  else
+                    conditions << (slicer[key] <= value.end)
+                  end
+                end
+              else
+                conditions << (slicer[key] == value)
+              end
+            end
+            slicers << conditions.inject(:&)
           else
             slicers << args[0]
           end
@@ -306,13 +316,13 @@ module Arrow
         end
       end
 
-      ranges = []
+      sliced_tables = []
       slicers.each do |slicer|
         slicer = slicer.evaluate if slicer.respond_to?(:evaluate)
         case slicer
         when Integer
           slicer += n_rows if slicer < 0
-          ranges << [slicer, n_rows - 1]
+          sliced_tables << slice_by_range(slicer, n_rows - 1)
         when Range
           original_from = from = slicer.first
           to = slicer.last
@@ -325,17 +335,9 @@ module Arrow
             raise ArgumentError, message
           end
           to += n_rows if to < 0
-          ranges << [from, to]
-        when ::Array
-          boolean_array_to_slice_ranges(slicer, 0, ranges)
-        when ChunkedArray
-          offset = 0
-          slicer.each_chunk do |array|
-            boolean_array_to_slice_ranges(array, offset, ranges)
-            offset += array.length
-          end
-        when BooleanArray
-          boolean_array_to_slice_ranges(slicer, 0, ranges)
+          sliced_tables << slice_by_range(from, to)
+        when ::Array, BooleanArray, ChunkedArray
+          sliced_tables << filter(slicer)
         else
           message = "slicer must be Integer, Range, (from, to), " +
             "Arrow::ChunkedArray of Arrow::BooleanArray, " +
@@ -343,7 +345,13 @@ module Arrow
           raise ArgumentError, message
         end
       end
-      slice_by_ranges(ranges)
+      if sliced_tables.size > 1
+        sliced_table = sliced_tables[0].concatenate(sliced_tables[1..-1])
+      else
+        sliced_table = sliced_tables[0]
+      end
+      share_input(sliced_table)
+      sliced_table
     end
 
     # TODO
@@ -395,7 +403,9 @@ module Arrow
         new_fields << new_column[:field]
         new_arrays << new_column[:data]
       end
-      self.class.new(new_fields, new_arrays)
+      table = self.class.new(new_fields, new_arrays)
+      share_input(table)
+      table
     end
 
     alias_method :remove_column_raw, :remove_column
@@ -417,42 +427,9 @@ module Arrow
           raise IndexError.new(message)
         end
       end
-      remove_column_raw(index)
-    end
-
-    # TODO
-    #
-    # @return [Arrow::Table]
-    def select_columns(*selectors, &block)
-      if selectors.empty?
-        return to_enum(__method__) unless block_given?
-        selected_columns = columns.select(&block)
-      else
-        selected_columns = []
-        selectors.each do |selector|
-          case selector
-          when String, Symbol
-            column = find_column(selector)
-            if column.nil?
-              message = "unknown column: #{selector.inspect}: #{inspect}"
-              raise KeyError.new(message)
-            end
-            selected_columns << column
-          when Range
-            selected_columns.concat(columns[selector])
-          else
-            column = columns[selector]
-            if column.nil?
-              message = "out of index (0..#{n_columns - 1}): " +
-              "#{selector.inspect}: #{inspect}"
-              raise IndexError.new(message)
-            end
-            selected_columns << column
-          end
-        end
-        selected_columns = selected_columns.select(&block) if block_given?
-      end
-      self.class.new(selected_columns)
+      table = remove_column_raw(index)
+      share_input(table)
+      table
     end
 
     # Experimental
@@ -465,8 +442,8 @@ module Arrow
       RollingWindow.new(self, size)
     end
 
-    def save(path, options={})
-      saver = TableSaver.new(self, path, options)
+    def save(output, options={})
+      saver = TableSaver.new(self, output, options)
       saver.save
     end
 
@@ -474,7 +451,144 @@ module Arrow
       packed_arrays = columns.collect do |column|
         column.data.pack
       end
-      self.class.new(schema, packed_arrays)
+      table = self.class.new(schema, packed_arrays)
+      share_input(table)
+      table
+    end
+
+    # Join another Table by matching with keys.
+    #
+    # @!macro join_common_before
+    #   @param right [Arrow::Table] The right table.
+    #
+    #   Join columns with `right` on join key columns.
+    #
+    # @!macro join_common_after
+    #   @param type [Arrow::JoinType] How to join.
+    #   @param left_outputs [::Array<String, Symbol>] Output columns in
+    #     `self`.
+    #
+    #     If both of `left_outputs` and `right_outputs` aren't
+    #     specified, all columns in `self` and `right` are
+    #     output.
+    #   @param right_outputs [::Array<String, Symbol>] Output columns in
+    #     `right`.
+    #
+    #     If both of `left_outputs` and `right_outputs` aren't
+    #     specified, all columns in `self` and `right` are
+    #     output.
+    #   @return [Arrow::Table]
+    #     The joined `Arrow::Table`.
+    #
+    # @overload join(right, type: :inner, left_outputs: nil, right_outputs: nil)
+    #   If key(s) are not supplied, common keys in self and right are used
+    #   (natural join).
+    #
+    #   Column used as keys are merged and remain in left side
+    #   when both of `left_outputs` and `right_outputs` are `nil`.
+    #
+    #   @macro join_common_before
+    #   @macro join_common_after
+    #
+    # @since 11.0.0
+    #
+    # @overload join(right, key, type: :inner, left_outputs: nil, right_outputs: nil)
+    #   Join right by a key.
+    #
+    #   Column used as keys are merged and remain in left side
+    #   when both of `left_outputs` and `right_outputs` are `nil`.
+    #
+    #   @macro join_common_before
+    #   @param key [String, Symbol] A join key.
+    #   @macro join_common_after
+    #
+    # @overload join(right, keys, type: :inner, left_suffix: "", right_suffix: "",
+    #                left_outputs: nil, right_outputs: nil)
+    #   Join right by keys.
+    #
+    #   Column name can be renamed by appending `left_suffix` or `right_suffix`.
+    #
+    #   @macro join_common_before
+    #   @param keys [::Array<String, Symbol>] Join keys.
+    #   @macro join_common_after
+    #
+    # @overload join(right, keys, type: :inner, left_outputs: nil, right_outputs: nil)
+    #   Join right by a key or keys mapped by a hash.
+    #
+    #   @macro join_common_before
+    #   @param keys [Hash] Specify join keys in `self` and `right` separately.
+    #   @option keys [String, Symbol, ::Array<String, Symbol>] :left
+    #     Join keys in `self`.
+    #   @option keys [String, Symbol, ::Array<String, Symbol>] :right
+    #     Join keys in `right`.
+    #   @macro join_common_after
+    #
+    # @since 7.0.0
+    def join(right,
+             keys=nil,
+             type: :inner,
+             left_suffix: "",
+             right_suffix: "",
+             left_outputs: nil,
+             right_outputs: nil)
+      is_natural_join = keys.nil?
+      keys ||= (column_names & right.column_names)
+      type = JoinType.try_convert(type) || type
+      plan = ExecutePlan.new
+      left_node = plan.build_source_node(self)
+      right_node = plan.build_source_node(right)
+      if keys.is_a?(Hash)
+        left_keys = keys[:left]
+        right_keys = keys[:right]
+      else
+        left_keys = keys
+        right_keys = keys
+      end
+      left_keys = Array(left_keys)
+      right_keys = Array(right_keys)
+      hash_join_node_options = HashJoinNodeOptions.new(type,
+                                                       left_keys,
+                                                       right_keys)
+      use_manual_outputs = false
+      unless left_outputs.nil?
+        hash_join_node_options.left_outputs = left_outputs
+        use_manual_outputs = true
+      end
+      unless right_outputs.nil?
+        hash_join_node_options.right_outputs = right_outputs
+        use_manual_outputs = true
+      end
+      hash_join_node = plan.build_hash_join_node(left_node,
+                                                 right_node,
+                                                 hash_join_node_options)
+      type_nick = type.nick
+      is_filter_join = (type_nick.end_with?("-semi") or
+                        type_nick.end_with?("-anti"))
+      if use_manual_outputs or is_filter_join
+        process_node = hash_join_node
+      elsif is_natural_join
+        process_node = join_merge_keys(plan, hash_join_node, right, keys)
+      elsif keys.is_a?(String) or keys.is_a?(Symbol)
+        process_node = join_merge_keys(plan, hash_join_node, right, [keys.to_s])
+      elsif !keys.is_a?(Hash) and (left_suffix != "" or right_suffix != "")
+        process_node = join_rename_keys(plan,
+                                        hash_join_node,
+                                        right,
+                                        keys,
+                                        left_suffix,
+                                        right_suffix)
+      else
+        process_node = hash_join_node
+      end
+      sink_node_options = SinkNodeOptions.new
+      plan.build_sink_node(process_node, sink_node_options)
+      plan.validate
+      plan.start
+      plan.wait
+      reader = sink_node_options.get_reader(process_node.output_schema)
+      table = reader.read_all
+      share_input(table)
+      table
     end
 
     alias_method :to_s_raw, :to_s
@@ -514,38 +628,8 @@ module Arrow
     end
 
     private
-    def boolean_array_to_slice_ranges(array, offset, ranges)
-      in_target = false
-      target_start = nil
-      array.each_with_index do |is_target, i|
-        if is_target
-          unless in_target
-            target_start = offset + i
-            in_target = true
-          end
-        else
-          if in_target
-            ranges << [target_start, offset + i - 1]
-            target_start = nil
-            in_target = false
-          end
-        end
-      end
-      if in_target
-        ranges << [target_start, offset + array.length - 1]
-      end
-    end
-
-    def slice_by_ranges(ranges)
-      sliced_table = []
-      ranges.each do |from, to|
-        sliced_table << slice_raw(from, to - from + 1)
-      end
-      if sliced_table.size > 1
-        sliced_table[0].concatenate(sliced_table[1..-1])
-      else
-        sliced_table[0]
-      end
+    def slice_by_range(from, to)
+      slice_raw(from, to - from + 1)
     end
 
     def ensure_raw_column(name, data)
@@ -573,6 +657,88 @@ module Arrow
           "<#{name}>: <#{data.inspect}>: #{inspect}"
         raise ArgumentError, message
       end
+    end
+
+    def join_merge_keys(plan, input_node, right, keys)
+      expressions = []
+      names = []
+      normalized_keys = {}
+      keys.each do |key|
+        normalized_keys[key.to_s] = true
+      end
+      key_to_outputs = {}
+      outputs = []
+      left_n_column_names = column_names.size
+      column_names.each_with_index do |name, i|
+        is_key = normalized_keys.include?(name)
+        output = {is_key: is_key, name: name, index: i, direction: :left}
+        outputs << output
+        key_to_outputs[name] = {left: output} if is_key
+      end
+      right.column_names.each_with_index do |name, i|
+        index = left_n_column_names + i
+        is_key = normalized_keys.include?(name)
+        output = {is_key: is_key, name: name, index: index, direction: :right}
+        outputs << output
+        key_to_outputs[name][:right] = output if is_key
+      end
+
+      outputs.each do |output|
+        if output[:is_key]
+          next if output[:direction] == :right
+          left_output = key_to_outputs[output[:name]][:left]
+          right_output = key_to_outputs[output[:name]][:right]
+          left_field = FieldExpression.new("[#{left_output[:index]}]")
+          right_field = FieldExpression.new("[#{right_output[:index]}]")
+          is_left_null = CallExpression.new("is_null", [left_field])
+          merge_column = CallExpression.new("if_else",
+                                            [
+                                              is_left_null,
+                                              right_field,
+                                              left_field,
+                                            ])
+          expressions << merge_column
+        else
+          expressions << FieldExpression.new("[#{output[:index]}]")
+        end
+        names << output[:name]
+      end
+      project_node_options = ProjectNodeOptions.new(expressions, names)
+      plan.build_project_node(input_node, project_node_options)
+    end
+
+    def join_rename_keys(plan,
+                         input_node,
+                         right,
+                         keys,
+                         left_suffix,
+                         right_suffix)
+      expressions = []
+      names = []
+      normalized_keys = {}
+      keys.each do |key|
+        normalized_keys[key.to_s] = true
+      end
+      left_n_column_names = column_names.size
+      column_names.each_with_index do |name, i|
+        expressions << FieldExpression.new("[#{i}]")
+        if normalized_keys.include?(name)
+          names << "#{name}#{left_suffix}"
+        else
+          names << name
+        end
+      end
+      right.column_names.each_with_index do |name, i|
+        index = left_n_column_names + i
+        expressions << FieldExpression.new("[#{index}]")
+        if normalized_keys.include?(name)
+          names << "#{name}#{right_suffix}"
+        else
+          names << name
+        end
+      end
+      project_node_options = ProjectNodeOptions.new(expressions, names)
+      plan.build_project_node(input_node, project_node_options)
     end
   end
 end

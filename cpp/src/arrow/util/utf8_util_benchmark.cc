@@ -22,7 +22,16 @@
 #include <vector>
 
 #include "arrow/testing/gtest_util.h"
-#include "arrow/util/utf8.h"
+#include "arrow/util/utf8_internal.h"
+
+// Do not benchmark potentially inlined functions directly inside the benchmark loop
+static ARROW_NOINLINE bool ValidateUTF8NoInline(const uint8_t* data, int64_t size) {
+  return ::arrow::util::ValidateUTF8Inline(data, size);
+}
+
+static ARROW_NOINLINE bool ValidateAsciiNoInline(const uint8_t* data, int64_t size) {
+  return ::arrow::util::ValidateAscii(data, size);
+}
 
 namespace arrow {
 namespace util {
@@ -57,21 +66,40 @@ static void BenchmarkUTF8Validation(
   auto data_size = static_cast<int64_t>(s.size());
 
   InitializeUTF8();
-  bool b = ValidateUTF8(data, data_size);
+  bool b = ValidateUTF8NoInline(data, data_size);
   if (b != expected) {
     std::cerr << "Unexpected validation result" << std::endl;
     std::abort();
   }
 
   while (state.KeepRunning()) {
-    bool b = ValidateUTF8(data, data_size);
+    bool b = ValidateUTF8NoInline(data, data_size);
+    benchmark::DoNotOptimize(b);
+  }
+  state.SetBytesProcessed(state.iterations() * s.size());
+}
+
+static void BenchmarkASCIIValidation(
+    benchmark::State& state,  // NOLINT non-const reference
+    const std::string& s, bool expected) {
+  auto data = reinterpret_cast<const uint8_t*>(s.data());
+  auto data_size = static_cast<int64_t>(s.size());
+
+  bool b = ValidateAsciiNoInline(data, data_size);
+  if (b != expected) {
+    std::cerr << "Unexpected validation result" << std::endl;
+    std::abort();
+  }
+
+  while (state.KeepRunning()) {
+    bool b = ValidateAsciiNoInline(data, data_size);
     benchmark::DoNotOptimize(b);
   }
   state.SetBytesProcessed(state.iterations() * s.size());
 }
 
 static void ValidateTinyAscii(benchmark::State& state) {  // NOLINT non-const reference
-  BenchmarkUTF8Validation(state, tiny_valid_ascii, true);
+  BenchmarkASCIIValidation(state, tiny_valid_ascii, true);
 }
 
 static void ValidateTinyNonAscii(benchmark::State& state) {  // NOLINT non-const reference
@@ -79,7 +107,7 @@ static void ValidateTinyNonAscii(benchmark::State& state) {  // NOLINT non-const
 }
 
 static void ValidateSmallAscii(benchmark::State& state) {  // NOLINT non-const reference
-  BenchmarkUTF8Validation(state, valid_ascii, true);
+  BenchmarkASCIIValidation(state, valid_ascii, true);
 }
 
 static void ValidateSmallAlmostAscii(
@@ -94,7 +122,7 @@ static void ValidateSmallNonAscii(
 
 static void ValidateLargeAscii(benchmark::State& state) {  // NOLINT non-const reference
   auto s = MakeLargeString(valid_ascii, 100000);
-  BenchmarkUTF8Validation(state, s, true);
+  BenchmarkASCIIValidation(state, s, true);
 }
 
 static void ValidateLargeAlmostAscii(

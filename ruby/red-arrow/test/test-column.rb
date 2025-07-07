@@ -49,6 +49,14 @@ class ColumnTest < Test::Unit::TestCase
     assert_equal([false, nil, true], @column.reverse_each.to_a)
   end
 
+  test("#size") do
+    assert_equal(3, @column.size)
+  end
+
+  test("#length") do
+    assert_equal(3, @column.length)
+  end
+
   test("#n_rows") do
     assert_equal(3, @column.n_rows)
   end
@@ -88,5 +96,36 @@ class ColumnTest < Test::Unit::TestCase
         not table.visible == 29
       end
     end
+  end
+
+  test("#count") do
+    table = Arrow::Table.new("revenue" => [1, nil, 3])
+    assert_equal(2, table["revenue"].count)
+  end
+
+  test("#min") do
+    table = Arrow::Table.new("revenue" => [1, 2, 3])
+    assert_equal(1, table["revenue"].min)
+  end
+
+  test("#max") do
+    table = Arrow::Table.new("revenue" => [1, 2, 3])
+    assert_equal(3, table["revenue"].max)
+  end
+
+  test("#sum") do
+    table = Arrow::Table.new("revenue" => [1, 2, 3])
+    assert_equal(6, table["revenue"].sum)
+  end
+
+  test("#uniq") do
+    table = Arrow::Table.new("revenue" => [1, 2, 2])
+    assert_equal([1, 2], table["revenue"].uniq)
+  end
+
+  test("#cast") do
+    table = Arrow::Table.new("revenue" => [1, nil, 3])
+    assert_equal(Arrow::ChunkedArray.new([["1", nil, "3"]]),
+                 table["revenue"].cast(:string))
   end
 end

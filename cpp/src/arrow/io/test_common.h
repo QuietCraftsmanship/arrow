@@ -15,39 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_IO_TEST_COMMON_H
-#define ARROW_IO_TEST_COMMON_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "arrow/status.h"
-#include "arrow/util/visibility.h"
+#include "arrow/io/interfaces.h"
+#include "arrow/testing/visibility.h"
+#include "arrow/type_fwd.h"
 
 namespace arrow {
 namespace io {
 
 class MemoryMappedFile;
 
-ARROW_EXPORT
+ARROW_TESTING_EXPORT
 void AssertFileContents(const std::string& path, const std::string& contents);
 
-ARROW_EXPORT bool FileExists(const std::string& path);
+ARROW_TESTING_EXPORT bool FileExists(const std::string& path);
 
-ARROW_EXPORT bool FileIsClosed(int fd);
+ARROW_TESTING_EXPORT Status PurgeLocalFileFromOsCache(const std::string& path);
 
-ARROW_EXPORT
+ARROW_TESTING_EXPORT
 Status ZeroMemoryMap(MemoryMappedFile* file);
 
-class ARROW_EXPORT MemoryMapFixture {
+class ARROW_TESTING_EXPORT MemoryMapFixture {
  public:
   void TearDown();
 
   void CreateFile(const std::string& path, int64_t size);
 
-  Status InitMemoryMap(int64_t size, const std::string& path,
-                       std::shared_ptr<MemoryMappedFile>* mmap);
+  Result<std::shared_ptr<MemoryMappedFile>> InitMemoryMap(int64_t size,
+                                                          const std::string& path);
 
   void AppendFile(const std::string& path);
 
@@ -55,7 +55,15 @@ class ARROW_EXPORT MemoryMapFixture {
   std::vector<std::string> tmp_files_;
 };
 
+class ARROW_TESTING_EXPORT TrackedRandomAccessFile : public io::RandomAccessFile {
+ public:
+  virtual int64_t num_reads() const = 0;
+  virtual int64_t bytes_read() const = 0;
+  virtual const std::vector<io::ReadRange>& get_read_ranges() const = 0;
+  virtual void ResetStats() = 0;
+
+  static std::unique_ptr<TrackedRandomAccessFile> Make(io::RandomAccessFile* target);
+};
+
 }  // namespace io
 }  // namespace arrow
-
-#endif  // ARROW_IO_TEST_COMMON_H

@@ -19,27 +19,34 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
 #include "arrow/buffer.h"
 #include "arrow/json/chunker.h"
 #include "arrow/json/test_common.h"
 #include "arrow/testing/gtest_util.h"
-#include "arrow/util/string_view.h"
+#include "arrow/util/logging.h"
+#include "arrow/util/string.h"
 
 namespace arrow {
+
+using internal::StartsWith;
+
 namespace json {
 
 // Use no nested objects and no string literals containing braces in this test.
 // This way the positions of '{' and '}' can be used as simple proxies
 // for object begin/end.
 
-using util::string_view;
+using std::string_view;
 
 template <typename Lines>
-static std::shared_ptr<Buffer> join(Lines&& lines, std::string delimiter) {
+static std::shared_ptr<Buffer> join(Lines&& lines, std::string delimiter,
+                                    bool delimiter_at_end = true) {
   std::shared_ptr<Buffer> joined;
   BufferVector line_buffers;
   auto delimiter_buffer = std::make_shared<Buffer>(delimiter);
@@ -47,8 +54,10 @@ static std::shared_ptr<Buffer> join(Lines&& lines, std::string delimiter) {
     line_buffers.push_back(std::make_shared<Buffer>(line));
     line_buffers.push_back(delimiter_buffer);
   }
-  ABORT_NOT_OK(ConcatenateBuffers(line_buffers, default_memory_pool(), &joined));
-  return joined;
+  if (!delimiter_at_end) {
+    line_buffers.pop_back();
+  }
+  return *ConcatenateBuffers(line_buffers);
 }
 
 static bool WhitespaceOnly(string_view s) {
@@ -75,15 +84,23 @@ static std::size_t ConsumeWholeObject(std::shared_ptr<Buffer>* buf) {
   return length;
 }
 
+void AssertOnlyWholeObjects(Chunker& chunker, std::shared_ptr<Buffer> whole, int* count) {
+  *count = 0;
+  while (whole && !WhitespaceOnly(whole)) {
+    auto buf = whole;
+    if (ConsumeWholeObject(&whole) == string_view::npos) {
+      FAIL() << "Not a whole JSON object: '" << buf->ToString() << "'";
+    }
+    ++*count;
+  }
+}
+
 void AssertWholeObjects(Chunker& chunker, const std::shared_ptr<Buffer>& block,
                         int expected_count) {
   std::shared_ptr<Buffer> whole, partial;
   ASSERT_OK(chunker.Process(block, &whole, &partial));
-  int count = 0;
-  while (whole && !WhitespaceOnly(whole)) {
-    if (ConsumeWholeObject(&whole) == string_view::npos) FAIL();
-    ++count;
-  }
+  int count;
+  AssertOnlyWholeObjects(chunker, whole, &count);
   ASSERT_EQ(count, expected_count);
 }
 
@@ -103,19 +120,51 @@ void AssertChunking(Chunker& chunker, std::shared_ptr<Buffer> buf, int total_cou
   }
 }
 
+void AssertChunkingBlockSize(Chunker& chunker, std::shared_ptr<Buffer> buf,
+                             int64_t block_size, int expected_count) {
+  std::shared_ptr<Buffer> partial = Buffer::FromString({});
+  int64_t pos = 0;
+  int total_count = 0;
+  while (pos < buf->size()) {
+    int count;
+    auto block = SliceBuffer(buf, pos, std::min(block_size, buf->size() - pos));
+    pos += block->size();
+    std::shared_ptr<Buffer> completion, whole, next_partial;
+
+    if (pos == buf->size()) {
+      // Last block
+      ASSERT_OK(chunker.ProcessFinal(partial, block, &completion, &whole));
+    } else {
+      std::shared_ptr<Buffer> starts_with_whole;
+      ASSERT_OK(
+          chunker.ProcessWithPartial(partial, block, &completion, &starts_with_whole));
+      ASSERT_OK(chunker.Process(starts_with_whole, &whole, &next_partial));
+    }
+    // partial + completion should be a valid JSON block
+    ASSERT_OK_AND_ASSIGN(partial, ConcatenateBuffers({partial, completion}));
+    AssertOnlyWholeObjects(chunker, partial, &count);
+    total_count += count;
+    // whole should be a valid JSON block
+    AssertOnlyWholeObjects(chunker, whole, &count);
+    total_count += count;
+    partial = next_partial;
+  }
+  ASSERT_EQ(pos, buf->size());
+  ASSERT_EQ(total_count, expected_count);
+}
+
 void AssertStraddledChunking(Chunker& chunker, const std::shared_ptr<Buffer>& buf) {
   auto first_half = SliceBuffer(buf, 0, buf->size() / 2);
   auto second_half = SliceBuffer(buf, buf->size() / 2);
   AssertChunking(chunker, first_half, 1);
   std::shared_ptr<Buffer> first_whole, partial;
   ASSERT_OK(chunker.Process(first_half, &first_whole, &partial));
-  ASSERT_TRUE(string_view(*first_half).starts_with(string_view(*first_whole)));
+  ASSERT_TRUE(StartsWith(std::string_view(*first_half), std::string_view(*first_whole)));
   std::shared_ptr<Buffer> completion, rest;
   ASSERT_OK(chunker.ProcessWithPartial(partial, second_half, &completion, &rest));
-  ASSERT_TRUE(string_view(*second_half).starts_with(string_view(*completion)));
+  ASSERT_TRUE(StartsWith(std::string_view(*second_half), std::string_view(*completion)));
   std::shared_ptr<Buffer> straddling;
-  ASSERT_OK(
-      ConcatenateBuffers({partial, completion}, default_memory_pool(), &straddling));
+  ASSERT_OK_AND_ASSIGN(straddling, ConcatenateBuffers({partial, completion}));
   auto length = ConsumeWholeObject(&straddling);
   ASSERT_NE(length, string_view::npos);
   ASSERT_NE(length, 0);
@@ -129,7 +178,7 @@ void AssertStraddledChunking(Chunker& chunker, const std::shared_ptr<Buffer>& bu
 std::unique_ptr<Chunker> MakeChunker(bool newlines_in_values) {
   auto options = ParseOptions::Defaults();
   options.newlines_in_values = newlines_in_values;
-  return Chunker::Make(options);
+  return MakeChunker(options);
 }
 
 class BaseChunkerTest : public ::testing::TestWithParam<bool> {
@@ -139,20 +188,42 @@ class BaseChunkerTest : public ::testing::TestWithParam<bool> {
   std::unique_ptr<Chunker> chunker_;
 };
 
-INSTANTIATE_TEST_CASE_P(NoNewlineChunkerTest, BaseChunkerTest, ::testing::Values(false));
+INSTANTIATE_TEST_SUITE_P(NoNewlineChunkerTest, BaseChunkerTest, ::testing::Values(false));
 
-INSTANTIATE_TEST_CASE_P(ChunkerTest, BaseChunkerTest, ::testing::Values(true));
+INSTANTIATE_TEST_SUITE_P(ChunkerTest, BaseChunkerTest, ::testing::Values(true));
 
-constexpr auto object_count = 3;
+constexpr int object_count = 4;
+constexpr int min_block_size = 28;
+
 static const std::vector<std::string>& lines() {
-  static const std::vector<std::string> l = {R"({"0":"ab","1":"c","2":""})",
-                                             R"({"0":"def","1":"","2":"gh"})",
-                                             R"({"0":"","1":"ij","2":"kl"})"};
+  // clang-format off
+  static const std::vector<std::string> l = {
+    R"({"0":"ab","1":"c","2":""})",
+    R"({"0":"def","1":"","2":"gh"})",
+    R"({"0":null})",
+    R"({"0":"","1":"ij","2":"kl"})"
+  };
+  // clang-format on
   return l;
 }
 
 TEST_P(BaseChunkerTest, Basics) {
   AssertChunking(*chunker_, join(lines(), "\n"), object_count);
+}
+
+TEST_P(BaseChunkerTest, BlockSizes) {
+  auto check_block_sizes = [&](std::shared_ptr<Buffer> data) {
+    for (int64_t block_size = min_block_size; block_size < min_block_size + 30;
+         ++block_size) {
+      AssertChunkingBlockSize(*chunker_, data, block_size, object_count);
+    }
+  };
+
+  check_block_sizes(join(lines(), "\n"));
+  check_block_sizes(join(lines(), "\r\n"));
+  // Without ending newline
+  check_block_sizes(join(lines(), "\n", false));
+  check_block_sizes(join(lines(), "\r\n", false));
 }
 
 TEST_P(BaseChunkerTest, Empty) {
@@ -189,6 +260,20 @@ TEST(ChunkerTest, StraddlingPrettyPrinted) {
 TEST(ChunkerTest, StraddlingSingleLine) {
   auto chunker = MakeChunker(true);
   AssertStraddledChunking(*chunker, join(lines(), ""));
+}
+
+TEST(ChunkerTest, Errors) {
+  std::string parts[] = {R"({"a":0})", "}", R"({"a":1})"};
+  auto chunker = MakeChunker(true);
+  std::shared_ptr<Buffer> whole, rest, completion;
+  ASSERT_OK(chunker->Process(Buffer::FromString(parts[0] + parts[1]), &whole, &rest));
+  ASSERT_EQ(std::string_view(*whole), parts[0]);
+  ASSERT_EQ(std::string_view(*rest), parts[1]);
+  auto status =
+      chunker->ProcessWithPartial(rest, Buffer::FromString(parts[2]), &completion, &rest);
+  ASSERT_RAISES(Invalid, status);
+  EXPECT_THAT(status.message(),
+              ::testing::StartsWith("JSON chunk error: invalid data at end of document"));
 }
 
 TEST_P(BaseChunkerTest, StraddlingEmpty) {

@@ -15,26 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Interfaces to use for defining Flight RPC servers. API should be considered
-// experimental for now
+// Interfaces to use for defining Flight RPC servers.
 
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "arrow/flight/server_auth.h"
+#include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"       // IWYU pragma: keep
 #include "arrow/flight/visibility.h"  // IWYU pragma: keep
 #include "arrow/ipc/dictionary.h"
-#include "arrow/memory_pool.h"
+#include "arrow/ipc/options.h"
 #include "arrow/record_batch.h"
 
 namespace arrow {
 
-class MemoryPool;
 class Schema;
 class Status;
 
@@ -49,26 +50,35 @@ class ARROW_FLIGHT_EXPORT FlightDataStream {
   virtual std::shared_ptr<Schema> schema() = 0;
 
   /// \brief Compute FlightPayload containing serialized RecordBatch schema
-  virtual Status GetSchemaPayload(FlightPayload* payload) = 0;
+  virtual arrow::Result<FlightPayload> GetSchemaPayload() = 0;
 
   // When the stream is completed, the last payload written will have null
   // metadata
-  virtual Status Next(FlightPayload* payload) = 0;
+  virtual arrow::Result<FlightPayload> Next() = 0;
+
+  virtual Status Close();
 };
 
 /// \brief A basic implementation of FlightDataStream that will provide
-/// a sequence of FlightData messages to be written to a gRPC stream
+/// a sequence of FlightData messages to be written to a stream
 class ARROW_FLIGHT_EXPORT RecordBatchStream : public FlightDataStream {
  public:
   /// \param[in] reader produces a sequence of record batches
-  /// \param[in,out] pool a MemoryPool to use for allocations
-  explicit RecordBatchStream(const std::shared_ptr<RecordBatchReader>& reader,
-                             MemoryPool* pool = default_memory_pool());
+  /// \param[in] options IPC options for writing
+  explicit RecordBatchStream(
+      const std::shared_ptr<RecordBatchReader>& reader,
+      const ipc::IpcWriteOptions& options = ipc::IpcWriteOptions::Defaults());
   ~RecordBatchStream() override;
 
+  // inherit deprecated API
+  using FlightDataStream::GetSchemaPayload;
+  using FlightDataStream::Next;
+
   std::shared_ptr<Schema> schema() override;
-  Status GetSchemaPayload(FlightPayload* payload) override;
-  Status Next(FlightPayload* payload) override;
+  arrow::Result<FlightPayload> GetSchemaPayload() override;
+
+  arrow::Result<FlightPayload> Next() override;
+  Status Close() override;
 
  private:
   class RecordBatchStreamImpl;
@@ -92,27 +102,81 @@ class ARROW_FLIGHT_EXPORT FlightMetadataWriter {
   virtual Status WriteMetadata(const Buffer& app_metadata) = 0;
 };
 
+/// \brief A writer for IPC payloads to a client. Also allows sending
+/// application-defined metadata via the Flight protocol.
+///
+/// This class offers more control compared to FlightDataStream,
+/// including the option to write metadata without data and the
+/// ability to interleave reading and writing.
+class ARROW_FLIGHT_EXPORT FlightMessageWriter : public MetadataRecordBatchWriter {
+ public:
+  virtual ~FlightMessageWriter() = default;
+};
+
 /// \brief Call state/contextual data.
 class ARROW_FLIGHT_EXPORT ServerCallContext {
  public:
   virtual ~ServerCallContext() = default;
   /// \brief The name of the authenticated peer (may be the empty string)
   virtual const std::string& peer_identity() const = 0;
+  /// \brief The peer address (not validated)
+  virtual const std::string& peer() const = 0;
+  /// \brief Add a response header.  This is only valid before the server
+  /// starts sending the response; generally this isn't an issue unless you
+  /// are implementing FlightDataStream, ResultStream, or similar interfaces
+  /// yourself, or during a DoExchange or DoPut.
+  virtual void AddHeader(const std::string& key, const std::string& value) const = 0;
+  /// \brief Add a response trailer.  This is only valid before the server
+  /// sends the final status; generally this isn't an issue unless your RPC
+  /// handler launches a thread or similar.
+  virtual void AddTrailer(const std::string& key, const std::string& value) const = 0;
+  /// \brief Look up a middleware by key. Do not maintain a reference
+  /// to the object beyond the request body.
+  /// \return The middleware, or nullptr if not found.
+  virtual ServerMiddleware* GetMiddleware(const std::string& key) const = 0;
+  /// \brief Check if the current RPC has been cancelled (by the client, by
+  /// a network error, etc.).
+  virtual bool is_cancelled() const = 0;
+  /// \brief The headers sent by the client for this call.
+  virtual const CallHeaders& incoming_headers() const = 0;
 };
 
 class ARROW_FLIGHT_EXPORT FlightServerOptions {
  public:
   explicit FlightServerOptions(const Location& location_);
 
+  ~FlightServerOptions();
+
+  /// \brief The host & port (or domain socket path) to listen on.
+  /// Use port 0 to bind to an available port.
   Location location;
-  std::unique_ptr<ServerAuthHandler> auth_handler;
+  /// \brief The authentication handler to use.
+  std::shared_ptr<ServerAuthHandler> auth_handler;
+  /// \brief A list of TLS certificate+key pairs to use.
   std::vector<CertKeyPair> tls_certificates;
+  /// \brief Enable mTLS and require that the client present a certificate.
+  bool verify_client;
+  /// \brief If using mTLS, the PEM-encoded root certificate to use.
+  std::string root_certificates;
+  /// \brief A list of server middleware to apply, along with a key to
+  /// identify them by.
+  ///
+  /// Middleware are always applied in the order provided. Duplicate
+  /// keys are an error.
+  std::vector<std::pair<std::string, std::shared_ptr<ServerMiddlewareFactory>>>
+      middleware;
+
+  /// \brief An optional memory manager to control where to allocate incoming data.
+  std::shared_ptr<MemoryManager> memory_manager;
+
   /// \brief A Flight implementation-specific callback to customize
   /// transport-specific options.
+  ///
   /// Not guaranteed to be called. The type of the parameter is
   /// specific to the Flight implementation. Users should take care to
   /// link to the same transport implementation as Flight to avoid
-  /// runtime problems.
+  /// runtime problems. See "Using Arrow C++ in your own project" in
+  /// the documentation for more details.
   std::function<void(void*)> builder_hook;
 };
 
@@ -128,7 +192,7 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   /// \brief Initialize a Flight server listening at the given location.
   /// This method must be called before any other method.
   /// \param[in] options The configuration for this server.
-  Status Init(FlightServerOptions& options);
+  Status Init(const FlightServerOptions& options);
 
   /// \brief Get the port that the Flight server is listening on.
   /// This method must only be called after Init().  Will return a
@@ -136,14 +200,20 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   /// domain socket).
   int port() const;
 
+  /// \brief Get the address that the Flight server is listening on.
+  /// This method must only be called after Init().
+  Location location() const;
+
   /// \brief Set the server to stop when receiving any of the given signal
   /// numbers.
   /// This method must be called before Serve().
   Status SetShutdownOnSignals(const std::vector<int> sigs);
 
   /// \brief Start serving.
-  /// This method blocks until either Shutdown() is called or one of the signals
-  /// registered in SetShutdownOnSignals() is received.
+  /// This method blocks until the server shuts down.
+  ///
+  /// The server will start to shut down when either Shutdown() is called
+  /// or one of the signals registered in SetShutdownOnSignals() is received.
   Status Serve();
 
   /// \brief Query whether Serve() was interrupted by a signal.
@@ -152,13 +222,18 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   /// \return int the signal number that interrupted Serve(), if any, otherwise 0
   int GotSignal() const;
 
-  /// \brief Shut down the server. Can be called from signal handler or another
-  /// thread while Serve() blocks.
+  /// \brief Shut down the server, blocking until current requests finish.
   ///
-  /// TODO(wesm): Shutdown with deadline
-  Status Shutdown();
+  /// Can be called from a signal handler or another thread while Serve()
+  /// blocks. Optionally a deadline can be set. Once the deadline expires
+  /// server will wait until remaining running calls complete.
+  ///
+  /// Should only be called once.
+  Status Shutdown(const std::chrono::system_clock::time_point* deadline = NULLPTR);
 
-  /// \brief Block until server is terminated with Shutdown.
+  /// \brief Block until server shuts down with Shutdown.
+  ///
+  /// Does not respond to signals like Serve().
   Status Wait();
 
   // Implement these methods to create your own server. The default
@@ -176,16 +251,26 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   /// \brief Retrieve the schema and an access plan for the indicated
   /// descriptor
   /// \param[in] context The call context.
-  /// \param[in] request may be null
+  /// \param[in] request the dataset request, whether a named dataset or command
   /// \param[out] info the returned flight info provider
   /// \return Status
   virtual Status GetFlightInfo(const ServerCallContext& context,
                                const FlightDescriptor& request,
                                std::unique_ptr<FlightInfo>* info);
 
+  /// \brief Retrieve the current status of the target query
+  /// \param[in] context The call context.
+  /// \param[in] request the dataset request or a descriptor returned by a
+  /// prior PollFlightInfo call
+  /// \param[out] info the returned retry info provider
+  /// \return Status
+  virtual Status PollFlightInfo(const ServerCallContext& context,
+                                const FlightDescriptor& request,
+                                std::unique_ptr<PollInfo>* info);
+
   /// \brief Retrieve the schema for the indicated descriptor
   /// \param[in] context The call context.
-  /// \param[in] request may be null
+  /// \param[in] request the dataset request, whether a named dataset or command
   /// \param[out] schema the returned flight schema provider
   /// \return Status
   virtual Status GetSchema(const ServerCallContext& context,
@@ -208,6 +293,15 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   virtual Status DoPut(const ServerCallContext& context,
                        std::unique_ptr<FlightMessageReader> reader,
                        std::unique_ptr<FlightMetadataWriter> writer);
+
+  /// \brief Process a bidirectional stream of IPC payloads
+  /// \param[in] context The call context.
+  /// \param[in] reader a sequence of uploaded record batches
+  /// \param[in] writer send data back to the client
+  /// \return Status
+  virtual Status DoExchange(const ServerCallContext& context,
+                            std::unique_ptr<FlightMessageReader> reader,
+                            std::unique_ptr<FlightMessageWriter> writer);
 
   /// \brief Execute an action, return stream of zero or more results
   /// \param[in] context The call context.

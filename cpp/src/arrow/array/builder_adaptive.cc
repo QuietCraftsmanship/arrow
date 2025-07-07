@@ -18,24 +18,26 @@
 #include "arrow/array/builder_adaptive.h"
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
-#include <utility>
 
-#include "arrow/array.h"
+#include "arrow/array/data.h"
 #include "arrow/buffer.h"
+#include "arrow/buffer_builder.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/type_traits.h"
-#include "arrow/util/bit_util.h"
 #include "arrow/util/int_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
 using internal::AdaptiveIntBuilderBase;
 
-AdaptiveIntBuilderBase::AdaptiveIntBuilderBase(MemoryPool* pool) : ArrayBuilder(pool) {}
+AdaptiveIntBuilderBase::AdaptiveIntBuilderBase(uint8_t start_int_size, MemoryPool* pool,
+                                               int64_t alignment)
+    : ArrayBuilder(pool, alignment),
+      start_int_size_(start_int_size),
+      int_size_(start_int_size) {}
 
 void AdaptiveIntBuilderBase::Reset() {
   ArrayBuilder::Reset();
@@ -43,21 +45,43 @@ void AdaptiveIntBuilderBase::Reset() {
   raw_data_ = nullptr;
   pending_pos_ = 0;
   pending_has_nulls_ = false;
+  int_size_ = start_int_size_;
 }
 
 Status AdaptiveIntBuilderBase::Resize(int64_t capacity) {
-  RETURN_NOT_OK(CheckCapacity(capacity, capacity_));
+  RETURN_NOT_OK(CheckCapacity(capacity));
   capacity = std::max(capacity, kMinBuilderCapacity);
 
   int64_t nbytes = capacity * int_size_;
   if (capacity_ == 0) {
-    RETURN_NOT_OK(AllocateResizableBuffer(pool_, nbytes, &data_));
+    ARROW_ASSIGN_OR_RAISE(data_, AllocateResizableBuffer(nbytes, pool_));
   } else {
     RETURN_NOT_OK(data_->Resize(nbytes));
   }
   raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
 
   return ArrayBuilder::Resize(capacity);
+}
+
+template <typename new_type, typename old_type>
+typename std::enable_if<sizeof(old_type) >= sizeof(new_type), Status>::type
+AdaptiveIntBuilderBase::ExpandIntSizeInternal() {
+  return Status::OK();
+}
+
+template <typename new_type, typename old_type>
+typename std::enable_if<(sizeof(old_type) < sizeof(new_type)), Status>::type
+AdaptiveIntBuilderBase::ExpandIntSizeInternal() {
+  int_size_ = sizeof(new_type);
+  RETURN_NOT_OK(Resize(data_->size() / sizeof(old_type)));
+
+  const old_type* src = reinterpret_cast<old_type*>(raw_data_);
+  new_type* dst = reinterpret_cast<new_type*>(raw_data_);
+  // By doing the backward copy, we ensure that no element is overridden during
+  // the copy process while the copy stays in-place.
+  std::copy_backward(src, src + length_, dst + length_);
+
+  return Status::OK();
 }
 
 std::shared_ptr<DataType> AdaptiveUIntBuilder::type() const {
@@ -104,7 +128,9 @@ std::shared_ptr<DataType> AdaptiveIntBuilder::type() const {
   return nullptr;
 }
 
-AdaptiveIntBuilder::AdaptiveIntBuilder(MemoryPool* pool) : AdaptiveIntBuilderBase(pool) {}
+AdaptiveIntBuilder::AdaptiveIntBuilder(uint8_t start_int_size, MemoryPool* pool,
+                                       int64_t alignment)
+    : AdaptiveIntBuilderBase(start_int_size, pool, alignment) {}
 
 Status AdaptiveIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   RETURN_NOT_OK(CommitPendingData());
@@ -113,7 +139,13 @@ Status AdaptiveIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   RETURN_NOT_OK(null_bitmap_builder_.Finish(&null_bitmap));
   RETURN_NOT_OK(TrimBuffer(length_ * int_size_, data_.get()));
 
-  *out = ArrayData::Make(type(), length_, {null_bitmap, data_}, null_count_);
+  std::shared_ptr<Buffer> values_buffer = data_;
+  if (!values_buffer) {
+    ARROW_ASSIGN_OR_RAISE(values_buffer, AllocateBuffer(0, pool_));
+  }
+
+  *out = ArrayData::Make(type(), length_, {null_bitmap, std::move(values_buffer)},
+                         null_count_);
 
   data_ = nullptr;
   capacity_ = length_ = null_count_ = 0;
@@ -137,6 +169,12 @@ static constexpr int64_t kAdaptiveIntChunkSize = 8192;
 
 Status AdaptiveIntBuilder::AppendValuesInternal(const int64_t* values, int64_t length,
                                                 const uint8_t* valid_bytes) {
+  if (pending_pos_ > 0) {
+    // UnsafeAppendToBitmap expects length_ to be the pre-update value, satisfy it
+    DCHECK_EQ(length, pending_pos_) << "AppendValuesInternal called while data pending";
+    length_ -= pending_pos_;
+  }
+
   while (length > 0) {
     // In case `length` is very large, we don't want to trash the cache by
     // scanning it twice (first to detect int width, second to copy the data).
@@ -173,7 +211,7 @@ Status AdaptiveIntBuilder::AppendValuesInternal(const int64_t* values, int64_t l
         DCHECK(false);
     }
 
-    // This updates length_
+    // UnsafeAppendToBitmap increments length_ by chunk_size
     ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, chunk_size);
     values += chunk_size;
     if (valid_bytes != nullptr) {
@@ -203,28 +241,6 @@ Status AdaptiveIntBuilder::AppendValues(const int64_t* values, int64_t length,
   RETURN_NOT_OK(Reserve(length));
 
   return AppendValuesInternal(values, length, valid_bytes);
-}
-
-template <typename new_type, typename old_type>
-typename std::enable_if<sizeof(old_type) >= sizeof(new_type), Status>::type
-AdaptiveIntBuilder::ExpandIntSizeInternal() {
-  return Status::OK();
-}
-
-template <typename new_type, typename old_type>
-typename std::enable_if<(sizeof(old_type) < sizeof(new_type)), Status>::type
-AdaptiveIntBuilder::ExpandIntSizeInternal() {
-  int_size_ = sizeof(new_type);
-  RETURN_NOT_OK(Resize(data_->size() / sizeof(old_type)));
-  raw_data_ = reinterpret_cast<uint8_t*>(data_->mutable_data());
-  const old_type* src = reinterpret_cast<old_type*>(raw_data_);
-  new_type* dst = reinterpret_cast<new_type*>(raw_data_);
-
-  // By doing the backward copy, we ensure that no element is overriden during
-  // the copy process and the copy stays in-place.
-  std::copy_backward(src, src + length_, dst + length_);
-
-  return Status::OK();
 }
 
 template <typename new_type>
@@ -260,8 +276,8 @@ Status AdaptiveIntBuilder::ExpandIntSize(uint8_t new_int_size) {
   return Status::OK();
 }
 
-AdaptiveUIntBuilder::AdaptiveUIntBuilder(MemoryPool* pool)
-    : AdaptiveIntBuilderBase(pool) {}
+AdaptiveUIntBuilder::AdaptiveUIntBuilder(uint8_t start_int_size, MemoryPool* pool)
+    : AdaptiveIntBuilderBase(start_int_size, pool) {}
 
 Status AdaptiveUIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   RETURN_NOT_OK(CommitPendingData());
@@ -279,6 +295,12 @@ Status AdaptiveUIntBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 
 Status AdaptiveUIntBuilder::AppendValuesInternal(const uint64_t* values, int64_t length,
                                                  const uint8_t* valid_bytes) {
+  if (pending_pos_ > 0) {
+    // UnsafeAppendToBitmap expects length_ to be the pre-update value, satisfy it
+    DCHECK_EQ(length, pending_pos_) << "AppendValuesInternal called while data pending";
+    length_ -= pending_pos_;
+  }
+
   while (length > 0) {
     // See AdaptiveIntBuilder::AppendValuesInternal
     const int64_t chunk_size = std::min(length, kAdaptiveIntChunkSize);
@@ -313,7 +335,7 @@ Status AdaptiveUIntBuilder::AppendValuesInternal(const uint64_t* values, int64_t
         DCHECK(false);
     }
 
-    // This updates length_
+    // UnsafeAppendToBitmap increments length_ by chunk_size
     ArrayBuilder::UnsafeAppendToBitmap(valid_bytes, chunk_size);
     values += chunk_size;
     if (valid_bytes != nullptr) {
@@ -330,27 +352,6 @@ Status AdaptiveUIntBuilder::AppendValues(const uint64_t* values, int64_t length,
   RETURN_NOT_OK(Reserve(length));
 
   return AppendValuesInternal(values, length, valid_bytes);
-}
-
-template <typename new_type, typename old_type>
-typename std::enable_if<sizeof(old_type) >= sizeof(new_type), Status>::type
-AdaptiveUIntBuilder::ExpandIntSizeInternal() {
-  return Status::OK();
-}
-
-template <typename new_type, typename old_type>
-typename std::enable_if<(sizeof(old_type) < sizeof(new_type)), Status>::type
-AdaptiveUIntBuilder::ExpandIntSizeInternal() {
-  int_size_ = sizeof(new_type);
-  RETURN_NOT_OK(Resize(data_->size() / sizeof(old_type)));
-
-  old_type* src = reinterpret_cast<old_type*>(raw_data_);
-  new_type* dst = reinterpret_cast<new_type*>(raw_data_);
-  // By doing the backward copy, we ensure that no element is overriden during
-  // the copy process and the copy stays in-place.
-  std::copy_backward(src, src + length_, dst + length_);
-
-  return Status::OK();
 }
 
 template <typename new_type>

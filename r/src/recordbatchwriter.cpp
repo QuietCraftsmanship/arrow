@@ -17,49 +17,48 @@
 
 #include "./arrow_types.h"
 
-#if defined(ARROW_R_WITH_ARROW)
+#include <arrow/ipc/writer.h>
 
 // [[arrow::export]]
 void ipc___RecordBatchWriter__WriteRecordBatch(
     const std::shared_ptr<arrow::ipc::RecordBatchWriter>& batch_writer,
     const std::shared_ptr<arrow::RecordBatch>& batch) {
-  STOP_IF_NOT_OK(batch_writer->WriteRecordBatch(*batch));
+  StopIfNotOk(batch_writer->WriteRecordBatch(*batch));
 }
 
 // [[arrow::export]]
 void ipc___RecordBatchWriter__WriteTable(
     const std::shared_ptr<arrow::ipc::RecordBatchWriter>& batch_writer,
     const std::shared_ptr<arrow::Table>& table) {
-  STOP_IF_NOT_OK(batch_writer->WriteTable(*table));
+  StopIfNotOk(batch_writer->WriteTable(*table));
 }
 
 // [[arrow::export]]
 void ipc___RecordBatchWriter__Close(
     const std::shared_ptr<arrow::ipc::RecordBatchWriter>& batch_writer) {
-  STOP_IF_NOT_OK(batch_writer->Close());
+  StopIfNotOk(batch_writer->Close());
 }
 
 // [[arrow::export]]
 std::shared_ptr<arrow::ipc::RecordBatchWriter> ipc___RecordBatchFileWriter__Open(
     const std::shared_ptr<arrow::io::OutputStream>& stream,
-    const std::shared_ptr<arrow::Schema>& schema, bool use_legacy_format) {
-  auto options = arrow::ipc::IpcOptions::Defaults();
+    const std::shared_ptr<arrow::Schema>& schema, bool use_legacy_format,
+    arrow::ipc::MetadataVersion metadata_version) {
+  auto options = arrow::ipc::IpcWriteOptions::Defaults();
   options.write_legacy_ipc_format = use_legacy_format;
-  ARROW_ASSIGN_OR_STOP(auto file_writer, arrow::ipc::RecordBatchFileWriter::Open(
-                                             stream.get(), schema, options));
-  return file_writer;
+  options.metadata_version = metadata_version;
+  options.memory_pool = gc_memory_pool();
+  return ValueOrStop(arrow::ipc::MakeFileWriter(stream, schema, options));
 }
 
 // [[arrow::export]]
 std::shared_ptr<arrow::ipc::RecordBatchWriter> ipc___RecordBatchStreamWriter__Open(
     const std::shared_ptr<arrow::io::OutputStream>& stream,
-    const std::shared_ptr<arrow::Schema>& schema, bool use_legacy_format) {
-  auto options = arrow::ipc::IpcOptions::Defaults();
+    const std::shared_ptr<arrow::Schema>& schema, bool use_legacy_format,
+    arrow::ipc::MetadataVersion metadata_version) {
+  auto options = arrow::ipc::IpcWriteOptions::Defaults();
   options.write_legacy_ipc_format = use_legacy_format;
-
-  ARROW_ASSIGN_OR_STOP(auto stream_writer, arrow::ipc::RecordBatchStreamWriter::Open(
-                                               stream.get(), schema, options));
-  return stream_writer;
+  options.metadata_version = metadata_version;
+  options.memory_pool = gc_memory_pool();
+  return ValueOrStop(MakeStreamWriter(stream, schema, options));
 }
-
-#endif

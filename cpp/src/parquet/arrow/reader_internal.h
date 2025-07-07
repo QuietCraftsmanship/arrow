@@ -17,15 +17,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "parquet/arrow/schema.h"
 #include "parquet/column_reader.h"
 #include "parquet/file_reader.h"
 #include "parquet/metadata.h"
@@ -65,7 +66,8 @@ class FileColumnIterator {
       : column_index_(column_index),
         reader_(reader),
         schema_(reader->metadata()->schema()),
-        row_groups_(row_groups.begin(), row_groups.end()) {}
+        row_groups_(row_groups.begin(), row_groups.end()),
+        row_group_index_(-1) {}
 
   virtual ~FileColumnIterator() {}
 
@@ -74,7 +76,8 @@ class FileColumnIterator {
       return nullptr;
     }
 
-    auto row_group_reader = reader_->RowGroup(row_groups_.front());
+    row_group_index_ = row_groups_.front();
+    auto row_group_reader = reader_->RowGroup(row_group_index_);
     row_groups_.pop_front();
     return row_group_reader->GetColumnPageReader(column_index_);
   }
@@ -85,113 +88,50 @@ class FileColumnIterator {
 
   std::shared_ptr<FileMetaData> metadata() const { return reader_->metadata(); }
 
+  std::unique_ptr<RowGroupMetaData> row_group_metadata() const {
+    return metadata()->RowGroup(row_group_index_);
+  }
+
+  std::unique_ptr<ColumnChunkMetaData> column_chunk_metadata() const {
+    return row_group_metadata()->ColumnChunk(column_index_);
+  }
+
   int column_index() const { return column_index_; }
+
+  int row_group_index() const { return row_group_index_; }
 
  protected:
   int column_index_;
   ParquetFileReader* reader_;
   const SchemaDescriptor* schema_;
   std::deque<int> row_groups_;
+  int row_group_index_;
 };
 
 using FileColumnIteratorFactory =
     std::function<FileColumnIterator*(int, ParquetFileReader*)>;
-
-Status TransferColumnData(::parquet::internal::RecordReader* reader,
-                          std::shared_ptr<::arrow::DataType> value_type,
-                          const ColumnDescriptor* descr, ::arrow::MemoryPool* pool,
-                          std::shared_ptr<::arrow::ChunkedArray>* out);
-
-Status ReconstructNestedList(const std::shared_ptr<::arrow::Array>& arr,
-                             std::shared_ptr<::arrow::Field> field, int16_t max_def_level,
-                             int16_t max_rep_level, const int16_t* def_levels,
-                             const int16_t* rep_levels, int64_t total_levels,
-                             ::arrow::MemoryPool* pool,
-                             std::shared_ptr<::arrow::Array>* out);
 
 struct ReaderContext {
   ParquetFileReader* reader;
   ::arrow::MemoryPool* pool;
   FileColumnIteratorFactory iterator_factory;
   bool filter_leaves;
-  std::unordered_set<int> included_leaves;
+  std::shared_ptr<std::unordered_set<int>> included_leaves;
+  ArrowReaderProperties* reader_properties;
 
   bool IncludesLeaf(int leaf_index) const {
-    return (!this->filter_leaves ||
-            (included_leaves.find(leaf_index) != included_leaves.end()));
-  }
-};
-
-struct PARQUET_EXPORT SchemaField {
-  std::shared_ptr<::arrow::Field> field;
-  std::vector<SchemaField> children;
-
-  // Only set for leaf nodes
-  int column_index = -1;
-
-  int16_t max_definition_level;
-  int16_t max_repetition_level;
-
-  bool is_leaf() const { return column_index != -1; }
-
-  Status GetReader(const ReaderContext& context,
-                   std::unique_ptr<ColumnReaderImpl>* out) const;
-};
-
-struct SchemaManifest {
-  const SchemaDescriptor* descr;
-  std::shared_ptr<::arrow::Schema> origin_schema;
-  std::shared_ptr<const KeyValueMetadata> schema_metadata;
-  std::vector<SchemaField> schema_fields;
-
-  std::unordered_map<int, const SchemaField*> column_index_to_field;
-  std::unordered_map<const SchemaField*, const SchemaField*> child_to_parent;
-
-  Status GetColumnField(int column_index, const SchemaField** out) const {
-    auto it = column_index_to_field.find(column_index);
-    if (it == column_index_to_field.end()) {
-      return Status::KeyError("Column index ", column_index,
-                              " not found in schema manifest, may be malformed");
-    }
-    *out = it->second;
-    return Status::OK();
-  }
-
-  const SchemaField* GetParent(const SchemaField* field) const {
-    // Returns nullptr also if not found
-    auto it = child_to_parent.find(field);
-    if (it == child_to_parent.end()) {
-      return nullptr;
-    }
-    return it->second;
-  }
-
-  bool GetFieldIndices(const std::vector<int>& column_indices, std::vector<int>* out) {
-    // Coalesce a list of schema fields indices which are the roots of the
-    // columns referred by a list of column indices
-    const schema::GroupNode* group = descr->group_node();
-    std::unordered_set<int> already_added;
-    out->clear();
-    for (auto& column_idx : column_indices) {
-      auto field_node = descr->GetColumnRoot(column_idx);
-      auto field_idx = group->FieldIndex(*field_node);
-      if (field_idx < 0) {
-        return false;
-      }
-      auto insertion = already_added.insert(field_idx);
-      if (insertion.second) {
-        out->push_back(field_idx);
-      }
+    if (this->filter_leaves) {
+      return this->included_leaves->find(leaf_index) != this->included_leaves->end();
     }
     return true;
   }
 };
 
-PARQUET_EXPORT
-Status BuildSchemaManifest(const SchemaDescriptor* schema,
-                           const std::shared_ptr<const KeyValueMetadata>& metadata,
-                           const ArrowReaderProperties& properties,
-                           SchemaManifest* manifest);
+Status TransferColumnData(::parquet::internal::RecordReader* reader,
+                          std::unique_ptr<::parquet::ColumnChunkMetaData> metadata,
+                          const std::shared_ptr<::arrow::Field>& value_field,
+                          const ColumnDescriptor* descr, const ReaderContext* ctx,
+                          std::shared_ptr<::arrow::ChunkedArray>* out);
 
 }  // namespace arrow
 }  // namespace parquet

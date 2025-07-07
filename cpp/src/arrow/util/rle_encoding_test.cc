@@ -24,15 +24,14 @@
 
 #include <gtest/gtest.h>
 
-#include <boost/utility.hpp>  // IWYU pragma: export
-
 #include "arrow/array.h"
 #include "arrow/buffer.h"
 #include "arrow/testing/random.h"
 #include "arrow/type.h"
-#include "arrow/util/bit_stream_utils.h"
+#include "arrow/util/bit_stream_utils_internal.h"
 #include "arrow/util/bit_util.h"
-#include "arrow/util/rle_encoding.h"
+#include "arrow/util/io_util.h"
+#include "arrow/util/rle_encoding_internal.h"
 
 namespace arrow {
 namespace util {
@@ -43,15 +42,15 @@ TEST(BitArray, TestBool) {
   const int len = 8;
   uint8_t buffer[len];
 
-  BitUtil::BitWriter writer(buffer, len);
+  bit_util::BitWriter writer(buffer, len);
 
   // Write alternating 0's and 1's
   for (int i = 0; i < 8; ++i) {
-    bool result = writer.PutValue(i % 2, 1);
-    EXPECT_TRUE(result);
+    EXPECT_TRUE(writer.PutValue(i % 2, 1));
   }
   writer.Flush();
-  EXPECT_EQ((int)buffer[0], BOOST_BINARY(1 0 1 0 1 0 1 0));
+
+  EXPECT_EQ(buffer[0], 0xAA /* 0b10101010 */);
 
   // Write 00110011
   for (int i = 0; i < 8; ++i) {
@@ -72,11 +71,11 @@ TEST(BitArray, TestBool) {
   writer.Flush();
 
   // Validate the exact bit value
-  EXPECT_EQ((int)buffer[0], BOOST_BINARY(1 0 1 0 1 0 1 0));
-  EXPECT_EQ((int)buffer[1], BOOST_BINARY(1 1 0 0 1 1 0 0));
+  EXPECT_EQ(buffer[0], 0xAA /* 0b10101010 */);
+  EXPECT_EQ(buffer[1], 0xCC /* 0b11001100 */);
 
   // Use the reader and validate
-  BitUtil::BitReader reader(buffer, len);
+  bit_util::BitReader reader(buffer, len);
   for (int i = 0; i < 8; ++i) {
     bool val = false;
     bool result = reader.GetValue(1, &val);
@@ -104,12 +103,12 @@ TEST(BitArray, TestBool) {
 
 // Writes 'num_vals' values with width 'bit_width' and reads them back.
 void TestBitArrayValues(int bit_width, int num_vals) {
-  int len = static_cast<int>(BitUtil::BytesForBits(bit_width * num_vals));
+  int len = static_cast<int>(bit_util::BytesForBits(bit_width * num_vals));
   EXPECT_GT(len, 0);
   const uint64_t mod = bit_width == 64 ? 1 : 1LL << bit_width;
 
   std::vector<uint8_t> buffer(len);
-  BitUtil::BitWriter writer(buffer.data(), len);
+  bit_util::BitWriter writer(buffer.data(), len);
   for (int i = 0; i < num_vals; ++i) {
     bool result = writer.PutValue(i % mod, bit_width);
     EXPECT_TRUE(result);
@@ -117,7 +116,7 @@ void TestBitArrayValues(int bit_width, int num_vals) {
   writer.Flush();
   EXPECT_EQ(writer.bytes_written(), len);
 
-  BitUtil::BitReader reader(buffer.data(), len);
+  bit_util::BitReader reader(buffer.data(), len);
   for (int i = 0; i < num_vals; ++i) {
     int64_t val = 0;
     bool result = reader.GetValue(bit_width, &val);
@@ -143,7 +142,7 @@ TEST(BitArray, TestMixed) {
   uint8_t buffer[len];
   bool parity = true;
 
-  BitUtil::BitWriter writer(buffer, len);
+  bit_util::BitWriter writer(buffer, len);
   for (int i = 0; i < len; ++i) {
     bool result;
     if (i % 2 == 0) {
@@ -157,7 +156,7 @@ TEST(BitArray, TestMixed) {
   writer.Flush();
 
   parity = true;
-  BitUtil::BitReader reader(buffer, len);
+  bit_util::BitReader reader(buffer, len);
   for (int i = 0; i < len; ++i) {
     bool result;
     if (i % 2 == 0) {
@@ -174,6 +173,40 @@ TEST(BitArray, TestMixed) {
   }
 }
 
+// Write up to 'num_vals' values with width 'bit_width' and reads them back.
+static void TestPutValue(int bit_width, uint64_t num_vals) {
+  // The max value representable in `bit_width` bits.
+  const uint64_t max = std::numeric_limits<uint64_t>::max() >> (64 - bit_width);
+  num_vals = std::min(num_vals, max);
+  int len = static_cast<int>(bit_util::BytesForBits(bit_width * num_vals));
+  EXPECT_GT(len, 0);
+
+  std::vector<uint8_t> buffer(len);
+  bit_util::BitWriter writer(buffer.data(), len);
+  for (uint64_t i = max - num_vals; i < max; i++) {
+    bool result = writer.PutValue(i, bit_width);
+    EXPECT_TRUE(result);
+  }
+  writer.Flush();
+  EXPECT_EQ(writer.bytes_written(), len);
+
+  bit_util::BitReader reader(buffer.data(), len);
+  for (uint64_t i = max - num_vals; i < max; i++) {
+    int64_t val = 0;
+    bool result = reader.GetValue(bit_width, &val);
+    EXPECT_TRUE(result);
+    EXPECT_EQ(val, i);
+  }
+  EXPECT_EQ(reader.bytes_left(), 0);
+}
+
+TEST(BitUtil, RoundTripIntValues) {
+  for (int width = 1; width < 64; width++) {
+    TestPutValue(width, 1);
+    TestPutValue(width, 1024);
+  }
+}
+
 // Validates encoding of values by encoding and decoding them.  If
 // expected_encoding != NULL, also validates that the encoded buffer is
 // exactly 'expected_encoding'.
@@ -181,7 +214,14 @@ TEST(BitArray, TestMixed) {
 void ValidateRle(const std::vector<int>& values, int bit_width,
                  uint8_t* expected_encoding, int expected_len) {
   const int len = 64 * 1024;
+#ifdef __EMSCRIPTEN__
+  // don't make this on the stack as it is
+  // too big for emscripten
+  std::vector<uint8_t> buffer_vec(static_cast<size_t>(len));
+  uint8_t* buffer = buffer_vec.data();
+#else
   uint8_t buffer[len];
+#endif
   EXPECT_LE(expected_len, len);
 
   RleEncoder encoder(buffer, len, bit_width);
@@ -194,7 +234,7 @@ void ValidateRle(const std::vector<int>& values, int bit_width,
   if (expected_len != -1) {
     EXPECT_EQ(encoded_len, expected_len);
   }
-  if (expected_encoding != NULL) {
+  if (expected_encoding != NULL && encoded_len == expected_len) {
     EXPECT_EQ(memcmp(buffer, expected_encoding, encoded_len), 0);
   }
 
@@ -223,7 +263,14 @@ void ValidateRle(const std::vector<int>& values, int bit_width,
 // the returned values are not all the same
 bool CheckRoundTrip(const std::vector<int>& values, int bit_width) {
   const int len = 64 * 1024;
+#ifdef __EMSCRIPTEN__
+  // don't make this on the stack as it is
+  // too big for emscripten
+  std::vector<uint8_t> buffer_vec(static_cast<size_t>(len));
+  uint8_t* buffer = buffer_vec.data();
+#else
   uint8_t buffer[len];
+#endif
   RleEncoder encoder(buffer, len, bit_width);
   for (size_t i = 0; i < values.size(); ++i) {
     bool result = encoder.Put(values[i]);
@@ -285,29 +332,67 @@ TEST(Rle, SpecificSequences) {
   }
 
   for (int width = 9; width <= MAX_WIDTH; ++width) {
-    ValidateRle(values, width, NULL,
-                2 * (1 + static_cast<int>(BitUtil::CeilDiv(width, 8))));
+    ValidateRle(values, width, nullptr,
+                2 * (1 + static_cast<int>(bit_util::CeilDiv(width, 8))));
   }
 
   // Test 100 0's and 1's alternating
   for (int i = 0; i < 100; ++i) {
     values[i] = i % 2;
   }
-  int num_groups = static_cast<int>(BitUtil::CeilDiv(100, 8));
+  int num_groups = static_cast<int>(bit_util::CeilDiv(100, 8));
   expected_buffer[0] = static_cast<uint8_t>((num_groups << 1) | 1);
   for (int i = 1; i <= 100 / 8; ++i) {
-    expected_buffer[i] = BOOST_BINARY(1 0 1 0 1 0 1 0);
+    expected_buffer[i] = 0xAA /* 0b10101010 */;
   }
   // Values for the last 4 0 and 1's. The upper 4 bits should be padded to 0.
-  expected_buffer[100 / 8 + 1] = BOOST_BINARY(0 0 0 0 1 0 1 0);
+  expected_buffer[100 / 8 + 1] = 0x0A /* 0b00001010 */;
 
   // num_groups and expected_buffer only valid for bit width = 1
   ValidateRle(values, 1, expected_buffer, 1 + num_groups);
   for (int width = 2; width <= MAX_WIDTH; ++width) {
-    int num_values = static_cast<int>(BitUtil::CeilDiv(100, 8)) * 8;
-    ValidateRle(values, width, NULL,
-                1 + static_cast<int>(BitUtil::CeilDiv(width * num_values, 8)));
+    int num_values = static_cast<int>(bit_util::CeilDiv(100, 8)) * 8;
+    ValidateRle(values, width, nullptr,
+                1 + static_cast<int>(bit_util::CeilDiv(width * num_values, 8)));
   }
+
+  // Test 16-bit values to confirm encoded values are stored in little endian
+  values.resize(28);
+  for (int i = 0; i < 16; ++i) {
+    values[i] = 0x55aa;
+  }
+  for (int i = 16; i < 28; ++i) {
+    values[i] = 0xaa55;
+  }
+  expected_buffer[0] = (16 << 1);
+  expected_buffer[1] = 0xaa;
+  expected_buffer[2] = 0x55;
+  expected_buffer[3] = (12 << 1);
+  expected_buffer[4] = 0x55;
+  expected_buffer[5] = 0xaa;
+
+  ValidateRle(values, 16, expected_buffer, 6);
+
+  // Test 32-bit values to confirm encoded values are stored in little endian
+  values.resize(28);
+  for (int i = 0; i < 16; ++i) {
+    values[i] = 0x555aaaa5;
+  }
+  for (int i = 16; i < 28; ++i) {
+    values[i] = 0x5aaaa555;
+  }
+  expected_buffer[0] = (16 << 1);
+  expected_buffer[1] = 0xa5;
+  expected_buffer[2] = 0xaa;
+  expected_buffer[3] = 0x5a;
+  expected_buffer[4] = 0x55;
+  expected_buffer[5] = (12 << 1);
+  expected_buffer[6] = 0x55;
+  expected_buffer[7] = 0xa5;
+  expected_buffer[8] = 0xaa;
+  expected_buffer[9] = 0x5a;
+
+  ValidateRle(values, 32, expected_buffer, 10);
 }
 
 // ValidateRle on 'num_vals' values with width 'bit_width'. If 'value' != -1, that value
@@ -382,14 +467,13 @@ TEST(BitRle, Random) {
   std::vector<int> values(ngroups + max_group_size);
 
   // prng setup
-  std::random_device rd;
+  const auto seed = ::arrow::internal::GetRandomSeed();
+  std::default_random_engine gen(
+      static_cast<std::default_random_engine::result_type>(seed));
   std::uniform_int_distribution<int> dist(1, 20);
 
   for (int iter = 0; iter < niters; ++iter) {
     // generate a seed with device entropy
-    uint32_t seed = rd();
-    std::mt19937 gen(seed);
-
     bool parity = 0;
     values.resize(0);
 
@@ -403,7 +487,7 @@ TEST(BitRle, Random) {
       }
       parity = !parity;
     }
-    if (!CheckRoundTrip(values, BitUtil::NumRequiredBits(values.size()))) {
+    if (!CheckRoundTrip(values, bit_util::NumRequiredBits(values.size()))) {
       FAIL() << "failing seed: " << seed;
     }
   }

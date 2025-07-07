@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef PARQUET_ARROW_READER_H
-#define PARQUET_ARROW_READER_H
+#pragma once
 
 #include <cstdint>
+// N.B. we don't include async_generator.h as it's relatively heavy
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -31,6 +32,7 @@ namespace arrow {
 class ChunkedArray;
 class KeyValueMetadata;
 class RecordBatchReader;
+struct Scalar;
 class Schema;
 class Table;
 class RecordBatch;
@@ -46,25 +48,32 @@ namespace arrow {
 
 class ColumnChunkReader;
 class ColumnReader;
+struct SchemaManifest;
 class RowGroupReader;
 
-// Arrow read adapter class for deserializing Parquet files as Arrow row
-// batches.
-//
-// This interfaces caters for different use cases and thus provides different
-// interfaces. In its most simplistic form, we cater for a user that wants to
-// read the whole Parquet at once with the FileReader::ReadTable method.
-//
-// More advanced users that also want to implement parallelism on top of each
-// single Parquet files should do this on the RowGroup level. For this, they can
-// call FileReader::RowGroup(i)->ReadTable to receive only the specified
-// RowGroup as a table.
-//
-// In the most advanced situation, where a consumer wants to independently read
-// RowGroups in parallel and consume each column individually, they can call
-// FileReader::RowGroup(i)->Column(j)->Read and receive an arrow::Column
-// instance.
-//
+/// \brief Arrow read adapter class for deserializing Parquet files as Arrow row batches.
+///
+/// This interfaces caters for different use cases and thus provides different
+/// interfaces. In its most simplistic form, we cater for a user that wants to
+/// read the whole Parquet at once with the `FileReader::ReadTable` method.
+///
+/// More advanced users that also want to implement parallelism on top of each
+/// single Parquet files should do this on the RowGroup level. For this, they can
+/// call `FileReader::RowGroup(i)->ReadTable` to receive only the specified
+/// RowGroup as a table.
+///
+/// In the most advanced situation, where a consumer wants to independently read
+/// RowGroups in parallel and consume each column individually, they can call
+/// `FileReader::RowGroup(i)->Column(j)->Read` and receive an `arrow::Column`
+/// instance.
+///
+/// Finally, one can also get a stream of record batches using
+/// `FileReader::GetRecordBatchReader()`. This can internally decode columns
+/// in parallel if use_threads was enabled in the ArrowReaderProperties.
+///
+/// The parquet format supports an optional integer field_id which can be assigned
+/// to a field.  Arrow will convert these field IDs to a metadata key named
+/// PARQUET:field_id on the appropriate field.
 // TODO(wesm): nested data does not always make sense with this user
 // interface unless you are only reading a single leaf node from a branch of
 // a table. For example:
@@ -78,7 +87,7 @@ class RowGroupReader;
 //   optional int32 val4;
 // }
 //
-// In the Parquet file, there are 3 leaf nodes:
+// In the Parquet file, there are 4 leaf nodes:
 //
 // * data.record.val1
 // * data.record.val2
@@ -106,11 +115,13 @@ class RowGroupReader;
 // arrays
 class PARQUET_EXPORT FileReader {
  public:
+  /// Factory function to create a FileReader from a ParquetFileReader and properties
   static ::arrow::Status Make(::arrow::MemoryPool* pool,
                               std::unique_ptr<ParquetFileReader> reader,
                               const ArrowReaderProperties& properties,
                               std::unique_ptr<FileReader>* out);
 
+  /// Factory function to create a FileReader from a ParquetFileReader
   static ::arrow::Status Make(::arrow::MemoryPool* pool,
                               std::unique_ptr<ParquetFileReader> reader,
                               std::unique_ptr<FileReader>* out);
@@ -122,72 +133,140 @@ class PARQUET_EXPORT FileReader {
   // fully-materialized arrow::Array instances
   //
   // Returns error status if the column of interest is not flat.
+  // The indicated column index is relative to the schema
   virtual ::arrow::Status GetColumn(int i, std::unique_ptr<ColumnReader>* out) = 0;
 
   /// \brief Return arrow schema for all the columns.
   virtual ::arrow::Status GetSchema(std::shared_ptr<::arrow::Schema>* out) = 0;
 
-  // Read column as a whole into an Array.
+  /// \brief Read column as a whole into a chunked array.
+  ///
+  /// The index i refers the index of the top level schema field, which may
+  /// be nested or flat - e.g.
+  ///
+  /// 0 foo.bar
+  ///   foo.bar.baz
+  ///   foo.qux
+  /// 1 foo2
+  /// 2 foo3
+  ///
+  /// i=0 will read the entire foo struct, i=1 the foo2 primitive column etc
   virtual ::arrow::Status ReadColumn(int i,
                                      std::shared_ptr<::arrow::ChunkedArray>* out) = 0;
 
-  // NOTE: Experimental API
-  // Reads a specific top level schema field into an Array
-  // The index i refers the index of the top level schema field, which may
-  // be nested or flat - e.g.
-  //
-  // 0 foo.bar
-  //   foo.bar.baz
-  //   foo.qux
-  // 1 foo2
-  // 2 foo3
-  //
-  // i=0 will read the entire foo struct, i=1 the foo2 primitive column etc
-  virtual ::arrow::Status ReadSchemaField(
-      int i, std::shared_ptr<::arrow::ChunkedArray>* out) = 0;
+  /// \brief Return a RecordBatchReader of all row groups and columns.
+  ///
+  /// \deprecated Deprecated in 19.0.0. Use arrow::Result version instead.
+  ARROW_DEPRECATED("Deprecated in 19.0.0. Use arrow::Result version instead.")
+  ::arrow::Status GetRecordBatchReader(std::unique_ptr<::arrow::RecordBatchReader>* out);
 
-  /// \brief Return a RecordBatchReader of row groups selected from row_group_indices, the
-  ///    ordering in row_group_indices matters.
-  /// \returns error Status if row_group_indices contains invalid index
+  /// \brief Return a RecordBatchReader of all row groups and columns.
+  virtual ::arrow::Result<std::unique_ptr<::arrow::RecordBatchReader>>
+  GetRecordBatchReader() = 0;
+
+  /// \brief Return a RecordBatchReader of row groups selected from row_group_indices.
+  ///
+  /// Note that the ordering in row_group_indices matters. FileReaders must outlive
+  /// their RecordBatchReaders.
+  ///
+  /// \returns error Status if row_group_indices contains an invalid index
+  ///
+  /// \deprecated Deprecated in 19.0.0. Use arrow::Result version instead.
+  ARROW_DEPRECATED("Deprecated in 19.0.0. Use arrow::Result version instead.")
   virtual ::arrow::Status GetRecordBatchReader(
       const std::vector<int>& row_group_indices,
-      std::unique_ptr<::arrow::RecordBatchReader>* out) = 0;
+      std::unique_ptr<::arrow::RecordBatchReader>* out);
 
-  ::arrow::Status GetRecordBatchReader(const std::vector<int>& row_group_indices,
-                                       std::shared_ptr<::arrow::RecordBatchReader>* out) {
-    std::unique_ptr<::arrow::RecordBatchReader> tmp;
-
-    ARROW_RETURN_NOT_OK(GetRecordBatchReader(row_group_indices, &tmp));
-    out->reset(tmp.release());
-
-    return ::arrow::Status::OK();
-  }
+  /// \brief Return a RecordBatchReader of row groups selected from row_group_indices.
+  ///
+  /// Note that the ordering in row_group_indices matters. FileReaders must outlive
+  /// their RecordBatchReaders.
+  ///
+  /// \returns error Result if row_group_indices contains an invalid index
+  virtual ::arrow::Result<std::unique_ptr<::arrow::RecordBatchReader>>
+  GetRecordBatchReader(const std::vector<int>& row_group_indices) = 0;
 
   /// \brief Return a RecordBatchReader of row groups selected from
-  ///     row_group_indices, whose columns are selected by column_indices. The
-  ///     ordering in row_group_indices and column_indices matter.
+  /// row_group_indices, whose columns are selected by column_indices.
+  ///
+  /// Note that the ordering in row_group_indices and column_indices
+  /// matter. FileReaders must outlive their RecordBatchReaders.
+  ///
   /// \returns error Status if either row_group_indices or column_indices
-  ///    contains invalid index
+  ///     contains an invalid index
+  ///
+  /// \deprecated Deprecated in 19.0.0. Use arrow::Result version instead.
+  ARROW_DEPRECATED("Deprecated in 19.0.0. Use arrow::Result version instead.")
   virtual ::arrow::Status GetRecordBatchReader(
       const std::vector<int>& row_group_indices, const std::vector<int>& column_indices,
-      std::unique_ptr<::arrow::RecordBatchReader>* out) = 0;
+      std::unique_ptr<::arrow::RecordBatchReader>* out);
 
-  virtual ::arrow::Status GetRecordBatchReader(
-      const std::vector<int>& row_group_indices, const std::vector<int>& column_indices,
-      std::shared_ptr<::arrow::RecordBatchReader>* out) {
-    std::unique_ptr<::arrow::RecordBatchReader> tmp;
+  /// \brief Return a RecordBatchReader of row groups selected from
+  /// row_group_indices, whose columns are selected by column_indices.
+  ///
+  /// Note that the ordering in row_group_indices and column_indices
+  /// matter. FileReaders must outlive their RecordBatchReaders.
+  ///
+  /// \returns error Result if either row_group_indices or column_indices
+  ///     contains an invalid index
+  virtual ::arrow::Result<std::unique_ptr<::arrow::RecordBatchReader>>
+  GetRecordBatchReader(const std::vector<int>& row_group_indices,
+                       const std::vector<int>& column_indices) = 0;
 
-    ARROW_RETURN_NOT_OK(GetRecordBatchReader(row_group_indices, column_indices, &tmp));
-    out->reset(tmp.release());
+  /// \brief Return a RecordBatchReader of row groups selected from
+  /// row_group_indices, whose columns are selected by column_indices.
+  ///
+  /// Note that the ordering in row_group_indices and column_indices
+  /// matter. FileReaders must outlive their RecordBatchReaders.
+  ///
+  /// \param row_group_indices which row groups to read (order determines read order).
+  /// \param column_indices which columns to read (order determines output schema).
+  /// \param[out] out record batch stream from parquet data.
+  ///
+  /// \returns error Status if either row_group_indices or column_indices
+  ///     contains an invalid index
+  ::arrow::Status GetRecordBatchReader(const std::vector<int>& row_group_indices,
+                                       const std::vector<int>& column_indices,
+                                       std::shared_ptr<::arrow::RecordBatchReader>* out);
+  ::arrow::Status GetRecordBatchReader(const std::vector<int>& row_group_indices,
+                                       std::shared_ptr<::arrow::RecordBatchReader>* out);
+  ::arrow::Status GetRecordBatchReader(std::shared_ptr<::arrow::RecordBatchReader>* out);
 
-    return ::arrow::Status::OK();
-  }
+  /// \brief Return a generator of record batches.
+  ///
+  /// The FileReader must outlive the generator, so this requires that you pass in a
+  /// shared_ptr.
+  ///
+  /// \returns error Result if either row_group_indices or column_indices contains an
+  ///     invalid index
+  virtual ::arrow::Result<
+      std::function<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>()>>
+  GetRecordBatchGenerator(std::shared_ptr<FileReader> reader,
+                          const std::vector<int> row_group_indices,
+                          const std::vector<int> column_indices,
+                          ::arrow::internal::Executor* cpu_executor = NULLPTR,
+                          int64_t rows_to_readahead = 0) = 0;
 
-  // Read a table of columns into a Table
+  /// Read all columns into a Table
   virtual ::arrow::Status ReadTable(std::shared_ptr<::arrow::Table>* out) = 0;
 
-  // Read a table of columns into a Table. Read only the indicated column
-  // indices (relative to the schema)
+  /// \brief Read the given columns into a Table
+  ///
+  /// The indicated column indices are relative to the internal representation
+  /// of the parquet table. For instance :
+  /// 0 foo.bar
+  ///       foo.bar.baz           0
+  ///       foo.bar.baz2          1
+  ///   foo.qux                   2
+  /// 1 foo2                      3
+  /// 2 foo3                      4
+  ///
+  /// i=0 will read foo.bar.baz, i=1 will read only foo.bar.baz2 and so on.
+  /// Only leaf fields have indices; foo itself doesn't have an index.
+  /// To get the index for a particular leaf field, one can use
+  /// manifest().schema_fields to get the top level fields, and then walk the
+  /// tree to identify the relevant leaf fields and access its column_index.
+  /// To get the total number of leaf fields, use FileMetadata.num_columns().
   virtual ::arrow::Status ReadTable(const std::vector<int>& column_indices,
                                     std::shared_ptr<::arrow::Table>* out) = 0;
 
@@ -212,6 +291,7 @@ class PARQUET_EXPORT FileReader {
   ///   FileReader.
   virtual std::shared_ptr<RowGroupReader> RowGroup(int row_group_index) = 0;
 
+  /// \brief The number of row groups in the file
   virtual int num_row_groups() const = 0;
 
   virtual ParquetFileReader* parquet_reader() const = 0;
@@ -219,6 +299,13 @@ class PARQUET_EXPORT FileReader {
   /// Set whether to use multiple threads during reads of multiple columns.
   /// By default only one thread is used.
   virtual void set_use_threads(bool use_threads) = 0;
+
+  /// Set number of records to read per batch for the RecordBatchReader.
+  virtual void set_batch_size(int64_t batch_size) = 0;
+
+  virtual const ArrowReaderProperties& properties() const = 0;
+
+  virtual const SchemaManifest& manifest() const = 0;
 
   virtual ~FileReader() = default;
 };
@@ -270,15 +357,25 @@ class PARQUET_EXPORT FileReaderBuilder {
  public:
   FileReaderBuilder();
 
-  ::arrow::Status Open(const std::shared_ptr<::arrow::io::RandomAccessFile>& file,
+  /// Create FileReaderBuilder from Arrow file and optional properties / metadata
+  ::arrow::Status Open(std::shared_ptr<::arrow::io::RandomAccessFile> file,
                        const ReaderProperties& properties = default_reader_properties(),
-                       const std::shared_ptr<FileMetaData>& metadata = NULLPTR);
+                       std::shared_ptr<FileMetaData> metadata = NULLPTR);
+
+  /// Create FileReaderBuilder from file path and optional properties / metadata
+  ::arrow::Status OpenFile(const std::string& path, bool memory_map = false,
+                           const ReaderProperties& props = default_reader_properties(),
+                           std::shared_ptr<FileMetaData> metadata = NULLPTR);
 
   ParquetFileReader* raw_reader() { return raw_reader_.get(); }
 
+  /// Set Arrow MemoryPool for memory allocation
   FileReaderBuilder* memory_pool(::arrow::MemoryPool* pool);
+  /// Set Arrow reader properties
   FileReaderBuilder* properties(const ArrowReaderProperties& arg_properties);
+  /// Build FileReader instance
   ::arrow::Status Build(std::unique_ptr<FileReader>* out);
+  ::arrow::Result<std::unique_ptr<FileReader>> Build();
 
  private:
   ::arrow::MemoryPool* pool_;
@@ -286,38 +383,40 @@ class PARQUET_EXPORT FileReaderBuilder {
   std::unique_ptr<ParquetFileReader> raw_reader_;
 };
 
+/// \defgroup parquet-arrow-reader-factories Factory functions for Parquet Arrow readers
+///
+/// @{
+
+/// \brief Build FileReader from Arrow file and MemoryPool
+///
+/// Advanced settings are supported through the FileReaderBuilder class.
+///
+/// \deprecated Deprecated in 19.0.0. Use arrow::Result version instead.
+ARROW_DEPRECATED("Deprecated in 19.0.0. Use arrow::Result version instead.")
 PARQUET_EXPORT
-::arrow::Status OpenFile(const std::shared_ptr<::arrow::io::RandomAccessFile>& file,
+::arrow::Status OpenFile(std::shared_ptr<::arrow::io::RandomAccessFile>,
                          ::arrow::MemoryPool* allocator,
                          std::unique_ptr<FileReader>* reader);
 
-ARROW_DEPRECATED("Deprecated since 0.15.0. Use FileReaderBuilder")
+/// \brief Build FileReader from Arrow file and MemoryPool
+///
+/// Advanced settings are supported through the FileReaderBuilder class.
 PARQUET_EXPORT
-::arrow::Status OpenFile(const std::shared_ptr<::arrow::io::RandomAccessFile>& file,
-                         ::arrow::MemoryPool* allocator,
-                         const ReaderProperties& properties,
-                         const std::shared_ptr<FileMetaData>& metadata,
-                         std::unique_ptr<FileReader>* reader);
+::arrow::Result<std::unique_ptr<FileReader>> OpenFile(
+    std::shared_ptr<::arrow::io::RandomAccessFile>, ::arrow::MemoryPool* allocator);
 
-ARROW_DEPRECATED("Deprecated since 0.15.0. Use FileReaderBuilder")
-PARQUET_EXPORT
-::arrow::Status OpenFile(const std::shared_ptr<::arrow::io::RandomAccessFile>& file,
-                         ::arrow::MemoryPool* allocator,
-                         const ArrowReaderProperties& properties,
-                         std::unique_ptr<FileReader>* reader);
+/// @}
 
 PARQUET_EXPORT
-::arrow::Status FromParquetSchema(
-    const SchemaDescriptor* parquet_schema, const ArrowReaderProperties& properties,
-    const std::shared_ptr<const ::arrow::KeyValueMetadata>& key_value_metadata,
-    std::shared_ptr<::arrow::Schema>* out);
+::arrow::Status StatisticsAsScalars(const Statistics& Statistics,
+                                    std::shared_ptr<::arrow::Scalar>* min,
+                                    std::shared_ptr<::arrow::Scalar>* max);
+
+namespace internal {
 
 PARQUET_EXPORT
-::arrow::Status FromParquetSchema(const SchemaDescriptor* parquet_schema,
-                                  const ArrowReaderProperties& properties,
-                                  std::shared_ptr<::arrow::Schema>* out);
+::arrow::Status FuzzReader(const uint8_t* data, int64_t size);
 
+}  // namespace internal
 }  // namespace arrow
 }  // namespace parquet
-
-#endif  // PARQUET_ARROW_READER_H
