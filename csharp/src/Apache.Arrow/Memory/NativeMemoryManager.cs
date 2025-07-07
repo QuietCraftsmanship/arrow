@@ -15,30 +15,37 @@
 
 using System;
 using System.Buffers;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Apache.Arrow.Memory
 {
-    public class NativeMemoryManager: MemoryManager<byte>
+    public class NativeMemoryManager : MemoryManager<byte>, IOwnableAllocation
     {
         private IntPtr _ptr;
         private readonly int _offset;
         private readonly int _length;
+        private readonly INativeAllocationOwner _owner;
 
         public NativeMemoryManager(IntPtr ptr, int offset, int length)
+            : this(NativeMemoryAllocator.ExclusiveOwner, ptr, offset, length)
+        {
+        }
+
+        internal NativeMemoryManager(INativeAllocationOwner owner, IntPtr ptr, int offset, int length)
         {
             _ptr = ptr;
             _offset = offset;
             _length = length;
+            _owner = owner;
         }
 
+#pragma warning disable CA2015 // TODO: is this correct?
         ~NativeMemoryManager()
         {
             Dispose(false);
         }
+#pragma warning restore CA2015
 
         public override unsafe Span<byte> GetSpan()
         {
@@ -64,20 +71,36 @@ namespace Apache.Arrow.Memory
         protected override void Dispose(bool disposing)
         {
             // Only free once.
-
-            lock (this)
+            IntPtr ptr = Interlocked.Exchange(ref _ptr, IntPtr.Zero);
+            if (ptr != IntPtr.Zero)
             {
-                if (_ptr != IntPtr.Zero)
-                {
-                    Marshal.FreeHGlobal(_ptr);
-                    Interlocked.Exchange(ref _ptr, IntPtr.Zero);
-                    GC.RemoveMemoryPressure(_length);
-                }
+                _owner.Release(ptr, _offset, _length);
             }
         }
 
+        bool IOwnableAllocation.TryAcquire(out IntPtr ptr, out int offset, out int length)
+        {
+            // TODO: implement refcounted buffers?
+
+            if (object.ReferenceEquals(_owner, NativeMemoryAllocator.ExclusiveOwner))
+            {
+                ptr = Interlocked.Exchange(ref _ptr, IntPtr.Zero);
+                if (ptr != IntPtr.Zero)
+                {
+                    offset = _offset;
+                    length = _length;
+                    return true;
+                }
+            }
+
+            ptr = IntPtr.Zero;
+            offset = 0;
+            length = 0;
+            return false;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe void* CalculatePointer(int index) => 
+        private unsafe void* CalculatePointer(int index) =>
             (_ptr + _offset + index).ToPointer();
     }
 }

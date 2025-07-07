@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "gandiva/decimal_type_util.h"
+#include "gandiva/function_registry_common.h"
 #include "gandiva/gandiva_aliases.h"
 #include "gandiva/node.h"
 
@@ -52,8 +53,8 @@ NodePtr TreeExprBuilder::MakeBinaryLiteral(const std::string& value) {
 }
 
 NodePtr TreeExprBuilder::MakeDecimalLiteral(const DecimalScalar128& value) {
-  return std::make_shared<LiteralNode>(arrow::decimal(value.precision(), value.scale()),
-                                       LiteralHolder(value), false);
+  return std::make_shared<LiteralNode>(
+      arrow::decimal128(value.precision(), value.scale()), LiteralHolder(value), false);
 }
 
 NodePtr TreeExprBuilder::MakeNull(DataTypePtr data_type) {
@@ -190,20 +191,34 @@ ConditionPtr TreeExprBuilder::MakeCondition(const std::string& function,
   return ConditionPtr(new Condition(func_node));
 }
 
-#define MAKE_IN(NAME, ctype)                                        \
-  NodePtr TreeExprBuilder::MakeInExpression##NAME(                  \
-      NodePtr node, const std::unordered_set<ctype>& values) {      \
-    return std::make_shared<InExpressionNode<ctype>>(node, values); \
+NodePtr TreeExprBuilder::MakeInExpressionDecimal(
+    NodePtr node, std::unordered_set<gandiva::DecimalScalar128>& constants) {
+  int32_t precision = 0;
+  int32_t scale = 0;
+  if (!constants.empty()) {
+    precision = constants.begin()->precision();
+    scale = constants.begin()->scale();
+  }
+  return std::make_shared<InExpressionNode<gandiva::DecimalScalar128>>(node, constants,
+                                                                       precision, scale);
+}
+
+#define MAKE_IN(NAME, ctype, type)                                        \
+  NodePtr TreeExprBuilder::MakeInExpression##NAME(                        \
+      NodePtr node, const std::unordered_set<ctype>& values) {            \
+    return std::make_shared<InExpressionNode<ctype>>(node, values, type); \
   }
 
-MAKE_IN(Int32, int32_t);
-MAKE_IN(Int64, int64_t);
-MAKE_IN(Date32, int32_t);
-MAKE_IN(Date64, int64_t);
-MAKE_IN(TimeStamp, int64_t);
-MAKE_IN(Time32, int32_t);
-MAKE_IN(Time64, int64_t);
-MAKE_IN(String, std::string);
-MAKE_IN(Binary, std::string);
+MAKE_IN(Int32, int32_t, int32());
+MAKE_IN(Int64, int64_t, int64());
+MAKE_IN(Date32, int32_t, date32());
+MAKE_IN(Date64, int64_t, date64());
+MAKE_IN(TimeStamp, int64_t, timestamp());
+MAKE_IN(Time32, int32_t, time32());
+MAKE_IN(Time64, int64_t, time64());
+MAKE_IN(Float, float, float32());
+MAKE_IN(Double, double, float64());
+MAKE_IN(String, std::string, utf8());
+MAKE_IN(Binary, std::string, binary());
 
 }  // namespace gandiva

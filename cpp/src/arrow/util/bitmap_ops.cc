@@ -17,21 +17,19 @@
 
 #include "arrow/util/bitmap_ops.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <type_traits>
 
 #include "arrow/buffer.h"
 #include "arrow/result.h"
 #include "arrow/util/align_util.h"
+#include "arrow/util/bit_block_counter.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_reader.h"
 #include "arrow/util/bitmap_writer.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/ubsan.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 namespace internal {
@@ -43,7 +41,7 @@ int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length) {
 
   const auto p = BitmapWordAlign<pop_len / 8>(data, bit_offset, length);
   for (int64_t i = bit_offset; i < bit_offset + p.leading_bits; ++i) {
-    if (BitUtil::GetBit(data, i)) {
+    if (bit_util::GetBit(data, i)) {
       ++count;
     }
   }
@@ -54,15 +52,32 @@ int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length) {
     DCHECK_EQ(reinterpret_cast<size_t>(u64_data) & 7, 0);
     const uint64_t* end = u64_data + p.aligned_words;
 
-    for (auto iter = u64_data; iter < end; ++iter) {
-      count += BitUtil::PopCount(*iter);
+    constexpr int64_t kCountUnrollFactor = 4;
+    const int64_t words_rounded =
+        bit_util::RoundDown(p.aligned_words, kCountUnrollFactor);
+    int64_t count_unroll[kCountUnrollFactor] = {0};
+
+    // Unroll the loop for better performance
+    for (int64_t i = 0; i < words_rounded; i += kCountUnrollFactor) {
+      for (int64_t k = 0; k < kCountUnrollFactor; k++) {
+        count_unroll[k] += bit_util::PopCount(u64_data[k]);
+      }
+      u64_data += kCountUnrollFactor;
+    }
+    for (int64_t k = 0; k < kCountUnrollFactor; k++) {
+      count += count_unroll[k];
+    }
+
+    // The trailing part
+    for (; u64_data < end; ++u64_data) {
+      count += bit_util::PopCount(*u64_data);
     }
   }
 
   // Account for left over bits (in theory we could fall back to smaller
   // versions of popcount but the code complexity is likely not worth it)
   for (int64_t i = p.trailing_bit_offset; i < bit_offset + length; ++i) {
-    if (BitUtil::GetBit(data, i)) {
+    if (bit_util::GetBit(data, i)) {
       ++count;
     }
   }
@@ -70,226 +85,44 @@ int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length) {
   return count;
 }
 
-namespace {
-
-template <typename Word>
-class BitmapWordReader {
- public:
-  BitmapWordReader(const uint8_t* bitmap, int64_t offset, int64_t length) {
-    bitmap_ = bitmap + offset / 8;
-    offset_ = offset % 8;
-    bitmap_end_ = bitmap_ + BitUtil::BytesForBits(offset_ + length);
-
-    // decrement word count by one as we may touch two adjacent words in one iteration
-    nwords_ = length / (sizeof(Word) * 8) - 1;
-    if (nwords_ < 0) {
-      nwords_ = 0;
+int64_t CountAndSetBits(const uint8_t* left_bitmap, int64_t left_offset,
+                        const uint8_t* right_bitmap, int64_t right_offset,
+                        int64_t length) {
+  BinaryBitBlockCounter bit_counter(left_bitmap, left_offset, right_bitmap, right_offset,
+                                    length);
+  int64_t count = 0;
+  while (true) {
+    BitBlockCount block = bit_counter.NextAndWord();
+    if (block.length == 0) {
+      break;
     }
-    trailing_bits_ = static_cast<int>(length - nwords_ * sizeof(Word) * 8);
-    trailing_bytes_ = static_cast<int>(BitUtil::BytesForBits(trailing_bits_));
-
-    if (nwords_ > 0) {
-      current_word_ = load<Word>(bitmap_);
-    } else if (length > 0) {
-      current_byte_ = load<uint8_t>(bitmap_);
-    }
+    count += block.popcount;
   }
+  return count;
+}
 
-  Word NextWord() {
-    bitmap_ += sizeof(Word);
-    const Word next_word = load<Word>(bitmap_);
-    Word word = current_word_;
-    if (offset_) {
-      // combine two adjacent words into one word
-      // |<------ next ----->|<---- current ---->|
-      // +-------------+-----+-------------+-----+
-      // |     ---     |  A  |      B      | --- |
-      // +-------------+-----+-------------+-----+
-      //                  |         |       offset
-      //                  v         v
-      //               +-----+-------------+
-      //               |  A  |      B      |
-      //               +-----+-------------+
-      //               |<------ word ----->|
-      word >>= offset_;
-      word |= next_word << (sizeof(Word) * 8 - offset_);
-    }
-    current_word_ = next_word;
-    return word;
-  }
+enum class TransferMode : bool { Copy, Invert };
 
-  uint8_t NextTrailingByte(int& valid_bits) {
-    uint8_t byte;
-    DCHECK_GT(trailing_bits_, 0);
+// Reverse all bits from entire byte(uint8)
+uint8_t ReverseUint8(uint8_t num) {
+  num = ((num & 0xf0) >> 4) | ((num & 0x0f) << 4);
+  num = ((num & 0xcc) >> 2) | ((num & 0x33) << 2);
+  num = ((num & 0xaa) >> 1) | ((num & 0x55) << 1);
+  return num;
+}
 
-    if (trailing_bits_ <= 8) {
-      // last byte
-      valid_bits = trailing_bits_;
-      trailing_bits_ = 0;
-      byte = 0;
-      internal::BitmapReader reader(bitmap_, offset_, valid_bits);
-      for (int i = 0; i < valid_bits; ++i) {
-        byte >>= 1;
-        if (reader.IsSet()) {
-          byte |= 0x80;
-        }
-        reader.Next();
-      }
-      byte >>= (8 - valid_bits);
-    } else {
-      ++bitmap_;
-      const uint8_t next_byte = load<uint8_t>(bitmap_);
-      byte = current_byte_;
-      if (offset_) {
-        byte >>= offset_;
-        byte |= next_byte << (8 - offset_);
-      }
-      current_byte_ = next_byte;
-      trailing_bits_ -= 8;
-      valid_bits = 8;
-    }
-    return byte;
-  }
+// Get a reverse block of byte(uint8) using offsets, the result can be
+// part of a left block and right block, length indicates the number of bits
+// to be taken from the right block
+uint8_t GetReversedBlock(uint8_t block_left, uint8_t block_right, uint8_t length) {
+  return ReverseUint8(((block_right << 8) + block_left) >> length);
+}
 
-  int64_t words() const { return nwords_; }
-  int trailing_bytes() const { return trailing_bytes_; }
-
- private:
-  int64_t offset_;
-  const uint8_t* bitmap_;
-
-  const uint8_t* bitmap_end_;
-  int64_t nwords_;
-  int trailing_bits_;
-  int trailing_bytes_;
-  union {
-    Word current_word_;
-    struct {
-#if ARROW_LITTLE_ENDIAN == 0
-      uint8_t padding_bytes_[sizeof(Word) - 1];
-#endif
-      uint8_t current_byte_;
-    };
-  };
-
-  template <typename DType>
-  DType load(const uint8_t* bitmap) {
-    DCHECK_LE(bitmap + sizeof(DType), bitmap_end_);
-    return BitUtil::ToLittleEndian(util::SafeLoadAs<DType>(bitmap));
-  }
-};
-
-template <typename Word>
-class BitmapWordWriter {
- public:
-  BitmapWordWriter(uint8_t* bitmap, int64_t offset, int64_t length) {
-    bitmap_ = bitmap + offset / 8;
-    offset_ = offset % 8;
-    bitmap_end_ = bitmap_ + BitUtil::BytesForBits(offset_ + length);
-    mask_ = (1U << offset_) - 1;
-
-    if (offset_) {
-      if (length >= static_cast<int>(sizeof(Word) * 8)) {
-        current_word_ = load<Word>(bitmap_);
-      } else if (length > 0) {
-        current_byte_ = load<uint8_t>(bitmap_);
-      }
-    }
-  }
-
-  void PutNextWord(Word word) {
-    if (offset_) {
-      // split one word into two adjacent words, don't touch unused bits
-      //               |<------ word ----->|
-      //               +-----+-------------+
-      //               |  A  |      B      |
-      //               +-----+-------------+
-      //                  |         |
-      //                  v         v       offset
-      // +-------------+-----+-------------+-----+
-      // |     ---     |  A  |      B      | --- |
-      // +-------------+-----+-------------+-----+
-      // |<------ next ----->|<---- current ---->|
-      word = (word << offset_) | (word >> (sizeof(Word) * 8 - offset_));
-      Word next_word = load<Word>(bitmap_ + sizeof(Word));
-      current_word_ = (current_word_ & mask_) | (word & ~mask_);
-      next_word = (next_word & ~mask_) | (word & mask_);
-      store<Word>(bitmap_, current_word_);
-      store<Word>(bitmap_ + sizeof(Word), next_word);
-      current_word_ = next_word;
-    } else {
-      store<Word>(bitmap_, word);
-    }
-    bitmap_ += sizeof(Word);
-  }
-
-  void PutNextTrailingByte(uint8_t byte, int valid_bits) {
-    if (valid_bits == 8) {
-      if (offset_) {
-        byte = (byte << offset_) | (byte >> (8 - offset_));
-        uint8_t next_byte = load<uint8_t>(bitmap_ + 1);
-        current_byte_ = (current_byte_ & mask_) | (byte & ~mask_);
-        next_byte = (next_byte & ~mask_) | (byte & mask_);
-        store<uint8_t>(bitmap_, current_byte_);
-        store<uint8_t>(bitmap_ + 1, next_byte);
-        current_byte_ = next_byte;
-      } else {
-        store<uint8_t>(bitmap_, byte);
-      }
-      ++bitmap_;
-    } else {
-      DCHECK_GT(valid_bits, 0);
-      DCHECK_LT(valid_bits, 8);
-      DCHECK_LE(bitmap_ + BitUtil::BytesForBits(offset_ + valid_bits), bitmap_end_);
-      internal::BitmapWriter writer(bitmap_, offset_, valid_bits);
-      for (int i = 0; i < valid_bits; ++i) {
-        (byte & 0x01) ? writer.Set() : writer.Clear();
-        writer.Next();
-        byte >>= 1;
-      }
-      writer.Finish();
-    }
-  }
-
- private:
-  int64_t offset_;
-  uint8_t* bitmap_;
-
-  const uint8_t* bitmap_end_;
-  uint64_t mask_;
-  union {
-    Word current_word_;
-    struct {
-#if ARROW_LITTLE_ENDIAN == 0
-      uint8_t padding_bytes_[sizeof(Word) - 1];
-#endif
-      uint8_t current_byte_;
-    };
-  };
-
-  template <typename DType>
-  DType load(const uint8_t* bitmap) {
-    DCHECK_LE(bitmap + sizeof(DType), bitmap_end_);
-    return BitUtil::ToLittleEndian(util::SafeLoadAs<DType>(bitmap));
-  }
-
-  template <typename DType>
-  void store(uint8_t* bitmap, DType data) {
-    DCHECK_LE(bitmap + sizeof(DType), bitmap_end_);
-    util::SafeStore(bitmap, BitUtil::FromLittleEndian(data));
-  }
-};
-
-}  // namespace
-
-template <bool invert_bits, bool restore_trailing_bits>
+template <TransferMode mode>
 void TransferBitmap(const uint8_t* data, int64_t offset, int64_t length,
                     int64_t dest_offset, uint8_t* dest) {
-  int64_t byte_offset = offset / 8;
   int64_t bit_offset = offset % 8;
-  int64_t dest_byte_offset = dest_offset / 8;
   int64_t dest_bit_offset = dest_offset % 8;
-  int64_t num_bytes = BitUtil::BytesForBits(length);
 
   if (bit_offset || dest_bit_offset) {
     auto reader = internal::BitmapWordReader<uint64_t>(data, offset, length);
@@ -298,87 +131,136 @@ void TransferBitmap(const uint8_t* data, int64_t offset, int64_t length,
     auto nwords = reader.words();
     while (nwords--) {
       auto word = reader.NextWord();
-      writer.PutNextWord(invert_bits ? ~word : word);
+      writer.PutNextWord(mode == TransferMode::Invert ? ~word : word);
     }
     auto nbytes = reader.trailing_bytes();
     while (nbytes--) {
       int valid_bits;
       auto byte = reader.NextTrailingByte(valid_bits);
-      writer.PutNextTrailingByte(invert_bits ? ~byte : byte, valid_bits);
+      writer.PutNextTrailingByte(mode == TransferMode::Invert ? ~byte : byte, valid_bits);
     }
-  } else {
-    // Shift dest by its byte offset
-    dest += dest_byte_offset;
+  } else if (length) {
+    int64_t num_bytes = bit_util::BytesForBits(length);
+
+    // Shift by its byte offset
+    data += offset / 8;
+    dest += dest_offset / 8;
 
     // Take care of the trailing bits in the last byte
+    // E.g., if trailing_bits = 5, last byte should be
+    // - low  3 bits: new bits from last byte of data buffer
+    // - high 5 bits: old bits from last byte of dest buffer
     int64_t trailing_bits = num_bytes * 8 - length;
-    uint8_t trail = 0;
-    if (trailing_bits && restore_trailing_bits) {
-      trail = dest[num_bytes - 1];
-    }
+    uint8_t trail_mask = (1U << (8 - trailing_bits)) - 1;
+    uint8_t last_data;
 
-    if (invert_bits) {
-      for (int64_t i = 0; i < num_bytes; i++) {
-        dest[i] = static_cast<uint8_t>(~(data[byte_offset + i]));
+    if (mode == TransferMode::Invert) {
+      for (int64_t i = 0; i < num_bytes - 1; i++) {
+        dest[i] = static_cast<uint8_t>(~(data[i]));
       }
+      last_data = ~data[num_bytes - 1];
     } else {
-      std::memcpy(dest, data + byte_offset, static_cast<size_t>(num_bytes));
+      std::memcpy(dest, data, static_cast<size_t>(num_bytes - 1));
+      last_data = data[num_bytes - 1];
     }
 
-    if (restore_trailing_bits) {
-      for (int i = 0; i < trailing_bits; i++) {
-        if (BitUtil::GetBit(&trail, i + 8 - trailing_bits)) {
-          BitUtil::SetBit(dest, length + i);
-        } else {
-          BitUtil::ClearBit(dest, length + i);
-        }
-      }
-    }
+    // Set last byte
+    dest[num_bytes - 1] &= ~trail_mask;
+    dest[num_bytes - 1] |= last_data & trail_mask;
   }
 }
 
-template <bool invert_bits>
+void ReverseBlockOffsets(const uint8_t* data, int64_t offset, int64_t length,
+                         int64_t dest_offset, uint8_t* dest) {
+  int64_t num_bytes = bit_util::BytesForBits(offset % 8 + length);
+  // Shift by its byte offset
+  data += offset / 8;
+  dest += dest_offset / 8;
+
+  int64_t j_src = num_bytes - 1;
+  int64_t i_dest = 0;
+
+  while (length > 0) {
+    uint8_t right_trailing_bits_src = (length + offset) % 8;
+    right_trailing_bits_src = !right_trailing_bits_src ? 8 : right_trailing_bits_src;
+
+    uint8_t left_trailing_bits_dest = 8 - dest_offset % 8;
+    uint8_t left_trailing_mask_dest = 0xFF << (8 - left_trailing_bits_dest);
+    if (length <= 8 && (dest_offset % 8) + length < 8) {
+      uint8_t extra_bits = static_cast<uint8_t>(8 - ((dest_offset % 8) + length));
+      left_trailing_mask_dest <<= extra_bits;
+      left_trailing_mask_dest >>= extra_bits;
+    }
+
+    uint8_t right_reversed_block;
+    if (j_src == 0) {
+      right_reversed_block = static_cast<uint8_t>(
+          GetReversedBlock(data[0], data[0], right_trailing_bits_src));
+    } else {
+      right_reversed_block = static_cast<uint8_t>(
+          GetReversedBlock(data[j_src - 1], data[j_src], right_trailing_bits_src));
+    }
+
+    dest[i_dest] &= ~left_trailing_mask_dest;
+    dest[i_dest] |=
+        (right_reversed_block << (8 - left_trailing_bits_dest)) & left_trailing_mask_dest;
+
+    dest_offset += left_trailing_bits_dest;
+    length -= left_trailing_bits_dest;
+
+    if (left_trailing_bits_dest >= right_trailing_bits_src) j_src--;
+    i_dest++;
+  }
+}
+
+template <TransferMode mode>
 Result<std::shared_ptr<Buffer>> TransferBitmap(MemoryPool* pool, const uint8_t* data,
-                                               int64_t offset, int64_t length) {
-  ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateEmptyBitmap(length, pool));
+                                               int64_t offset, int64_t length,
+                                               int64_t out_offset) {
+  const int64_t phys_bits = length + out_offset;
+  ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateEmptyBitmap(phys_bits, pool));
   uint8_t* dest = buffer->mutable_data();
 
-  TransferBitmap<invert_bits, false>(data, offset, length, 0, dest);
+  TransferBitmap<mode>(data, offset, length, out_offset, dest);
 
-  // As we have freshly allocated this bitmap, we should take care of zeroing the
-  // remaining bits.
-  int64_t num_bytes = BitUtil::BytesForBits(length);
-  int64_t bits_to_zero = num_bytes * 8 - length;
-  for (int64_t i = length; i < length + bits_to_zero; ++i) {
-    // Both branches may copy extra bits - unsetting to match specification.
-    BitUtil::ClearBit(dest, i);
-  }
   return buffer;
 }
 
 void CopyBitmap(const uint8_t* data, int64_t offset, int64_t length, uint8_t* dest,
-                int64_t dest_offset, bool restore_trailing_bits) {
-  if (restore_trailing_bits) {
-    TransferBitmap<false, true>(data, offset, length, dest_offset, dest);
-  } else {
-    TransferBitmap<false, false>(data, offset, length, dest_offset, dest);
-  }
+                int64_t dest_offset) {
+  TransferBitmap<TransferMode::Copy>(data, offset, length, dest_offset, dest);
 }
 
 void InvertBitmap(const uint8_t* data, int64_t offset, int64_t length, uint8_t* dest,
                   int64_t dest_offset) {
-  TransferBitmap<true, true>(data, offset, length, dest_offset, dest);
+  TransferBitmap<TransferMode::Invert>(data, offset, length, dest_offset, dest);
+}
+
+void ReverseBitmap(const uint8_t* data, int64_t offset, int64_t length, uint8_t* dest,
+                   int64_t dest_offset) {
+  ReverseBlockOffsets(data, offset, length, dest_offset, dest);
 }
 
 Result<std::shared_ptr<Buffer>> CopyBitmap(MemoryPool* pool, const uint8_t* data,
-                                           int64_t offset, int64_t length) {
-  return TransferBitmap<false>(pool, data, offset, length);
+                                           int64_t offset, int64_t length,
+                                           int64_t out_offset) {
+  return TransferBitmap<TransferMode::Copy>(pool, data, offset, length, out_offset);
 }
 
 Result<std::shared_ptr<Buffer>> InvertBitmap(MemoryPool* pool, const uint8_t* data,
-                                             int64_t offset, int64_t length,
-                                             std::shared_ptr<Buffer>* out) {
-  return TransferBitmap<true>(pool, data, offset, length);
+                                             int64_t offset, int64_t length) {
+  return TransferBitmap<TransferMode::Invert>(pool, data, offset, length,
+                                              /*out_offset=*/0);
+}
+
+Result<std::shared_ptr<Buffer>> ReverseBitmap(MemoryPool* pool, const uint8_t* data,
+                                              int64_t offset, int64_t length) {
+  ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateEmptyBitmap(length, pool));
+  uint8_t* dest = buffer->mutable_data();
+
+  ReverseBlockOffsets(data, offset, length, /*start_offset=*/0, dest);
+
+  return buffer;
 }
 
 bool BitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right,
@@ -391,8 +273,8 @@ bool BitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right
       return false;
     }
     for (int64_t i = (length / 8) * 8; i < length; ++i) {
-      if (BitUtil::GetBit(left, left_offset + i) !=
-          BitUtil::GetBit(right, right_offset + i)) {
+      if (bit_util::GetBit(left, left_offset + i) !=
+          bit_util::GetBit(right, right_offset + i)) {
         return false;
       }
     }
@@ -420,6 +302,26 @@ bool BitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right
   return true;
 }
 
+bool OptionalBitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                          int64_t right_offset, int64_t length) {
+  if (left == nullptr && right == nullptr) {
+    return true;
+  } else if (left != nullptr && right != nullptr) {
+    return BitmapEquals(left, left_offset, right, right_offset, length);
+  } else if (left != nullptr) {
+    return CountSetBits(left, left_offset, length) == length;
+  } else {
+    return CountSetBits(right, right_offset, length) == length;
+  }
+}
+
+bool OptionalBitmapEquals(const std::shared_ptr<Buffer>& left, int64_t left_offset,
+                          const std::shared_ptr<Buffer>& right, int64_t right_offset,
+                          int64_t length) {
+  return OptionalBitmapEquals(left ? left->data() : nullptr, left_offset,
+                              right ? right->data() : nullptr, right_offset, length);
+}
+
 namespace {
 
 template <template <typename> class BitOp>
@@ -430,7 +332,7 @@ void AlignedBitmapOp(const uint8_t* left, int64_t left_offset, const uint8_t* ri
   DCHECK_EQ(left_offset % 8, right_offset % 8);
   DCHECK_EQ(left_offset % 8, out_offset % 8);
 
-  const int64_t nbytes = BitUtil::BytesForBits(length + left_offset % 8);
+  const int64_t nbytes = bit_util::BytesForBits(length + left_offset % 8);
   left += left_offset / 8;
   right += right_offset / 8;
   out += out_offset / 8;
@@ -529,6 +431,43 @@ Result<std::shared_ptr<Buffer>> BitmapXor(MemoryPool* pool, const uint8_t* left,
 void BitmapXor(const uint8_t* left, int64_t left_offset, const uint8_t* right,
                int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out) {
   BitmapOp<std::bit_xor>(left, left_offset, right, right_offset, length, out_offset, out);
+}
+
+template <typename T>
+struct AndNotOp {
+  constexpr T operator()(const T& l, const T& r) const { return l & ~r; }
+};
+
+Result<std::shared_ptr<Buffer>> BitmapAndNot(MemoryPool* pool, const uint8_t* left,
+                                             int64_t left_offset, const uint8_t* right,
+                                             int64_t right_offset, int64_t length,
+                                             int64_t out_offset) {
+  return BitmapOp<AndNotOp>(pool, left, left_offset, right, right_offset, length,
+                            out_offset);
+}
+
+void BitmapAndNot(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                  int64_t right_offset, int64_t length, int64_t out_offset,
+                  uint8_t* out) {
+  BitmapOp<AndNotOp>(left, left_offset, right, right_offset, length, out_offset, out);
+}
+
+template <typename T>
+struct OrNotOp {
+  constexpr T operator()(const T& l, const T& r) const { return l | ~r; }
+};
+
+Result<std::shared_ptr<Buffer>> BitmapOrNot(MemoryPool* pool, const uint8_t* left,
+                                            int64_t left_offset, const uint8_t* right,
+                                            int64_t right_offset, int64_t length,
+                                            int64_t out_offset) {
+  return BitmapOp<OrNotOp>(pool, left, left_offset, right, right_offset, length,
+                           out_offset);
+}
+
+void BitmapOrNot(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                 int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out) {
+  BitmapOp<OrNotOp>(left, left_offset, right, right_offset, length, out_offset, out);
 }
 
 }  // namespace internal

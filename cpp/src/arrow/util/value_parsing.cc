@@ -15,75 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#define FASTFLOAT_ALLOWS_LEADING_PLUS 1
+
 #include "arrow/util/value_parsing.h"
 
 #include <string>
 #include <utility>
 
-#include "arrow/util/double_conversion.h"
+#include "arrow/util/float16.h"
+#include "arrow/vendored/fast_float/fast_float.h"
+
+using arrow::util::Float16;
 
 namespace arrow {
 namespace internal {
 
-namespace {
-
-struct StringToFloatConverterImpl {
-  StringToFloatConverterImpl()
-      : main_converter_(flags_, main_junk_value_, main_junk_value_, "inf", "nan"),
-        fallback_converter_(flags_, fallback_junk_value_, fallback_junk_value_, "inf",
-                            "nan") {}
-
-  // NOTE: This is only supported in double-conversion 3.1+
-  static constexpr int flags_ =
-      util::double_conversion::StringToDoubleConverter::ALLOW_CASE_INSENSIBILITY;
-
-  // Two unlikely values to signal a parsing error
-  static constexpr double main_junk_value_ = 0.7066424364107089;
-  static constexpr double fallback_junk_value_ = 0.40088499148279166;
-
-  util::double_conversion::StringToDoubleConverter main_converter_;
-  util::double_conversion::StringToDoubleConverter fallback_converter_;
-};
-
-static const StringToFloatConverterImpl g_string_to_float;
-
-// Older clang versions need an explicit implementation definition.
-constexpr double StringToFloatConverterImpl::main_junk_value_;
-constexpr double StringToFloatConverterImpl::fallback_junk_value_;
-
-}  // namespace
-
-bool StringToFloat(const char* s, size_t length, float* out) {
-  int processed_length;
-  float v;
-  v = g_string_to_float.main_converter_.StringToFloat(s, static_cast<int>(length),
-                                                      &processed_length);
-  if (ARROW_PREDICT_FALSE(v == static_cast<float>(g_string_to_float.main_junk_value_))) {
-    v = g_string_to_float.fallback_converter_.StringToFloat(s, static_cast<int>(length),
-                                                            &processed_length);
-    if (ARROW_PREDICT_FALSE(v ==
-                            static_cast<float>(g_string_to_float.fallback_junk_value_))) {
-      return false;
-    }
-  }
-  *out = v;
-  return true;
+bool StringToFloat(const char* s, size_t length, char decimal_point, float* out) {
+  ::arrow_vendored::fast_float::parse_options options{
+      ::arrow_vendored::fast_float::chars_format::general, decimal_point};
+  const auto res =
+      ::arrow_vendored::fast_float::from_chars_advanced(s, s + length, *out, options);
+  return res.ec == std::errc() && res.ptr == s + length;
 }
 
-bool StringToFloat(const char* s, size_t length, double* out) {
-  int processed_length;
-  double v;
-  v = g_string_to_float.main_converter_.StringToDouble(s, static_cast<int>(length),
-                                                       &processed_length);
-  if (ARROW_PREDICT_FALSE(v == g_string_to_float.main_junk_value_)) {
-    v = g_string_to_float.fallback_converter_.StringToDouble(s, static_cast<int>(length),
-                                                             &processed_length);
-    if (ARROW_PREDICT_FALSE(v == g_string_to_float.fallback_junk_value_)) {
-      return false;
-    }
+bool StringToFloat(const char* s, size_t length, char decimal_point, double* out) {
+  ::arrow_vendored::fast_float::parse_options options{
+      ::arrow_vendored::fast_float::chars_format::general, decimal_point};
+  const auto res =
+      ::arrow_vendored::fast_float::from_chars_advanced(s, s + length, *out, options);
+  return res.ec == std::errc() && res.ptr == s + length;
+}
+
+// Half float
+bool StringToFloat(const char* s, size_t length, char decimal_point, uint16_t* out) {
+  ::arrow_vendored::fast_float::parse_options options{
+      ::arrow_vendored::fast_float::chars_format::general, decimal_point};
+  float temp_out;
+  const auto res =
+      ::arrow_vendored::fast_float::from_chars_advanced(s, s + length, temp_out, options);
+  const bool ok = res.ec == std::errc() && res.ptr == s + length;
+  if (ok) {
+    *out = Float16::FromFloat(temp_out).bits();
   }
-  *out = v;
-  return true;
+  return ok;
 }
 
 // ----------------------------------------------------------------------
@@ -93,10 +67,27 @@ namespace {
 
 class StrptimeTimestampParser : public TimestampParser {
  public:
-  explicit StrptimeTimestampParser(std::string format) : format_(std::move(format)) {}
+  explicit StrptimeTimestampParser(std::string format)
+      : format_(std::move(format)), have_zone_offset_(false) {
+    // Check for use of %z
+    size_t cur = 0;
+    while (cur < format_.size()) {
+      if (format_[cur] == '%') {
+        if (cur + 1 < format_.size() && format_[cur + 1] == 'z') {
+          have_zone_offset_ = true;
+          break;
+        }
+        cur++;
+      }
+      cur++;
+    }
+  }
 
-  bool operator()(const char* s, size_t length, TimeUnit::type out_unit,
-                  int64_t* out) const override {
+  bool operator()(const char* s, size_t length, TimeUnit::type out_unit, int64_t* out,
+                  bool* out_zone_offset_present = NULLPTR) const override {
+    if (out_zone_offset_present) {
+      *out_zone_offset_present = have_zone_offset_;
+    }
     return ParseTimestampStrptime(s, length, format_.c_str(),
                                   /*ignore_time_in_day=*/false,
                                   /*allow_trailing_chars=*/false, out_unit, out);
@@ -108,15 +99,16 @@ class StrptimeTimestampParser : public TimestampParser {
 
  private:
   std::string format_;
+  bool have_zone_offset_;
 };
 
 class ISO8601Parser : public TimestampParser {
  public:
   ISO8601Parser() {}
 
-  bool operator()(const char* s, size_t length, TimeUnit::type out_unit,
-                  int64_t* out) const override {
-    return ParseTimestampISO8601(s, length, out_unit, out);
+  bool operator()(const char* s, size_t length, TimeUnit::type out_unit, int64_t* out,
+                  bool* out_zone_offset_present = NULLPTR) const override {
+    return ParseTimestampISO8601(s, length, out_unit, out, out_zone_offset_present);
   }
 
   const char* kind() const override { return "iso8601"; }

@@ -15,25 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../../data/tables';
+import { generateRandomTables } from '../../../data/tables.js';
+import { ArrowIOTestHelper } from '../helpers.js';
 
-import { ArrowIOTestHelper } from '../helpers';
 import {
-    RecordBatchReader,
-    RecordBatchFileReader,
-    RecordBatchStreamReader,
     AsyncRecordBatchFileReader,
-    AsyncRecordBatchStreamReader
-} from '../../../Arrow';
-
-/* tslint:disable */
-const { parse: bignumJSONParse } = require('json-bignum');
+    AsyncRecordBatchStreamReader,
+    RecordBatchFileReader,
+    RecordBatchReader,
+    RecordBatchStreamReader
+} from 'apache-arrow';
 
 for (const table of generateRandomTables([10, 20, 30])) {
     const name = `[\n ${table.schema.fields.join(',\n ')}\n]`;
+    // eslint-disable-next-line jest/valid-describe-callback
     describe('RecordBatchReader.from', ((table, name) => () => {
         testFromFile(ArrowIOTestHelper.file(table), name);
         testFromJSON(ArrowIOTestHelper.json(table), name);
@@ -44,10 +39,10 @@ for (const table of generateRandomTables([10, 20, 30])) {
 function testFromJSON(io: ArrowIOTestHelper, name: string) {
     describe(`should return a RecordBatchJSONReader (${name})`, () => {
         test(`Uint8Array`, io.buffer((buffer) => {
-            const json = bignumJSONParse(`${Buffer.from(buffer)}`);
+            const json = JSON.parse(`${Buffer.from(buffer)}`);
             const reader = RecordBatchReader.from(json);
-            expect(reader.isSync()).toEqual(true);
-            expect(reader.isAsync()).toEqual(false);
+            expect(reader.isSync()).toBe(true);
+            expect(reader.isAsync()).toBe(false);
             expect(reader).toBeInstanceOf(RecordBatchStreamReader);
         }));
     });
@@ -78,8 +73,8 @@ function testFromFile(io: ArrowIOTestHelper, name: string) {
 
     function syncSync(source: any) {
         const reader = RecordBatchReader.from(source);
-        expect(reader.isSync()).toEqual(true);
-        expect(reader.isAsync()).toEqual(false);
+        expect(reader.isSync()).toBe(true);
+        expect(reader.isAsync()).toBe(false);
         expect(reader).toBeInstanceOf(RecordBatchFileReader);
     }
 
@@ -87,8 +82,8 @@ function testFromFile(io: ArrowIOTestHelper, name: string) {
         const pending = RecordBatchReader.from(source);
         expect(pending).toBeInstanceOf(Promise);
         const reader = await pending;
-        expect(reader.isSync()).toEqual(true);
-        expect(reader.isAsync()).toEqual(false);
+        expect(reader.isSync()).toBe(true);
+        expect(reader.isAsync()).toBe(false);
         expect(reader).toBeInstanceOf(RecordBatchFileReader);
     }
 
@@ -96,8 +91,8 @@ function testFromFile(io: ArrowIOTestHelper, name: string) {
         const pending = RecordBatchReader.from(source);
         expect(pending).toBeInstanceOf(Promise);
         const reader = await pending;
-        expect(reader.isSync()).toEqual(false);
-        expect(reader.isAsync()).toEqual(true);
+        expect(reader.isSync()).toBe(false);
+        expect(reader.isAsync()).toBe(true);
         expect(reader).toBeInstanceOf(AsyncRecordBatchFileReader);
     }
 }
@@ -127,8 +122,8 @@ function testFromStream(io: ArrowIOTestHelper, name: string) {
 
     function syncSync(source: any) {
         const reader = RecordBatchReader.from(source);
-        expect(reader.isSync()).toEqual(true);
-        expect(reader.isAsync()).toEqual(false);
+        expect(reader.isSync()).toBe(true);
+        expect(reader.isAsync()).toBe(false);
         expect(reader).toBeInstanceOf(RecordBatchStreamReader);
     }
 
@@ -136,8 +131,8 @@ function testFromStream(io: ArrowIOTestHelper, name: string) {
         const pending = RecordBatchReader.from(source);
         expect(pending).toBeInstanceOf(Promise);
         const reader = await pending;
-        expect(reader.isSync()).toEqual(true);
-        expect(reader.isAsync()).toEqual(false);
+        expect(reader.isSync()).toBe(true);
+        expect(reader.isAsync()).toBe(false);
         expect(reader).toBeInstanceOf(RecordBatchStreamReader);
     }
 
@@ -145,8 +140,8 @@ function testFromStream(io: ArrowIOTestHelper, name: string) {
         const pending = RecordBatchReader.from(source);
         expect(pending).toBeInstanceOf(Promise);
         const reader = await pending;
-        expect(reader.isSync()).toEqual(false);
-        expect(reader.isAsync()).toEqual(true);
+        expect(reader.isSync()).toBe(false);
+        expect(reader.isAsync()).toBe(true);
         expect(reader).toBeInstanceOf(AsyncRecordBatchStreamReader);
     }
 }

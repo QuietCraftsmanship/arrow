@@ -24,13 +24,13 @@
 
 #include "arrow/buffer.h"
 #include "arrow/compute/exec.h"
-#include "arrow/compute/util_internal.h"
+#include "arrow/device_allocation_type_set.h"
 #include "arrow/result.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/hash_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 
 namespace arrow {
@@ -45,36 +45,39 @@ namespace compute {
 // ----------------------------------------------------------------------
 // KernelContext
 
-Result<std::shared_ptr<Buffer>> KernelContext::Allocate(int64_t nbytes) {
-  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Buffer> result,
-                        AllocateBuffer(nbytes, exec_ctx_->memory_pool()));
-  result->ZeroPadding();
+Result<std::shared_ptr<ResizableBuffer>> KernelContext::Allocate(int64_t nbytes) {
+  return AllocateResizableBuffer(nbytes, exec_ctx_->memory_pool());
+}
+
+Result<std::shared_ptr<ResizableBuffer>> KernelContext::AllocateBitmap(int64_t num_bits) {
+  const int64_t nbytes = bit_util::BytesForBits(num_bits);
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<ResizableBuffer> result,
+                        AllocateResizableBuffer(nbytes, exec_ctx_->memory_pool()));
+  // Since bitmaps are typically written bit by bit, we could leak uninitialized bits.
+  // Make sure all memory is initialized (this also appeases Valgrind).
+  std::memset(result->mutable_data(), 0, result->size());
   return result;
 }
 
-Result<std::shared_ptr<Buffer>> KernelContext::AllocateBitmap(int64_t num_bits) {
-  const int64_t nbytes = BitUtil::BytesForBits(num_bits);
-  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Buffer> result,
-                        AllocateBuffer(nbytes, exec_ctx_->memory_pool()));
-  // Some utility methods access the last byte before it might be
-  // initialized this makes valgrind/asan unhappy, so we proactively
-  // zero it.
-  if (nbytes > 0) {
-    internal::ZeroByte(result.get(), result->size() - 1);
-    result->ZeroPadding();
+Status Kernel::InitAll(KernelContext* ctx, const KernelInitArgs& args,
+                       std::vector<std::unique_ptr<KernelState>>* states) {
+  for (auto& state : *states) {
+    ARROW_ASSIGN_OR_RAISE(state, args.kernel->init(ctx, args));
   }
-  return result;
+  return Status::OK();
 }
 
-void KernelContext::SetStatus(const Status& status) {
-  if (ARROW_PREDICT_FALSE(!status_.ok())) {
-    return;
+Result<std::unique_ptr<KernelState>> ScalarAggregateKernel::MergeAll(
+    const ScalarAggregateKernel* kernel, KernelContext* ctx,
+    std::vector<std::unique_ptr<KernelState>> states) {
+  auto out = std::move(states.back());
+  states.pop_back();
+  ctx->SetState(out.get());
+  for (auto& state : states) {
+    RETURN_NOT_OK(kernel->merge(ctx, std::move(*state), out.get()));
   }
-  status_ = status;
+  return out;
 }
-
-/// \brief Clear any error status
-void KernelContext::ResetStatus() { status_ = Status::OK(); }
 
 // ----------------------------------------------------------------------
 // Some basic TypeMatcher implementations
@@ -112,24 +115,27 @@ std::shared_ptr<TypeMatcher> SameTypeId(Type::type type_id) {
   return std::make_shared<SameTypeIdMatcher>(type_id);
 }
 
-class TimestampUnitMatcher : public TypeMatcher {
+template <typename ArrowType>
+class TimeUnitMatcher : public TypeMatcher {
+  using ThisType = TimeUnitMatcher<ArrowType>;
+
  public:
-  explicit TimestampUnitMatcher(TimeUnit::type accepted_unit)
+  explicit TimeUnitMatcher(TimeUnit::type accepted_unit)
       : accepted_unit_(accepted_unit) {}
 
   bool Matches(const DataType& type) const override {
-    if (type.id() != Type::TIMESTAMP) {
+    if (type.id() != ArrowType::type_id) {
       return false;
     }
-    const auto& ts_type = checked_cast<const TimestampType&>(type);
-    return ts_type.unit() == accepted_unit_;
+    const auto& time_type = checked_cast<const ArrowType&>(type);
+    return time_type.unit() == accepted_unit_;
   }
 
   bool Equals(const TypeMatcher& other) const override {
     if (this == &other) {
       return true;
     }
-    auto casted = dynamic_cast<const TimestampUnitMatcher*>(&other);
+    auto casted = dynamic_cast<const ThisType*>(&other);
     if (casted == nullptr) {
       return false;
     }
@@ -138,7 +144,8 @@ class TimestampUnitMatcher : public TypeMatcher {
 
   std::string ToString() const override {
     std::stringstream ss;
-    ss << "timestamp(" << ::arrow::internal::ToString(accepted_unit_) << ")";
+    ss << ArrowType::type_name() << "(" << ::arrow::internal::ToString(accepted_unit_)
+       << ")";
     return ss.str();
   }
 
@@ -146,8 +153,201 @@ class TimestampUnitMatcher : public TypeMatcher {
   TimeUnit::type accepted_unit_;
 };
 
-std::shared_ptr<TypeMatcher> TimestampUnit(TimeUnit::type unit) {
-  return std::make_shared<TimestampUnitMatcher>(unit);
+using DurationTypeUnitMatcher = TimeUnitMatcher<DurationType>;
+using Time32TypeUnitMatcher = TimeUnitMatcher<Time32Type>;
+using Time64TypeUnitMatcher = TimeUnitMatcher<Time64Type>;
+using TimestampTypeUnitMatcher = TimeUnitMatcher<TimestampType>;
+
+std::shared_ptr<TypeMatcher> TimestampTypeUnit(TimeUnit::type unit) {
+  return std::make_shared<TimestampTypeUnitMatcher>(unit);
+}
+
+std::shared_ptr<TypeMatcher> Time32TypeUnit(TimeUnit::type unit) {
+  return std::make_shared<Time32TypeUnitMatcher>(unit);
+}
+
+std::shared_ptr<TypeMatcher> Time64TypeUnit(TimeUnit::type unit) {
+  return std::make_shared<Time64TypeUnitMatcher>(unit);
+}
+
+std::shared_ptr<TypeMatcher> DurationTypeUnit(TimeUnit::type unit) {
+  return std::make_shared<DurationTypeUnitMatcher>(unit);
+}
+
+class IntegerMatcher : public TypeMatcher {
+ public:
+  IntegerMatcher() {}
+
+  bool Matches(const DataType& type) const override { return is_integer(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const IntegerMatcher*>(&other);
+    return casted != nullptr;
+  }
+
+  std::string ToString() const override { return "integer"; }
+};
+
+std::shared_ptr<TypeMatcher> Integer() { return std::make_shared<IntegerMatcher>(); }
+
+class PrimitiveMatcher : public TypeMatcher {
+ public:
+  PrimitiveMatcher() {}
+
+  bool Matches(const DataType& type) const override { return is_primitive(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const PrimitiveMatcher*>(&other);
+    return casted != nullptr;
+  }
+
+  std::string ToString() const override { return "primitive"; }
+};
+
+std::shared_ptr<TypeMatcher> Primitive() { return std::make_shared<PrimitiveMatcher>(); }
+
+class BinaryLikeMatcher : public TypeMatcher {
+ public:
+  BinaryLikeMatcher() {}
+
+  bool Matches(const DataType& type) const override { return is_binary_like(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const BinaryLikeMatcher*>(&other);
+    return casted != nullptr;
+  }
+  std::string ToString() const override { return "binary-like"; }
+};
+
+std::shared_ptr<TypeMatcher> BinaryLike() {
+  return std::make_shared<BinaryLikeMatcher>();
+}
+
+class LargeBinaryLikeMatcher : public TypeMatcher {
+ public:
+  LargeBinaryLikeMatcher() {}
+
+  bool Matches(const DataType& type) const override {
+    return is_large_binary_like(type.id());
+  }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const LargeBinaryLikeMatcher*>(&other);
+    return casted != nullptr;
+  }
+  std::string ToString() const override { return "large-binary-like"; }
+};
+
+class FixedSizeBinaryLikeMatcher : public TypeMatcher {
+ public:
+  FixedSizeBinaryLikeMatcher() {}
+
+  bool Matches(const DataType& type) const override {
+    return is_fixed_size_binary(type.id());
+  }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    auto casted = dynamic_cast<const FixedSizeBinaryLikeMatcher*>(&other);
+    return casted != nullptr;
+  }
+  std::string ToString() const override { return "fixed-size-binary-like"; }
+};
+
+std::shared_ptr<TypeMatcher> LargeBinaryLike() {
+  return std::make_shared<LargeBinaryLikeMatcher>();
+}
+
+std::shared_ptr<TypeMatcher> FixedSizeBinaryLike() {
+  return std::make_shared<FixedSizeBinaryLikeMatcher>();
+}
+
+class RunEndIntegerMatcher : public TypeMatcher {
+ public:
+  ~RunEndIntegerMatcher() override = default;
+
+  bool Matches(const DataType& type) const override { return is_run_end_type(type.id()); }
+
+  bool Equals(const TypeMatcher& other) const override {
+    auto casted = dynamic_cast<const RunEndIntegerMatcher*>(&other);
+    return casted != nullptr;
+  }
+
+  std::string ToString() const override { return "run-end-integer"; }
+};
+
+std::shared_ptr<TypeMatcher> RunEndInteger() {
+  return std::make_shared<RunEndIntegerMatcher>();
+}
+
+class RunEndEncodedMatcher : public TypeMatcher {
+ public:
+  RunEndEncodedMatcher(std::shared_ptr<TypeMatcher> run_end_type_matcher,
+                       std::shared_ptr<TypeMatcher> value_type_matcher)
+      : run_end_type_matcher{std::move(run_end_type_matcher)},
+        value_type_matcher{std::move(value_type_matcher)} {}
+
+  ~RunEndEncodedMatcher() override = default;
+
+  bool Matches(const DataType& type) const override {
+    if (type.id() == Type::RUN_END_ENCODED) {
+      const auto& ree_type = dynamic_cast<const RunEndEncodedType&>(type);
+      // This invariant is enforced in RunEndEncodedType's constructor
+      DCHECK(is_run_end_type(ree_type.run_end_type()->id()));
+      return run_end_type_matcher->Matches(*ree_type.run_end_type()) &&
+             value_type_matcher->Matches(*ree_type.value_type());
+    }
+    return false;
+  }
+
+  bool Equals(const TypeMatcher& other) const override {
+    if (this == &other) {
+      return true;
+    }
+    const auto* casted = dynamic_cast<const RunEndEncodedMatcher*>(&other);
+    return casted != nullptr && value_type_matcher->Equals(*casted->value_type_matcher) &&
+           run_end_type_matcher->Equals(*casted->run_end_type_matcher);
+  }
+
+  std::string ToString() const override {
+    return "run_end_encoded(" + run_end_type_matcher->ToString() + ", " +
+           value_type_matcher->ToString() + ")";
+  };
+
+ private:
+  std::shared_ptr<TypeMatcher> run_end_type_matcher;
+  std::shared_ptr<TypeMatcher> value_type_matcher;
+};
+
+std::shared_ptr<TypeMatcher> RunEndEncoded(
+    std::shared_ptr<TypeMatcher> value_type_matcher) {
+  return std::make_shared<RunEndEncodedMatcher>(RunEndInteger(),
+                                                std::move(value_type_matcher));
+}
+
+std::shared_ptr<TypeMatcher> RunEndEncoded(Type::type value_type_id) {
+  return RunEndEncoded(SameTypeId(value_type_id));
+}
+
+std::shared_ptr<TypeMatcher> RunEndEncoded(
+    std::shared_ptr<TypeMatcher> run_end_type_matcher,
+    std::shared_ptr<TypeMatcher> value_type_matcher) {
+  return std::make_shared<RunEndEncodedMatcher>(std::move(run_end_type_matcher),
+                                                std::move(value_type_matcher));
 }
 
 class IntegerMatcher : public TypeMatcher {
@@ -195,13 +395,13 @@ std::shared_ptr<TypeMatcher> Primitive() { return std::make_shared<PrimitiveMatc
 
 size_t InputType::Hash() const {
   size_t result = kHashSeed;
-  hash_combine(result, static_cast<int>(shape_));
   hash_combine(result, static_cast<int>(kind_));
   switch (kind_) {
     case InputType::EXACT_TYPE:
       hash_combine(result, type_->Hash());
       break;
-    default:
+    case InputType::ANY_TYPE:
+    case InputType::USE_TYPE_MATCHER:
       break;
   }
   return result;
@@ -209,33 +409,18 @@ size_t InputType::Hash() const {
 
 std::string InputType::ToString() const {
   std::stringstream ss;
-  switch (shape_) {
-    case ValueDescr::ANY:
+  switch (kind_) {
+    case InputType::ANY_TYPE:
       ss << "any";
       break;
-    case ValueDescr::ARRAY:
-      ss << "array";
-      break;
-    case ValueDescr::SCALAR:
-      ss << "scalar";
-      break;
-    default:
-      DCHECK(false);
-      break;
-  }
-  ss << "[";
-  switch (kind_) {
     case InputType::EXACT_TYPE:
       ss << type_->ToString();
       break;
     case InputType::USE_TYPE_MATCHER: {
       ss << type_matcher_->ToString();
-    } break;
-    default:
-      DCHECK(false);
       break;
+    }
   }
-  ss << "]";
   return ss.str();
 }
 
@@ -243,35 +428,46 @@ bool InputType::Equals(const InputType& other) const {
   if (this == &other) {
     return true;
   }
-  if (kind_ != other.kind_ || shape_ != other.shape_) {
+  if (kind_ != other.kind_) {
     return false;
   }
   switch (kind_) {
+    case InputType::ANY_TYPE:
+      return true;
     case InputType::EXACT_TYPE:
       return type_->Equals(*other.type_);
     case InputType::USE_TYPE_MATCHER:
       return type_matcher_->Equals(*other.type_matcher_);
-    default:
-      return false;
   }
+  return false;
 }
 
-bool InputType::Matches(const ValueDescr& descr) const {
-  if (shape_ != ValueDescr::ANY && descr.shape != shape_) {
-    return false;
-  }
+bool InputType::Matches(const DataType& type) const {
   switch (kind_) {
     case InputType::EXACT_TYPE:
-      return type_->Equals(*descr.type);
+      return type_->Equals(type);
     case InputType::USE_TYPE_MATCHER:
-      return type_matcher_->Matches(*descr.type);
-    default:
-      // ANY_TYPE
+      return type_matcher_->Matches(type);
+    case InputType::ANY_TYPE:
       return true;
   }
+  return false;
 }
 
-bool InputType::Matches(const Datum& value) const { return Matches(value.descr()); }
+bool InputType::Matches(const Datum& value) const {
+  switch (value.kind()) {
+    case Datum::NONE:
+    case Datum::RECORD_BATCH:
+    case Datum::TABLE:
+      DCHECK(false) << "Matches expects ARRAY, CHUNKED_ARRAY or SCALAR";
+      return false;
+    case Datum::ARRAY:
+    case Datum::CHUNKED_ARRAY:
+    case Datum::SCALAR:
+      break;
+  }
+  return Matches(*value.type());
+}
 
 const std::shared_ptr<DataType>& InputType::type() const {
   DCHECK_EQ(InputType::EXACT_TYPE, kind_);
@@ -286,22 +482,15 @@ const TypeMatcher& InputType::type_matcher() const {
 // ----------------------------------------------------------------------
 // OutputType
 
-OutputType::OutputType(ValueDescr descr) : OutputType(descr.type) {
-  shape_ = descr.shape;
-}
-
-Result<ValueDescr> OutputType::Resolve(KernelContext* ctx,
-                                       const std::vector<ValueDescr>& args) const {
-  ValueDescr::Shape broadcasted_shape = GetBroadcastShape(args);
-  if (kind_ == OutputType::FIXED) {
-    return ValueDescr(type_, shape_ == ValueDescr::ANY ? broadcasted_shape : shape_);
-  } else {
-    ARROW_ASSIGN_OR_RAISE(ValueDescr resolved_descr, resolver_(ctx, args));
-    if (resolved_descr.shape == ValueDescr::ANY) {
-      resolved_descr.shape = broadcasted_shape;
-    }
-    return resolved_descr;
+Result<TypeHolder> OutputType::Resolve(KernelContext* ctx,
+                                       const std::vector<TypeHolder>& types) const {
+  switch (kind_) {
+    case OutputType::FIXED:
+      return type_;
+    case OutputType::COMPUTED:
+      break;
   }
+  return resolver_(ctx, types);
 }
 
 const std::shared_ptr<DataType>& OutputType::type() const {
@@ -315,11 +504,13 @@ const OutputType::Resolver& OutputType::resolver() const {
 }
 
 std::string OutputType::ToString() const {
-  if (kind_ == OutputType::FIXED) {
-    return type_->ToString();
-  } else {
-    return "computed";
+  switch (kind_) {
+    case OutputType::FIXED:
+      return type_->ToString();
+    case OutputType::COMPUTED:
+      break;
   }
+  return "computed";
 }
 
 // ----------------------------------------------------------------------
@@ -331,8 +522,7 @@ KernelSignature::KernelSignature(std::vector<InputType> in_types, OutputType out
       out_type_(std::move(out_type)),
       is_varargs_(is_varargs),
       hash_code_(0) {
-  // VarArgs sigs must have only a single input type to use for argument validation
-  DCHECK(!is_varargs || (is_varargs && (in_types_.size() == 1)));
+  DCHECK(!is_varargs || (is_varargs && (in_types_.size() >= 1)));
 }
 
 std::shared_ptr<KernelSignature> KernelSignature::Make(std::vector<InputType> in_types,
@@ -357,19 +547,19 @@ bool KernelSignature::Equals(const KernelSignature& other) const {
   return true;
 }
 
-bool KernelSignature::MatchesInputs(const std::vector<ValueDescr>& args) const {
+bool KernelSignature::MatchesInputs(const std::vector<TypeHolder>& types) const {
   if (is_varargs_) {
-    for (const auto& arg : args) {
-      if (!in_types_[0].Matches(arg)) {
+    for (size_t i = 0; i < types.size(); ++i) {
+      if (!in_types_[std::min(i, in_types_.size() - 1)].Matches(*types[i])) {
         return false;
       }
     }
   } else {
-    if (args.size() != in_types_.size()) {
+    if (types.size() != in_types_.size()) {
       return false;
     }
     for (size_t i = 0; i < in_types_.size(); ++i) {
-      if (!in_types_[i].Matches(args[i])) {
+      if (!in_types_[i].Matches(*types[i])) {
         return false;
       }
     }
@@ -393,15 +583,19 @@ std::string KernelSignature::ToString() const {
   std::stringstream ss;
 
   if (is_varargs_) {
-    ss << "varargs[" << in_types_[0].ToString() << "]";
+    ss << "varargs[";
   } else {
     ss << "(";
-    for (size_t i = 0; i < in_types_.size(); ++i) {
-      if (i > 0) {
-        ss << ", ";
-      }
-      ss << in_types_[i].ToString();
+  }
+  for (size_t i = 0; i < in_types_.size(); ++i) {
+    if (i > 0) {
+      ss << ", ";
     }
+    ss << in_types_[i].ToString();
+  }
+  if (is_varargs_) {
+    ss << "*]";
+  } else {
     ss << ")";
   }
   ss << " -> " << out_type_.ToString();

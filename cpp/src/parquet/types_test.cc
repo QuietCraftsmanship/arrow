@@ -19,6 +19,7 @@
 
 #include <string>
 
+#include "arrow/util/endian.h"
 #include "parquet/types.h"
 
 namespace parquet {
@@ -64,11 +65,11 @@ TEST(TestConvertedTypeToString, ConvertedTypes) {
 }
 
 #ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #elif defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996)
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
 #endif
 
 TEST(TypePrinter, StatisticsTypes) {
@@ -102,8 +103,13 @@ TEST(TypePrinter, StatisticsTypes) {
   ASSERT_STREQ("1.0245", FormatStatValue(Type::DOUBLE, smin).c_str());
   ASSERT_STREQ("2.0489", FormatStatValue(Type::DOUBLE, smax).c_str());
 
+#if ARROW_LITTLE_ENDIAN
   Int96 Int96_min = {{1024, 2048, 4096}};
   Int96 Int96_max = {{2048, 4096, 8192}};
+#else
+  Int96 Int96_min = {{2048, 1024, 4096}};
+  Int96 Int96_max = {{4096, 2048, 8192}};
+#endif
   smin = std::string(reinterpret_cast<char*>(&Int96_min), sizeof(Int96));
   smax = std::string(reinterpret_cast<char*>(&Int96_max), sizeof(Int96));
   ASSERT_STREQ("1024 2048 4096", FormatStatValue(Type::INT96, smin).c_str());
@@ -126,9 +132,14 @@ TEST(TypePrinter, StatisticsTypes) {
 
 TEST(TestInt96Timestamp, Decoding) {
   auto check = [](int32_t julian_day, uint64_t nanoseconds) {
+#if ARROW_LITTLE_ENDIAN
     Int96 i96{static_cast<uint32_t>(nanoseconds),
               static_cast<uint32_t>(nanoseconds >> 32),
               static_cast<uint32_t>(julian_day)};
+#else
+    Int96 i96{static_cast<uint32_t>(nanoseconds >> 32),
+              static_cast<uint32_t>(nanoseconds), static_cast<uint32_t>(julian_day)};
+#endif
     // Official formula according to https://github.com/apache/parquet-format/pull/49
     int64_t expected =
         (julian_day - 2440588) * (86400LL * 1000 * 1000 * 1000) + nanoseconds;
@@ -153,9 +164,9 @@ TEST(TestInt96Timestamp, Decoding) {
 }
 
 #if !(defined(_WIN32) || defined(__CYGWIN__))
-#pragma GCC diagnostic pop
+#  pragma GCC diagnostic pop
 #elif _MSC_VER
-#pragma warning(pop)
+#  pragma warning(pop)
 #endif
 
 }  // namespace parquet

@@ -31,6 +31,10 @@
 
 namespace arrow {
 
+/// \defgroup array-factories Array factory functions
+///
+/// @{
+
 /// \brief Create a strongly-typed Array instance from generic ArrayData
 /// \param[in] data the array contents
 /// \return the resulting Array instance
@@ -54,7 +58,32 @@ ARROW_EXPORT
 Result<std::shared_ptr<Array>> MakeArrayFromScalar(
     const Scalar& scalar, int64_t length, MemoryPool* pool = default_memory_pool());
 
+/// \brief Create an empty Array of a given type
+///
+/// The output Array will be of the given type.
+///
+/// \param[in] type the data type of the empty Array
+/// \param[in] pool the memory pool to allocate memory from
+/// \return the resulting Array
+ARROW_EXPORT
+Result<std::shared_ptr<Array>> MakeEmptyArray(std::shared_ptr<DataType> type,
+                                              MemoryPool* pool = default_memory_pool());
+
+/// @}
+
 namespace internal {
+
+/// \brief Swap endian of each element in a generic ArrayData
+///
+/// As dictionaries are often shared between different arrays, dictionaries
+/// are not swapped by this function and should be handled separately.
+///
+/// \param[in] data the array contents
+/// \param[in] pool the memory pool to allocate memory from
+/// \return the resulting ArrayData whose elements were swapped
+ARROW_EXPORT
+Result<std::shared_ptr<ArrayData>> SwapEndianArrayData(
+    const std::shared_ptr<ArrayData>& data, MemoryPool* pool = default_memory_pool());
 
 /// Given a number of ArrayVectors, treat each ArrayVector as the
 /// chunks of a chunked array.  Then rechunk each ArrayVector such that

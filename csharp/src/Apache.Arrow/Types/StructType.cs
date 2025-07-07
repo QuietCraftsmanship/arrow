@@ -19,19 +19,15 @@ using System.Linq;
 
 namespace Apache.Arrow.Types
 {
-    public sealed class StructType : ArrowType
+    public sealed class StructType : NestedType, IRecordType
     {
-        private readonly List<Field> _fields;
-
         public override ArrowTypeId TypeId => ArrowTypeId.Struct;
         public override string Name => "struct";
 
-        public IEnumerable<Field> Fields => _fields;
+        public StructType(IReadOnlyList<Field> fields) : base(fields)
+        { }
 
-        public StructType(IEnumerable<Field> fields)
-        {
-            _fields = fields?.ToList();
-        }
+        public Field GetFieldByIndex(int index) => Fields[index];
 
         public Field GetFieldByName(string name,
             IEqualityComparer<string> comparer = default)
@@ -51,10 +47,35 @@ namespace Apache.Arrow.Types
 
             // TODO: Consider caching field index if this method is in hot path.
 
-            return _fields.FindIndex(
-                field => comparer.Equals(field.Name, name));
+            for (int i = 0; i < Fields.Count; i++)
+            {
+                if (comparer.Equals(Fields[i].Name, name))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
         }
 
-        public override void Accept(IArrowTypeVisitor visitor) => Accept(this, visitor);
+        public override void Accept(IArrowTypeVisitor visitor)
+        {
+            if (visitor is IArrowTypeVisitor<StructType> structTypeVisitor)
+            {
+                structTypeVisitor.Visit(this);
+            }
+            else if (visitor is IArrowTypeVisitor<IRecordType> interfaceVisitor)
+            {
+                interfaceVisitor.Visit(this);
+            }
+            else
+            {
+                visitor.Visit(this);
+            }
+        }
+
+        int IRecordType.FieldCount => Fields.Count;
+
+        Field IRecordType.GetFieldByName(string name) => GetFieldByName(name);
     }
 }

@@ -26,7 +26,10 @@ import sysconfig
 import pytest
 
 import pyarrow as pa
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    pytestmark = pytest.mark.numpy
 
 
 cuda = pytest.importorskip("pyarrow.cuda")
@@ -56,6 +59,17 @@ def test_Context():
     assert cuda.Context.get_num_devices() > 0
     assert global_context.device_number == 0
     assert global_context1.device_number == cuda.Context.get_num_devices() - 1
+
+    mm = global_context.memory_manager
+    assert not mm.is_cpu
+    assert "<pyarrow.MemoryManager device: CudaDevice" in repr(mm)
+
+    dev = global_context.device
+    assert dev == mm.device
+
+    assert not dev.is_cpu
+    assert dev.device_id == 0
+    assert dev.device_type == pa.DeviceAllocationType.CUDA
 
     with pytest.raises(ValueError,
                        match=("device_number argument must "
@@ -349,27 +363,29 @@ def test_HostBuffer(size):
 
 @pytest.mark.parametrize("size", [0, 1, 1000])
 def test_copy_from_to_host(size):
-
     # Create a buffer in host containing range(size)
-    buf = pa.allocate_buffer(size, resizable=True)  # in host
+    dt = np.dtype('uint16')
+    nbytes = size * dt.itemsize
+    buf = pa.allocate_buffer(nbytes, resizable=True)  # in host
     assert isinstance(buf, pa.Buffer)
     assert not isinstance(buf, cuda.CudaBuffer)
-    arr = np.frombuffer(buf, dtype=np.uint8)
+    arr = np.frombuffer(buf, dtype=dt)
     assert arr.size == size
     arr[:] = range(size)
-    arr_ = np.frombuffer(buf, dtype=np.uint8)
+    arr_ = np.frombuffer(buf, dtype=dt)
     np.testing.assert_equal(arr, arr_)
 
-    device_buffer = global_context.new_buffer(size)
+    # Create a device buffer of the same size and copy from host
+    device_buffer = global_context.new_buffer(nbytes)
     assert isinstance(device_buffer, cuda.CudaBuffer)
     assert isinstance(device_buffer, pa.Buffer)
-    assert device_buffer.size == size
+    assert device_buffer.size == nbytes
     assert not device_buffer.is_cpu
+    device_buffer.copy_from_host(buf, position=0, nbytes=nbytes)
 
-    device_buffer.copy_from_host(buf, position=0, nbytes=size)
-
-    buf2 = device_buffer.copy_to_host(position=0, nbytes=size)
-    arr2 = np.frombuffer(buf2, dtype=np.uint8)
+    # Copy back to host and compare contents
+    buf2 = device_buffer.copy_to_host(position=0, nbytes=nbytes)
+    arr2 = np.frombuffer(buf2, dtype=dt)
     np.testing.assert_equal(arr, arr2)
 
 
@@ -532,6 +548,28 @@ def test_copy_from_host(size):
             put(position=position, nbytes=nbytes)
 
 
+def test_buffer_device():
+    buf = cuda.new_host_buffer(10)
+    assert buf.device_type == pa.DeviceAllocationType.CUDA_HOST
+    assert isinstance(buf.device, pa.Device)
+    assert isinstance(buf.memory_manager, pa.MemoryManager)
+    assert buf.is_cpu
+    assert buf.device.is_cpu
+    assert buf.device == pa.default_cpu_memory_manager().device
+    # it is not entirely clear if CudaHostBuffer should use the default CPU memory
+    # manager (as it does now), see https://github.com/apache/arrow/pull/42221
+    assert buf.memory_manager.is_cpu
+
+    _, buf = make_random_buffer(size=10, target='device')
+    assert buf.device_type == pa.DeviceAllocationType.CUDA
+    assert isinstance(buf.device, pa.Device)
+    assert buf.device == global_context.memory_manager.device
+    assert isinstance(buf.memory_manager, pa.MemoryManager)
+    assert not buf.is_cpu
+    assert not buf.device.is_cpu
+    assert not buf.memory_manager.is_cpu
+
+
 def test_BufferWriter():
     def allocate(size):
         cbuf = global_context.new_buffer(size)
@@ -670,16 +708,100 @@ def test_batch_serialize():
     batch = make_recordbatch(10)
     hbuf = batch.serialize()
     cbuf = cuda.serialize_record_batch(batch, global_context)
-    # test that read_record_batch works properly:
-    cuda.read_record_batch(cbuf, batch.schema)
+
+    # Test that read_record_batch works properly
+    cbatch = cuda.read_record_batch(cbuf, batch.schema)
+    assert isinstance(cbatch, pa.RecordBatch)
+    assert batch.schema == cbatch.schema
+    assert batch.num_columns == cbatch.num_columns
+    assert batch.num_rows == cbatch.num_rows
+
+    # Deserialize CUDA-serialized batch on host
     buf = cbuf.copy_to_host()
     assert hbuf.equals(buf)
     batch2 = pa.ipc.read_record_batch(buf, batch.schema)
     assert hbuf.equals(batch2.serialize())
+
     assert batch.num_columns == batch2.num_columns
     assert batch.num_rows == batch2.num_rows
     assert batch.column(0).equals(batch2.column(0))
     assert batch.equals(batch2)
+
+
+def make_table():
+    a0 = pa.array([0, 1, 42, None], type=pa.int16())
+    a1 = pa.array([[0, 1], [2], [], None], type=pa.list_(pa.int32()))
+    a2 = pa.array([("ab", True), ("cde", False), (None, None), None],
+                  type=pa.struct([("strs", pa.utf8()),
+                                  ("bools", pa.bool_())]))
+    # Dictionaries are validated on the IPC read path, but that can produce
+    # issues for GPU-located dictionaries.  Check that they work fine.
+    a3 = pa.DictionaryArray.from_arrays(
+        indices=[0, 1, 1, None],
+        dictionary=pa.array(['foo', 'bar']))
+    a4 = pa.DictionaryArray.from_arrays(
+        indices=[2, 1, 2, None],
+        dictionary=a1)
+    a5 = pa.DictionaryArray.from_arrays(
+        indices=[2, 1, 0, None],
+        dictionary=a2)
+
+    arrays = [a0, a1, a2, a3, a4, a5]
+    schema = pa.schema([('f{}'.format(i), arr.type)
+                        for i, arr in enumerate(arrays)])
+    batch = pa.record_batch(arrays, schema=schema)
+    table = pa.Table.from_batches([batch])
+    return table
+
+
+def make_table_cuda():
+    htable = make_table()
+    # Serialize the host table to bytes
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, htable.schema) as out:
+        out.write_table(htable)
+    hbuf = pa.py_buffer(sink.getvalue().to_pybytes())
+
+    # Copy the host bytes to a device buffer
+    dbuf = global_context.new_buffer(len(hbuf))
+    dbuf.copy_from_host(hbuf, nbytes=len(hbuf))
+    # Deserialize the device buffer into a Table
+    dtable = pa.ipc.open_stream(cuda.BufferReader(dbuf)).read_all()
+    return hbuf, htable, dbuf, dtable
+
+
+def test_table_deserialize():
+    # ARROW-9659: make sure that we can deserialize a GPU-located table
+    # without crashing when initializing or validating the underlying arrays.
+    hbuf, htable, dbuf, dtable = make_table_cuda()
+    # Assert basic fields the same between host and device tables
+    assert htable.schema == dtable.schema
+    assert htable.num_rows == dtable.num_rows
+    assert htable.num_columns == dtable.num_columns
+    # Assert byte-level equality
+    assert hbuf.equals(dbuf.copy_to_host())
+    # Copy DtoH and assert the tables are still equivalent
+    assert htable.equals(pa.ipc.open_stream(
+        dbuf.copy_to_host()
+    ).read_all())
+
+
+def test_create_table_with_device_buffers():
+    # ARROW-11872: make sure that we can create an Arrow Table from
+    # GPU-located Arrays without crashing.
+    hbuf, htable, dbuf, dtable = make_table_cuda()
+    # Construct a new Table from the device Table
+    dtable2 = pa.Table.from_arrays(dtable.columns, dtable.column_names)
+    # Assert basic fields the same between host and device tables
+    assert htable.schema == dtable2.schema
+    assert htable.num_rows == dtable2.num_rows
+    assert htable.num_columns == dtable2.num_columns
+    # Assert byte-level equality
+    assert hbuf.equals(dbuf.copy_to_host())
+    # Copy DtoH and assert the tables are still equivalent
+    assert htable.equals(pa.ipc.open_stream(
+        dbuf.copy_to_host()
+    ).read_all())
 
 
 def other_process_for_test_IPC(handle_buffer, expected_arr):
@@ -706,3 +828,202 @@ def test_IPC(size):
     p.start()
     p.join()
     assert p.exitcode == 0
+
+
+def test_copy_to():
+    _, buf = make_random_buffer(size=10, target='device')
+    mm_cuda = buf.memory_manager
+
+    for dest in [mm_cuda, mm_cuda.device]:
+        arr = pa.array([0, 1, 2])
+        arr_cuda = arr.copy_to(dest)
+        assert not arr_cuda.buffers()[1].is_cpu
+        assert arr_cuda.buffers()[1].device_type == pa.DeviceAllocationType.CUDA
+        assert arr_cuda.buffers()[1].device == mm_cuda.device
+
+        arr_roundtrip = arr_cuda.copy_to(pa.default_cpu_memory_manager())
+        assert arr_roundtrip.equals(arr)
+
+        batch = pa.record_batch({"col": arr})
+        batch_cuda = batch.copy_to(dest)
+        buf_cuda = batch_cuda["col"].buffers()[1]
+        assert not buf_cuda.is_cpu
+        assert buf_cuda.device_type == pa.DeviceAllocationType.CUDA
+        assert buf_cuda.device == mm_cuda.device
+
+        batch_roundtrip = batch_cuda.copy_to(pa.default_cpu_memory_manager())
+        assert batch_roundtrip.equals(batch)
+
+
+def test_device_interface_array():
+    cffi = pytest.importorskip("pyarrow.cffi")
+    ffi = cffi.ffi
+
+    c_schema = ffi.new("struct ArrowSchema*")
+    ptr_schema = int(ffi.cast("uintptr_t", c_schema))
+    c_array = ffi.new("struct ArrowDeviceArray*")
+    ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+    typ = pa.list_(pa.int32())
+    arr = pa.array([[1], [2, 42]], type=typ)
+
+    # copy to device
+    _, buf = make_random_buffer(size=10, target='device')
+    mm_cuda = buf.memory_manager
+    carr = arr.copy_to(mm_cuda)
+
+    # Type is known up front
+    carr._export_to_c_device(ptr_array)
+
+    # verify exported struct
+    assert c_array.device_type == 2  # ARROW_DEVICE_CUDA 2
+    assert c_array.device_id == global_context.device_number
+    assert c_array.array.length == 2
+
+    # Delete recreate C++ object from exported pointer
+    del carr
+    carr_new = pa.Array._import_from_c_device(ptr_array, typ)
+    assert carr_new.type == pa.list_(pa.int32())
+    arr_new = carr_new.copy_to(pa.default_cpu_memory_manager())
+    assert arr_new.equals(arr)
+
+    del carr_new
+    # Now released
+    with pytest.raises(ValueError, match="Cannot import released ArrowArray"):
+        pa.Array._import_from_c_device(ptr_array, typ)
+
+    # Schema is exported and imported at the same time
+    carr = arr.copy_to(mm_cuda)
+    carr._export_to_c_device(ptr_array, ptr_schema)
+    # Delete and recreate C++ objects from exported pointers
+    del carr
+    carr_new = pa.Array._import_from_c_device(ptr_array, ptr_schema)
+    assert carr_new.type == pa.list_(pa.int32())
+    arr_new = carr_new.copy_to(pa.default_cpu_memory_manager())
+    assert arr_new.equals(arr)
+
+    del carr_new
+    # Now released
+    with pytest.raises(ValueError, match="Cannot import released ArrowSchema"):
+        pa.Array._import_from_c_device(ptr_array, ptr_schema)
+
+
+def test_device_interface_batch_array():
+    cffi = pytest.importorskip("pyarrow.cffi")
+    ffi = cffi.ffi
+
+    c_schema = ffi.new("struct ArrowSchema*")
+    ptr_schema = int(ffi.cast("uintptr_t", c_schema))
+    c_array = ffi.new("struct ArrowDeviceArray*")
+    ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+    batch = make_recordbatch(10)
+    schema = batch.schema
+    cbuf = cuda.serialize_record_batch(batch, global_context)
+    cbatch = cuda.read_record_batch(cbuf, schema)
+
+    # Schema is known up front
+    cbatch._export_to_c_device(ptr_array)
+
+    # verify exported struct
+    assert c_array.device_type == 2  # ARROW_DEVICE_CUDA 2
+    assert c_array.device_id == global_context.device_number
+    assert c_array.array.length == 10
+
+    # Delete recreate C++ object from exported pointer
+    del cbatch
+    cbatch_new = pa.RecordBatch._import_from_c_device(ptr_array, schema)
+    assert cbatch_new.schema == schema
+    batch_new = cbatch_new.copy_to(pa.default_cpu_memory_manager())
+    assert batch_new.equals(batch)
+
+    del cbatch_new
+    # Now released
+    with pytest.raises(ValueError, match="Cannot import released ArrowArray"):
+        pa.RecordBatch._import_from_c_device(ptr_array, schema)
+
+    # Schema is exported and imported at the same time
+    cbatch = cuda.read_record_batch(cbuf, schema)
+    cbatch._export_to_c_device(ptr_array, ptr_schema)
+    # Delete and recreate C++ objects from exported pointers
+    del cbatch
+    cbatch_new = pa.RecordBatch._import_from_c_device(ptr_array, ptr_schema)
+    assert cbatch_new.schema == schema
+    batch_new = cbatch_new.copy_to(pa.default_cpu_memory_manager())
+    assert batch_new.equals(batch)
+
+    del cbatch_new
+    # Now released
+    with pytest.raises(ValueError, match="Cannot import released ArrowSchema"):
+        pa.RecordBatch._import_from_c_device(ptr_array, ptr_schema)
+
+    # Not a struct type
+    pa.int32()._export_to_c(ptr_schema)
+    with pytest.raises(ValueError,
+                       match="ArrowSchema describes non-struct type"):
+        pa.RecordBatch._import_from_c_device(ptr_array, ptr_schema)
+
+
+def test_print_array():
+    batch = make_recordbatch(10)
+    cbuf = cuda.serialize_record_batch(batch, global_context)
+    cbatch = cuda.read_record_batch(cbuf, batch.schema)
+    arr = batch["f0"]
+    carr = cbatch["f0"]
+    assert str(carr) == str(arr)
+
+    batch = make_recordbatch(100)
+    cbuf = cuda.serialize_record_batch(batch, global_context)
+    cbatch = cuda.read_record_batch(cbuf, batch.schema)
+    arr = batch["f0"]
+    carr = cbatch["f0"]
+    assert str(carr) == str(arr)
+
+
+@pytest.mark.parametrize("size", [10, 100])
+def test_print_array_host(size):
+    buf = cuda.new_host_buffer(size*8)
+    np_arr = np.frombuffer(buf, dtype=np.int64)
+    np_arr[:] = range(size)
+
+    arr = pa.array(range(size), pa.int64())
+    carr = pa.Array.from_buffers(pa.int64(), size, [None, buf])
+    assert str(carr) == str(arr)
+
+
+def make_chunked_array(n_elements_per_chunk, n_chunks):
+    arrs = []
+    carrs = []
+    for _ in range(n_chunks):
+        batch = make_recordbatch(n_elements_per_chunk)
+        cbuf = cuda.serialize_record_batch(batch, global_context)
+        cbatch = cuda.read_record_batch(cbuf, batch.schema)
+        arrs.append(batch["f0"])
+        carrs.append(cbatch["f0"])
+
+    return pa.chunked_array(arrs), pa.chunked_array(carrs)
+
+
+def test_print_chunked_array():
+    arr, carr = make_chunked_array(10, 3)
+    assert str(carr) == str(arr)
+
+    arr, carr = make_chunked_array(100, 20)
+    assert str(carr) == str(arr)
+
+
+def test_print_record_batch():
+    batch = make_recordbatch(10)
+    cbuf = cuda.serialize_record_batch(batch, global_context)
+    cbatch = cuda.read_record_batch(cbuf, batch.schema)
+    assert str(cbatch) == str(batch)
+
+    batch = make_recordbatch(100)
+    cbuf = cuda.serialize_record_batch(batch, global_context)
+    cbatch = cuda.read_record_batch(cbuf, batch.schema)
+    assert str(cbatch) == str(batch)
+
+
+def test_print_table():
+    _, table, _, ctable = make_table_cuda()
+    assert str(ctable) == str(table)

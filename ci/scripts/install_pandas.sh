@@ -19,20 +19,28 @@
 
 set -e
 
-if [ "$#" -ne 1 ]; then
-  echo "Usage: $0 <pandas version>"
+if [ "$#" -lt 1 ]; then
+  echo "Usage: $0 <pandas version> <optional numpy version = latest>"
   exit 1
 fi
 
 pandas=$1
+numpy=${2:-"latest"}
 
-if [ "${pandas}" = "master" ]; then
-  conda install -q numpy
-  pip install git+https://github.com/pandas-dev/pandas.git --no-build-isolation
-elif [ "${pandas}" = "latest" ]; then
-  conda install -q pandas
+if [ "${numpy}" = "nightly" ]; then
+  pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple --pre numpy
+elif [ "${numpy}" = "latest" ]; then
+  pip install numpy
 else
-  conda install -q pandas=${pandas}
+  pip install numpy==${numpy}
 fi
 
-conda clean --all
+if [ "${pandas}" = "upstream_devel" ]; then
+  pip install git+https://github.com/pandas-dev/pandas.git
+elif [ "${pandas}" = "nightly" ]; then
+  pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple --pre pandas
+elif [ "${pandas}" = "latest" ]; then
+  pip install pandas
+else
+  pip install pandas==${pandas}
+fi

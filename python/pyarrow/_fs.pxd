@@ -17,10 +17,9 @@
 
 # cython: language_level = 3
 
-from pyarrow.compat import frombytes, tobytes
 from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow_fs cimport *
-from pyarrow.lib import _detect_compression
+from pyarrow.lib import _detect_compression, frombytes, tobytes
 from pyarrow.lib cimport *
 
 
@@ -31,7 +30,7 @@ cpdef enum FileType:
     Directory = <int8_t> CFileType_Directory
 
 
-cdef class FileInfo:
+cdef class FileInfo(_Weakrefable):
     cdef:
         CFileInfo info
 
@@ -40,15 +39,21 @@ cdef class FileInfo:
 
     cdef inline CFileInfo unwrap(self) nogil
 
+    @staticmethod
+    cdef CFileInfo unwrap_safe(obj)
 
-cdef class FileSelector:
+
+cdef class FileSelector(_Weakrefable):
     cdef:
         CFileSelector selector
+
+    @staticmethod
+    cdef FileSelector wrap(CFileSelector selector)
 
     cdef inline CFileSelector unwrap(self) nogil
 
 
-cdef class FileSystem:
+cdef class FileSystem(_Weakrefable):
     cdef:
         shared_ptr[CFileSystem] wrapped
         CFileSystem* fs
@@ -62,9 +67,6 @@ cdef class FileSystem:
 
 
 cdef class LocalFileSystem(FileSystem):
-    cdef:
-        CLocalFileSystem* localfs
-
     cdef init(self, const shared_ptr[CFileSystem]& wrapped)
 
 
@@ -78,5 +80,12 @@ cdef class SubTreeFileSystem(FileSystem):
 cdef class _MockFileSystem(FileSystem):
     cdef:
         CMockFileSystem* mockfs
+
+    cdef init(self, const shared_ptr[CFileSystem]& wrapped)
+
+
+cdef class PyFileSystem(FileSystem):
+    cdef:
+        CPyFileSystem* pyfs
 
     cdef init(self, const shared_ptr[CFileSystem]& wrapped)

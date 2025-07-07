@@ -17,11 +17,11 @@
 
 #pragma once
 
-#include "arrow/builder.h"
 #include "arrow/compute/api_vector.h"
 #include "arrow/compute/cast.h"           // IWYU pragma: export
 #include "arrow/compute/cast_internal.h"  // IWYU pragma: export
-#include "arrow/compute/kernels/common.h"
+#include "arrow/compute/kernels/common_internal.h"
+#include "arrow/compute/kernels/util_internal.h"
 
 namespace arrow {
 
@@ -37,83 +37,50 @@ struct CastFunctor {};
 template <typename O, typename I>
 struct CastFunctor<
     O, I, enable_if_t<std::is_same<O, I>::value && is_parameter_free_type<I>::value>> {
-  static void Exec(KernelContext*, const ExecBatch&, Datum*) {}
+  static Status Exec(KernelContext*, const ExecSpan&, ExecResult*) {
+    return Status::OK();
+  }
 };
 
-void CastFromExtension(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status CastFromExtension(KernelContext* ctx, const ExecSpan& batch, ExecResult* out);
+
+// Utility for numeric casts
+void CastNumberToNumberUnsafe(Type::type in_type, Type::type out_type,
+                              const ArraySpan& input, ArraySpan* out);
 
 // ----------------------------------------------------------------------
 // Dictionary to other things
 
-void UnpackDictionary(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status UnpackDictionary(KernelContext* ctx, const ExecSpan& batch, ExecResult* out);
 
-void OutputAllNull(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status OutputAllNull(KernelContext* ctx, const ExecSpan& batch, ExecResult* out);
 
-template <typename T>
-struct FromNullCast {
-  static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
-    ArrayData* output = out->mutable_array();
-    std::shared_ptr<Array> nulls;
-    Status s = MakeArrayOfNull(output->type, batch.length).Value(&nulls);
-    KERNEL_RETURN_IF_ERROR(ctx, s);
-    out->value = nulls->data();
-  }
-};
+Status CastFromNull(KernelContext* ctx, const ExecSpan& batch, ExecResult* out);
 
-// Adds a cast function where the functor is defined and the input and output
-// types have a type_singleton
+// Adds a cast function where CastFunctor is specialized and the input and output
+// types are parameter free (have a type_singleton).
 template <typename InType, typename OutType>
 void AddSimpleCast(InputType in_ty, OutputType out_ty, CastFunction* func) {
-  DCHECK_OK(func->AddKernel(InType::type_id, {in_ty}, out_ty,
-                            CastFunctor<OutType, InType>::Exec));
+  ARROW_DCHECK_OK(func->AddKernel(InType::type_id, {in_ty}, out_ty,
+                                  CastFunctor<OutType, InType>::Exec));
 }
 
-void ZeroCopyCastExec(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status ZeroCopyCastExec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out);
 
 void AddZeroCopyCast(Type::type in_type_id, InputType in_type, OutputType out_type,
                      CastFunction* func);
 
-// OutputType::Resolver that returns a descr with the shape of the input
-// argument and the type from CastOptions
-Result<ValueDescr> ResolveOutputFromOptions(KernelContext* ctx,
-                                            const std::vector<ValueDescr>& args);
+// OutputType::Resolver that returns a type the type from CastOptions
+Result<TypeHolder> ResolveOutputFromOptions(KernelContext* ctx,
+                                            const std::vector<TypeHolder>& args);
 
 ARROW_EXPORT extern OutputType kOutputTargetType;
 
-template <typename T, typename Enable = void>
-struct MaybeAddFromDictionary {
-  static void Add(const OutputType& out_ty, CastFunction* func) {}
-};
-
-template <typename T>
-struct MaybeAddFromDictionary<
-    T, enable_if_t<!is_boolean_type<T>::value && !is_nested_type<T>::value &&
-                   !is_null_type<T>::value && !std::is_same<DictionaryType, T>::value>> {
-  static void Add(const OutputType& out_ty, CastFunction* func) {
-    // Dictionary unpacking not implemented for boolean or nested types.
-    //
-    // XXX: Uses Take and does its own memory allocation for the moment. We can
-    // fix this later.
-    DCHECK_OK(func->AddKernel(
-        Type::DICTIONARY, {InputType::Array(Type::DICTIONARY)}, out_ty, UnpackDictionary,
-        NullHandling::COMPUTED_NO_PREALLOCATE, MemAllocation::NO_PREALLOCATE));
-  }
-};
-
-template <typename OutType>
-void AddCommonCasts(OutputType out_ty, CastFunction* func) {
-  // From null to this type
-  DCHECK_OK(func->AddKernel(Type::NA, {InputType::Array(null())}, out_ty,
-                            FromNullCast<OutType>::Exec));
-
-  // From dictionary to this type
-  MaybeAddFromDictionary<OutType>::Add(out_ty, func);
-
-  // From extension type to this type
-  DCHECK_OK(func->AddKernel(Type::EXTENSION, {InputType::Array(Type::EXTENSION)}, out_ty,
-                            CastFromExtension, NullHandling::COMPUTED_NO_PREALLOCATE,
-                            MemAllocation::NO_PREALLOCATE));
-}
+// Add generic casts to out_ty from:
+// - the null type
+// - dictionary with out_ty as given value type
+// - extension types with a compatible storage type
+void AddCommonCasts(Type::type out_type_id, OutputType out_ty, CastFunction* func);
 
 }  // namespace internal
 }  // namespace compute

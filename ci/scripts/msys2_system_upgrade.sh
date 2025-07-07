@@ -21,6 +21,8 @@ set -eux
 
 pacman \
   --noconfirm \
+  --refresh \
+  --refresh \
   --sync \
-  -uu \
-  -yy
+  --sysupgrade \
+  --sysupgrade

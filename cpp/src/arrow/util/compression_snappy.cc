@@ -25,7 +25,7 @@
 
 #include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 
 using std::size_t;
@@ -41,8 +41,6 @@ namespace {
 
 class SnappyCodec : public Codec {
  public:
-  SnappyCodec() {}
-
   Result<int64_t> Decompress(int64_t input_len, const uint8_t* input,
                              int64_t output_buffer_len, uint8_t* output_buffer) override {
     size_t decompressed_size;
@@ -87,14 +85,15 @@ class SnappyCodec : public Codec {
     return Status::NotImplemented("Streaming decompression unsupported with Snappy");
   }
 
-  const char* name() const override { return "snappy"; }
+  Compression::type compression_type() const override { return Compression::SNAPPY; }
+  int minimum_compression_level() const override { return kUseDefaultCompressionLevel; }
+  int maximum_compression_level() const override { return kUseDefaultCompressionLevel; }
+  int default_compression_level() const override { return kUseDefaultCompressionLevel; }
 };
 
 }  // namespace
 
-std::unique_ptr<Codec> MakeSnappyCodec() {
-  return std::unique_ptr<Codec>(new SnappyCodec());
-}
+std::unique_ptr<Codec> MakeSnappyCodec() { return std::make_unique<SnappyCodec>(); }
 
 }  // namespace internal
 }  // namespace util

@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { DataType } from '../type';
-import { valueToString } from '../util/pretty';
-import { BigIntAvailable } from '../util/compat';
+import { DataType } from '../type.js';
+import { valueToString } from '../util/pretty.js';
 
 /**
  * Dynamically compile the null values into an `isValid()` function whose
@@ -47,7 +46,7 @@ export function createIsValidFunction<T extends DataType = any, TNull = any>(nul
     }
 
     let fnBody = '';
-    let noNaNs = nullValues.filter((x) => x === x);
+    const noNaNs = nullValues.filter((x) => x === x);
 
     if (noNaNs.length > 0) {
         fnBody = `
@@ -70,8 +69,6 @@ export function createIsValidFunction<T extends DataType = any, TNull = any>(nul
 function valueToCase(x: any) {
     if (typeof x !== 'bigint') {
         return valueToString(x);
-    } else if (BigIntAvailable) {
-        return `${valueToString(x)}n`;
     }
-    return `"${valueToString(x)}"`;
+    return `${valueToString(x)}n`;
 }

@@ -22,8 +22,6 @@
 #include <vector>
 
 #include "arrow/array/builder_base.h"
-#include "arrow/memory_pool.h"
-#include "arrow/record_batch.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
@@ -32,26 +30,28 @@
 
 namespace arrow {
 
+class MemoryPool;
+class RecordBatch;
+
 /// \class RecordBatchBuilder
 /// \brief Helper class for creating record batches iteratively given a known
 /// schema
 class ARROW_EXPORT RecordBatchBuilder {
  public:
-  /// \brief Create an initialize a RecordBatchBuilder
+  /// \brief Create and initialize a RecordBatchBuilder
   /// \param[in] schema The schema for the record batch
   /// \param[in] pool A MemoryPool to use for allocations
-  /// \param[in] builder the created builder instance
-  static Status Make(const std::shared_ptr<Schema>& schema, MemoryPool* pool,
-                     std::unique_ptr<RecordBatchBuilder>* builder);
+  /// \return the created builder instance
+  static Result<std::unique_ptr<RecordBatchBuilder>> Make(
+      const std::shared_ptr<Schema>& schema, MemoryPool* pool);
 
-  /// \brief Create an initialize a RecordBatchBuilder
+  /// \brief Create and initialize a RecordBatchBuilder
   /// \param[in] schema The schema for the record batch
   /// \param[in] pool A MemoryPool to use for allocations
   /// \param[in] initial_capacity The initial capacity for the builders
-  /// \param[in] builder the created builder instance
-  static Status Make(const std::shared_ptr<Schema>& schema, MemoryPool* pool,
-                     int64_t initial_capacity,
-                     std::unique_ptr<RecordBatchBuilder>* builder);
+  /// \return the created builder instance
+  static Result<std::unique_ptr<RecordBatchBuilder>> Make(
+      const std::shared_ptr<Schema>& schema, MemoryPool* pool, int64_t initial_capacity);
 
   /// \brief Get base pointer to field builder
   /// \param i the field index
@@ -68,14 +68,12 @@ class ARROW_EXPORT RecordBatchBuilder {
 
   /// \brief Finish current batch and optionally reset
   /// \param[in] reset_builders the resulting RecordBatch
-  /// \param[out] batch the resulting RecordBatch
-  /// \return Status
-  Status Flush(bool reset_builders, std::shared_ptr<RecordBatch>* batch);
+  /// \return the resulting RecordBatch
+  Result<std::shared_ptr<RecordBatch>> Flush(bool reset_builders);
 
   /// \brief Finish current batch and reset
-  /// \param[out] batch the resulting RecordBatch
-  /// \return Status
-  Status Flush(std::shared_ptr<RecordBatch>* batch);
+  /// \return the resulting RecordBatch
+  Result<std::shared_ptr<RecordBatch>> Flush();
 
   /// \brief Set the initial capacity for new builders
   void SetInitialCapacity(int64_t capacity);

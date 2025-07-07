@@ -25,11 +25,11 @@ def items_per_seconds_fmt(value):
     if value < 1000:
         return "{} items/sec".format(value)
     if value < 1000**2:
-        return "{:.3f}k items/sec".format(value / 1000)
+        return "{:.3f}K items/sec".format(value / 1000)
     if value < 1000**3:
-        return "{:.3f}m items/sec".format(value / 1000**2)
+        return "{:.3f}M items/sec".format(value / 1000**2)
     else:
-        return "{:.3f}b items/sec".format(value / 1000**3)
+        return "{:.3f}G items/sec".format(value / 1000**3)
 
 
 def bytes_per_seconds_fmt(value):
@@ -118,6 +118,7 @@ class BenchmarkComparator:
             "contender": fmt(self.contender.value),
             "unit": self.unit,
             "less_is_better": self.less_is_better,
+            "counters": str(self.baseline.counters)
         }
 
     def compare(self, comparator=None):
@@ -129,6 +130,7 @@ class BenchmarkComparator:
             "contender": self.contender.value,
             "unit": self.unit,
             "less_is_better": self.less_is_better,
+            "counters": self.baseline.counters
         }
 
     def __call__(self, **kwargs):

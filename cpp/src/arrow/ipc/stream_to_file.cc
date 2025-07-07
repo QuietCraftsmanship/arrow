@@ -19,12 +19,11 @@
 #include <memory>
 #include <string>
 
+#include "arrow/io/stdio.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
 #include "arrow/record_batch.h"
 #include "arrow/status.h"
-
-#include "arrow/util/io_util.h"
 
 namespace arrow {
 namespace ipc {
@@ -36,8 +35,11 @@ Status ConvertToFile() {
   io::StdinStream input;
   io::StdoutStream sink;
 
+  IpcWriteOptions write_options;
+  write_options.emit_dictionary_deltas = true;
   ARROW_ASSIGN_OR_RAISE(auto reader, RecordBatchStreamReader::Open(&input));
-  ARROW_ASSIGN_OR_RAISE(auto writer, NewFileWriter(&sink, reader->schema()));
+  ARROW_ASSIGN_OR_RAISE(auto writer,
+                        MakeFileWriter(&sink, reader->schema(), write_options));
   std::shared_ptr<RecordBatch> batch;
   while (true) {
     ARROW_ASSIGN_OR_RAISE(batch, reader->Next());

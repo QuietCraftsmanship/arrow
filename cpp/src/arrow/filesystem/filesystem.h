@@ -19,50 +19,31 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "arrow/filesystem/type_fwd.h"
+#include "arrow/io/interfaces.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/compare.h"
 #include "arrow/util/macros.h"
+#include "arrow/util/type_fwd.h"
 #include "arrow/util/visibility.h"
 #include "arrow/util/windows_fixup.h"
 
 namespace arrow {
-
-namespace io {
-
-class InputStream;
-class LatencyGenerator;
-class OutputStream;
-class RandomAccessFile;
-
-}  // namespace io
-
 namespace fs {
+
+using arrow::util::Uri;
 
 // A system clock time point expressed as a 64-bit (or more) number of
 // nanoseconds since the epoch.
 using TimePoint =
     std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>;
-
-/// \brief FileSystem entry type
-enum class FileType : int8_t {
-  /// Entry is not found
-  NotFound,
-  /// Entry exists but its type is unknown
-  ///
-  /// This can designate a special file such as a Unix socket or character
-  /// device, or Windows NUL / CON / ...
-  Unknown,
-  /// Entry is a regular file
-  File,
-  /// Entry is a directory
-  Directory
-};
 
 ARROW_EXPORT std::string ToString(FileType);
 
@@ -78,6 +59,9 @@ struct ARROW_EXPORT FileInfo : public util::EqualityComparable<FileInfo> {
   FileInfo& operator=(FileInfo&&) = default;
   FileInfo(const FileInfo&) = default;
   FileInfo& operator=(const FileInfo&) = default;
+
+  explicit FileInfo(std::string path, FileType type = FileType::Unknown)
+      : path_(std::move(path)), type_(type) {}
 
   /// The file type
   FileType type() const { return type_; }
@@ -130,8 +114,8 @@ struct ARROW_EXPORT FileInfo : public util::EqualityComparable<FileInfo> {
   };
 
  protected:
-  FileType type_ = FileType::Unknown;
   std::string path_;
+  FileType type_ = FileType::Unknown;
   int64_t size_ = kNoSize;
   TimePoint mtime_ = kNoTime;
 };
@@ -145,27 +129,78 @@ struct ARROW_EXPORT FileSelector {
   std::string base_dir;
   /// The behavior if `base_dir` isn't found in the filesystem.  If false,
   /// an error is returned.  If true, an empty selection is returned.
-  bool allow_not_found = false;
+  bool allow_not_found;
   /// Whether to recurse into subdirectories.
-  bool recursive = false;
+  bool recursive;
   /// The maximum number of subdirectories to recurse into.
-  int32_t max_recursion = INT32_MAX;
+  int32_t max_recursion;
 
-  FileSelector() {}
+  FileSelector() : allow_not_found(false), recursive(false), max_recursion(INT32_MAX) {}
 };
 
+/// \brief FileSystem, path pair
+struct ARROW_EXPORT FileLocator {
+  std::shared_ptr<FileSystem> filesystem;
+  std::string path;
+};
+
+using FileInfoVector = std::vector<FileInfo>;
+using FileInfoGenerator = std::function<Future<FileInfoVector>()>;
+
+}  // namespace fs
+
+template <>
+struct IterationTraits<fs::FileInfoVector> {
+  static fs::FileInfoVector End() { return {}; }
+  static bool IsEnd(const fs::FileInfoVector& val) { return val.empty(); }
+};
+
+namespace fs {
+
 /// \brief Abstract file system API
-class ARROW_EXPORT FileSystem : public std::enable_shared_from_this<FileSystem> {
+class ARROW_EXPORT FileSystem
+    /// \cond false
+    : public std::enable_shared_from_this<FileSystem>
+/// \endcond
+{  // NOLINT
  public:
   virtual ~FileSystem();
 
   virtual std::string type_name() const = 0;
+
+  /// EXPERIMENTAL: The IOContext associated with this filesystem.
+  const io::IOContext& io_context() const { return io_context_; }
 
   /// Normalize path for the given filesystem
   ///
   /// The default implementation of this method is a no-op, but subclasses
   /// may allow normalizing irregular path forms (such as Windows local paths).
   virtual Result<std::string> NormalizePath(std::string path);
+
+  /// \brief Ensure a URI (or path) is compatible with the given filesystem and return the
+  ///        path
+  ///
+  /// \param uri_string A URI representing a resource in the given filesystem.
+  ///
+  /// This method will check to ensure the given filesystem is compatible with the
+  /// URI. This can be useful when the user provides both a URI and a filesystem or
+  /// when a user provides multiple URIs that should be compatible with the same
+  /// filesystem.
+  ///
+  /// uri_string can be an absolute path instead of a URI.  In that case it will ensure
+  /// the filesystem (if supplied) is the local filesystem (or some custom filesystem that
+  /// is capable of reading local paths) and will normalize the path's file separators.
+  ///
+  /// Note, this method only checks to ensure the URI scheme is valid.  It will not detect
+  /// inconsistencies like a mismatching region or endpoint override.
+  ///
+  /// \return The path inside the filesystem that is indicated by the URI.
+  virtual Result<std::string> PathFromUri(const std::string& uri_string) const;
+
+  /// \brief Make a URI from which FileSystemFromUri produces an equivalent filesystem
+  /// \param path The path component to use in the resulting URI
+  /// \return A URI string, or an error if an equivalent URI cannot be produced
+  virtual Result<std::string> MakeUri(std::string path) const;
 
   virtual bool Equals(const FileSystem& other) const = 0;
 
@@ -181,19 +216,28 @@ class ARROW_EXPORT FileSystem : public std::enable_shared_from_this<FileSystem> 
   /// a truly exceptional condition (low-level I/O error, etc.).
   virtual Result<FileInfo> GetFileInfo(const std::string& path) = 0;
   /// Same, for many targets at once.
-  virtual Result<std::vector<FileInfo>> GetFileInfo(
-      const std::vector<std::string>& paths);
+  virtual Result<FileInfoVector> GetFileInfo(const std::vector<std::string>& paths);
   /// Same, according to a selector.
   ///
   /// The selector's base directory will not be part of the results, even if
   /// it exists.
   /// If it doesn't exist, see `FileSelector::allow_not_found`.
-  virtual Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) = 0;
+  virtual Result<FileInfoVector> GetFileInfo(const FileSelector& select) = 0;
+
+  /// Async version of GetFileInfo
+  virtual Future<FileInfoVector> GetFileInfoAsync(const std::vector<std::string>& paths);
+
+  /// Streaming async version of GetFileInfo
+  ///
+  /// The returned generator is not async-reentrant, i.e. you need to wait for
+  /// the returned future to complete before calling the generator again.
+  virtual FileInfoGenerator GetFileInfoGenerator(const FileSelector& select);
 
   /// Create a directory and subdirectories.
   ///
   /// This function succeeds if the directory already exists.
-  virtual Status CreateDir(const std::string& path, bool recursive = true) = 0;
+  virtual Status CreateDir(const std::string& path, bool recursive) = 0;
+  Status CreateDir(const std::string& path) { return CreateDir(path, true); }
 
   /// Delete a directory and its contents, recursively.
   virtual Status DeleteDir(const std::string& path) = 0;
@@ -201,8 +245,26 @@ class ARROW_EXPORT FileSystem : public std::enable_shared_from_this<FileSystem> 
   /// Delete a directory's contents, recursively.
   ///
   /// Like DeleteDir, but doesn't delete the directory itself.
-  /// Passing an empty path ("") will wipe the entire filesystem tree.
-  virtual Status DeleteDirContents(const std::string& path) = 0;
+  /// Passing an empty path ("" or "/") is disallowed, see DeleteRootDirContents.
+  virtual Status DeleteDirContents(const std::string& path, bool missing_dir_ok) = 0;
+  Status DeleteDirContents(const std::string& path) {
+    return DeleteDirContents(path, false);
+  }
+
+  /// Async version of DeleteDirContents.
+  virtual Future<> DeleteDirContentsAsync(const std::string& path, bool missing_dir_ok);
+
+  /// Async version of DeleteDirContents.
+  ///
+  /// This overload allows missing directories.
+  Future<> DeleteDirContentsAsync(const std::string& path);
+
+  /// EXPERIMENTAL: Delete the root directory's contents, recursively.
+  ///
+  /// Implementations may decide to raise an error if this operation is
+  /// too dangerous.
+  // NOTE: may decide to remove this if it's deemed not useful
+  virtual Status DeleteRootDirContents() = 0;
 
   /// Delete a file.
   virtual Status DeleteFile(const std::string& path) = 0;
@@ -229,21 +291,88 @@ class ARROW_EXPORT FileSystem : public std::enable_shared_from_this<FileSystem> 
   virtual Result<std::shared_ptr<io::InputStream>> OpenInputStream(
       const std::string& path) = 0;
 
+  /// Open an input stream for sequential reading.
+  ///
+  /// This override assumes the given FileInfo validly represents the file's
+  /// characteristics, and may optimize access depending on them (for example
+  /// avoid querying the file size or its existence).
+  virtual Result<std::shared_ptr<io::InputStream>> OpenInputStream(const FileInfo& info);
+
   /// Open an input file for random access reading.
   virtual Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) = 0;
+
+  /// Open an input file for random access reading.
+  ///
+  /// This override assumes the given FileInfo validly represents the file's
+  /// characteristics, and may optimize access depending on them (for example
+  /// avoid querying the file size or its existence).
+  virtual Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
+      const FileInfo& info);
+
+  /// Async version of OpenInputStream
+  virtual Future<std::shared_ptr<io::InputStream>> OpenInputStreamAsync(
+      const std::string& path);
+
+  /// Async version of OpenInputStream
+  virtual Future<std::shared_ptr<io::InputStream>> OpenInputStreamAsync(
+      const FileInfo& info);
+
+  /// Async version of OpenInputFile
+  virtual Future<std::shared_ptr<io::RandomAccessFile>> OpenInputFileAsync(
+      const std::string& path);
+
+  /// Async version of OpenInputFile
+  virtual Future<std::shared_ptr<io::RandomAccessFile>> OpenInputFileAsync(
+      const FileInfo& info);
 
   /// Open an output stream for sequential writing.
   ///
   /// If the target already exists, existing data is truncated.
   virtual Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) = 0;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) = 0;
+  Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(const std::string& path);
 
   /// Open an output stream for appending.
   ///
   /// If the target doesn't exist, a new empty file is created.
+  ///
+  /// Note: some filesystem implementations do not support efficient appending
+  /// to an existing file, in which case this method will return NotImplemented.
+  /// Consider writing to multiple files (using e.g. the dataset layer) instead.
   virtual Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) = 0;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) = 0;
+  Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(const std::string& path);
+
+ protected:
+  explicit FileSystem(io::IOContext io_context = io::default_io_context())
+      : io_context_(std::move(io_context)) {}
+
+  io::IOContext io_context_;
+  // Whether metadata operations (such as GetFileInfo or OpenInputStream)
+  // are cheap enough that the default async variants don't bother with
+  // a thread pool.
+  bool default_async_is_sync_ = true;
+};
+
+struct FileSystemFactory {
+  std::function<Result<std::shared_ptr<FileSystem>>(
+      const Uri& uri, const io::IOContext& io_context, std::string* out_path)>
+      function;
+  std::string_view file;
+  int line;
+
+  bool operator==(const FileSystemFactory& other) const {
+    // In the case where libarrow is linked statically both to the executable and to a
+    // dynamically loaded filesystem implementation library, the library contains a
+    // duplicate definition of the registry and duplicate definitions of any
+    // FileSystemRegistrars which are statically linked to libarrow. When retrieving
+    // factories from the filesystem implementation library, we use the file and line
+    // of the registrar's definition to determine equivalence of the duplicate factories.
+    return file == other.file && line == other.line;
+  }
 };
 
 /// \brief A FileSystem implementation that delegates to another
@@ -267,19 +396,28 @@ class ARROW_EXPORT SubTreeFileSystem : public FileSystem {
   std::shared_ptr<FileSystem> base_fs() const { return base_fs_; }
 
   Result<std::string> NormalizePath(std::string path) override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
 
   bool Equals(const FileSystem& other) const override;
 
   /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
   using FileSystem::GetFileInfo;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
   /// \endcond
-  Result<FileInfo> GetFileInfo(const std::string& path) override;
-  Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  Result<FileInfo> GetFileInfo(const std::string& path) override;
+  Result<FileInfoVector> GetFileInfo(const FileSelector& select) override;
+
+  FileInfoGenerator GetFileInfoGenerator(const FileSelector& select) override;
+
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
-  Status DeleteDirContents(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -289,21 +427,36 @@ class ARROW_EXPORT SubTreeFileSystem : public FileSystem {
 
   Result<std::shared_ptr<io::InputStream>> OpenInputStream(
       const std::string& path) override;
+  Result<std::shared_ptr<io::InputStream>> OpenInputStream(const FileInfo& info) override;
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) override;
+  Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
+      const FileInfo& info) override;
+
+  Future<std::shared_ptr<io::InputStream>> OpenInputStreamAsync(
+      const std::string& path) override;
+  Future<std::shared_ptr<io::InputStream>> OpenInputStreamAsync(
+      const FileInfo& info) override;
+  Future<std::shared_ptr<io::RandomAccessFile>> OpenInputFileAsync(
+      const std::string& path) override;
+  Future<std::shared_ptr<io::RandomAccessFile>> OpenInputFileAsync(
+      const FileInfo& info) override;
+
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
  protected:
-  SubTreeFileSystem() {}
+  SubTreeFileSystem() = default;
 
   const std::string base_path_;
   std::shared_ptr<FileSystem> base_fs_;
 
-  std::string PrependBase(const std::string& s) const;
-  Status PrependBaseNonEmpty(std::string* s) const;
+  Result<std::string> PrependBase(const std::string& s) const;
+  Result<std::string> PrependBaseNonEmpty(const std::string& s) const;
   Result<std::string> StripBase(const std::string& s) const;
   Status FixInfo(FileInfo* info) const;
 
@@ -323,15 +476,24 @@ class ARROW_EXPORT SlowFileSystem : public FileSystem {
 
   std::string type_name() const override { return "slow"; }
   bool Equals(const FileSystem& other) const override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
 
+  /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
   using FileSystem::GetFileInfo;
-  Result<FileInfo> GetFileInfo(const std::string& path) override;
-  Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
+  /// \endcond
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  Result<FileInfo> GetFileInfo(const std::string& path) override;
+  Result<FileInfoVector> GetFileInfo(const FileSelector& select) override;
+
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
-  Status DeleteDirContents(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -341,17 +503,31 @@ class ARROW_EXPORT SlowFileSystem : public FileSystem {
 
   Result<std::shared_ptr<io::InputStream>> OpenInputStream(
       const std::string& path) override;
+  Result<std::shared_ptr<io::InputStream>> OpenInputStream(const FileInfo& info) override;
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) override;
+  Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
+      const FileInfo& info) override;
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
  protected:
   std::shared_ptr<FileSystem> base_fs_;
   std::shared_ptr<io::LatencyGenerator> latencies_;
 };
+
+/// \brief Ensure all registered filesystem implementations are finalized.
+///
+/// Individual finalizers may wait for concurrent calls to finish so as to avoid
+/// race conditions. After this function has been called, all filesystem APIs
+/// will fail with an error.
+///
+/// The user is responsible for synchronization of calls to this function.
+void EnsureFinalized();
 
 /// \defgroup filesystem-factories Functions for creating FileSystem instances
 ///
@@ -359,7 +535,10 @@ class ARROW_EXPORT SlowFileSystem : public FileSystem {
 
 /// \brief Create a new FileSystem by URI
 ///
-/// Recognized schemes are "file", "mock", "hdfs" and "s3fs".
+/// Recognized schemes are "file", "mock", "hdfs", "viewfs", "s3",
+/// "gs" and "gcs".
+///
+/// Support for other schemes can be added using RegisterFileSystemFactory.
 ///
 /// \param[in] uri a URI-based path, ex: file:///some/local/path
 /// \param[out] out_path (optional) Path inside the filesystem.
@@ -368,7 +547,25 @@ ARROW_EXPORT
 Result<std::shared_ptr<FileSystem>> FileSystemFromUri(const std::string& uri,
                                                       std::string* out_path = NULLPTR);
 
+/// \brief Create a new FileSystem by URI with a custom IO context
+///
+/// Recognized schemes are "file", "mock", "hdfs", "viewfs", "s3",
+/// "gs" and "gcs".
+///
+/// Support for other schemes can be added using RegisterFileSystemFactory.
+///
+/// \param[in] uri a URI-based path, ex: file:///some/local/path
+/// \param[in] io_context an IOContext which will be associated with the filesystem
+/// \param[out] out_path (optional) Path inside the filesystem.
+/// \return out_fs FileSystem instance.
+ARROW_EXPORT
+Result<std::shared_ptr<FileSystem>> FileSystemFromUri(const std::string& uri,
+                                                      const io::IOContext& io_context,
+                                                      std::string* out_path = NULLPTR);
+
 /// \brief Create a new FileSystem by URI
+///
+/// Support for other schemes can be added using RegisterFileSystemFactory.
 ///
 /// Same as FileSystemFromUri, but in addition also recognize non-URIs
 /// and treat them as local filesystem paths.  Only absolute local filesystem
@@ -377,7 +574,150 @@ ARROW_EXPORT
 Result<std::shared_ptr<FileSystem>> FileSystemFromUriOrPath(
     const std::string& uri, std::string* out_path = NULLPTR);
 
+/// \brief Create a new FileSystem by URI with a custom IO context
+///
+/// Support for other schemes can be added using RegisterFileSystemFactory.
+///
+/// Same as FileSystemFromUri, but in addition also recognize non-URIs
+/// and treat them as local filesystem paths.  Only absolute local filesystem
+/// paths are allowed.
+ARROW_EXPORT
+Result<std::shared_ptr<FileSystem>> FileSystemFromUriOrPath(
+    const std::string& uri, const io::IOContext& io_context,
+    std::string* out_path = NULLPTR);
+
 /// @}
+
+/// \defgroup filesystem-factory-registration Helpers for FileSystem registration
+///
+/// @{
+
+/// \brief Register a FileSystem factory
+///
+/// Support for custom URI schemes can be added by registering a factory
+/// for the corresponding FileSystem.
+///
+/// \param[in] scheme a Uri scheme which the factory will handle.
+///            If a factory has already been registered for a scheme,
+///            the new factory will be ignored.
+/// \param[in] factory a function which can produce a FileSystem for Uris which match
+///            scheme.
+/// \param[in] finalizer a function which must be called to finalize the factory before
+///            the process exits, or nullptr if no finalization is necessary.
+/// \return raises KeyError if a name collision occurs.
+ARROW_EXPORT Status RegisterFileSystemFactory(std::string scheme,
+                                              FileSystemFactory factory,
+                                              std::function<void()> finalizer = {});
+
+/// \brief Register FileSystem factories from a shared library
+///
+/// FileSystem implementations may be housed in separate shared libraries and only
+/// registered when the shared library is explicitly loaded. FileSystemRegistrar is
+/// provided to simplify definition of such libraries: each instance at namespace scope
+/// in the library will register a factory for a scheme. Any library which uses
+/// FileSystemRegistrars and which must be dynamically loaded should be loaded using
+/// LoadFileSystemFactories(), which will additionally merge registries are if necessary
+/// (static linkage to arrow can produce isolated registries).
+ARROW_EXPORT Status LoadFileSystemFactories(const char* libpath);
+
+struct ARROW_EXPORT FileSystemRegistrar {
+  /// \brief Register a FileSystem factory at load time
+  ///
+  /// Support for custom URI schemes can be added by registering a factory for the
+  /// corresponding FileSystem. An instance of this helper can be defined at namespace
+  /// scope to cause the factory to be registered at load time.
+  ///
+  /// Global constructors will finish execution before main() starts if the registrar is
+  /// linked into the same binary as main(), or before dlopen()/LoadLibrary() returns if
+  /// the library in which the registrar is defined is dynamically loaded.
+  ///
+  /// \code
+  ///     FileSystemRegistrar kSlowFileSystemModule{
+  ///       "slowfile",
+  ///       [](const Uri& uri, const io::IOContext& io_context, std::string* out_path)
+  ///           ->Result<std::shared_ptr<FileSystem>> {
+  ///         auto local_uri = "file" + uri.ToString().substr(uri.scheme().size());
+  ///         ARROW_ASSIGN_OR_RAISE(auto base_fs,
+  ///             FileSystemFromUri(local_uri, io_context, out_path));
+  ///         double average_latency = 1;
+  ///         int32_t seed = 0xDEADBEEF;
+  ///         ARROW_ASSIGN_OR_RAISE(auto params, uri.query_item());
+  ///         for (const auto& [key, value] : params) {
+  ///           if (key == "average_latency") {
+  ///             average_latency = std::stod(value);
+  ///           }
+  ///           if (key == "seed") {
+  ///             seed = std::stoi(value, nullptr, /*base=*/16);
+  ///           }
+  ///         }
+  ///         return std::make_shared<SlowFileSystem>(base_fs, average_latency, seed);
+  ///     }));
+  /// \endcode
+  ///
+  /// \param[in] scheme a Uri scheme which the factory will handle.
+  ///            If a factory has already been registered for a scheme, the
+  ///            new factory will be ignored.
+  /// \param[in] factory a function which can produce a FileSystem for Uris which match
+  ///            scheme.
+  /// \param[in] finalizer a function which must be called to finalize the factory before
+  ///            the process exits, or nullptr if no finalization is necessary.
+  FileSystemRegistrar(std::string scheme, FileSystemFactory factory,
+                      std::function<void()> finalizer = {});
+};
+
+#define ARROW_REGISTER_FILESYSTEM(scheme, factory_function, finalizer)            \
+  ::arrow::fs::FileSystemRegistrar {                                              \
+    scheme, ::arrow::fs::FileSystemFactory{factory_function, __FILE__, __LINE__}, \
+        finalizer                                                                 \
+  }
+
+/// @}
+
+namespace internal {
+ARROW_EXPORT void* GetFileSystemRegistry();
+}  // namespace internal
+
+/// \brief Copy files, including from one FileSystem to another
+///
+/// If a source and destination are resident in the same FileSystem FileSystem::CopyFile
+/// will be used, otherwise the file will be opened as a stream in both FileSystems and
+/// chunks copied from the source to the destination. No directories will be created.
+ARROW_EXPORT
+Status CopyFiles(const std::vector<FileLocator>& sources,
+                 const std::vector<FileLocator>& destinations,
+                 const io::IOContext& io_context = io::default_io_context(),
+                 int64_t chunk_size = 1024 * 1024, bool use_threads = true);
+
+/// \brief Copy selected files, including from one FileSystem to another
+///
+/// Directories will be created under the destination base directory as needed.
+ARROW_EXPORT
+Status CopyFiles(const std::shared_ptr<FileSystem>& source_fs,
+                 const FileSelector& source_sel,
+                 const std::shared_ptr<FileSystem>& destination_fs,
+                 const std::string& destination_base_dir,
+                 const io::IOContext& io_context = io::default_io_context(),
+                 int64_t chunk_size = 1024 * 1024, bool use_threads = true);
+
+struct FileSystemGlobalOptions {
+  /// Path to a single PEM file holding all TLS CA certificates
+  ///
+  /// If empty, the underlying TLS library's defaults will be used.
+  std::string tls_ca_file_path;
+
+  /// Path to a directory holding TLS CA certificates in individual PEM files
+  /// named along the OpenSSL "hashed" format.
+  ///
+  /// If empty, the underlying TLS library's defaults will be used.
+  std::string tls_ca_dir_path;
+};
+
+/// EXPERIMENTAL: optional global initialization routine
+///
+/// This is for environments (such as manylinux) where the path
+/// to TLS CA certificates needs to be configured at runtime.
+ARROW_EXPORT
+Status Initialize(const FileSystemGlobalOptions& options);
 
 }  // namespace fs
 }  // namespace arrow

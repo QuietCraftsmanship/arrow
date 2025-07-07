@@ -17,8 +17,10 @@
 
 // Cast types to boolean
 
-#include "arrow/compute/kernels/common.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/compute/kernels/common_internal.h"
 #include "arrow/compute/kernels/scalar_cast_internal.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/value_parsing.h"
 
 namespace arrow {
@@ -29,18 +31,18 @@ namespace compute {
 namespace internal {
 
 struct IsNonZero {
-  template <typename OUT, typename ARG0>
-  static OUT Call(KernelContext*, ARG0 val) {
+  template <typename OutValue, typename Arg0Value>
+  static OutValue Call(KernelContext*, Arg0Value val, Status*) {
     return val != 0;
   }
 };
 
 struct ParseBooleanString {
-  template <typename OUT, typename ARG0>
-  static OUT Call(KernelContext* ctx, ARG0 val) {
+  template <typename OutValue, typename Arg0Value>
+  static OutValue Call(KernelContext*, Arg0Value val, Status* st) {
     bool result = false;
     if (ARROW_PREDICT_FALSE(!ParseValue<BooleanType>(val.data(), val.size(), &result))) {
-      ctx->SetStatus(Status::Invalid("Failed to parse value: ", val));
+      *st = Status::Invalid("Failed to parse value: ", val);
     }
     return result;
   }
@@ -48,17 +50,23 @@ struct ParseBooleanString {
 
 std::vector<std::shared_ptr<CastFunction>> GetBooleanCasts() {
   auto func = std::make_shared<CastFunction>("cast_boolean", Type::BOOL);
-  AddCommonCasts<BooleanType>(boolean(), func.get());
+  AddCommonCasts(Type::BOOL, boolean(), func.get());
+  AddZeroCopyCast(Type::BOOL, boolean(), boolean(), func.get());
 
   for (const auto& ty : NumericTypes()) {
     ArrayKernelExec exec =
-        codegen::Numeric<codegen::ScalarUnary, BooleanType, IsNonZero>(*ty);
+        GenerateNumeric<applicator::ScalarUnary, BooleanType, IsNonZero>(*ty);
     DCHECK_OK(func->AddKernel(ty->id(), {ty}, boolean(), exec));
   }
   for (const auto& ty : BaseBinaryTypes()) {
+    ArrayKernelExec exec = GenerateVarBinaryBase<applicator::ScalarUnaryNotNull,
+                                                 BooleanType, ParseBooleanString>(*ty);
+    DCHECK_OK(func->AddKernel(ty->id(), {ty}, boolean(), exec));
+  }
+  for (const auto& ty : BinaryViewTypes()) {
     ArrayKernelExec exec =
-        codegen::BaseBinary<codegen::ScalarUnaryNotNull, BooleanType, ParseBooleanString>(
-            *ty);
+        GenerateVarBinaryViewBase<applicator::ScalarUnaryNotNull, BooleanType,
+                                  ParseBooleanString>(*ty);
     DCHECK_OK(func->AddKernel(ty->id(), {ty}, boolean(), exec));
   }
   return {func};

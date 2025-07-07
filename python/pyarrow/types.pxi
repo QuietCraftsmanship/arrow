@@ -15,42 +15,75 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from cpython.pycapsule cimport (
+    PyCapsule_CheckExact,
+    PyCapsule_GetPointer,
+    PyCapsule_GetName,
+    PyCapsule_New,
+    PyCapsule_IsValid
+)
+
 import atexit
 from collections.abc import Mapping
+import pickle
 import re
 import sys
 import warnings
-
-from pyarrow import compat
-from pyarrow.compat import builtin_pickle
-
+from cython import sizeof
 
 # These are imprecise because the type (in pandas 0.x) depends on the presence
 # of nulls
-cdef dict _pandas_type_map = {
-    _Type_NA: np.object_,  # NaNs
-    _Type_BOOL: np.bool_,
-    _Type_INT8: np.int8,
-    _Type_INT16: np.int16,
-    _Type_INT32: np.int32,
-    _Type_INT64: np.int64,
-    _Type_UINT8: np.uint8,
-    _Type_UINT16: np.uint16,
-    _Type_UINT32: np.uint32,
-    _Type_UINT64: np.uint64,
-    _Type_HALF_FLOAT: np.float16,
-    _Type_FLOAT: np.float32,
-    _Type_DOUBLE: np.float64,
-    _Type_DATE32: np.dtype('datetime64[ns]'),
-    _Type_DATE64: np.dtype('datetime64[ns]'),
-    _Type_TIMESTAMP: np.dtype('datetime64[ns]'),
-    _Type_DURATION: np.dtype('timedelta64[ns]'),
-    _Type_BINARY: np.object_,
-    _Type_FIXED_SIZE_BINARY: np.object_,
-    _Type_STRING: np.object_,
-    _Type_LIST: np.object_,
-    _Type_DECIMAL: np.object_,
-}
+cdef dict _pandas_type_map = {}
+
+
+def _get_pandas_type_map():
+    global _pandas_type_map
+    if not _pandas_type_map:
+        _pandas_type_map.update({
+            _Type_NA: np.object_,  # NaNs
+            _Type_BOOL: np.bool_,
+            _Type_INT8: np.int8,
+            _Type_INT16: np.int16,
+            _Type_INT32: np.int32,
+            _Type_INT64: np.int64,
+            _Type_UINT8: np.uint8,
+            _Type_UINT16: np.uint16,
+            _Type_UINT32: np.uint32,
+            _Type_UINT64: np.uint64,
+            _Type_HALF_FLOAT: np.float16,
+            _Type_FLOAT: np.float32,
+            _Type_DOUBLE: np.float64,
+            # Pandas does not support [D]ay, so default to [ms] for date32
+            _Type_DATE32: np.dtype('datetime64[ms]'),
+            _Type_DATE64: np.dtype('datetime64[ms]'),
+            _Type_TIMESTAMP: {
+                's': np.dtype('datetime64[s]'),
+                'ms': np.dtype('datetime64[ms]'),
+                'us': np.dtype('datetime64[us]'),
+                'ns': np.dtype('datetime64[ns]'),
+            },
+            _Type_DURATION: {
+                's': np.dtype('timedelta64[s]'),
+                'ms': np.dtype('timedelta64[ms]'),
+                'us': np.dtype('timedelta64[us]'),
+                'ns': np.dtype('timedelta64[ns]'),
+            },
+            _Type_BINARY: np.object_,
+            _Type_LARGE_BINARY: np.object_,
+            _Type_BINARY_VIEW: np.object_,
+            _Type_FIXED_SIZE_BINARY: np.object_,
+            _Type_STRING: np.object_,
+            _Type_LARGE_STRING: np.object_,
+            _Type_STRING_VIEW: np.object_,
+            _Type_LIST: np.object_,
+            _Type_MAP: np.object_,
+            _Type_DECIMAL32: np.object_,
+            _Type_DECIMAL64: np.object_,
+            _Type_DECIMAL128: np.object_,
+            _Type_DECIMAL256: np.object_,
+        })
+    return _pandas_type_map
+
 
 cdef dict _pep3118_type_map = {
     _Type_INT8: b'b',
@@ -84,9 +117,88 @@ cdef bytes _datatype_to_pep3118(CDataType* type):
             return char
 
 
+cdef void* _as_c_pointer(v, allow_null=False) except *:
+    """
+    Convert a Python object to a raw C pointer.
+
+    Used mainly for the C data interface.
+    Integers are accepted as well as capsule objects with a NULL name.
+    (the latter for compatibility with raw pointers exported by reticulate)
+    """
+    cdef void* c_ptr
+    cdef const char* capsule_name
+    if isinstance(v, int):
+        c_ptr = <void*> <uintptr_t > v
+    elif isinstance(v, float):
+        warnings.warn(
+            "Passing a pointer value as a float is unsafe and only "
+            "supported for compatibility with older versions of the R "
+            "Arrow library", UserWarning, stacklevel=2)
+        c_ptr = <void*> <uintptr_t > v
+    elif PyCapsule_CheckExact(v):
+        # An R external pointer was how the R bindings passed pointer values to
+        # Python from versions 7 to 15 (inclusive); however, the reticulate 1.35.0
+        # update changed the name of the capsule from NULL to "r_extptr".
+        # Newer versions of the R package pass a Python integer; however, this
+        # workaround ensures that old versions of the R package continue to work
+        # with newer versions of pyarrow.
+        capsule_name = PyCapsule_GetName(v)
+        if capsule_name == NULL or capsule_name == b"r_extptr":
+            c_ptr = PyCapsule_GetPointer(v, capsule_name)
+        else:
+            capsule_name_str = capsule_name.decode()
+            raise ValueError(
+                f"Can't convert PyCapsule with name '{capsule_name_str}' to pointer address"
+            )
+    else:
+        raise TypeError(f"Expected a pointer value, got {type(v)!r}")
+    if not allow_null and c_ptr == NULL:
+        raise ValueError(f"Null pointer (value before cast = {v!r})")
+    return c_ptr
+
+
 def _is_primitive(Type type):
     # This is simply a redirect, the official API is in pyarrow.types.
     return is_primitive(type)
+
+
+def _get_pandas_type(arrow_type, coerce_to_ns=False):
+    cdef Type type_id = arrow_type.id
+    cdef dict pandas_type_map = _get_pandas_type_map()
+    if type_id not in pandas_type_map:
+        return None
+    if coerce_to_ns:
+        # ARROW-3789: Coerce date/timestamp types to datetime64[ns]
+        if type_id == _Type_DURATION:
+            return np.dtype('timedelta64[ns]')
+        return np.dtype('datetime64[ns]')
+    pandas_type = pandas_type_map[type_id]
+    if isinstance(pandas_type, dict):
+        unit = getattr(arrow_type, 'unit', None)
+        pandas_type = pandas_type.get(unit, None)
+    return pandas_type
+
+
+def _get_pandas_tz_type(arrow_type, coerce_to_ns=False):
+    from pyarrow.pandas_compat import make_datetimetz
+    unit = 'ns' if coerce_to_ns else arrow_type.unit
+    return make_datetimetz(unit, arrow_type.tz)
+
+
+def _to_pandas_dtype(arrow_type, options=None):
+    coerce_to_ns = (options and options.get('coerce_temporal_nanoseconds', False)) or (
+        _pandas_api.is_v1() and arrow_type.id in
+        [_Type_DATE32, _Type_DATE64, _Type_TIMESTAMP, _Type_DURATION])
+
+    if getattr(arrow_type, 'tz', None):
+        dtype = _get_pandas_tz_type(arrow_type, coerce_to_ns)
+    else:
+        dtype = _get_pandas_type(arrow_type, coerce_to_ns)
+
+    if not dtype:
+        raise NotImplementedError(str(arrow_type))
+
+    return dtype
 
 
 # Workaround for Cython parsing bug
@@ -94,11 +206,19 @@ def _is_primitive(Type type):
 ctypedef CFixedWidthType* _CFixedWidthTypePtr
 
 
-cdef class DataType:
+cdef class DataType(_Weakrefable):
     """
     Base class of all Arrow data types.
 
     Each data type is an *instance* of this class.
+
+    Examples
+    --------
+    Instance of int64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.int64()
+    DataType(int64)
     """
 
     def __cinit__(self):
@@ -115,7 +235,18 @@ cdef class DataType:
         self.type = type.get()
         self.pep3118_format = _datatype_to_pep3118(self.type)
 
-    cdef Field field(self, int i):
+    cpdef Field field(self, i):
+        """
+        Parameters
+        ----------
+        i : int
+
+        Returns
+        -------
+        pyarrow.Field
+        """
+        if not isinstance(i, int):
+            raise TypeError(f"Expected int index, got type '{type(i)}'")
         cdef int index = <int> _normalize_index(i, self.type.num_fields())
         return pyarrow_wrap_field(self.type.field(index))
 
@@ -125,6 +256,17 @@ cdef class DataType:
 
     @property
     def bit_width(self):
+        """
+        Bit width for fixed width type.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64()
+        DataType(int64)
+        >>> pa.int64().bit_width
+        64
+        """
         cdef _CFixedWidthTypePtr ty
         ty = dynamic_cast[_CFixedWidthTypePtr](self.type)
         if ty == nullptr:
@@ -132,19 +274,46 @@ cdef class DataType:
         return ty.bit_width()
 
     @property
-    def num_children(self):
+    def byte_width(self):
         """
-        The number of child fields.
+        Byte width for fixed width type.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64()
+        DataType(int64)
+        >>> pa.int64().byte_width
+        8
         """
-        import warnings
-        warnings.warn("num_children is deprecated, use num_fields",
-                      FutureWarning)
-        return self.num_fields
+        cdef _CFixedWidthTypePtr ty
+        ty = dynamic_cast[_CFixedWidthTypePtr](self.type)
+        if ty == nullptr:
+            raise ValueError("Non-fixed width type")
+        byte_width = ty.byte_width()
+        if byte_width == 0 and self.bit_width != 0:
+            raise ValueError("Less than one byte")
+        return byte_width
 
     @property
     def num_fields(self):
         """
         The number of child fields.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64()
+        DataType(int64)
+        >>> pa.int64().num_fields
+        0
+        >>> pa.list_(pa.string())
+        ListType(list<item: string>)
+        >>> pa.list_(pa.string()).num_fields
+        1
+        >>> struct = pa.struct({'x': pa.int32(), 'y': pa.string()})
+        >>> struct.num_fields
+        2
         """
         return self.type.num_fields()
 
@@ -153,11 +322,35 @@ cdef class DataType:
         """
         Number of data buffers required to construct Array type
         excluding children.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64().num_buffers
+        2
+        >>> pa.string().num_buffers
+        3
         """
         return self.type.layout().buffers.size()
 
+    @property
+    def has_variadic_buffers(self):
+        """
+        If True, the number of expected buffers is only
+        lower-bounded by num_buffers.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64().has_variadic_buffers
+        False
+        >>> pa.string_view().has_variadic_buffers
+        True
+        """
+        return self.type.layout().variadic_spec.has_value()
+
     def __str__(self):
-        return frombytes(self.type.ToString())
+        return frombytes(self.type.ToString(), safe=True)
 
     def __hash__(self):
         return hash(str(self))
@@ -174,34 +367,49 @@ cdef class DataType:
         except (TypeError, ValueError):
             return NotImplemented
 
-    def equals(self, other):
+    def equals(self, other, *, check_metadata=False):
         """
         Return true if type is equivalent to passed value.
 
         Parameters
         ----------
         other : DataType or string convertible to DataType
+        check_metadata : bool
+            Whether nested Field metadata equality should be checked as well.
 
         Returns
         -------
         is_equal : bool
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64().equals(pa.string())
+        False
+        >>> pa.int64().equals(pa.int64())
+        True
         """
-        cdef DataType other_type
+        cdef:
+            DataType other_type
+            c_bool c_check_metadata
 
         other_type = ensure_type(other)
-        return self.type.Equals(deref(other_type.type))
+        c_check_metadata = check_metadata
+        return self.type.Equals(deref(other_type.type), c_check_metadata)
 
     def to_pandas_dtype(self):
         """
         Return the equivalent NumPy / Pandas dtype.
-        """
-        cdef Type type_id = self.type.id()
-        if type_id in _pandas_type_map:
-            return _pandas_type_map[type_id]
-        else:
-            raise NotImplementedError(str(self))
 
-    def _export_to_c(self, uintptr_t out_ptr):
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.int64().to_pandas_dtype()
+        <class 'numpy.int64'>
+        """
+        return _to_pandas_dtype(self)
+
+    def _export_to_c(self, out_ptr):
         """
         Export to a C ArrowSchema struct, given its pointer.
 
@@ -209,20 +417,62 @@ cdef class DataType:
         its memory will leak.  This is a low-level function intended for
         expert users.
         """
-        check_status(ExportType(deref(self.type), <ArrowSchema*> out_ptr))
+        check_status(ExportType(deref(self.type),
+                                <ArrowSchema*> _as_c_pointer(out_ptr)))
 
     @staticmethod
-    def _import_from_c(uintptr_t in_ptr):
+    def _import_from_c(in_ptr):
         """
         Import DataType from a C ArrowSchema struct, given its pointer.
 
         This is a low-level function intended for expert users.
         """
-        result = GetResultValue(ImportType(<ArrowSchema*> in_ptr))
+        result = GetResultValue(ImportType(<ArrowSchema*>
+                                           _as_c_pointer(in_ptr)))
         return pyarrow_wrap_data_type(result)
 
+    def __arrow_c_schema__(self):
+        """
+        Export to a ArrowSchema PyCapsule
 
-cdef class DictionaryMemo:
+        Unlike _export_to_c, this will not leak memory if the capsule is not used.
+        """
+        cdef ArrowSchema* c_schema
+        capsule = alloc_c_schema(&c_schema)
+
+        with nogil:
+            check_status(ExportType(deref(self.type), c_schema))
+
+        return capsule
+
+    @staticmethod
+    def _import_from_c_capsule(schema):
+        """
+        Import a DataType from a ArrowSchema PyCapsule
+
+        Parameters
+        ----------
+        schema : PyCapsule
+            A valid PyCapsule with name 'arrow_schema' containing an
+            ArrowSchema pointer.
+        """
+        cdef:
+            ArrowSchema* c_schema
+            shared_ptr[CDataType] c_type
+
+        if not PyCapsule_IsValid(schema, 'arrow_schema'):
+            raise TypeError(
+                "Not an ArrowSchema object"
+            )
+        c_schema = <ArrowSchema*> PyCapsule_GetPointer(schema, 'arrow_schema')
+
+        with nogil:
+            c_type = GetResultValue(ImportType(c_schema))
+
+        return pyarrow_wrap_data_type(c_type)
+
+
+cdef class DictionaryMemo(_Weakrefable):
     """
     Tracking container for dictionary-encoded fields.
     """
@@ -235,6 +485,14 @@ cdef class DictionaryMemo:
 cdef class DictionaryType(DataType):
     """
     Concrete class for dictionary data types.
+
+    Examples
+    --------
+    Create an instance of dictionary type:
+
+    >>> import pyarrow as pa
+    >>> pa.dictionary(pa.int64(), pa.utf8())
+    DictionaryType(dictionary<values=string, indices=int64, ordered=0>)
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -249,6 +507,12 @@ cdef class DictionaryType(DataType):
         """
         Whether the dictionary is ordered, i.e. whether the ordering of values
         in the dictionary is important.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.dictionary(pa.int64(), pa.utf8()).ordered
+        False
         """
         return self.dict_type.ordered()
 
@@ -256,6 +520,12 @@ cdef class DictionaryType(DataType):
     def index_type(self):
         """
         The data type of dictionary indices (a signed integer type).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.dictionary(pa.int16(), pa.utf8()).index_type
+        DataType(int16)
         """
         return pyarrow_wrap_data_type(self.dict_type.index_type())
 
@@ -265,6 +535,12 @@ cdef class DictionaryType(DataType):
         The dictionary value type.
 
         The dictionary values are found in an instance of DictionaryArray.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.dictionary(pa.int16(), pa.utf8()).value_type
+        DataType(string)
         """
         return pyarrow_wrap_data_type(self.dict_type.value_type())
 
@@ -272,6 +548,14 @@ cdef class DictionaryType(DataType):
 cdef class ListType(DataType):
     """
     Concrete class for list data types.
+
+    Examples
+    --------
+    Create an instance of ListType:
+
+    >>> import pyarrow as pa
+    >>> pa.list_(pa.string())
+    ListType(list<item: string>)
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -279,16 +563,31 @@ cdef class ListType(DataType):
         self.list_type = <const CListType*> type.get()
 
     def __reduce__(self):
-        return list_, (self.value_type,)
+        return list_, (self.value_field,)
 
     @property
     def value_field(self):
+        """
+        The field for list values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_(pa.string()).value_field
+        pyarrow.Field<item: string>
+        """
         return pyarrow_wrap_field(self.list_type.value_field())
 
     @property
     def value_type(self):
         """
         The data type of list values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_(pa.string()).value_type
+        DataType(string)
         """
         return pyarrow_wrap_data_type(self.list_type.value_type())
 
@@ -297,6 +596,14 @@ cdef class LargeListType(DataType):
     """
     Concrete class for large list data types
     (like ListType, but with 64-bit offsets).
+
+    Examples
+    --------
+    Create an instance of LargeListType:
+
+    >>> import pyarrow as pa
+    >>> pa.large_list(pa.string())
+    LargeListType(large_list<item: string>)
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -304,19 +611,134 @@ cdef class LargeListType(DataType):
         self.list_type = <const CLargeListType*> type.get()
 
     def __reduce__(self):
-        return large_list, (self.value_type,)
+        return large_list, (self.value_field,)
+
+    @property
+    def value_field(self):
+        return pyarrow_wrap_field(self.list_type.value_field())
 
     @property
     def value_type(self):
         """
         The data type of large list values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.large_list(pa.string()).value_type
+        DataType(string)
         """
         return pyarrow_wrap_data_type(self.list_type.value_type())
+
+
+cdef class ListViewType(DataType):
+    """
+    Concrete class for list view data types.
+
+    Examples
+    --------
+    Create an instance of ListViewType:
+
+    >>> import pyarrow as pa
+    >>> pa.list_view(pa.string())
+    ListViewType(list_view<item: string>)
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        DataType.init(self, type)
+        self.list_view_type = <const CListViewType*> type.get()
+
+    def __reduce__(self):
+        return list_view, (self.value_field,)
+
+    @property
+    def value_field(self):
+        """
+        The field for list view values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_view(pa.string()).value_field
+        pyarrow.Field<item: string>
+        """
+        return pyarrow_wrap_field(self.list_view_type.value_field())
+
+    @property
+    def value_type(self):
+        """
+        The data type of list view values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_view(pa.string()).value_type
+        DataType(string)
+        """
+        return pyarrow_wrap_data_type(self.list_view_type.value_type())
+
+
+cdef class LargeListViewType(DataType):
+    """
+    Concrete class for large list view data types
+    (like ListViewType, but with 64-bit offsets).
+
+    Examples
+    --------
+    Create an instance of LargeListViewType:
+
+    >>> import pyarrow as pa
+    >>> pa.large_list_view(pa.string())
+    LargeListViewType(large_list_view<item: string>)
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        DataType.init(self, type)
+        self.list_view_type = <const CLargeListViewType*> type.get()
+
+    def __reduce__(self):
+        return large_list_view, (self.value_field,)
+
+    @property
+    def value_field(self):
+        """
+        The field for large list view values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.large_list_view(pa.string()).value_field
+        pyarrow.Field<item: string>
+        """
+        return pyarrow_wrap_field(self.list_view_type.value_field())
+
+    @property
+    def value_type(self):
+        """
+        The data type of large list view values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.large_list_view(pa.string()).value_type
+        DataType(string)
+        """
+        return pyarrow_wrap_data_type(self.list_view_type.value_type())
 
 
 cdef class MapType(DataType):
     """
     Concrete class for map data types.
+
+    Examples
+    --------
+    Create an instance of MapType:
+
+    >>> import pyarrow as pa
+    >>> pa.map_(pa.string(), pa.int32())
+    MapType(map<string, int32>)
+    >>> pa.map_(pa.string(), pa.int32(), keys_sorted=True)
+    MapType(map<string, int32, keys_sorted>)
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -324,26 +746,85 @@ cdef class MapType(DataType):
         self.map_type = <const CMapType*> type.get()
 
     def __reduce__(self):
-        return map_, (self.key_type, self.item_type)
+        return map_, (self.key_field, self.item_field)
+
+    @property
+    def key_field(self):
+        """
+        The field for keys in the map entries.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.map_(pa.string(), pa.int32()).key_field
+        pyarrow.Field<key: string not null>
+        """
+        return pyarrow_wrap_field(self.map_type.key_field())
 
     @property
     def key_type(self):
         """
         The data type of keys in the map entries.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.map_(pa.string(), pa.int32()).key_type
+        DataType(string)
         """
         return pyarrow_wrap_data_type(self.map_type.key_type())
+
+    @property
+    def item_field(self):
+        """
+        The field for items in the map entries.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.map_(pa.string(), pa.int32()).item_field
+        pyarrow.Field<value: int32>
+        """
+        return pyarrow_wrap_field(self.map_type.item_field())
 
     @property
     def item_type(self):
         """
         The data type of items in the map entries.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.map_(pa.string(), pa.int32()).item_type
+        DataType(int32)
         """
         return pyarrow_wrap_data_type(self.map_type.item_type())
+
+    @property
+    def keys_sorted(self):
+        """
+        Should the entries be sorted according to keys.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.map_(pa.string(), pa.int32(), keys_sorted=True).keys_sorted
+        True
+        """
+        return self.map_type.keys_sorted()
 
 
 cdef class FixedSizeListType(DataType):
     """
     Concrete class for fixed size list data types.
+
+    Examples
+    --------
+    Create an instance of FixedSizeListType:
+
+    >>> import pyarrow as pa
+    >>> pa.list_(pa.int32(), 2)
+    FixedSizeListType(fixed_size_list<item: int32>[2])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -354,9 +835,28 @@ cdef class FixedSizeListType(DataType):
         return list_, (self.value_type, self.list_size)
 
     @property
+    def value_field(self):
+        """
+        The field for list values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_(pa.int32(), 2).value_field
+        pyarrow.Field<item: int32>
+        """
+        return pyarrow_wrap_field(self.list_type.value_field())
+
+    @property
     def value_type(self):
         """
         The data type of large list values.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_(pa.int32(), 2).value_type
+        DataType(int32)
         """
         return pyarrow_wrap_data_type(self.list_type.value_type())
 
@@ -364,6 +864,12 @@ cdef class FixedSizeListType(DataType):
     def list_size(self):
         """
         The size of the fixed size lists.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> pa.list_(pa.int32(), 2).list_size
+        2
         """
         return self.list_type.list_size()
 
@@ -371,6 +877,34 @@ cdef class FixedSizeListType(DataType):
 cdef class StructType(DataType):
     """
     Concrete class for struct data types.
+
+    ``StructType`` supports direct indexing using ``[...]`` (implemented via
+    ``__getitem__``) to access its fields.
+    It will return the struct field with the given index or name.
+
+    Examples
+    --------
+    >>> import pyarrow as pa
+
+    Accessing fields using direct indexing:
+
+    >>> struct_type = pa.struct({'x': pa.int32(), 'y': pa.string()})
+    >>> struct_type[0]
+    pyarrow.Field<x: int32>
+    >>> struct_type['y']
+    pyarrow.Field<y: string>
+
+    Accessing fields using ``field()``:
+
+    >>> struct_type.field(1)
+    pyarrow.Field<y: string>
+    >>> struct_type.field('x')
+    pyarrow.Field<x: int32>
+
+    # Creating a schema from the struct type's fields:
+    >>> pa.schema(list(struct_type))
+    x: int32
+    y: string
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -379,7 +913,23 @@ cdef class StructType(DataType):
 
     cdef Field field_by_name(self, name):
         """
-        Return a child field by its name rather than its index.
+        Return a child field by its name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to look up.
+
+        Returns
+        -------
+        field : Field
+            The child field with the given name.
+
+        Raises
+        ------
+        KeyError
+            If the name isn't found, or if several fields have the given
+            name.
         """
         cdef vector[shared_ptr[CField]] fields
 
@@ -395,14 +945,91 @@ cdef class StructType(DataType):
 
     def get_field_index(self, name):
         """
-        Return index of field with given unique name. Returns -1 if not found
-        or if duplicated
+        Return index of the unique field with the given name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to look up.
+
+        Returns
+        -------
+        index : int
+            The index of the field with the given name; -1 if the
+            name isn't found or there are several fields with the given
+            name.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> struct_type = pa.struct({'x': pa.int32(), 'y': pa.string()})
+
+        Index of the field with a name 'y':
+
+        >>> struct_type.get_field_index('y')
+        1
+
+        Index of the field that does not exist:
+
+        >>> struct_type.get_field_index('z')
+        -1
         """
         return self.struct_type.GetFieldIndex(tobytes(name))
 
+    cpdef Field field(self, i):
+        """
+        Select a field by its column name or numeric index.
+
+        Parameters
+        ----------
+        i : int or str
+
+        Returns
+        -------
+        pyarrow.Field
+
+        Examples
+        --------
+
+        >>> import pyarrow as pa
+        >>> struct_type = pa.struct({'x': pa.int32(), 'y': pa.string()})
+
+        Select the second field:
+
+        >>> struct_type.field(1)
+        pyarrow.Field<y: string>
+
+        Select the field named 'x':
+
+        >>> struct_type.field('x')
+        pyarrow.Field<x: int32>
+        """
+        if isinstance(i, (bytes, str)):
+            return self.field_by_name(i)
+        elif isinstance(i, int):
+            return DataType.field(self, i)
+        else:
+            raise TypeError('Expected integer or string index')
+
     def get_all_field_indices(self, name):
         """
-        Return sorted list of indices for fields with the given name
+        Return sorted list of indices for the fields with the given name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to look up.
+
+        Returns
+        -------
+        indices : List[int]
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> struct_type = pa.struct({'x': pa.int32(), 'y': pa.string()})
+        >>> struct_type.get_all_field_indices('x')
+        [0]
         """
         return self.struct_type.GetAllFieldIndices(tobytes(name))
 
@@ -422,21 +1049,70 @@ cdef class StructType(DataType):
     def __getitem__(self, i):
         """
         Return the struct field with the given index or name.
+
+        Alias of ``field``.
         """
-        if isinstance(i, (bytes, str)):
-            return self.field_by_name(i)
-        elif isinstance(i, int):
-            return self.field(i)
-        else:
-            raise TypeError('Expected integer or string index')
+        return self.field(i)
 
     def __reduce__(self):
         return struct, (list(self),)
 
+    @property
+    def names(self):
+        """
+        Lists the field names.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> struct_type = pa.struct([('a', pa.int64()), ('b', pa.float64()), ('c', pa.string())])
+        >>> struct_type.names
+        ['a', 'b', 'c']
+        """
+        return [f.name for f in self]
+
+    @property
+    def fields(self):
+        """
+        Lists all fields within the StructType.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> struct_type = pa.struct([('a', pa.int64()), ('b', pa.float64()), ('c', pa.string())])
+        >>> struct_type.fields
+        [pyarrow.Field<a: int64>, pyarrow.Field<b: double>, pyarrow.Field<c: string>]
+        """
+        return list(self)
 
 cdef class UnionType(DataType):
     """
-    Concrete class for struct data types.
+    Base class for union data types.
+
+    Examples
+    --------
+    Create an instance of a dense UnionType using ``pa.union``:
+
+    >>> import pyarrow as pa
+    >>> pa.union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())],
+    ...          mode=pa.lib.UnionMode_DENSE),
+    (DenseUnionType(dense_union<a: fixed_size_binary[10]=0, b: string=1>),)
+
+    Create an instance of a dense UnionType using ``pa.dense_union``:
+
+    >>> pa.dense_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+    DenseUnionType(dense_union<a: fixed_size_binary[10]=0, b: string=1>)
+
+    Create an instance of a sparse UnionType using ``pa.union``:
+
+    >>> pa.union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())],
+    ...          mode=pa.lib.UnionMode_SPARSE),
+    (SparseUnionType(sparse_union<a: fixed_size_binary[10]=0, b: string=1>),)
+
+    Create an instance of a sparse UnionType using ``pa.sparse_union``:
+
+    >>> pa.sparse_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+    SparseUnionType(sparse_union<a: fixed_size_binary[10]=0, b: string=1>)
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -446,6 +1122,13 @@ cdef class UnionType(DataType):
     def mode(self):
         """
         The mode of the union ("dense" or "sparse").
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> union = pa.sparse_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+        >>> union.mode
+        'sparse'
         """
         cdef CUnionType* type = <CUnionType*> self.sp_type.get()
         cdef int mode = type.mode()
@@ -459,6 +1142,13 @@ cdef class UnionType(DataType):
     def type_codes(self):
         """
         The type code to indicate each data type in this union.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> union = pa.sparse_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+        >>> union.type_codes
+        [0, 1]
         """
         cdef CUnionType* type = <CUnionType*> self.sp_type.get()
         return type.type_codes()
@@ -476,9 +1166,35 @@ cdef class UnionType(DataType):
         for i in range(len(self)):
             yield self[i]
 
+    cpdef Field field(self, i):
+        """
+        Return a child field by its numeric index.
+
+        Parameters
+        ----------
+        i : int
+
+        Returns
+        -------
+        pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> union = pa.sparse_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+        >>> union[0]
+        pyarrow.Field<a: fixed_size_binary[10]>
+        """
+        if isinstance(i, int):
+            return DataType.field(self, i)
+        else:
+            raise TypeError('Expected integer')
+
     def __getitem__(self, i):
         """
         Return a child field by its index.
+
+        Alias of ``field``.
         """
         return self.field(i)
 
@@ -486,9 +1202,63 @@ cdef class UnionType(DataType):
         return union, (list(self), self.mode, self.type_codes)
 
 
+cdef class SparseUnionType(UnionType):
+    """
+    Concrete class for sparse union types.
+
+    Examples
+    --------
+    Create an instance of a sparse UnionType using ``pa.union``:
+
+    >>> import pyarrow as pa
+    >>> pa.union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())],
+    ...          mode=pa.lib.UnionMode_SPARSE),
+    (SparseUnionType(sparse_union<a: fixed_size_binary[10]=0, b: string=1>),)
+
+    Create an instance of a sparse UnionType using ``pa.sparse_union``:
+
+    >>> pa.sparse_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+    SparseUnionType(sparse_union<a: fixed_size_binary[10]=0, b: string=1>)
+    """
+
+
+cdef class DenseUnionType(UnionType):
+    """
+    Concrete class for dense union types.
+
+    Examples
+    --------
+    Create an instance of a dense UnionType using ``pa.union``:
+
+    >>> import pyarrow as pa
+    >>> pa.union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())],
+    ...          mode=pa.lib.UnionMode_DENSE),
+    (DenseUnionType(dense_union<a: fixed_size_binary[10]=0, b: string=1>),)
+
+    Create an instance of a dense UnionType using ``pa.dense_union``:
+
+    >>> pa.dense_union([pa.field('a', pa.binary(10)), pa.field('b', pa.string())])
+    DenseUnionType(dense_union<a: fixed_size_binary[10]=0, b: string=1>)
+    """
+
+
 cdef class TimestampType(DataType):
     """
     Concrete class for timestamp data types.
+
+    Examples
+    --------
+    >>> import pyarrow as pa
+
+    Create an instance of timestamp type:
+
+    >>> pa.timestamp('us')
+    TimestampType(timestamp[us])
+
+    Create an instance of timestamp type with timezone:
+
+    >>> pa.timestamp('s', tz='UTC')
+    TimestampType(timestamp[s, tz=UTC])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -499,6 +1269,13 @@ cdef class TimestampType(DataType):
     def unit(self):
         """
         The timestamp unit ('s', 'ms', 'us' or 'ns').
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.timestamp('us')
+        >>> t.unit
+        'us'
         """
         return timeunit_to_string(self.ts_type.unit())
 
@@ -506,22 +1283,18 @@ cdef class TimestampType(DataType):
     def tz(self):
         """
         The timestamp time zone, if any, or None.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.timestamp('s', tz='UTC')
+        >>> t.tz
+        'UTC'
         """
         if self.ts_type.timezone().size() > 0:
             return frombytes(self.ts_type.timezone())
         else:
             return None
-
-    def to_pandas_dtype(self):
-        """
-        Return the equivalent NumPy / Pandas dtype.
-        """
-        if self.tz is None:
-            return _pandas_type_map[_Type_TIMESTAMP]
-        else:
-            # Return DatetimeTZ
-            from pyarrow.pandas_compat import make_datetimetz
-            return make_datetimetz(self.tz)
 
     def __reduce__(self):
         return timestamp, (self.unit, self.tz)
@@ -530,6 +1303,17 @@ cdef class TimestampType(DataType):
 cdef class Time32Type(DataType):
     """
     Concrete class for time32 data types.
+
+    Supported time unit resolutions are 's' [second]
+    and 'ms' [millisecond].
+
+    Examples
+    --------
+    Create an instance of time32 type:
+
+    >>> import pyarrow as pa
+    >>> pa.time32('ms')
+    Time32Type(time32[ms])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -539,7 +1323,14 @@ cdef class Time32Type(DataType):
     @property
     def unit(self):
         """
-        The time unit ('s', 'ms', 'us' or 'ns').
+        The time unit ('s' or 'ms').
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.time32('ms')
+        >>> t.unit
+        'ms'
         """
         return timeunit_to_string(self.time_type.unit())
 
@@ -547,6 +1338,17 @@ cdef class Time32Type(DataType):
 cdef class Time64Type(DataType):
     """
     Concrete class for time64 data types.
+
+    Supported time unit resolutions are 'us' [microsecond]
+    and 'ns' [nanosecond].
+
+    Examples
+    --------
+    Create an instance of time64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.time64('us')
+    Time64Type(time64[us])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -556,7 +1358,14 @@ cdef class Time64Type(DataType):
     @property
     def unit(self):
         """
-        The time unit ('s', 'ms', 'us' or 'ns').
+        The time unit ('us' or 'ns').
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.time64('us')
+        >>> t.unit
+        'us'
         """
         return timeunit_to_string(self.time_type.unit())
 
@@ -564,6 +1373,14 @@ cdef class Time64Type(DataType):
 cdef class DurationType(DataType):
     """
     Concrete class for duration data types.
+
+    Examples
+    --------
+    Create an instance of duration type:
+
+    >>> import pyarrow as pa
+    >>> pa.duration('s')
+    DurationType(duration[s])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -574,6 +1391,13 @@ cdef class DurationType(DataType):
     def unit(self):
         """
         The duration unit ('s', 'ms', 'us' or 'ns').
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.duration('s')
+        >>> t.unit
+        's'
         """
         return timeunit_to_string(self.duration_type.unit())
 
@@ -581,6 +1405,14 @@ cdef class DurationType(DataType):
 cdef class FixedSizeBinaryType(DataType):
     """
     Concrete class for fixed-size binary data types.
+
+    Examples
+    --------
+    Create an instance of fixed-size binary type:
+
+    >>> import pyarrow as pa
+    >>> pa.binary(3)
+    FixedSizeBinaryType(fixed_size_binary[3])
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -591,17 +1423,116 @@ cdef class FixedSizeBinaryType(DataType):
     def __reduce__(self):
         return binary, (self.byte_width,)
 
+
+cdef class Decimal32Type(FixedSizeBinaryType):
+    """
+    Concrete class for decimal32 data types.
+
+    Examples
+    --------
+    Create an instance of decimal32 type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal32(5, 2)
+    Decimal32Type(decimal32(5, 2))
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        FixedSizeBinaryType.init(self, type)
+        self.decimal32_type = <const CDecimal32Type*> type.get()
+
+    def __reduce__(self):
+        return decimal32, (self.precision, self.scale)
+
     @property
-    def byte_width(self):
+    def precision(self):
         """
-        The binary size in bytes.
+        The decimal precision, in number of decimal digits (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal32(5, 2)
+        >>> t.precision
+        5
         """
-        return self.fixed_size_binary_type.byte_width()
+        return self.decimal32_type.precision()
+
+    @property
+    def scale(self):
+        """
+        The decimal scale (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal32(5, 2)
+        >>> t.scale
+        2
+        """
+        return self.decimal32_type.scale()
+
+
+cdef class Decimal64Type(FixedSizeBinaryType):
+    """
+    Concrete class for decimal64 data types.
+
+    Examples
+    --------
+    Create an instance of decimal64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal64(5, 2)
+    Decimal64Type(decimal64(5, 2))
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        FixedSizeBinaryType.init(self, type)
+        self.decimal64_type = <const CDecimal64Type*> type.get()
+
+    def __reduce__(self):
+        return decimal64, (self.precision, self.scale)
+
+    @property
+    def precision(self):
+        """
+        The decimal precision, in number of decimal digits (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal64(5, 2)
+        >>> t.precision
+        5
+        """
+        return self.decimal64_type.precision()
+
+    @property
+    def scale(self):
+        """
+        The decimal scale (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal64(5, 2)
+        >>> t.scale
+        2
+        """
+        return self.decimal64_type.scale()
 
 
 cdef class Decimal128Type(FixedSizeBinaryType):
     """
     Concrete class for decimal128 data types.
+
+    Examples
+    --------
+    Create an instance of decimal128 type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal128(5, 2)
+    Decimal128Type(decimal128(5, 2))
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -615,6 +1546,13 @@ cdef class Decimal128Type(FixedSizeBinaryType):
     def precision(self):
         """
         The decimal precision, in number of decimal digits (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal128(5, 2)
+        >>> t.precision
+        5
         """
         return self.decimal128_type.precision()
 
@@ -622,8 +1560,85 @@ cdef class Decimal128Type(FixedSizeBinaryType):
     def scale(self):
         """
         The decimal scale (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal128(5, 2)
+        >>> t.scale
+        2
         """
         return self.decimal128_type.scale()
+
+
+cdef class Decimal256Type(FixedSizeBinaryType):
+    """
+    Concrete class for decimal256 data types.
+
+    Examples
+    --------
+    Create an instance of decimal256 type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal256(76, 38)
+    Decimal256Type(decimal256(76, 38))
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        FixedSizeBinaryType.init(self, type)
+        self.decimal256_type = <const CDecimal256Type*> type.get()
+
+    def __reduce__(self):
+        return decimal256, (self.precision, self.scale)
+
+    @property
+    def precision(self):
+        """
+        The decimal precision, in number of decimal digits (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal256(76, 38)
+        >>> t.precision
+        76
+        """
+        return self.decimal256_type.precision()
+
+    @property
+    def scale(self):
+        """
+        The decimal scale (an integer).
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> t = pa.decimal256(76, 38)
+        >>> t.scale
+        38
+        """
+        return self.decimal256_type.scale()
+
+
+cdef class RunEndEncodedType(DataType):
+    """
+    Concrete class for run-end encoded types.
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        DataType.init(self, type)
+        self.run_end_encoded_type = <const CRunEndEncodedType*> type.get()
+
+    def __reduce__(self):
+        return run_end_encoded, (self.run_end_type, self.value_type)
+
+    @property
+    def run_end_type(self):
+        return pyarrow_wrap_data_type(self.run_end_encoded_type.run_end_type())
+
+    @property
+    def value_type(self):
+        return pyarrow_wrap_data_type(self.run_end_encoded_type.value_type())
 
 
 cdef class BaseExtensionType(DataType):
@@ -634,6 +1649,18 @@ cdef class BaseExtensionType(DataType):
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
         DataType.init(self, type)
         self.ext_type = <const CExtensionType*> type.get()
+
+    def __arrow_ext_class__(self):
+        """
+        The associated array extension class
+        """
+        return ExtensionArray
+
+    def __arrow_ext_scalar_class__(self):
+        """
+        The associated scalar class
+        """
+        return ExtensionScalar
 
     @property
     def extension_name(self):
@@ -649,10 +1676,169 @@ cdef class BaseExtensionType(DataType):
         """
         return pyarrow_wrap_data_type(self.ext_type.storage_type())
 
+    @property
+    def byte_width(self):
+        """
+        The byte width of the extension type.
+        """
+        if self.ext_type.byte_width() == -1:
+            raise ValueError("Non-fixed width type")
+        return self.ext_type.byte_width()
+
+    @property
+    def bit_width(self):
+        """
+        The bit width of the extension type.
+        """
+        if self.ext_type.bit_width() == -1:
+            raise ValueError("Non-fixed width type")
+        return self.ext_type.bit_width()
+
+    def wrap_array(self, storage):
+        """
+        Wrap the given storage array as an extension array.
+
+        Parameters
+        ----------
+        storage : Array or ChunkedArray
+
+        Returns
+        -------
+        array : Array or ChunkedArray
+            Extension array wrapping the storage array
+        """
+        cdef:
+            shared_ptr[CDataType] c_storage_type
+
+        if isinstance(storage, Array):
+            c_storage_type = (<Array> storage).ap.type()
+        elif isinstance(storage, ChunkedArray):
+            c_storage_type = (<ChunkedArray> storage).chunked_array.type()
+        else:
+            raise TypeError(
+                f"Expected array or chunked array, got {storage.__class__}")
+
+        if not c_storage_type.get().Equals(deref(self.ext_type)
+                                           .storage_type(), False):
+            raise TypeError(
+                f"Incompatible storage type for {self}: "
+                f"expected {self.storage_type}, got {storage.type}")
+
+        if isinstance(storage, Array):
+            return pyarrow_wrap_array(
+                self.ext_type.WrapArray(
+                    self.sp_type, (<Array> storage).sp_array))
+        else:
+            return pyarrow_wrap_chunked_array(
+                self.ext_type.WrapArray(
+                    self.sp_type, (<ChunkedArray> storage).sp_chunked_array))
+
 
 cdef class ExtensionType(BaseExtensionType):
     """
     Concrete base class for Python-defined extension types.
+
+    Parameters
+    ----------
+    storage_type : DataType
+        The underlying storage type for the extension type.
+    extension_name : str
+        A unique name distinguishing this extension type. The name will be
+        used when deserializing IPC data.
+
+    Examples
+    --------
+    Define a RationalType extension type subclassing ExtensionType:
+
+    >>> import pyarrow as pa
+    >>> class RationalType(pa.ExtensionType):
+    ...     def __init__(self, data_type: pa.DataType):
+    ...         if not pa.types.is_integer(data_type):
+    ...             raise TypeError(f"data_type must be an integer type not {data_type}")
+    ...         super().__init__(
+    ...             pa.struct(
+    ...                 [
+    ...                     ("numer", data_type),
+    ...                     ("denom", data_type),
+    ...                 ],
+    ...             ),
+    ...             # N.B. This name does _not_ reference `data_type` so deserialization
+    ...             # will work for _any_ integer `data_type` after registration
+    ...             "my_package.rational",
+    ...         )
+    ...     def __arrow_ext_serialize__(self) -> bytes:
+    ...         # No parameters are necessary
+    ...         return b""
+    ...     @classmethod
+    ...     def __arrow_ext_deserialize__(cls, storage_type, serialized):
+    ...         # return an instance of this subclass
+    ...         return RationalType(storage_type[0].type)
+
+    Register the extension type:
+
+    >>> pa.register_extension_type(RationalType(pa.int64()))
+
+    Create an instance of RationalType extension type:
+
+    >>> rational_type = RationalType(pa.int32())
+
+    Inspect the extension type:
+
+    >>> rational_type.extension_name
+    'my_package.rational'
+    >>> rational_type.storage_type
+    StructType(struct<numer: int32, denom: int32>)
+
+    Wrap an array as an extension array:
+
+    >>> storage_array = pa.array(
+    ...     [
+    ...         {"numer": 10, "denom": 17},
+    ...         {"numer": 20, "denom": 13},
+    ...     ],
+    ...     type=rational_type.storage_type
+    ... )
+    >>> rational_array = rational_type.wrap_array(storage_array)
+    >>> rational_array
+    <pyarrow.lib.ExtensionArray object at ...>
+    -- is_valid: all not null
+    -- child 0 type: int32
+      [
+        10,
+        20
+      ]
+    -- child 1 type: int32
+      [
+        17,
+        13
+      ]
+
+    Or do the same with creating an ExtensionArray:
+
+    >>> rational_array = pa.ExtensionArray.from_storage(rational_type, storage_array)
+    >>> rational_array
+    <pyarrow.lib.ExtensionArray object at ...>
+    -- is_valid: all not null
+    -- child 0 type: int32
+      [
+        10,
+        20
+      ]
+    -- child 1 type: int32
+      [
+        17,
+        13
+      ]
+
+    Unregister the extension type:
+
+    >>> pa.unregister_extension_type("my_package.rational")
+
+    Note that even though we registered the concrete type
+    ``RationalType(pa.int64())``, PyArrow will be able to deserialize
+    ``RationalType(integer_type)`` for any ``integer_type``, as the deserializer
+    will reference the name ``my_package.rational`` and the ``@classmethod``
+    ``__arrow_ext_deserialize__``.
     """
 
     def __cinit__(self):
@@ -666,11 +1852,6 @@ cdef class ExtensionType(BaseExtensionType):
 
         This should be called at the end of the subclass'
         ``__init__`` method.
-
-        Parameters
-        ----------
-        storage_type : DataType
-        extension_name : str
         """
         cdef:
             shared_ptr[CExtensionType] cpy_ext_type
@@ -700,6 +1881,10 @@ cdef class ExtensionType(BaseExtensionType):
         else:
             return NotImplemented
 
+    def __repr__(self):
+        fmt = '{0.__class__.__name__}({1})'
+        return fmt.format(self, repr(self.storage_type))
+
     def __arrow_ext_serialize__(self):
         """
         Serialized representation of metadata to reconstruct the type object.
@@ -713,7 +1898,7 @@ cdef class ExtensionType(BaseExtensionType):
         return NotImplementedError
 
     @classmethod
-    def __arrow_ext_deserialize__(self, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
         """
         Return an extension type instance from the storage type and serialized
         metadata.
@@ -723,6 +1908,9 @@ cdef class ExtensionType(BaseExtensionType):
         return value of ``__arrow_ext_serialize__``).
         """
         return NotImplementedError
+
+    def __reduce__(self):
+        return self.__arrow_ext_deserialize__, (self.storage_type, self.__arrow_ext_serialize__())
 
     def __arrow_ext_class__(self):
         """Return an extension array class to be used for building or
@@ -734,11 +1922,236 @@ cdef class ExtensionType(BaseExtensionType):
         """
         return ExtensionArray
 
+    def __arrow_ext_scalar_class__(self):
+        """Return an extension scalar class for building scalars with this
+        extension type.
+
+        This method should return subclass of the ExtensionScalar class. By
+        default, if not specialized in the extension implementation, an
+        extension type scalar will be a built-in ExtensionScalar instance.
+        """
+        return ExtensionScalar
+
+
+cdef class JsonType(BaseExtensionType):
+    """
+    Concrete class for JSON extension type.
+
+    Examples
+    --------
+    Define the extension type for JSON array
+
+    >>> import pyarrow as pa
+    >>> json_type = pa.json_(pa.large_utf8())
+
+    Create an extension array
+
+    >>> arr = [None, '{ "id":30, "values":["a", "b"] }']
+    >>> storage = pa.array(arr, pa.large_utf8())
+    >>> pa.ExtensionArray.from_storage(json_type, storage)
+    <pyarrow.lib.JsonArray object at ...>
+    [
+      null,
+      "{ "id":30, "values":["a", "b"] }"
+    ]
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        BaseExtensionType.init(self, type)
+        self.json_ext_type = <const CJsonType*> type.get()
+
+    def __arrow_ext_class__(self):
+        return JsonArray
+
+    def __reduce__(self):
+        return json_, (self.storage_type,)
+
+    def __arrow_ext_scalar_class__(self):
+        return JsonScalar
+
+
+cdef class UuidType(BaseExtensionType):
+    """
+    Concrete class for UUID extension type.
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        BaseExtensionType.init(self, type)
+        self.uuid_ext_type = <const CUuidType*> type.get()
+
+    def __arrow_ext_class__(self):
+        return UuidArray
+
+    def __reduce__(self):
+        return uuid, ()
+
+    def __arrow_ext_scalar_class__(self):
+        return UuidScalar
+
+
+cdef class FixedShapeTensorType(BaseExtensionType):
+    """
+    Concrete class for fixed shape tensor extension type.
+
+    Examples
+    --------
+    Create an instance of fixed shape tensor extension type:
+
+    >>> import pyarrow as pa
+    >>> pa.fixed_shape_tensor(pa.int32(), [2, 2])
+    FixedShapeTensorType(extension<arrow.fixed_shape_tensor[value_type=int32, shape=[2,2]]>)
+
+    Create an instance of fixed shape tensor extension type with
+    permutation:
+
+    >>> tensor_type = pa.fixed_shape_tensor(pa.int8(), (2, 2, 3),
+    ...                                     permutation=[0, 2, 1])
+    >>> tensor_type.permutation
+    [0, 2, 1]
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        BaseExtensionType.init(self, type)
+        self.tensor_ext_type = <const CFixedShapeTensorType*> type.get()
+
+    @property
+    def value_type(self):
+        """
+        Data type of an individual tensor.
+        """
+        return pyarrow_wrap_data_type(self.tensor_ext_type.value_type())
+
+    @property
+    def shape(self):
+        """
+        Shape of the tensors.
+        """
+        return self.tensor_ext_type.shape()
+
+    @property
+    def dim_names(self):
+        """
+        Explicit names of the dimensions.
+        """
+        list_of_bytes = self.tensor_ext_type.dim_names()
+        if len(list_of_bytes) != 0:
+            return [frombytes(x) for x in list_of_bytes]
+        else:
+            return None
+
+    @property
+    def permutation(self):
+        """
+        Indices of the dimensions ordering.
+        """
+        indices = self.tensor_ext_type.permutation()
+        if len(indices) != 0:
+            return indices
+        else:
+            return None
+
+    def __arrow_ext_class__(self):
+        return FixedShapeTensorArray
+
+    def __reduce__(self):
+        return fixed_shape_tensor, (self.value_type, self.shape,
+                                    self.dim_names, self.permutation)
+
+    def __arrow_ext_scalar_class__(self):
+        return FixedShapeTensorScalar
+
+
+cdef class Bool8Type(BaseExtensionType):
+    """
+    Concrete class for bool8 extension type.
+
+    Bool8 is an alternate representation for boolean
+    arrays using 8 bits instead of 1 bit per value. The underlying
+    storage type is int8.
+
+    Examples
+    --------
+    Create an instance of bool8 extension type:
+
+    >>> import pyarrow as pa
+    >>> pa.bool8()
+    Bool8Type(extension<arrow.bool8>)
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        BaseExtensionType.init(self, type)
+        self.bool8_ext_type = <const CBool8Type*> type.get()
+
+    def __arrow_ext_class__(self):
+        return Bool8Array
+
+    def __reduce__(self):
+        return bool8, ()
+
+    def __arrow_ext_scalar_class__(self):
+        return Bool8Scalar
+
+
+cdef class OpaqueType(BaseExtensionType):
+    """
+    Concrete class for opaque extension type.
+
+    Opaque is a placeholder for a type from an external (often non-Arrow)
+    system that could not be interpreted.
+
+    Examples
+    --------
+    Create an instance of opaque extension type:
+
+    >>> import pyarrow as pa
+    >>> pa.opaque(pa.int32(), "geometry", "postgis")
+    OpaqueType(extension<arrow.opaque[storage_type=int32, type_name=geometry, vendor_name=postgis]>)
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        BaseExtensionType.init(self, type)
+        self.opaque_ext_type = <const COpaqueType*> type.get()
+
+    @property
+    def type_name(self):
+        """
+        The name of the type in the external system.
+        """
+        return frombytes(c_string(self.opaque_ext_type.type_name()))
+
+    @property
+    def vendor_name(self):
+        """
+        The name of the external system.
+        """
+        return frombytes(c_string(self.opaque_ext_type.vendor_name()))
+
+    def __arrow_ext_class__(self):
+        return OpaqueArray
+
+    def __reduce__(self):
+        return opaque, (self.storage_type, self.type_name, self.vendor_name)
+
+    def __arrow_ext_scalar_class__(self):
+        return OpaqueScalar
+
+
+_py_extension_type_auto_load = False
+
 
 cdef class PyExtensionType(ExtensionType):
     """
     Concrete base class for Python-defined extension types based on pickle
     for (de)serialization.
+
+    .. warning::
+       This class is deprecated and its deserialization is disabled by default.
+       :class:`ExtensionType` is recommended instead.
+
+    Parameters
+    ----------
+    storage_type : DataType
+        The storage type for which the extension is built.
     """
 
     def __cinit__(self):
@@ -747,6 +2160,12 @@ cdef class PyExtensionType(ExtensionType):
                             "PyExtensionType")
 
     def __init__(self, DataType storage_type):
+        warnings.warn(
+            "pyarrow.PyExtensionType is deprecated "
+            "and will refuse deserialization by default. "
+            "Instead, please derive from pyarrow.ExtensionType and implement "
+            "your own serialization mechanism.",
+            FutureWarning)
         ExtensionType.__init__(self, storage_type, "arrow.py_extension_type")
 
     def __reduce__(self):
@@ -754,12 +2173,23 @@ cdef class PyExtensionType(ExtensionType):
                                   .format(type(self).__name__))
 
     def __arrow_ext_serialize__(self):
-        return builtin_pickle.dumps(self)
+        return pickle.dumps(self)
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        if not _py_extension_type_auto_load:
+            warnings.warn(
+                "pickle-based deserialization of pyarrow.PyExtensionType subclasses "
+                "is disabled by default; if you only ingest "
+                "trusted data files, you may re-enable this using "
+                "`pyarrow.PyExtensionType.set_auto_load(True)`.\n"
+                "In the future, Python-defined extension subclasses should "
+                "derive from pyarrow.ExtensionType (not pyarrow.PyExtensionType) "
+                "and implement their own serialization mechanism.\n",
+                RuntimeWarning)
+            return UnknownExtensionType(storage_type, serialized)
         try:
-            ty = builtin_pickle.loads(serialized)
+            ty = pickle.loads(serialized)
         except Exception:
             # For some reason, it's impossible to deserialize the
             # ExtensionType instance.  Perhaps the serialized data is
@@ -773,11 +2203,34 @@ cdef class PyExtensionType(ExtensionType):
                             .format(ty.storage_type, storage_type))
         return ty
 
+    # XXX Cython marks extension types as immutable, so cannot expose this
+    # as a writable class attribute.
+    @classmethod
+    def set_auto_load(cls, value):
+        """
+        Enable or disable auto-loading of serialized PyExtensionType instances.
+
+        Parameters
+        ----------
+        value : bool
+            Whether to enable auto-loading.
+        """
+        global _py_extension_type_auto_load
+        assert isinstance(value, bool)
+        _py_extension_type_auto_load = value
+
 
 cdef class UnknownExtensionType(PyExtensionType):
     """
     A concrete class for Python-defined extension types that refer to
     an unknown Python implementation.
+
+    Parameters
+    ----------
+    storage_type : DataType
+        The storage type for which the extension is built.
+    serialized : bytes
+        The serialised output.
     """
 
     cdef:
@@ -808,6 +2261,41 @@ def register_extension_type(ext_type):
     ext_type : BaseExtensionType instance
         The ExtensionType subclass to register.
 
+    Examples
+    --------
+    Define a RationalType extension type subclassing ExtensionType:
+
+    >>> import pyarrow as pa
+    >>> class RationalType(pa.ExtensionType):
+    ...     def __init__(self, data_type: pa.DataType):
+    ...         if not pa.types.is_integer(data_type):
+    ...             raise TypeError(f"data_type must be an integer type not {data_type}")
+    ...         super().__init__(
+    ...             pa.struct(
+    ...                 [
+    ...                     ("numer", data_type),
+    ...                     ("denom", data_type),
+    ...                 ],
+    ...             ),
+    ...             # N.B. This name does _not_ reference `data_type` so deserialization
+    ...             # will work for _any_ integer `data_type` after registration
+    ...             "my_package.rational",
+    ...         )
+    ...     def __arrow_ext_serialize__(self) -> bytes:
+    ...         # No parameters are necessary
+    ...         return b""
+    ...     @classmethod
+    ...     def __arrow_ext_deserialize__(cls, storage_type, serialized):
+    ...         # return an instance of this subclass
+    ...         return RationalType(storage_type[0].type)
+
+    Register the extension type:
+
+    >>> pa.register_extension_type(RationalType(pa.int64()))
+
+    Unregister the extension type:
+
+    >>> pa.unregister_extension_type("my_package.rational")
     """
     cdef:
         DataType _type = ensure_type(ext_type, allow_none=False)
@@ -832,6 +2320,41 @@ def unregister_extension_type(type_name):
     type_name : str
         The name of the ExtensionType subclass to unregister.
 
+    Examples
+    --------
+    Define a RationalType extension type subclassing ExtensionType:
+
+    >>> import pyarrow as pa
+    >>> class RationalType(pa.ExtensionType):
+    ...     def __init__(self, data_type: pa.DataType):
+    ...         if not pa.types.is_integer(data_type):
+    ...             raise TypeError(f"data_type must be an integer type not {data_type}")
+    ...         super().__init__(
+    ...             pa.struct(
+    ...                 [
+    ...                     ("numer", data_type),
+    ...                     ("denom", data_type),
+    ...                 ],
+    ...             ),
+    ...             # N.B. This name does _not_ reference `data_type` so deserialization
+    ...             # will work for _any_ integer `data_type` after registration
+    ...             "my_package.rational",
+    ...         )
+    ...     def __arrow_ext_serialize__(self) -> bytes:
+    ...         # No parameters are necessary
+    ...         return b""
+    ...     @classmethod
+    ...     def __arrow_ext_deserialize__(cls, storage_type, serialized):
+    ...         # return an instance of this subclass
+    ...         return RationalType(storage_type[0].type)
+
+    Register the extension type:
+
+    >>> pa.register_extension_type(RationalType(pa.int64()))
+
+    Unregister the extension type:
+
+    >>> pa.unregister_extension_type("my_package.rational")
     """
     cdef:
         c_string c_type_name = tobytes(type_name)
@@ -839,6 +2362,16 @@ def unregister_extension_type(type_name):
 
 
 cdef class KeyValueMetadata(_Metadata, Mapping):
+    """
+    KeyValueMetadata
+
+    Parameters
+    ----------
+    __arg0__ : dict
+        A dict of the key-value metadata
+    **kwargs : optional
+        additional key-value metadata
+    """
 
     def __init__(self, __arg0__=None, **kwargs):
         cdef:
@@ -881,13 +2414,22 @@ cdef class KeyValueMetadata(_Metadata, Mapping):
         return self.wrapped
 
     def equals(self, KeyValueMetadata other):
+        """
+        Parameters
+        ----------
+        other : pyarrow.KeyValueMetadata
+
+        Returns
+        -------
+        bool
+        """
         return self.metadata.Equals(deref(other.wrapped))
 
     def __repr__(self):
         return str(self)
 
     def __str__(self):
-        return frombytes(self.metadata.ToString())
+        return frombytes(self.metadata.ToString(), safe=True)
 
     def __eq__(self, other):
         try:
@@ -920,9 +2462,27 @@ cdef class KeyValueMetadata(_Metadata, Mapping):
         return KeyValueMetadata, (list(self.items()),)
 
     def key(self, i):
+        """
+        Parameters
+        ----------
+        i : int
+
+        Returns
+        -------
+        byte
+        """
         return self.metadata.key(i)
 
     def value(self, i):
+        """
+        Parameters
+        ----------
+        i : int
+
+        Returns
+        -------
+        byte
+        """
         return self.metadata.value(i)
 
     def keys(self):
@@ -938,6 +2498,15 @@ cdef class KeyValueMetadata(_Metadata, Mapping):
             yield (self.metadata.key(i), self.metadata.value(i))
 
     def get_all(self, key):
+        """
+        Parameters
+        ----------
+        key : str
+
+        Returns
+        -------
+        list[byte]
+        """
         key = tobytes(key)
         return [v for k, v in self.items() if k == key]
 
@@ -955,7 +2524,7 @@ cdef class KeyValueMetadata(_Metadata, Mapping):
         return result
 
 
-cdef KeyValueMetadata ensure_metadata(object meta, c_bool allow_none=False):
+cpdef KeyValueMetadata ensure_metadata(object meta, c_bool allow_none=False):
     if allow_none and meta is None:
         return None
     elif isinstance(meta, KeyValueMetadata):
@@ -964,13 +2533,34 @@ cdef KeyValueMetadata ensure_metadata(object meta, c_bool allow_none=False):
         return KeyValueMetadata(meta)
 
 
-cdef class Field:
+cdef class Field(_Weakrefable):
     """
     A named field, with a data type, nullability, and optional metadata.
 
     Notes
     -----
     Do not use this class's constructor directly; use pyarrow.field
+
+    Examples
+    --------
+    Create an instance of pyarrow.Field:
+
+    >>> import pyarrow as pa
+    >>> pa.field('key', pa.int32())
+    pyarrow.Field<key: int32>
+    >>> pa.field('key', pa.int32(), nullable=False)
+    pyarrow.Field<key: int32 not null>
+    >>> field = pa.field('key', pa.int32(),
+    ...                  metadata={"key": "Something important"})
+    >>> field
+    pyarrow.Field<key: int32>
+    >>> field.metadata
+    {b'key': b'Something important'}
+
+    Use the field to create a struct type:
+
+    >>> pa.struct([field])
+    StructType(struct<key: int32>)
     """
 
     def __cinit__(self):
@@ -998,6 +2588,16 @@ cdef class Field:
         Returns
         -------
         is_equal : bool
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> f1 = pa.field('key', pa.int32())
+        >>> f2 = pa.field('key', pa.int32(), nullable=False)
+        >>> f1.equals(f2)
+        False
+        >>> f1.equals(f1)
+        True
         """
         return self.field.Equals(deref(other.field), check_metadata)
 
@@ -1011,7 +2611,8 @@ cdef class Field:
         return field, (self.name, self.type, self.nullable, self.metadata)
 
     def __str__(self):
-        return 'pyarrow.Field<{0}>'.format(frombytes(self.field.ToString()))
+        return 'pyarrow.Field<{0}>'.format(
+            frombytes(self.field.ToString(), safe=True))
 
     def __repr__(self):
         return self.__str__()
@@ -1021,24 +2622,57 @@ cdef class Field:
 
     @property
     def nullable(self):
+        """
+        The field nullability.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> f1 = pa.field('key', pa.int32())
+        >>> f2 = pa.field('key', pa.int32(), nullable=False)
+        >>> f1.nullable
+        True
+        >>> f2.nullable
+        False
+        """
         return self.field.nullable()
 
     @property
     def name(self):
+        """
+        The field name.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32())
+        >>> field.name
+        'key'
+        """
         return frombytes(self.field.name())
 
     @property
     def metadata(self):
+        """
+        The field metadata (if any is set).
+
+        Returns
+        -------
+        metadata : dict or None
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32(),
+        ...                  metadata={"key": "Something important"})
+        >>> field.metadata
+        {b'key': b'Something important'}
+        """
         wrapped = pyarrow_wrap_metadata(self.field.metadata())
         if wrapped is not None:
             return wrapped.to_dict()
         else:
             return wrapped
-
-    def add_metadata(self, metadata):
-        warnings.warn("The 'add_metadata' method is deprecated, use "
-                      "'with_metadata' instead", FutureWarning, stacklevel=2)
-        return self.with_metadata(metadata)
 
     def with_metadata(self, metadata):
         """
@@ -1052,6 +2686,19 @@ cdef class Field:
         Returns
         -------
         field : pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32())
+
+        Create new field by adding metadata to existing one:
+
+        >>> field_new = field.with_metadata({"key": "Something important"})
+        >>> field_new
+        pyarrow.Field<key: int32>
+        >>> field_new.metadata
+        {b'key': b'Something important'}
         """
         cdef shared_ptr[CField] c_field
 
@@ -1068,6 +2715,19 @@ cdef class Field:
         Returns
         -------
         field : pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32(),
+        ...                  metadata={"key": "Something important"})
+        >>> field.metadata
+        {b'key': b'Something important'}
+
+        Create new field by removing the metadata from the existing one:
+
+        >>> field_new = field.remove_metadata()
+        >>> field_new.metadata
         """
         cdef shared_ptr[CField] new_field
         with nogil:
@@ -1085,6 +2745,19 @@ cdef class Field:
         Returns
         -------
         field : pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32())
+        >>> field
+        pyarrow.Field<key: int32>
+
+        Create new field by replacing type of an existing one:
+
+        >>> field_new = field.with_type(pa.int64())
+        >>> field_new
+        pyarrow.Field<key: int64>
         """
         cdef:
             shared_ptr[CField] c_field
@@ -1107,6 +2780,19 @@ cdef class Field:
         Returns
         -------
         field : pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32())
+        >>> field
+        pyarrow.Field<key: int32>
+
+        Create new field by replacing the name of an existing one:
+
+        >>> field_new = field.with_name('lock')
+        >>> field_new
+        pyarrow.Field<lock: int32>
         """
         cdef:
             shared_ptr[CField] c_field
@@ -1126,6 +2812,23 @@ cdef class Field:
         Returns
         -------
         field: pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> field = pa.field('key', pa.int32())
+        >>> field
+        pyarrow.Field<key: int32>
+        >>> field.nullable
+        True
+
+        Create new field by replacing the nullability of an existing one:
+
+        >>> field_new = field.with_nullable(False)
+        >>> field_new
+        pyarrow.Field<key: int32 not null>
+        >>> field_new.nullable
+        False
         """
         cdef:
             shared_ptr[CField] field
@@ -1145,14 +2848,127 @@ cdef class Field:
         Returns
         -------
         fields : List[pyarrow.Field]
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> f1 = pa.field('bar', pa.float64(), nullable=False)
+        >>> f2 = pa.field('foo', pa.int32()).with_metadata({"key": "Something important"})
+        >>> ff = pa.field('ff', pa.struct([f1, f2]), nullable=False)
+
+        Flatten a struct field:
+
+        >>> ff
+        pyarrow.Field<ff: struct<bar: double not null, foo: int32> not null>
+        >>> ff.flatten()
+        [pyarrow.Field<ff.bar: double not null>, pyarrow.Field<ff.foo: int32>]
         """
         cdef vector[shared_ptr[CField]] flattened
         with nogil:
             flattened = self.field.Flatten()
         return [pyarrow_wrap_field(f) for f in flattened]
 
+    def _export_to_c(self, out_ptr):
+        """
+        Export to a C ArrowSchema struct, given its pointer.
 
-cdef class Schema:
+        Be careful: if you don't pass the ArrowSchema struct to a consumer,
+        its memory will leak.  This is a low-level function intended for
+        expert users.
+        """
+        check_status(ExportField(deref(self.field),
+                                 <ArrowSchema*> _as_c_pointer(out_ptr)))
+
+    @staticmethod
+    def _import_from_c(in_ptr):
+        """
+        Import Field from a C ArrowSchema struct, given its pointer.
+
+        This is a low-level function intended for expert users.
+        """
+        cdef void* c_ptr = _as_c_pointer(in_ptr)
+        with nogil:
+            result = GetResultValue(ImportField(<ArrowSchema*> c_ptr))
+        return pyarrow_wrap_field(result)
+
+    def __arrow_c_schema__(self):
+        """
+        Export to a ArrowSchema PyCapsule
+
+        Unlike _export_to_c, this will not leak memory if the capsule is not used.
+        """
+        cdef ArrowSchema* c_schema
+        capsule = alloc_c_schema(&c_schema)
+
+        with nogil:
+            check_status(ExportField(deref(self.field), c_schema))
+
+        return capsule
+
+    @staticmethod
+    def _import_from_c_capsule(schema):
+        """
+        Import a Field from a ArrowSchema PyCapsule
+
+        Parameters
+        ----------
+        schema : PyCapsule
+            A valid PyCapsule with name 'arrow_schema' containing an
+            ArrowSchema pointer.
+        """
+        cdef:
+            ArrowSchema* c_schema
+            shared_ptr[CField] c_field
+
+        if not PyCapsule_IsValid(schema, 'arrow_schema'):
+            raise ValueError(
+                "Not an ArrowSchema object"
+            )
+        c_schema = <ArrowSchema*> PyCapsule_GetPointer(schema, 'arrow_schema')
+
+        with nogil:
+            c_field = GetResultValue(ImportField(c_schema))
+
+        return pyarrow_wrap_field(c_field)
+
+
+cdef class Schema(_Weakrefable):
+    """
+    A named collection of types a.k.a schema. A schema defines the
+    column names and types in a record batch or table data structure.
+    They also contain metadata about the columns. For example, schemas
+    converted from Pandas contain metadata about their original Pandas
+    types so they can be converted back to the same types.
+
+    Warnings
+    --------
+    Do not call this class's constructor directly. Instead use
+    :func:`pyarrow.schema` factory function which makes a new Arrow
+    Schema object.
+
+    Examples
+    --------
+    Create a new Arrow Schema object:
+
+    >>> import pyarrow as pa
+    >>> pa.schema([
+    ...     ('some_int', pa.int32()),
+    ...     ('some_string', pa.string())
+    ... ])
+    some_int: int32
+    some_string: string
+
+    Create Arrow Schema with metadata:
+
+    >>> pa.schema([
+    ...     pa.field('n_legs', pa.int64()),
+    ...     pa.field('animals', pa.string())],
+    ...     metadata={"n_legs": "Number of legs per animal"})
+    n_legs: int64
+    animals: string
+    -- schema metadata --
+    n_legs: 'Number of legs per animal'
+    """
 
     def __cinit__(self):
         pass
@@ -1199,6 +3015,19 @@ cdef class Schema:
     def pandas_metadata(self):
         """
         Return deserialized-from-JSON pandas metadata field (if it exists)
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import pandas as pd
+        >>> df = pd.DataFrame({'n_legs': [2, 4, 5, 100],
+        ...                    'animals': ["Flamingo", "Horse", "Brittle stars", "Centipede"]})
+        >>> schema = pa.Table.from_pandas(df).schema
+
+        Select pandas metadata field from Arrow Schema:
+
+        >>> schema.pandas_metadata
+        {'index_columns': [{'kind': 'range', 'name': None, 'start': 0, 'stop': 4, 'step': 1}], ...
         """
         metadata = self.metadata
         key = b'pandas'
@@ -1216,6 +3045,18 @@ cdef class Schema:
         Returns
         -------
         list of str
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Get the names of the schema's fields:
+
+        >>> schema.names
+        ['n_legs', 'animals']
         """
         cdef int i
         result = []
@@ -1232,11 +3073,43 @@ cdef class Schema:
         Returns
         -------
         list of DataType
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Get the types of the schema's fields:
+
+        >>> schema.types
+        [DataType(int64), DataType(string)]
         """
         return [field.type for field in self]
 
     @property
     def metadata(self):
+        """
+        The schema's metadata (if any is set).
+
+        Returns
+        -------
+        metadata: dict or None
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())],
+        ...     metadata={"n_legs": "Number of legs per animal"})
+
+        Get the metadata of the schema's fields:
+
+        >>> schema.metadata
+        {b'n_legs': b'Number of legs per animal'}
+        """
         wrapped = pyarrow_wrap_metadata(self.schema.metadata())
         if wrapped is not None:
             return wrapped.to_dict()
@@ -1256,17 +3129,26 @@ cdef class Schema:
         Returns
         -------
         table: pyarrow.Table
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Create an empty table with schema's fields:
+
+        >>> schema.empty_table()
+        pyarrow.Table
+        n_legs: int64
+        animals: string
+        ----
+        n_legs: [[]]
+        animals: [[]]
         """
-        arrays = []
-        names = []
-        for field in self:
-            arrays.append(_empty_array(field.type))
-            names.append(field.name)
-        return Table.from_arrays(
-            arrays=arrays,
-            names=names,
-            metadata=self.metadata
-        )
+        arrays = [_empty_array(field.type) for field in self]
+        return Table.from_arrays(arrays, schema=self)
 
     def equals(self, Schema other not None, bint check_metadata=False):
         """
@@ -1281,6 +3163,28 @@ cdef class Schema:
         Returns
         -------
         is_equal : bool
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema1 = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())],
+        ...     metadata={"n_legs": "Number of legs per animal"})
+        >>> schema2 = pa.schema([
+        ...     ('some_int', pa.int32()),
+        ...     ('some_string', pa.string())
+        ... ])
+
+        Test two equal schemas:
+
+        >>> schema1.equals(schema1)
+        True
+
+        Test two unequal schemas:
+
+        >>> schema1.equals(schema2)
+        False
         """
         return self.sp_schema.get().Equals(deref(other.schema),
                                            check_metadata)
@@ -1306,17 +3210,20 @@ cdef class Schema:
 
         Examples
         --------
-
         >>> import pandas as pd
         >>> import pyarrow as pa
         >>> df = pd.DataFrame({
-            ...     'int': [1, 2],
-            ...     'str': ['a', 'b']
-            ... })
+        ...     'int': [1, 2],
+        ...     'str': ['a', 'b']
+        ... })
+
+        Create an Arrow Schema from the schema of a pandas dataframe:
+
         >>> pa.Schema.from_pandas(df)
         int: int64
         str: string
-        __index_level_0__: int64
+        -- schema metadata --
+        pandas: '{"index_columns": [{"kind": "range", "name": null, ...
         """
         from pyarrow.pandas_compat import dataframe_to_types
         names, types, metadata = dataframe_to_types(
@@ -1339,6 +3246,23 @@ cdef class Schema:
         Returns
         -------
         pyarrow.Field
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Select the second field:
+
+        >>> schema.field(1)
+        pyarrow.Field<animals: string>
+
+        Select the field of the column named 'n_legs':
+
+        >>> schema.field('n_legs')
+        pyarrow.Field<n_legs: int64>
         """
         if isinstance(i, (bytes, str)):
             field_index = self.get_field_index(i)
@@ -1352,17 +3276,27 @@ cdef class Schema:
             raise TypeError("Index must either be string or integer")
 
     def _field(self, int i):
-        """Select a field by its numeric index."""
+        """
+        Select a field by its numeric index.
+
+        Parameters
+        ----------
+        i : int
+
+        Returns
+        -------
+        pyarrow.Field
+        """
         cdef int index = <int> _normalize_index(i, self.schema.num_fields())
         return pyarrow_wrap_field(self.schema.field(index))
 
     def field_by_name(self, name):
         """
-        Access a field by its name rather than the column index.
+        DEPRECATED
 
         Parameters
         ----------
-        name: str
+        name : str
 
         Returns
         -------
@@ -1387,14 +3321,69 @@ cdef class Schema:
 
     def get_field_index(self, name):
         """
-        Return index of field with given unique name. Returns -1 if not found
-        or if duplicated
+        Return index of the unique field with the given name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to look up.
+
+        Returns
+        -------
+        index : int
+            The index of the field with the given name; -1 if the
+            name isn't found or there are several fields with the given
+            name.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Get the index of the field named 'animals':
+
+        >>> schema.get_field_index("animals")
+        1
+
+        Index in case of several fields with the given name:
+
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string()),
+        ...     pa.field('animals', pa.bool_())],
+        ...     metadata={"n_legs": "Number of legs per animal"})
+        >>> schema.get_field_index("animals")
+        -1
         """
         return self.schema.GetFieldIndex(tobytes(name))
 
     def get_all_field_indices(self, name):
         """
-        Return sorted list of indices for fields with the given name
+        Return sorted list of indices for the fields with the given name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to look up.
+
+        Returns
+        -------
+        indices : List[int]
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string()),
+        ...     pa.field('animals', pa.bool_())])
+
+        Get the indexes of the fields named 'animals':
+
+        >>> schema.get_all_field_indices("animals")
+        [1, 2]
         """
         return self.schema.GetAllFieldIndices(tobytes(name))
 
@@ -1407,12 +3396,33 @@ cdef class Schema:
 
         Parameters
         ----------
-        field: Field
+        field : Field
 
         Returns
         -------
         schema: Schema
             New object with appended field.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Append a field 'extra' at the end of the schema:
+
+        >>> schema_new = schema.append(pa.field('extra', pa.bool_()))
+        >>> schema_new
+        n_legs: int64
+        animals: string
+        extra: bool
+
+        Original schema is unmodified:
+
+        >>> schema
+        n_legs: int64
+        animals: string
         """
         return self.insert(self.schema.num_fields(), field)
 
@@ -1422,12 +3432,26 @@ cdef class Schema:
 
         Parameters
         ----------
-        i: int
-        field: Field
+        i : int
+        field : Field
 
         Returns
         -------
         schema: Schema
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Insert a new field on the second position:
+
+        >>> schema.insert(1, pa.field('extra', pa.bool_()))
+        n_legs: int64
+        extra: bool
+        animals: string
         """
         cdef:
             shared_ptr[CSchema] new_schema
@@ -1446,11 +3470,23 @@ cdef class Schema:
 
         Parameters
         ----------
-        i: int
+        i : int
 
         Returns
         -------
         schema: Schema
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Remove the second field of the schema:
+
+        >>> schema.remove(1)
+        n_legs: int64
         """
         cdef shared_ptr[CSchema] new_schema
 
@@ -1465,12 +3501,25 @@ cdef class Schema:
 
         Parameters
         ----------
-        i: int
-        field: Field
+        i : int
+        field : Field
 
         Returns
         -------
         schema: Schema
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Replace the second field of the schema with a new field 'extra':
+
+        >>> schema.set(1, pa.field('replaced', pa.bool_()))
+        n_legs: int64
+        replaced: bool
         """
         cdef:
             shared_ptr[CSchema] new_schema
@@ -1484,6 +3533,14 @@ cdef class Schema:
         return pyarrow_wrap_schema(new_schema)
 
     def add_metadata(self, metadata):
+        """
+        DEPRECATED
+
+        Parameters
+        ----------
+        metadata : dict
+            Keys and values must be string-like / coercible to bytes
+        """
         warnings.warn("The 'add_metadata' method is deprecated, use "
                       "'with_metadata' instead", FutureWarning, stacklevel=2)
         return self.with_metadata(metadata)
@@ -1500,6 +3557,21 @@ cdef class Schema:
         Returns
         -------
         schema : pyarrow.Schema
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Add metadata to existing schema field:
+
+        >>> schema.with_metadata({"n_legs": "Number of legs per animal"})
+        n_legs: int64
+        animals: string
+        -- schema metadata --
+        n_legs: 'Number of legs per animal'
         """
         cdef shared_ptr[CSchema] c_schema
 
@@ -1509,7 +3581,7 @@ cdef class Schema:
 
         return pyarrow_wrap_schema(c_schema)
 
-    def serialize(self, DictionaryMemo dictionary_memo=None, memory_pool=None):
+    def serialize(self, memory_pool=None):
         """
         Write Schema to Buffer as encapsulated IPC message
 
@@ -1517,29 +3589,30 @@ cdef class Schema:
         ----------
         memory_pool : MemoryPool, default None
             Uses default memory pool if not specified
-        dictionary_memo : DictionaryMemo, optional
-            If schema contains dictionaries, must pass a
-            DictionaryMemo to be able to deserialize RecordBatch
-            objects
 
         Returns
         -------
         serialized : Buffer
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())])
+
+        Write schema to Buffer:
+
+        >>> schema.serialize()
+        <pyarrow.Buffer address=0x... size=... is_cpu=True is_mutable=True>
         """
         cdef:
             shared_ptr[CBuffer] buffer
             CMemoryPool* pool = maybe_unbox_memory_pool(memory_pool)
-            CDictionaryMemo temp_memo
-            CDictionaryMemo* arg_dict_memo
-
-        if dictionary_memo is not None:
-            arg_dict_memo = dictionary_memo.memo
-        else:
-            arg_dict_memo = &temp_memo
 
         with nogil:
             buffer = GetResultValue(SerializeSchema(deref(self.schema),
-                                                    arg_dict_memo, pool))
+                                                    pool))
         return pyarrow_wrap_buffer(buffer)
 
     def remove_metadata(self):
@@ -1549,6 +3622,25 @@ cdef class Schema:
         Returns
         -------
         schema : pyarrow.Schema
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([
+        ...     pa.field('n_legs', pa.int64()),
+        ...     pa.field('animals', pa.string())],
+        ...     metadata={"n_legs": "Number of legs per animal"})
+        >>> schema
+        n_legs: int64
+        animals: string
+        -- schema metadata --
+        n_legs: 'Number of legs per animal'
+
+        Create a new schema with removing the metadata from the original:
+
+        >>> schema.remove_metadata()
+        n_legs: int64
+        animals: string
         """
         cdef shared_ptr[CSchema] new_schema
         with nogil:
@@ -1592,9 +3684,9 @@ cdef class Schema:
                 )
             )
 
-        return frombytes(result)
+        return frombytes(result, safe=True)
 
-    def _export_to_c(self, uintptr_t out_ptr):
+    def _export_to_c(self, out_ptr):
         """
         Export to a C ArrowSchema struct, given its pointer.
 
@@ -1602,17 +3694,19 @@ cdef class Schema:
         its memory will leak.  This is a low-level function intended for
         expert users.
         """
-        check_status(ExportSchema(deref(self.schema), <ArrowSchema*> out_ptr))
+        check_status(ExportSchema(deref(self.schema),
+                                  <ArrowSchema*> _as_c_pointer(out_ptr)))
 
     @staticmethod
-    def _import_from_c(uintptr_t in_ptr):
+    def _import_from_c(in_ptr):
         """
         Import Schema from a C ArrowSchema struct, given its pointer.
 
         This is a low-level function intended for expert users.
         """
+        cdef void* c_ptr = _as_c_pointer(in_ptr)
         with nogil:
-            result = GetResultValue(ImportSchema(<ArrowSchema*> in_ptr))
+            result = GetResultValue(ImportSchema(<ArrowSchema*> c_ptr))
         return pyarrow_wrap_schema(result)
 
     def __str__(self):
@@ -1621,14 +3715,53 @@ cdef class Schema:
     def __repr__(self):
         return self.__str__()
 
+    def __arrow_c_schema__(self):
+        """
+        Export to a ArrowSchema PyCapsule
 
-def unify_schemas(list schemas):
+        Unlike _export_to_c, this will not leak memory if the capsule is not used.
+        """
+        cdef ArrowSchema* c_schema
+        capsule = alloc_c_schema(&c_schema)
+
+        with nogil:
+            check_status(ExportSchema(deref(self.schema), c_schema))
+
+        return capsule
+
+    @staticmethod
+    def _import_from_c_capsule(schema):
+        """
+        Import a Schema from a ArrowSchema PyCapsule
+
+        Parameters
+        ----------
+        schema : PyCapsule
+            A valid PyCapsule with name 'arrow_schema' containing an
+            ArrowSchema pointer.
+        """
+        cdef:
+            ArrowSchema* c_schema
+
+        if not PyCapsule_IsValid(schema, 'arrow_schema'):
+            raise ValueError(
+                "Not an ArrowSchema object"
+            )
+        c_schema = <ArrowSchema*> PyCapsule_GetPointer(schema, 'arrow_schema')
+
+        with nogil:
+            result = GetResultValue(ImportSchema(c_schema))
+
+        return pyarrow_wrap_schema(result)
+
+
+def unify_schemas(schemas, *, promote_options="default"):
     """
     Unify schemas by merging fields by name.
 
     The resulting schema will contain the union of fields from all schemas.
     Fields with the same name will be merged. Note that two fields with
-    different types will fail merging.
+    different types will fail merging by default.
 
     - The unified field will inherit the metadata from the schema where
         that field is first defined.
@@ -1642,6 +3775,10 @@ def unify_schemas(list schemas):
     ----------
     schemas : list of Schema
         Schemas to merge into a single one.
+    promote_options : str, default default
+        Accepts strings "default" and "permissive".
+        Default: null and only null can be unified with another type.
+        Permissive: types are promoted to the greater common denominator.
 
     Returns
     -------
@@ -1655,10 +3792,22 @@ def unify_schemas(list schemas):
     """
     cdef:
         Schema schema
+        CField.CMergeOptions c_options
         vector[shared_ptr[CSchema]] c_schemas
     for schema in schemas:
+        if not isinstance(schema, Schema):
+            raise TypeError("Expected Schema, got {}".format(type(schema)))
         c_schemas.push_back(pyarrow_unwrap_schema(schema))
-    return pyarrow_wrap_schema(GetResultValue(UnifySchemas(c_schemas)))
+
+    if promote_options == "default":
+        c_options = CField.CMergeOptions.Defaults()
+    elif promote_options == "permissive":
+        c_options = CField.CMergeOptions.Permissive()
+    else:
+        raise ValueError(f"Invalid merge mode: {promote_options}")
+
+    return pyarrow_wrap_schema(
+        GetResultValue(UnifySchemas(c_schemas, c_options)))
 
 
 cdef dict _type_cache = {}
@@ -1679,7 +3828,7 @@ cdef DataType primitive_type(Type type):
 # Type factory functions
 
 
-def field(name, type, bint nullable=True, metadata=None):
+def field(name, type=None, nullable=None, metadata=None):
     """
     Create a pyarrow.Field instance.
 
@@ -1687,8 +3836,10 @@ def field(name, type, bint nullable=True, metadata=None):
     ----------
     name : str or bytes
         Name of the field.
-    type : pyarrow.DataType
-        Arrow datatype of the field.
+        Alternatively, you can also pass an object that implements the Arrow
+        PyCapsule Protocol for schemas (has an ``__arrow_c_schema__`` method).
+    type : pyarrow.DataType or str
+        Arrow datatype of the field or a string matching one.
     nullable : bool, default True
         Whether the field's values are nullable.
     metadata : dict, default None
@@ -1698,14 +3849,58 @@ def field(name, type, bint nullable=True, metadata=None):
     Returns
     -------
     field : pyarrow.Field
+
+    Examples
+    --------
+    Create an instance of pyarrow.Field:
+
+    >>> import pyarrow as pa
+    >>> pa.field('key', pa.int32())
+    pyarrow.Field<key: int32>
+    >>> pa.field('key', pa.int32(), nullable=False)
+    pyarrow.Field<key: int32 not null>
+
+    >>> field = pa.field('key', pa.int32(),
+    ...                  metadata={"key": "Something important"})
+    >>> field
+    pyarrow.Field<key: int32>
+    >>> field.metadata
+    {b'key': b'Something important'}
+
+    Use the field to create a struct type:
+
+    >>> pa.struct([field])
+    StructType(struct<key: int32>)
+
+    A str can also be passed for the type parameter:
+
+    >>> pa.field('key', 'int32')
+    pyarrow.Field<key: int32>
     """
+    if hasattr(name, "__arrow_c_schema__"):
+        if type is not None:
+            raise ValueError(
+                "cannot specify 'type' when creating a Field from an ArrowSchema"
+            )
+        field = Field._import_from_c_capsule(name.__arrow_c_schema__())
+        if metadata is not None:
+            field = field.with_metadata(metadata)
+        if nullable is not None:
+            field = field.with_nullable(nullable)
+        return field
+
     cdef:
         Field result = Field.__new__(Field)
         DataType _type = ensure_type(type, allow_none=False)
         shared_ptr[const CKeyValueMetadata] c_meta
 
+    nullable = True if nullable is None else nullable
+
     metadata = ensure_metadata(metadata, allow_none=True)
     c_meta = pyarrow_unwrap_metadata(metadata)
+
+    if _type.type.id() == _Type_NA and not nullable:
+        raise ValueError("A null type field may not be non-nullable")
 
     result.sp_field.reset(
         new CField(tobytes(name), _type.sp_type, nullable, c_meta)
@@ -1733,6 +3928,21 @@ cdef set PRIMITIVE_TYPES = set([
 def null():
     """
     Create instance of null type.
+
+    Examples
+    --------
+    Create an instance of a null type:
+
+    >>> import pyarrow as pa
+    >>> pa.null()
+    DataType(null)
+    >>> print(pa.null())
+    null
+
+    Create a ``Field`` type with a null type and a name:
+
+    >>> pa.field('null_field', pa.null())
+    pyarrow.Field<null_field: null>
     """
     return primitive_type(_Type_NA)
 
@@ -1740,6 +3950,22 @@ def null():
 def bool_():
     """
     Create instance of boolean type.
+
+    Examples
+    --------
+    Create an instance of a boolean type:
+
+    >>> import pyarrow as pa
+    >>> pa.bool_()
+    DataType(bool)
+    >>> print(pa.bool_())
+    bool
+
+    Create a ``Field`` type with a boolean type
+    and a name:
+
+    >>> pa.field('bool_field', pa.bool_())
+    pyarrow.Field<bool_field: bool>
     """
     return primitive_type(_Type_BOOL)
 
@@ -1747,6 +3973,26 @@ def bool_():
 def uint8():
     """
     Create instance of unsigned int8 type.
+
+    Examples
+    --------
+    Create an instance of unsigned int8 type:
+
+    >>> import pyarrow as pa
+    >>> pa.uint8()
+    DataType(uint8)
+    >>> print(pa.uint8())
+    uint8
+
+    Create an array with unsigned int8 type:
+
+    >>> pa.array([0, 1, 2], type=pa.uint8())
+    <pyarrow.lib.UInt8Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_UINT8)
 
@@ -1754,6 +4000,26 @@ def uint8():
 def int8():
     """
     Create instance of signed int8 type.
+
+    Examples
+    --------
+    Create an instance of int8 type:
+
+    >>> import pyarrow as pa
+    >>> pa.int8()
+    DataType(int8)
+    >>> print(pa.int8())
+    int8
+
+    Create an array with int8 type:
+
+    >>> pa.array([0, 1, 2], type=pa.int8())
+    <pyarrow.lib.Int8Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_INT8)
 
@@ -1761,6 +4027,26 @@ def int8():
 def uint16():
     """
     Create instance of unsigned uint16 type.
+
+    Examples
+    --------
+    Create an instance of unsigned int16 type:
+
+    >>> import pyarrow as pa
+    >>> pa.uint16()
+    DataType(uint16)
+    >>> print(pa.uint16())
+    uint16
+
+    Create an array with unsigned int16 type:
+
+    >>> pa.array([0, 1, 2], type=pa.uint16())
+    <pyarrow.lib.UInt16Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_UINT16)
 
@@ -1768,6 +4054,26 @@ def uint16():
 def int16():
     """
     Create instance of signed int16 type.
+
+    Examples
+    --------
+    Create an instance of int16 type:
+
+    >>> import pyarrow as pa
+    >>> pa.int16()
+    DataType(int16)
+    >>> print(pa.int16())
+    int16
+
+    Create an array with int16 type:
+
+    >>> pa.array([0, 1, 2], type=pa.int16())
+    <pyarrow.lib.Int16Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_INT16)
 
@@ -1775,6 +4081,26 @@ def int16():
 def uint32():
     """
     Create instance of unsigned uint32 type.
+
+    Examples
+    --------
+    Create an instance of unsigned int32 type:
+
+    >>> import pyarrow as pa
+    >>> pa.uint32()
+    DataType(uint32)
+    >>> print(pa.uint32())
+    uint32
+
+    Create an array with unsigned int32 type:
+
+    >>> pa.array([0, 1, 2], type=pa.uint32())
+    <pyarrow.lib.UInt32Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_UINT32)
 
@@ -1782,6 +4108,26 @@ def uint32():
 def int32():
     """
     Create instance of signed int32 type.
+
+    Examples
+    --------
+    Create an instance of int32 type:
+
+    >>> import pyarrow as pa
+    >>> pa.int32()
+    DataType(int32)
+    >>> print(pa.int32())
+    int32
+
+    Create an array with int32 type:
+
+    >>> pa.array([0, 1, 2], type=pa.int32())
+    <pyarrow.lib.Int32Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_INT32)
 
@@ -1789,6 +4135,26 @@ def int32():
 def uint64():
     """
     Create instance of unsigned uint64 type.
+
+    Examples
+    --------
+    Create an instance of unsigned int64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.uint64()
+    DataType(uint64)
+    >>> print(pa.uint64())
+    uint64
+
+    Create an array with unsigned uint64 type:
+
+    >>> pa.array([0, 1, 2], type=pa.uint64())
+    <pyarrow.lib.UInt64Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_UINT64)
 
@@ -1796,6 +4162,26 @@ def uint64():
 def int64():
     """
     Create instance of signed int64 type.
+
+    Examples
+    --------
+    Create an instance of int64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.int64()
+    DataType(int64)
+    >>> print(pa.int64())
+    int64
+
+    Create an array with int64 type:
+
+    >>> pa.array([0, 1, 2], type=pa.int64())
+    <pyarrow.lib.Int64Array object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_INT64)
 
@@ -1816,7 +4202,17 @@ cdef timeunit_to_string(TimeUnit unit):
         return 'ns'
 
 
-_FIXED_OFFSET_RE = re.compile(r'([+-])(0[0-9]|1[0-9]|2[0-3]):([0-5][0-9])$')
+cdef TimeUnit string_to_timeunit(unit) except *:
+    if unit == 's':
+        return TimeUnit_SECOND
+    elif unit == 'ms':
+        return TimeUnit_MILLI
+    elif unit == 'us':
+        return TimeUnit_MICRO
+    elif unit == 'ns':
+        return TimeUnit_NANO
+    else:
+        raise ValueError(f"Invalid time unit: {unit!r}")
 
 
 def tzinfo_to_string(tz):
@@ -1837,32 +4233,7 @@ def tzinfo_to_string(tz):
       name : str
         Time zone name
     """
-    import pytz
-    import datetime
-
-    def fixed_offset_to_string(offset):
-        seconds = int(offset.utcoffset(None).total_seconds())
-        sign = '+' if seconds >= 0 else '-'
-        minutes, seconds = divmod(abs(seconds), 60)
-        hours, minutes = divmod(minutes, 60)
-        if seconds > 0:
-            raise ValueError('Offset must represent whole number of minutes')
-        return '{}{:02d}:{:02d}'.format(sign, hours, minutes)
-
-    if tz is pytz.utc:
-        return tz.zone  # ARROW-4055
-    elif isinstance(tz, pytz.tzinfo.BaseTzInfo):
-        return tz.zone
-    elif isinstance(tz, pytz._FixedOffset):
-        return fixed_offset_to_string(tz)
-    elif isinstance(tz, datetime.tzinfo):
-        if isinstance(tz, datetime.timezone):
-            return fixed_offset_to_string(tz)
-        else:
-            raise ValueError('Unable to convert timezone `{}` to string'
-                             .format(tz))
-    else:
-        raise TypeError('Must be an instance of `datetime.tzinfo`')
+    return frombytes(GetResultValue(TzinfoToString(<PyObject*>tz)))
 
 
 def string_to_tzinfo(name):
@@ -1884,14 +4255,8 @@ def string_to_tzinfo(name):
       tz : datetime.tzinfo
         Time zone object
     """
-    import pytz
-    m = _FIXED_OFFSET_RE.match(name)
-    if m:
-        sign = 1 if m.group(1) == '+' else -1
-        hours, minutes = map(int, m.group(2, 3))
-        return pytz.FixedOffset(sign * (hours * 60 + minutes))
-    else:
-        return pytz.timezone(name)
+    cdef PyObject* tz = GetResultValue(StringToTzinfo(name.encode('utf-8')))
+    return PyObject_to_object(tz)
 
 
 def timestamp(unit, tz=None):
@@ -1908,6 +4273,8 @@ def timestamp(unit, tz=None):
 
     Examples
     --------
+    Create an instance of timestamp type:
+
     >>> import pyarrow as pa
     >>> pa.timestamp('us')
     TimestampType(timestamp[us])
@@ -1915,6 +4282,14 @@ def timestamp(unit, tz=None):
     TimestampType(timestamp[s, tz=America/New_York])
     >>> pa.timestamp('s', tz='+07:30')
     TimestampType(timestamp[s, tz=+07:30])
+
+    Use timestamp type when creating a scalar object:
+
+    >>> from datetime import datetime
+    >>> pa.scalar(datetime(2012, 1, 1), type=pa.timestamp('s', tz='UTC'))
+    <pyarrow.TimestampScalar: '2012-01-01T00:00:00+0000'>
+    >>> pa.scalar(datetime(2012, 1, 1), type=pa.timestamp('us'))
+    <pyarrow.TimestampScalar: '2012-01-01T00:00:00.000000'>
 
     Returns
     -------
@@ -1924,16 +4299,7 @@ def timestamp(unit, tz=None):
         TimeUnit unit_code
         c_string c_timezone
 
-    if unit == "s":
-        unit_code = TimeUnit_SECOND
-    elif unit == 'ms':
-        unit_code = TimeUnit_MILLI
-    elif unit == 'us':
-        unit_code = TimeUnit_MICRO
-    elif unit == 'ns':
-        unit_code = TimeUnit_NANO
-    else:
-        raise ValueError('Invalid TimeUnit string')
+    unit_code = string_to_timeunit(unit)
 
     cdef TimestampType out = TimestampType.__new__(TimestampType)
 
@@ -1982,7 +4348,7 @@ def time32(unit):
     elif unit == 'ms':
         unit_code = TimeUnit_MILLI
     else:
-        raise ValueError('Invalid TimeUnit for time32: {}'.format(unit))
+        raise ValueError(f"Invalid time unit for time32: {unit!r}")
 
     if unit_code in _time_type_cache:
         return _time_type_cache[unit_code]
@@ -2025,7 +4391,7 @@ def time64(unit):
     elif unit == 'ns':
         unit_code = TimeUnit_NANO
     else:
-        raise ValueError('Invalid TimeUnit for time64: {}'.format(unit))
+        raise ValueError(f"Invalid time unit for time64: {unit!r}")
 
     if unit_code in _time_type_cache:
         return _time_type_cache[unit_code]
@@ -2054,25 +4420,28 @@ def duration(unit):
 
     Examples
     --------
+    Create an instance of duration type:
+
     >>> import pyarrow as pa
     >>> pa.duration('us')
     DurationType(duration[us])
     >>> pa.duration('s')
     DurationType(duration[s])
+
+    Create an array with duration type:
+
+    >>> pa.array([0, 1, 2], type=pa.duration('s'))
+    <pyarrow.lib.DurationArray object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     cdef:
         TimeUnit unit_code
 
-    if unit == "s":
-        unit_code = TimeUnit_SECOND
-    elif unit == 'ms':
-        unit_code = TimeUnit_MILLI
-    elif unit == 'us':
-        unit_code = TimeUnit_MICRO
-    elif unit == 'ns':
-        unit_code = TimeUnit_NANO
-    else:
-        raise ValueError('Invalid TimeUnit string')
+    unit_code = string_to_timeunit(unit)
 
     if unit_code in _duration_type_cache:
         return _duration_type_cache[unit_code]
@@ -2085,9 +4454,44 @@ def duration(unit):
     return out
 
 
+def month_day_nano_interval():
+    """
+    Create instance of an interval type representing months, days and
+    nanoseconds between two dates.
+
+    Examples
+    --------
+    Create an instance of an month_day_nano_interval type:
+
+    >>> import pyarrow as pa
+    >>> pa.month_day_nano_interval()
+    DataType(month_day_nano_interval)
+
+    Create a scalar with month_day_nano_interval type:
+
+    >>> pa.scalar((1, 15, -30), type=pa.month_day_nano_interval())
+    <pyarrow.MonthDayNanoIntervalScalar: MonthDayNano(months=1, days=15, nanoseconds=-30)>
+    """
+    return primitive_type(_Type_INTERVAL_MONTH_DAY_NANO)
+
+
 def date32():
     """
     Create instance of 32-bit date (days since UNIX epoch 1970-01-01).
+
+    Examples
+    --------
+    Create an instance of 32-bit date type:
+
+    >>> import pyarrow as pa
+    >>> pa.date32()
+    DataType(date32[day])
+
+    Create a scalar with 32-bit date type:
+
+    >>> from datetime import date
+    >>> pa.scalar(date(2012, 1, 1), type=pa.date32())
+    <pyarrow.Date32Scalar: datetime.date(2012, 1, 1)>
     """
     return primitive_type(_Type_DATE32)
 
@@ -2095,6 +4499,20 @@ def date32():
 def date64():
     """
     Create instance of 64-bit date (milliseconds since UNIX epoch 1970-01-01).
+
+    Examples
+    --------
+    Create an instance of 64-bit date type:
+
+    >>> import pyarrow as pa
+    >>> pa.date64()
+    DataType(date64[ms])
+
+    Create a scalar with 64-bit date type:
+
+    >>> from datetime import datetime
+    >>> pa.scalar(datetime(2012, 1, 1), type=pa.date64())
+    <pyarrow.Date64Scalar: datetime.date(2012, 1, 1)>
     """
     return primitive_type(_Type_DATE64)
 
@@ -2102,6 +4520,33 @@ def date64():
 def float16():
     """
     Create half-precision floating point type.
+
+    Examples
+    --------
+    Create an instance of float16 type:
+
+    >>> import pyarrow as pa
+    >>> pa.float16()
+    DataType(halffloat)
+    >>> print(pa.float16())
+    halffloat
+
+    Create an array with float16 type:
+
+    >>> arr = np.array([1.5, np.nan], dtype=np.float16)
+    >>> a = pa.array(arr, type=pa.float16())
+    >>> a
+    <pyarrow.lib.HalfFloatArray object at ...>
+    [
+      15872,
+      32256
+    ]
+
+    Note that unlike other float types, if you convert this array
+    to a python list, the types of its elements will be ``np.float16``
+
+    >>> [type(val) for val in a.to_pylist()]
+    [<class 'numpy.float16'>, <class 'numpy.float16'>]
     """
     return primitive_type(_Type_HALF_FLOAT)
 
@@ -2109,6 +4554,26 @@ def float16():
 def float32():
     """
     Create single-precision floating point type.
+
+    Examples
+    --------
+    Create an instance of float32 type:
+
+    >>> import pyarrow as pa
+    >>> pa.float32()
+    DataType(float)
+    >>> print(pa.float32())
+    float
+
+    Create an array with float32 type:
+
+    >>> pa.array([0.0, 1.0, 2.0], type=pa.float32())
+    <pyarrow.lib.FloatArray object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_FLOAT)
 
@@ -2116,22 +4581,187 @@ def float32():
 def float64():
     """
     Create double-precision floating point type.
+
+    Examples
+    --------
+    Create an instance of float64 type:
+
+    >>> import pyarrow as pa
+    >>> pa.float64()
+    DataType(double)
+    >>> print(pa.float64())
+    double
+
+    Create an array with float64 type:
+
+    >>> pa.array([0.0, 1.0, 2.0], type=pa.float64())
+    <pyarrow.lib.DoubleArray object at ...>
+    [
+      0,
+      1,
+      2
+    ]
     """
     return primitive_type(_Type_DOUBLE)
 
 
-cpdef DataType decimal128(int precision, int scale=0):
+cpdef DataType decimal32(int precision, int scale=0):
     """
-    Create decimal type with precision and scale and 128bit width.
+    Create decimal type with precision and scale and 32-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    As an example, ``decimal32(7, 3)`` can exactly represent the numbers
+    1234.567 and -1234.567 (encoded internally as the 32-bit integers
+    1234567 and -1234567, respectively), but neither 12345.67 nor 123.4567.
+
+    ``decimal32(5, -3)`` can exactly represent the number 12345000
+    (encoded internally as the 32-bit integer 12345), but neither
+    123450000 nor 1234500.
+
+    If you need a precision higher than 9 significant digits, consider
+    using ``decimal64``, ``decimal128``, or ``decimal256``.
 
     Parameters
     ----------
     precision : int
+        Must be between 1 and 9
+    scale : int
+
+    Returns
+    -------
+    decimal_type : Decimal32Type
+
+    Examples
+    --------
+    Create an instance of decimal type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal32(5, 2)
+    Decimal32Type(decimal32(5, 2))
+
+    Create an array with decimal type:
+
+    >>> import decimal
+    >>> a = decimal.Decimal('123.45')
+    >>> pa.array([a], pa.decimal32(5, 2))
+    <pyarrow.lib.Decimal32Array object at ...>
+    [
+      123.45
+    ]
+    """
+    cdef shared_ptr[CDataType] decimal_type
+    if precision < 1 or precision > 9:
+        raise ValueError("precision should be between 1 and 9")
+    decimal_type.reset(new CDecimal32Type(precision, scale))
+    return pyarrow_wrap_data_type(decimal_type)
+
+
+cpdef DataType decimal64(int precision, int scale=0):
+    """
+    Create decimal type with precision and scale and 64-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    As an example, ``decimal64(7, 3)`` can exactly represent the numbers
+    1234.567 and -1234.567 (encoded internally as the 64-bit integers
+    1234567 and -1234567, respectively), but neither 12345.67 nor 123.4567.
+
+    ``decimal64(5, -3)`` can exactly represent the number 12345000
+    (encoded internally as the 64-bit integer 12345), but neither
+    123450000 nor 1234500.
+
+    If you need a precision higher than 18 significant digits, consider
+    using ``decimal128``, or ``decimal256``.
+
+    Parameters
+    ----------
+    precision : int
+        Must be between 1 and 18
+    scale : int
+
+    Returns
+    -------
+    decimal_type : Decimal64Type
+
+    Examples
+    --------
+    Create an instance of decimal type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal64(5, 2)
+    Decimal64Type(decimal64(5, 2))
+
+    Create an array with decimal type:
+
+    >>> import decimal
+    >>> a = decimal.Decimal('123.45')
+    >>> pa.array([a], pa.decimal64(5, 2))
+    <pyarrow.lib.Decimal64Array object at ...>
+    [
+      123.45
+    ]
+    """
+    cdef shared_ptr[CDataType] decimal_type
+    if precision < 1 or precision > 18:
+        raise ValueError("precision should be between 1 and 18")
+    decimal_type.reset(new CDecimal64Type(precision, scale))
+    return pyarrow_wrap_data_type(decimal_type)
+
+
+cpdef DataType decimal128(int precision, int scale=0):
+    """
+    Create decimal type with precision and scale and 128-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    As an example, ``decimal128(7, 3)`` can exactly represent the numbers
+    1234.567 and -1234.567 (encoded internally as the 128-bit integers
+    1234567 and -1234567, respectively), but neither 12345.67 nor 123.4567.
+
+    ``decimal128(5, -3)`` can exactly represent the number 12345000
+    (encoded internally as the 128-bit integer 12345), but neither
+    123450000 nor 1234500.
+
+    If you need a precision higher than 38 significant digits, consider
+    using ``decimal256``.
+
+    Parameters
+    ----------
+    precision : int
+        Must be between 1 and 38
     scale : int
 
     Returns
     -------
     decimal_type : Decimal128Type
+
+    Examples
+    --------
+    Create an instance of decimal type:
+
+    >>> import pyarrow as pa
+    >>> pa.decimal128(5, 2)
+    Decimal128Type(decimal128(5, 2))
+
+    Create an array with decimal type:
+
+    >>> import decimal
+    >>> a = decimal.Decimal('123.45')
+    >>> pa.array([a], pa.decimal128(5, 2))
+    <pyarrow.lib.Decimal128Array object at ...>
+    [
+      123.45
+    ]
     """
     cdef shared_ptr[CDataType] decimal_type
     if precision < 1 or precision > 38:
@@ -2140,9 +4770,58 @@ cpdef DataType decimal128(int precision, int scale=0):
     return pyarrow_wrap_data_type(decimal_type)
 
 
+cpdef DataType decimal256(int precision, int scale=0):
+    """
+    Create decimal type with precision and scale and 256-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    For most use cases, the maximum precision offered by ``decimal128``
+    is sufficient, and it will result in a more compact and more efficient
+    encoding.  ``decimal256`` is useful if you need a precision higher
+    than 38 significant digits.
+
+    Parameters
+    ----------
+    precision : int
+        Must be between 1 and 76
+    scale : int
+
+    Returns
+    -------
+    decimal_type : Decimal256Type
+    """
+    cdef shared_ptr[CDataType] decimal_type
+    if precision < 1 or precision > 76:
+        raise ValueError("precision should be between 1 and 76")
+    decimal_type.reset(new CDecimal256Type(precision, scale))
+    return pyarrow_wrap_data_type(decimal_type)
+
+
 def string():
     """
     Create UTF8 variable-length string type.
+
+    Examples
+    --------
+    Create an instance of a string type:
+
+    >>> import pyarrow as pa
+    >>> pa.string()
+    DataType(string)
+
+    and use the string type to create an array:
+
+    >>> pa.array(['foo', 'bar', 'baz'], type=pa.string())
+    <pyarrow.lib.StringArray object at ...>
+    [
+      "foo",
+      "bar",
+      "baz"
+    ]
     """
     return primitive_type(_Type_STRING)
 
@@ -2150,13 +4829,31 @@ def string():
 def utf8():
     """
     Alias for string().
+
+    Examples
+    --------
+    Create an instance of a string type:
+
+    >>> import pyarrow as pa
+    >>> pa.utf8()
+    DataType(string)
+
+    and use the string type to create an array:
+
+    >>> pa.array(['foo', 'bar', 'baz'], type=pa.utf8())
+    <pyarrow.lib.StringArray object at ...>
+    [
+      "foo",
+      "bar",
+      "baz"
+    ]
     """
     return string()
 
 
 def binary(int length=-1):
     """
-    Create variable-length binary type.
+    Create variable-length or fixed size binary type.
 
     Parameters
     ----------
@@ -2164,6 +4861,39 @@ def binary(int length=-1):
         If length == -1 then return a variable length binary type. If length is
         greater than or equal to 0 then return a fixed size binary type of
         width `length`.
+
+    Examples
+    --------
+    Create an instance of a variable-length binary type:
+
+    >>> import pyarrow as pa
+    >>> pa.binary()
+    DataType(binary)
+
+    and use the variable-length binary type to create an array:
+
+    >>> pa.array(['foo', 'bar', 'baz'], type=pa.binary())
+    <pyarrow.lib.BinaryArray object at ...>
+    [
+      666F6F,
+      626172,
+      62617A
+    ]
+
+    Create an instance of a fixed-size binary type:
+
+    >>> pa.binary(3)
+    FixedSizeBinaryType(fixed_size_binary[3])
+
+    and use the fixed-length binary type to create an array:
+
+    >>> pa.array(['foo', 'bar', 'baz'], type=pa.binary(3))
+    <pyarrow.lib.FixedSizeBinaryArray object at ...>
+    [
+      666F6F,
+      626172,
+      62617A
+    ]
     """
     if length == -1:
         return primitive_type(_Type_BINARY)
@@ -2179,6 +4909,24 @@ def large_binary():
 
     This data type may not be supported by all Arrow implementations.  Unless
     you need to represent data larger than 2GB, you should prefer binary().
+
+    Examples
+    --------
+    Create an instance of large variable-length binary type:
+
+    >>> import pyarrow as pa
+    >>> pa.large_binary()
+    DataType(large_binary)
+
+    and use the type to create an array:
+
+    >>> pa.array(['foo', 'bar', 'baz'], type=pa.large_binary())
+    <pyarrow.lib.LargeBinaryArray object at ...>
+    [
+      666F6F,
+      626172,
+      62617A
+    ]
     """
     return primitive_type(_Type_LARGE_BINARY)
 
@@ -2189,6 +4937,26 @@ def large_string():
 
     This data type may not be supported by all Arrow implementations.  Unless
     you need to represent data larger than 2GB, you should prefer string().
+
+    Examples
+    --------
+    Create an instance of large UTF8 variable-length binary type:
+
+    >>> import pyarrow as pa
+    >>> pa.large_string()
+    DataType(large_string)
+
+    and use the type to create an array:
+
+    >>> pa.array(['foo', 'bar'] * 50, type=pa.large_string())
+    <pyarrow.lib.LargeStringArray object at ...>
+    [
+      "foo",
+      "bar",
+      ...
+      "foo",
+      "bar"
+    ]
     """
     return primitive_type(_Type_LARGE_STRING)
 
@@ -2196,8 +4964,58 @@ def large_string():
 def large_utf8():
     """
     Alias for large_string().
+
+    Examples
+    --------
+    Create an instance of large UTF8 variable-length binary type:
+
+    >>> import pyarrow as pa
+    >>> pa.large_utf8()
+    DataType(large_string)
+
+    and use the type to create an array:
+
+    >>> pa.array(['foo', 'bar'] * 50, type=pa.large_utf8())
+    <pyarrow.lib.LargeStringArray object at ...>
+    [
+      "foo",
+      "bar",
+      ...
+      "foo",
+      "bar"
+    ]
     """
     return large_string()
+
+
+def binary_view():
+    """
+    Create a variable-length binary view type.
+
+    Examples
+    --------
+    Create an instance of a string type:
+
+    >>> import pyarrow as pa
+    >>> pa.binary_view()
+    DataType(binary_view)
+    """
+    return primitive_type(_Type_BINARY_VIEW)
+
+
+def string_view():
+    """
+    Create UTF8 variable-length string view type.
+
+    Examples
+    --------
+    Create an instance of a string type:
+
+    >>> import pyarrow as pa
+    >>> pa.string_view()
+    DataType(string_view)
+    """
+    return primitive_type(_Type_STRING_VIEW)
 
 
 def list_(value_type, int list_size=-1):
@@ -2214,6 +5032,36 @@ def list_(value_type, int list_size=-1):
     Returns
     -------
     list_type : DataType
+
+    Examples
+    --------
+    Create an instance of ListType:
+
+    >>> import pyarrow as pa
+    >>> pa.list_(pa.string())
+    ListType(list<item: string>)
+    >>> pa.list_(pa.int32(), 2)
+    FixedSizeListType(fixed_size_list<item: int32>[2])
+
+    Use the ListType to create a scalar:
+
+    >>> pa.scalar(['foo', None], type=pa.list_(pa.string(), 2))
+    <pyarrow.FixedSizeListScalar: ['foo', None]>
+
+    or an array:
+
+    >>> pa.array([[1, 2], [3, 4]], pa.list_(pa.int32(), 2))
+    <pyarrow.lib.FixedSizeListArray object at ...>
+    [
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        4
+      ]
+    ]
     """
     cdef:
         Field _field
@@ -2251,6 +5099,29 @@ cpdef LargeListType large_list(value_type):
     Returns
     -------
     list_type : DataType
+
+    Examples
+    --------
+    Create an instance of LargeListType:
+
+    >>> import pyarrow as pa
+    >>> pa.large_list(pa.int8())
+    LargeListType(large_list<item: int8>)
+
+    Use the LargeListType to create an array:
+
+    >>> pa.array([[-1, 3]] * 5, type=pa.large_list(pa.int8()))
+    <pyarrow.lib.LargeListArray object at ...>
+    [
+      [
+        -1,
+        3
+      ],
+      [
+        -1,
+        3
+      ],
+    ...
     """
     cdef:
         DataType data_type
@@ -2270,27 +5141,152 @@ cpdef LargeListType large_list(value_type):
     return out
 
 
-cpdef MapType map_(key_type, item_type, keys_sorted=False):
+cpdef ListViewType list_view(value_type):
     """
-    Create MapType instance from key and item data types.
+    Create ListViewType instance from child data type or field.
+
+    This data type may not be supported by all Arrow implementations
+    because it is an alternative to the ListType.
 
     Parameters
     ----------
-    key_type : DataType
-    item_type : DataType
+    value_type : DataType or Field
+
+    Returns
+    -------
+    list_view_type : DataType
+
+    Examples
+    --------
+    Create an instance of ListViewType:
+
+    >>> import pyarrow as pa
+    >>> pa.list_view(pa.string())
+    ListViewType(list_view<item: string>)
+    """
+    cdef:
+        Field _field
+        shared_ptr[CDataType] list_view_type
+
+    if isinstance(value_type, DataType):
+        _field = field('item', value_type)
+    elif isinstance(value_type, Field):
+        _field = value_type
+    else:
+        raise TypeError('ListView requires DataType or Field')
+
+    list_view_type = CMakeListViewType(_field.sp_field)
+    return pyarrow_wrap_data_type(list_view_type)
+
+
+cpdef LargeListViewType large_list_view(value_type):
+    """
+    Create LargeListViewType instance from child data type or field.
+
+    This data type may not be supported by all Arrow implementations
+    because it is an alternative to the ListType.
+
+    Parameters
+    ----------
+    value_type : DataType or Field
+
+    Returns
+    -------
+    list_view_type : DataType
+
+    Examples
+    --------
+    Create an instance of LargeListViewType:
+
+    >>> import pyarrow as pa
+    >>> pa.large_list_view(pa.int8())
+    LargeListViewType(large_list_view<item: int8>)
+    """
+    cdef:
+        Field _field
+        shared_ptr[CDataType] list_view_type
+
+    if isinstance(value_type, DataType):
+        _field = field('item', value_type)
+    elif isinstance(value_type, Field):
+        _field = value_type
+    else:
+        raise TypeError('LargeListView requires DataType or Field')
+
+    list_view_type = CMakeLargeListViewType(_field.sp_field)
+    return pyarrow_wrap_data_type(list_view_type)
+
+
+cpdef MapType map_(key_type, item_type, keys_sorted=False):
+    """
+    Create MapType instance from key and item data types or fields.
+
+    Parameters
+    ----------
+    key_type : DataType or Field
+    item_type : DataType or Field
     keys_sorted : bool
 
     Returns
     -------
     map_type : DataType
+
+    Examples
+    --------
+    Create an instance of MapType:
+
+    >>> import pyarrow as pa
+    >>> pa.map_(pa.string(), pa.int32())
+    MapType(map<string, int32>)
+    >>> pa.map_(pa.string(), pa.int32(), keys_sorted=True)
+    MapType(map<string, int32, keys_sorted>)
+
+    Use MapType to create an array:
+
+    >>> data = [[{'key': 'a', 'value': 1}, {'key': 'b', 'value': 2}], [{'key': 'c', 'value': 3}]]
+    >>> pa.array(data, type=pa.map_(pa.string(), pa.int32(), keys_sorted=True))
+    <pyarrow.lib.MapArray object at ...>
+    [
+      keys:
+      [
+        "a",
+        "b"
+      ]
+      values:
+      [
+        1,
+        2
+      ],
+      keys:
+      [
+        "c"
+      ]
+      values:
+      [
+        3
+      ]
+    ]
     """
     cdef:
-        DataType _key_type = ensure_type(key_type, allow_none=False)
-        DataType _item_type = ensure_type(item_type, allow_none=False)
+        Field _key_field
+        Field _item_field
         shared_ptr[CDataType] map_type
         MapType out = MapType.__new__(MapType)
 
-    map_type.reset(new CMapType(_key_type.sp_type, _item_type.sp_type,
+    if isinstance(key_type, Field):
+        if key_type.nullable:
+            raise TypeError('Map key field should be non-nullable')
+        _key_field = key_type
+    else:
+        _key_field = field('key', ensure_type(key_type, allow_none=False),
+                           nullable=False)
+
+    if isinstance(item_type, Field):
+        _item_field = item_type
+    else:
+        _item_field = field('value', ensure_type(item_type, allow_none=False))
+
+    map_type.reset(new CMapType(_key_field.sp_field, _item_field.sp_field,
                                 keys_sorted))
     out.init(map_type)
     return out
@@ -2309,6 +5305,33 @@ cpdef DictionaryType dictionary(index_type, value_type, bint ordered=False):
     Returns
     -------
     type : DictionaryType
+
+    Examples
+    --------
+    Create an instance of dictionary type:
+
+    >>> import pyarrow as pa
+    >>> pa.dictionary(pa.int64(), pa.utf8())
+    DictionaryType(dictionary<values=string, indices=int64, ordered=0>)
+
+    Use dictionary type to create an array:
+
+    >>> pa.array(["a", "b", None, "d"], pa.dictionary(pa.int64(), pa.utf8()))
+    <pyarrow.lib.DictionaryArray object at ...>
+    ...
+    -- dictionary:
+      [
+        "a",
+        "b",
+        "d"
+      ]
+    -- indices:
+      [
+        0,
+        1,
+        null,
+        2
+      ]
     """
     cdef:
         DataType _index_type = ensure_type(index_type, allow_none=False)
@@ -2316,8 +5339,11 @@ cpdef DictionaryType dictionary(index_type, value_type, bint ordered=False):
         DictionaryType out = DictionaryType.__new__(DictionaryType)
         shared_ptr[CDataType] dict_type
 
-    if _index_type.id not in {Type_INT8, Type_INT16, Type_INT32, Type_INT64}:
-        raise TypeError("The dictionary index type should be signed integer.")
+    if _index_type.id not in {
+        Type_INT8, Type_INT16, Type_INT32, Type_INT64,
+        Type_UINT8, Type_UINT16, Type_UINT32, Type_UINT64,
+    }:
+        raise TypeError("The dictionary index type should be integer.")
 
     dict_type.reset(new CDictionaryType(_index_type.sp_type,
                                         _value_type.sp_type, ordered == 1))
@@ -2340,6 +5366,8 @@ def struct(fields):
 
     Examples
     --------
+    Create an instance of StructType from an iterable of tuples:
+
     >>> import pyarrow as pa
     >>> fields = [
     ...     ('f1', pa.int32()),
@@ -2348,6 +5376,16 @@ def struct(fields):
     >>> struct_type = pa.struct(fields)
     >>> struct_type
     StructType(struct<f1: int32, f2: string>)
+
+    Retrieve a field from a StructType:
+
+    >>> struct_type[0]
+    pyarrow.Field<f1: int32>
+    >>> struct_type['f1']
+    pyarrow.Field<f1: int32>
+
+    Create an instance of StructType from an iterable of Fields:
+
     >>> fields = [
     ...     pa.field('f1', pa.int32()),
     ...     pa.field('f2', pa.string(), nullable=False),
@@ -2364,7 +5402,7 @@ def struct(fields):
         vector[shared_ptr[CField]] c_fields
         cdef shared_ptr[CDataType] struct_type
 
-    if isinstance(fields, compat.Mapping):
+    if isinstance(fields, Mapping):
         fields = fields.items()
 
     for item in fields:
@@ -2378,33 +5416,120 @@ def struct(fields):
     return pyarrow_wrap_data_type(struct_type)
 
 
-def union(children_fields, mode, type_codes=None):
-    """
-    Create UnionType from children fields.
+cdef _extract_union_params(child_fields, type_codes,
+                           vector[shared_ptr[CField]]* c_fields,
+                           vector[int8_t]* c_type_codes):
+    cdef:
+        Field child_field
 
-    A union is defined by an ordered sequence of types; each slot in the union
-    can have a value chosen from these types.
+    for child_field in child_fields:
+        c_fields[0].push_back(child_field.sp_field)
+
+    if type_codes is not None:
+        if len(type_codes) != <Py_ssize_t>(c_fields.size()):
+            raise ValueError("type_codes should have the same length "
+                             "as fields")
+        for code in type_codes:
+            c_type_codes[0].push_back(code)
+    else:
+        c_type_codes[0] = range(c_fields.size())
+
+
+def sparse_union(child_fields, type_codes=None):
+    """
+    Create SparseUnionType from child fields.
+
+    A sparse union is a nested type where each logical value is taken from
+    a single child.  A buffer of 8-bit type ids indicates which child
+    a given logical value is to be taken from.
+
+    In a sparse union, each child array should have the same length as the
+    union array, regardless of the actual number of union values that
+    refer to it.
 
     Parameters
     ----------
-    fields : sequence of Field values
+    child_fields : sequence of Field values
         Each field must have a UTF8-encoded name, and these field names are
         part of the type metadata.
-    mode : str
-        Either 'dense' or 'sparse'.
     type_codes : list of integers, default None
 
     Returns
     -------
-    type : DataType
+    type : SparseUnionType
     """
     cdef:
-        Field child_field
         vector[shared_ptr[CField]] c_fields
         vector[int8_t] c_type_codes
-        shared_ptr[CDataType] union_type
-        int i
 
+    _extract_union_params(child_fields, type_codes,
+                          &c_fields, &c_type_codes)
+
+    return pyarrow_wrap_data_type(
+        CMakeSparseUnionType(move(c_fields), move(c_type_codes)))
+
+
+def dense_union(child_fields, type_codes=None):
+    """
+    Create DenseUnionType from child fields.
+
+    A dense union is a nested type where each logical value is taken from
+    a single child, at a specific offset.  A buffer of 8-bit type ids
+    indicates which child a given logical value is to be taken from,
+    and a buffer of 32-bit offsets indicates at which physical position
+    in the given child array the logical value is to be taken from.
+
+    Unlike a sparse union, a dense union allows encoding only the child array
+    values which are actually referred to by the union array.  This is
+    counterbalanced by the additional footprint of the offsets buffer, and
+    the additional indirection cost when looking up values.
+
+    Parameters
+    ----------
+    child_fields : sequence of Field values
+        Each field must have a UTF8-encoded name, and these field names are
+        part of the type metadata.
+    type_codes : list of integers, default None
+
+    Returns
+    -------
+    type : DenseUnionType
+    """
+    cdef:
+        vector[shared_ptr[CField]] c_fields
+        vector[int8_t] c_type_codes
+
+    _extract_union_params(child_fields, type_codes,
+                          &c_fields, &c_type_codes)
+
+    return pyarrow_wrap_data_type(
+        CMakeDenseUnionType(move(c_fields), move(c_type_codes)))
+
+
+def union(child_fields, mode, type_codes=None):
+    """
+    Create UnionType from child fields.
+
+    A union is a nested type where each logical value is taken from a
+    single child.  A buffer of 8-bit type ids indicates which child
+    a given logical value is to be taken from.
+
+    Unions come in two flavors: sparse and dense
+    (see also `pyarrow.sparse_union` and `pyarrow.dense_union`).
+
+    Parameters
+    ----------
+    child_fields : sequence of Field values
+        Each field must have a UTF8-encoded name, and these field names are
+        part of the type metadata.
+    mode : str
+        Must be 'sparse' or 'dense'
+    type_codes : list of integers, default None
+
+    Returns
+    -------
+    type : UnionType
+    """
     if isinstance(mode, int):
         if mode not in (_UnionMode_SPARSE, _UnionMode_DENSE):
             raise ValueError("Invalid union mode {0!r}".format(mode))
@@ -2416,26 +5541,291 @@ def union(children_fields, mode, type_codes=None):
         else:
             raise ValueError("Invalid union mode {0!r}".format(mode))
 
-    for child_field in children_fields:
-        c_fields.push_back(child_field.sp_field)
-
-    if type_codes is not None:
-        if len(type_codes) != <Py_ssize_t>(c_fields.size()):
-            raise ValueError("type_codes should have the same length "
-                             "as fields")
-        for code in type_codes:
-            c_type_codes.push_back(code)
+    if mode == _UnionMode_SPARSE:
+        return sparse_union(child_fields, type_codes)
     else:
-        c_type_codes = range(c_fields.size())
+        return dense_union(child_fields, type_codes)
 
-    if mode == UnionMode_SPARSE:
-        union_type.reset(new CUnionType(c_fields, c_type_codes,
-                                        _UnionMode_SPARSE))
-    else:
-        union_type.reset(new CUnionType(c_fields, c_type_codes,
-                                        _UnionMode_DENSE))
 
-    return pyarrow_wrap_data_type(union_type)
+def run_end_encoded(run_end_type, value_type):
+    """
+    Create RunEndEncodedType from run-end and value types.
+
+    Parameters
+    ----------
+    run_end_type : pyarrow.DataType
+        The integer type of the run_ends array. Must be 'int16', 'int32', or 'int64'.
+    value_type : pyarrow.DataType
+        The type of the values array.
+
+    Returns
+    -------
+    type : RunEndEncodedType
+    """
+    cdef:
+        DataType _run_end_type = ensure_type(run_end_type, allow_none=False)
+        DataType _value_type = ensure_type(value_type, allow_none=False)
+        shared_ptr[CDataType] ree_type
+
+    if not _run_end_type.type.id() in [_Type_INT16, _Type_INT32, _Type_INT64]:
+        raise ValueError("The run_end_type should be 'int16', 'int32', or 'int64'")
+    ree_type = CMakeRunEndEncodedType(_run_end_type.sp_type, _value_type.sp_type)
+    return pyarrow_wrap_data_type(ree_type)
+
+
+def json_(DataType storage_type=utf8()):
+    """
+    Create instance of JSON extension type.
+
+    Parameters
+    ----------
+    storage_type : DataType, default pyarrow.string()
+        The underlying data type. Can be on of the following types:
+        string, large_string, string_view.
+
+    Returns
+    -------
+    type : JsonType
+
+    Examples
+    --------
+    Create an instance of JSON extension type:
+
+    >>> import pyarrow as pa
+    >>> pa.json_(pa.utf8())
+    JsonType(extension<arrow.json>)
+
+    Use the JSON type to create an array:
+
+    >>> pa.array(['{"a": 1}', '{"b": 2}'], type=pa.json_(pa.utf8()))
+    <pyarrow.lib.JsonArray object at ...>
+    [
+      "{"a": 1}",
+      "{"b": 2}"
+    ]
+    """
+
+    cdef JsonType out = JsonType.__new__(JsonType)
+    c_json_ext_type = GetResultValue(CJsonType.Make(storage_type.sp_type))
+    out.init(c_json_ext_type)
+    return out
+
+
+def uuid():
+    """
+    Create UuidType instance.
+
+    Returns
+    -------
+    type : UuidType
+    """
+
+    cdef UuidType out = UuidType.__new__(UuidType)
+    c_uuid_ext_type = GetResultValue(CUuidType.Make())
+    out.init(c_uuid_ext_type)
+    return out
+
+
+def fixed_shape_tensor(DataType value_type, shape, dim_names=None, permutation=None):
+    """
+    Create instance of fixed shape tensor extension type with shape and optional
+    names of tensor dimensions and indices of the desired logical
+    ordering of dimensions.
+
+    Parameters
+    ----------
+    value_type : DataType
+        Data type of individual tensor elements.
+    shape : tuple or list of integers
+        The physical shape of the contained tensors.
+    dim_names : tuple or list of strings, default None
+        Explicit names to tensor dimensions.
+    permutation : tuple or list integers, default None
+        Indices of the desired ordering of the original dimensions.
+        The indices contain a permutation of the values ``[0, 1, .., N-1]`` where
+        N is the number of dimensions. The permutation indicates which dimension
+        of the logical layout corresponds to which dimension of the physical tensor.
+        For more information on this parameter see
+        :ref:`fixed_shape_tensor_extension`.
+
+    Examples
+    --------
+    Create an instance of fixed shape tensor extension type:
+
+    >>> import pyarrow as pa
+    >>> tensor_type = pa.fixed_shape_tensor(pa.int32(), [2, 2])
+    >>> tensor_type
+    FixedShapeTensorType(extension<arrow.fixed_shape_tensor[value_type=int32, shape=[2,2]]>)
+
+    Inspect the data type:
+
+    >>> tensor_type.value_type
+    DataType(int32)
+    >>> tensor_type.shape
+    [2, 2]
+
+    Create a table with fixed shape tensor extension array:
+
+    >>> arr = [[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]]
+    >>> storage = pa.array(arr, pa.list_(pa.int32(), 4))
+    >>> tensor = pa.ExtensionArray.from_storage(tensor_type, storage)
+    >>> pa.table([tensor], names=["tensor_array"])
+    pyarrow.Table
+    tensor_array: extension<arrow.fixed_shape_tensor[value_type=int32, shape=[2,2]]>
+    ----
+    tensor_array: [[[1,2,3,4],[10,20,30,40],[100,200,300,400]]]
+
+    Create an instance of fixed shape tensor extension type with names
+    of tensor dimensions:
+
+    >>> tensor_type = pa.fixed_shape_tensor(pa.int8(), (2, 2, 3),
+    ...                                     dim_names=['C', 'H', 'W'])
+    >>> tensor_type.dim_names
+    ['C', 'H', 'W']
+
+    Create an instance of fixed shape tensor extension type with
+    permutation:
+
+    >>> tensor_type = pa.fixed_shape_tensor(pa.int8(), (2, 2, 3),
+    ...                                     permutation=[0, 2, 1])
+    >>> tensor_type.permutation
+    [0, 2, 1]
+
+    Returns
+    -------
+    type : FixedShapeTensorType
+    """
+
+    cdef:
+        vector[int64_t] c_shape
+        vector[int64_t] c_permutation
+        vector[c_string] c_dim_names
+        shared_ptr[CDataType] c_tensor_ext_type
+
+    assert value_type is not None
+    assert shape is not None
+
+    for i in shape:
+        c_shape.push_back(i)
+
+    if permutation is not None:
+        for i in permutation:
+            c_permutation.push_back(i)
+
+    if dim_names is not None:
+        for x in dim_names:
+            c_dim_names.push_back(tobytes(x))
+
+    cdef FixedShapeTensorType out = FixedShapeTensorType.__new__(FixedShapeTensorType)
+
+    with nogil:
+        c_tensor_ext_type = GetResultValue(CFixedShapeTensorType.Make(
+            value_type.sp_type, c_shape, c_permutation, c_dim_names))
+
+    out.init(c_tensor_ext_type)
+
+    return out
+
+
+def bool8():
+    """
+    Create instance of bool8 extension type.
+
+    Examples
+    --------
+    Create an instance of bool8 extension type:
+
+    >>> import pyarrow as pa
+    >>> type = pa.bool8()
+    >>> type
+    Bool8Type(extension<arrow.bool8>)
+
+    Inspect the data type:
+
+    >>> type.storage_type
+    DataType(int8)
+
+    Create a table with a bool8 array:
+
+    >>> arr = [-1, 0, 1, 2, None]
+    >>> storage = pa.array(arr, pa.int8())
+    >>> other = pa.ExtensionArray.from_storage(type, storage)
+    >>> pa.table([other], names=["unknown_col"])
+    pyarrow.Table
+    unknown_col: extension<arrow.bool8>
+    ----
+    unknown_col: [[-1,0,1,2,null]]
+
+    Returns
+    -------
+    type : Bool8Type
+    """
+
+    cdef Bool8Type out = Bool8Type.__new__(Bool8Type)
+
+    c_type = GetResultValue(CBool8Type.Make())
+
+    out.init(c_type)
+
+    return out
+
+
+def opaque(DataType storage_type, str type_name not None, str vendor_name not None):
+    """
+    Create instance of opaque extension type.
+
+    Parameters
+    ----------
+    storage_type : DataType
+        The underlying data type.
+    type_name : str
+        The name of the type in the external system.
+    vendor_name : str
+        The name of the external system.
+
+    Examples
+    --------
+    Create an instance of an opaque extension type:
+
+    >>> import pyarrow as pa
+    >>> type = pa.opaque(pa.binary(), "other", "jdbc")
+    >>> type
+    OpaqueType(extension<arrow.opaque[storage_type=binary, type_name=other, vendor_name=jdbc]>)
+
+    Inspect the data type:
+
+    >>> type.storage_type
+    DataType(binary)
+    >>> type.type_name
+    'other'
+    >>> type.vendor_name
+    'jdbc'
+
+    Create a table with an opaque array:
+
+    >>> arr = [None, b"foobar"]
+    >>> storage = pa.array(arr, pa.binary())
+    >>> other = pa.ExtensionArray.from_storage(type, storage)
+    >>> pa.table([other], names=["unknown_col"])
+    pyarrow.Table
+    unknown_col: extension<arrow.opaque[storage_type=binary, type_name=other, vendor_name=jdbc]>
+    ----
+    unknown_col: [[null,666F6F626172]]
+
+    Returns
+    -------
+    type : OpaqueType
+    """
+
+    cdef:
+        c_string c_type_name = tobytes(type_name)
+        c_string c_vendor_name = tobytes(vendor_name)
+        shared_ptr[COpaqueType] c_opaque_type = make_shared[COpaqueType](
+            storage_type.sp_type, c_type_name, c_vendor_name)
+        shared_ptr[CDataType] c_type = static_pointer_cast[CDataType, COpaqueType](c_opaque_type)
+        OpaqueType out = OpaqueType.__new__(OpaqueType)
+    out.init(c_type)
+    return out
 
 
 cdef dict _type_aliases = {
@@ -2475,6 +5865,8 @@ cdef dict _type_aliases = {
     'large_str': large_string,
     'large_utf8': large_string,
     'large_binary': large_binary,
+    'binary_view': binary_view,
+    'string_view': string_view,
     'date32': date32,
     'date64': date64,
     'date32[day]': date32,
@@ -2491,12 +5883,18 @@ cdef dict _type_aliases = {
     'duration[ms]': duration('ms'),
     'duration[us]': duration('us'),
     'duration[ns]': duration('ns'),
+    'month_day_nano_interval': month_day_nano_interval(),
 }
 
 
 def type_for_alias(name):
     """
     Return DataType given a string alias if one exists.
+
+    Parameters
+    ----------
+    name : str
+        The alias of the DataType that should be retrieved.
 
     Returns
     -------
@@ -2530,22 +5928,50 @@ def schema(fields, metadata=None):
 
     Parameters
     ----------
-    field : iterable of Fields or tuples, or mapping of strings to DataTypes
+    fields : iterable of Fields or tuples, or mapping of strings to DataTypes
+        Can also pass an object that implements the Arrow PyCapsule Protocol
+        for schemas (has an ``__arrow_c_schema__`` method).
     metadata : dict, default None
         Keys and values must be coercible to bytes.
 
     Examples
     --------
+    Create a Schema from iterable of tuples:
+
     >>> import pyarrow as pa
     >>> pa.schema([
     ...     ('some_int', pa.int32()),
-    ...     ('some_string', pa.string())
+    ...     ('some_string', pa.string()),
+    ...     pa.field('some_required_string', pa.string(), nullable=False)
     ... ])
     some_int: int32
     some_string: string
+    some_required_string: string not null
+
+    Create a Schema from iterable of Fields:
+
     >>> pa.schema([
     ...     pa.field('some_int', pa.int32()),
     ...     pa.field('some_string', pa.string())
+    ... ])
+    some_int: int32
+    some_string: string
+
+    DataTypes can also be passed as strings. The following is equivalent to the
+    above example:
+
+    >>> pa.schema([
+    ...     pa.field('some_int', "int32"),
+    ...     pa.field('some_string', "string")
+    ... ])
+    some_int: int32
+    some_string: string
+
+    Or more concisely:
+
+    >>> pa.schema([
+    ...     ('some_int', "int32"),
+    ...     ('some_string', "string")
     ... ])
     some_int: int32
     some_string: string
@@ -2561,7 +5987,13 @@ def schema(fields, metadata=None):
         Field py_field
         vector[shared_ptr[CField]] c_fields
 
-    if isinstance(fields, compat.Mapping):
+    if hasattr(fields, "__arrow_c_schema__"):
+        result = Schema._import_from_c_capsule(fields.__arrow_c_schema__())
+        if metadata is not None:
+            result = result.with_metadata(metadata)
+        return result
+
+    if isinstance(fields, Mapping):
         fields = fields.items()
 
     for item in fields:
@@ -2586,28 +6018,68 @@ def schema(fields, metadata=None):
 def from_numpy_dtype(object dtype):
     """
     Convert NumPy dtype to pyarrow.DataType.
-    """
-    cdef shared_ptr[CDataType] c_type
-    dtype = np.dtype(dtype)
-    with nogil:
-        check_status(NumPyDtypeToArrow(dtype, &c_type))
 
-    return pyarrow_wrap_data_type(c_type)
+    Parameters
+    ----------
+    dtype : the numpy dtype to convert
+
+
+    Examples
+    --------
+    Create a pyarrow DataType from NumPy dtype:
+
+    >>> import pyarrow as pa
+    >>> import numpy as np
+    >>> pa.from_numpy_dtype(np.dtype('float16'))
+    DataType(halffloat)
+    >>> pa.from_numpy_dtype('U')
+    DataType(string)
+    >>> pa.from_numpy_dtype(bool)
+    DataType(bool)
+    >>> pa.from_numpy_dtype(np.str_)
+    DataType(string)
+    """
+    dtype = np.dtype(dtype)
+    return pyarrow_wrap_data_type(GetResultValue(NumPyDtypeToArrow(dtype)))
 
 
 def is_boolean_value(object obj):
+    """
+    Check if the object is a boolean.
+
+    Parameters
+    ----------
+    obj : object
+        The object to check
+    """
     return IsPyBool(obj)
 
 
 def is_integer_value(object obj):
+    """
+    Check if the object is an integer.
+
+    Parameters
+    ----------
+    obj : object
+        The object to check
+    """
     return IsPyInt(obj)
 
 
 def is_float_value(object obj):
+    """
+    Check if the object is a float.
+
+    Parameters
+    ----------
+    obj : object
+        The object to check
+    """
     return IsPyFloat(obj)
 
 
-cdef class _ExtensionRegistryNanny:
+cdef class _ExtensionRegistryNanny(_Weakrefable):
     # Keep the registry alive until we have unregistered PyExtensionType
     cdef:
         shared_ptr[CExtensionTypeRegistry] registry
@@ -2653,3 +6125,82 @@ def _unregister_py_extension_types():
 
 _register_py_extension_type()
 atexit.register(_unregister_py_extension_types)
+
+
+#
+# PyCapsule export utilities
+#
+
+cdef void pycapsule_schema_deleter(object schema_capsule) noexcept:
+    cdef ArrowSchema* schema = <ArrowSchema*>PyCapsule_GetPointer(
+        schema_capsule, 'arrow_schema'
+    )
+    if schema.release != NULL:
+        schema.release(schema)
+
+    free(schema)
+
+cdef object alloc_c_schema(ArrowSchema** c_schema):
+    c_schema[0] = <ArrowSchema*> malloc(sizeof(ArrowSchema))
+    # Ensure the capsule destructor doesn't call a random release pointer
+    c_schema[0].release = NULL
+    return PyCapsule_New(c_schema[0], 'arrow_schema', &pycapsule_schema_deleter)
+
+
+cdef void pycapsule_array_deleter(object array_capsule) noexcept:
+    cdef:
+        ArrowArray* array
+    # Do not invoke the deleter on a used/moved capsule
+    array = <ArrowArray*>cpython.PyCapsule_GetPointer(
+        array_capsule, 'arrow_array'
+    )
+    if array.release != NULL:
+        array.release(array)
+
+    free(array)
+
+cdef object alloc_c_array(ArrowArray** c_array):
+    c_array[0] = <ArrowArray*> malloc(sizeof(ArrowArray))
+    # Ensure the capsule destructor doesn't call a random release pointer
+    c_array[0].release = NULL
+    return PyCapsule_New(c_array[0], 'arrow_array', &pycapsule_array_deleter)
+
+
+cdef void pycapsule_stream_deleter(object stream_capsule) noexcept:
+    cdef:
+        ArrowArrayStream* stream
+    # Do not invoke the deleter on a used/moved capsule
+    stream = <ArrowArrayStream*>PyCapsule_GetPointer(
+        stream_capsule, 'arrow_array_stream'
+    )
+    if stream.release != NULL:
+        stream.release(stream)
+
+    free(stream)
+
+cdef object alloc_c_stream(ArrowArrayStream** c_stream):
+    c_stream[0] = <ArrowArrayStream*> malloc(sizeof(ArrowArrayStream))
+    # Ensure the capsule destructor doesn't call a random release pointer
+    c_stream[0].release = NULL
+    return PyCapsule_New(c_stream[0], 'arrow_array_stream', &pycapsule_stream_deleter)
+
+
+cdef void pycapsule_device_array_deleter(object array_capsule) noexcept:
+    cdef:
+        ArrowDeviceArray* device_array
+    # Do not invoke the deleter on a used/moved capsule
+    device_array = <ArrowDeviceArray*>cpython.PyCapsule_GetPointer(
+        array_capsule, 'arrow_device_array'
+    )
+    if device_array.array.release != NULL:
+        device_array.array.release(&device_array.array)
+
+    free(device_array)
+
+
+cdef object alloc_c_device_array(ArrowDeviceArray** c_array):
+    c_array[0] = <ArrowDeviceArray*> malloc(sizeof(ArrowDeviceArray))
+    # Ensure the capsule destructor doesn't call a random release pointer
+    c_array[0].array.release = NULL
+    return PyCapsule_New(
+        c_array[0], 'arrow_device_array', &pycapsule_device_array_deleter)

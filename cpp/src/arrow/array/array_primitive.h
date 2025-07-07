@@ -25,6 +25,7 @@
 
 #include "arrow/array/array_base.h"
 #include "arrow/array/data.h"
+#include "arrow/stl_iterator.h"
 #include "arrow/type.h"
 #include "arrow/type_fwd.h"  // IWYU pragma: export
 #include "arrow/type_traits.h"
@@ -34,42 +35,11 @@
 
 namespace arrow {
 
-/// Concrete Array class for numeric data.
-template <typename TYPE>
-class NumericArray : public PrimitiveArray {
- public:
-  using TypeClass = TYPE;
-  using value_type = typename TypeClass::c_type;
-
-  explicit NumericArray(const std::shared_ptr<ArrayData>& data) : PrimitiveArray(data) {}
-
-  // Only enable this constructor without a type argument for types without additional
-  // metadata
-  template <typename T1 = TYPE>
-  NumericArray(enable_if_parameter_free<T1, int64_t> length,
-               const std::shared_ptr<Buffer>& data,
-               const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
-               int64_t null_count = kUnknownNullCount, int64_t offset = 0)
-      : PrimitiveArray(TypeTraits<T1>::type_singleton(), length, data, null_bitmap,
-                       null_count, offset) {}
-
-  const value_type* raw_values() const {
-    return reinterpret_cast<const value_type*>(raw_values_) + data_->offset;
-  }
-
-  value_type Value(int64_t i) const { return raw_values()[i]; }
-
-  // For API compatibility with BinaryArray etc.
-  value_type GetView(int64_t i) const { return Value(i); }
-
- protected:
-  using PrimitiveArray::PrimitiveArray;
-};
-
 /// Concrete Array class for boolean data
 class ARROW_EXPORT BooleanArray : public PrimitiveArray {
  public:
   using TypeClass = BooleanType;
+  using IteratorType = stl::ArrayIterator<BooleanArray>;
 
   explicit BooleanArray(const std::shared_ptr<ArrayData>& data);
 
@@ -78,14 +48,97 @@ class ARROW_EXPORT BooleanArray : public PrimitiveArray {
                int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 
   bool Value(int64_t i) const {
-    return BitUtil::GetBit(reinterpret_cast<const uint8_t*>(raw_values_),
-                           i + data_->offset);
+    return bit_util::GetBit(reinterpret_cast<const uint8_t*>(raw_values_),
+                            i + data_->offset);
   }
 
   bool GetView(int64_t i) const { return Value(i); }
 
+  std::optional<bool> operator[](int64_t i) const { return *IteratorType(*this, i); }
+
+  /// \brief Return the number of false (0) values among the valid
+  /// values. Result is not cached.
+  int64_t false_count() const;
+
+  /// \brief Return the number of true (1) values among the valid
+  /// values. Result is not cached.
+  int64_t true_count() const;
+
+  IteratorType begin() const { return IteratorType(*this); }
+
+  IteratorType end() const { return IteratorType(*this, length()); }
+
  protected:
   using PrimitiveArray::PrimitiveArray;
+};
+
+/// \addtogroup numeric-arrays
+///
+/// @{
+
+/// \brief Concrete Array class for numeric data with a corresponding C type
+///
+/// This class is templated on the corresponding DataType subclass for the
+/// given data, for example NumericArray<Int8Type> or NumericArray<Date32Type>.
+///
+/// Note that convenience aliases are available for all accepted types
+/// (for example Int8Array for NumericArray<Int8Type>).
+template <typename TYPE>
+class NumericArray : public PrimitiveArray {
+ public:
+  using TypeClass = TYPE;
+  using value_type = typename TypeClass::c_type;
+  using IteratorType = stl::ArrayIterator<NumericArray<TYPE>>;
+
+  explicit NumericArray(const std::shared_ptr<ArrayData>& data) {
+    NumericArray::SetData(data);
+  }
+
+  // Only enable this constructor without a type argument for types without additional
+  // metadata
+  template <typename T1 = TYPE>
+  NumericArray(enable_if_parameter_free<T1, int64_t> length,
+               const std::shared_ptr<Buffer>& data,
+               const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+               int64_t null_count = kUnknownNullCount, int64_t offset = 0) {
+    NumericArray::SetData(ArrayData::Make(TypeTraits<T1>::type_singleton(), length,
+                                          {null_bitmap, data}, null_count, offset));
+  }
+
+  NumericArray(std::shared_ptr<DataType> type, int64_t length,
+               const std::shared_ptr<Buffer>& data,
+               const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+               int64_t null_count = kUnknownNullCount, int64_t offset = 0) {
+    NumericArray::SetData(ArrayData::Make(std::move(type), length, {null_bitmap, data},
+                                          null_count, offset));
+  }
+
+  const value_type* raw_values() const { return values_; }
+
+  value_type Value(int64_t i) const { return values_[i]; }
+
+  // For API compatibility with BinaryArray etc.
+  value_type GetView(int64_t i) const { return values_[i]; }
+
+  std::optional<value_type> operator[](int64_t i) const {
+    return *IteratorType(*this, i);
+  }
+
+  IteratorType begin() const { return IteratorType(*this); }
+
+  IteratorType end() const { return IteratorType(*this, length()); }
+
+ protected:
+  NumericArray() : values_(NULLPTR) {}
+
+  void SetData(const std::shared_ptr<ArrayData>& data) {
+    this->PrimitiveArray::SetData(data);
+    values_ = raw_values_
+                  ? (reinterpret_cast<const value_type*>(raw_values_) + data_->offset)
+                  : NULLPTR;
+  }
+
+  const value_type* values_;
 };
 
 /// DayTimeArray
@@ -94,11 +147,16 @@ class ARROW_EXPORT BooleanArray : public PrimitiveArray {
 class ARROW_EXPORT DayTimeIntervalArray : public PrimitiveArray {
  public:
   using TypeClass = DayTimeIntervalType;
+  using IteratorType = stl::ArrayIterator<DayTimeIntervalArray>;
 
   explicit DayTimeIntervalArray(const std::shared_ptr<ArrayData>& data);
 
   DayTimeIntervalArray(const std::shared_ptr<DataType>& type, int64_t length,
                        const std::shared_ptr<Buffer>& data,
+                       const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+                       int64_t null_count = kUnknownNullCount, int64_t offset = 0);
+
+  DayTimeIntervalArray(int64_t length, const std::shared_ptr<Buffer>& data,
                        const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
                        int64_t null_count = kUnknownNullCount, int64_t offset = 0);
 
@@ -108,14 +166,55 @@ class ARROW_EXPORT DayTimeIntervalArray : public PrimitiveArray {
   // For compatibility with Take kernel.
   TypeClass::DayMilliseconds GetView(int64_t i) const { return GetValue(i); }
 
+  IteratorType begin() const { return IteratorType(*this); }
+
+  IteratorType end() const { return IteratorType(*this, length()); }
+
+  std::optional<TypeClass::DayMilliseconds> operator[](int64_t i) const {
+    return *IteratorType(*this, i);
+  }
+
   int32_t byte_width() const { return sizeof(TypeClass::DayMilliseconds); }
 
   const uint8_t* raw_values() const { return raw_values_ + data_->offset * byte_width(); }
-
- protected:
-  inline void SetData(const std::shared_ptr<ArrayData>& data) {
-    this->PrimitiveArray::SetData(data);
-  }
 };
+
+/// \brief Array of Month, Day and nanosecond values.
+class ARROW_EXPORT MonthDayNanoIntervalArray : public PrimitiveArray {
+ public:
+  using TypeClass = MonthDayNanoIntervalType;
+  using IteratorType = stl::ArrayIterator<MonthDayNanoIntervalArray>;
+
+  explicit MonthDayNanoIntervalArray(const std::shared_ptr<ArrayData>& data);
+
+  MonthDayNanoIntervalArray(const std::shared_ptr<DataType>& type, int64_t length,
+                            const std::shared_ptr<Buffer>& data,
+                            const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+                            int64_t null_count = kUnknownNullCount, int64_t offset = 0);
+
+  MonthDayNanoIntervalArray(int64_t length, const std::shared_ptr<Buffer>& data,
+                            const std::shared_ptr<Buffer>& null_bitmap = NULLPTR,
+                            int64_t null_count = kUnknownNullCount, int64_t offset = 0);
+
+  TypeClass::MonthDayNanos GetValue(int64_t i) const;
+  TypeClass::MonthDayNanos Value(int64_t i) const { return GetValue(i); }
+
+  // For compatibility with Take kernel.
+  TypeClass::MonthDayNanos GetView(int64_t i) const { return GetValue(i); }
+
+  IteratorType begin() const { return IteratorType(*this); }
+
+  IteratorType end() const { return IteratorType(*this, length()); }
+
+  std::optional<TypeClass::MonthDayNanos> operator[](int64_t i) const {
+    return *IteratorType(*this, i);
+  }
+
+  int32_t byte_width() const { return sizeof(TypeClass::MonthDayNanos); }
+
+  const uint8_t* raw_values() const { return raw_values_ + data_->offset * byte_width(); }
+};
+
+/// @}
 
 }  // namespace arrow

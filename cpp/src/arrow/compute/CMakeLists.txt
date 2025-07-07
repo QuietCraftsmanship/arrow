@@ -15,19 +15,52 @@
 # specific language governing permissions and limitations
 # under the License.
 
-add_custom_target(arrow_compute)
+add_custom_target(arrow-compute-tests)
 
 arrow_install_all_headers("arrow/compute")
 
-# pkg-config support
-arrow_add_pkg_config("arrow-compute")
+if(ARROW_COMPUTE)
+  # pkg-config support
+  arrow_add_pkg_config("arrow-compute")
+endif()
 
 #
 # Unit tests
 #
 
+# Define arrow_compute_testing object library for common test files
+if(ARROW_TESTING)
+  add_library(arrow_compute_testing OBJECT test_util_internal.cc)
+  # Even though this is still just an object library we still need to "link" our
+  # dependencies so that include paths are configured correctly
+  target_link_libraries(arrow_compute_testing PUBLIC ${ARROW_GTEST_GMOCK})
+endif()
+
+set(ARROW_COMPUTE_TEST_PREFIX "arrow-compute")
+set(ARROW_COMPUTE_TEST_LABELS "arrow-compute-tests")
+set(ARROW_COMPUTE_TEST_ARGS PREFIX ${ARROW_COMPUTE_TEST_PREFIX} LABELS
+                            ${ARROW_COMPUTE_TEST_LABELS})
+
+# This will only add the test if ARROW_COMPUTE is enabled, meaning the full kernel registry is available.
+#
+# The following kernels are always present in default builds:
+#  - array_filter
+#  - array_take
+#  - cast
+#  - dictionary_encode
+#  - drop_null
+#  - filter
+#  - indices_nonzero
+#  - take
+#  - unique
+#  - value_counts
+#
+# Also see: GH-34388, GH-34615
 function(ADD_ARROW_COMPUTE_TEST REL_TEST_NAME)
-  set(options)
+  if(NOT ARROW_COMPUTE)
+    return()
+  endif()
+
   set(one_value_args PREFIX)
   set(multi_value_args LABELS)
   cmake_parse_arguments(ARG
@@ -39,18 +72,16 @@ function(ADD_ARROW_COMPUTE_TEST REL_TEST_NAME)
   if(ARG_PREFIX)
     set(PREFIX ${ARG_PREFIX})
   else()
-    set(PREFIX "arrow-compute")
+    set(PREFIX ${ARROW_COMPUTE_TEST_PREFIX})
   endif()
 
   if(ARG_LABELS)
     set(LABELS ${ARG_LABELS})
   else()
-    set(LABELS "arrow_compute")
+    set(LABELS ${ARROW_COMPUTE_TEST_LABELS})
   endif()
 
   add_arrow_test(${REL_TEST_NAME}
-                 EXTRA_LINK_LIBS
-                 ${ARROW_DATASET_TEST_LINK_LIBS}
                  PREFIX
                  ${PREFIX}
                  LABELS
@@ -58,11 +89,36 @@ function(ADD_ARROW_COMPUTE_TEST REL_TEST_NAME)
                  ${ARG_UNPARSED_ARGUMENTS})
 endfunction()
 
-add_arrow_compute_test(internals_test
+add_arrow_test(internals_test
+               ${ARROW_COMPUTE_TEST_ARGS}
+               SOURCES
+               function_test.cc
+               exec_test.cc
+               kernel_test.cc
+               registry_test.cc
+               EXTRA_LINK_LIBS
+               arrow_compute_testing)
+
+add_arrow_compute_test(expression_test
                        SOURCES
-                       function_test.cc
-                       exec_test.cc
-                       kernel_test.cc
-                       registry_test.cc)
+                       expression_test.cc
+                       EXTRA_LINK_LIBS
+                       arrow_compute_testing)
+
+add_arrow_compute_test(row_test
+                       SOURCES
+                       key_hash_test.cc
+                       light_array_test.cc
+                       row/compare_test.cc
+                       row/grouper_test.cc
+                       row/row_encoder_internal_test.cc
+                       row/row_test.cc
+                       util_internal_test.cc
+                       EXTRA_LINK_LIBS
+                       arrow_compute_testing)
+
+add_arrow_benchmark(function_benchmark PREFIX "arrow-compute")
 
 add_subdirectory(kernels)
+
+add_subdirectory(row)

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import fnmatch
 import gzip
 import os
 from pathlib import Path
@@ -22,14 +23,19 @@ from pathlib import Path
 import click
 
 from .command import Bash, Command, default_bin
+from ..compat import _get_module
 from .cmake import CMake
 from .git import git
 from .logger import logger
 from ..lang.cpp import CppCMakeDefinition, CppConfiguration
-from ..lang.rust import Cargo
-from ..lang.python import Autopep8, Flake8, NumpyDoc
+from ..lang.python import Autopep8, Flake8, CythonLint, NumpyDoc, PythonCommand
 from .rat import Rat, exclusion_from_globs
 from .tmpdir import tmpdir
+
+
+_archery_install_msg = (
+    "Please install archery using: `pip install -e dev/archery[lint]`. "
+)
 
 
 class LintValidationException(Exception):
@@ -91,20 +97,78 @@ def cpp_linter(src, build_dir, clang_format=True, cpplint=True,
 
 
 class CMakeFormat(Command):
-    def __init__(self, cmake_format_bin):
-        self.bin = cmake_format_bin
+
+    def __init__(self, paths, cmake_format_bin=None):
+        self.check_version()
+        self.bin = default_bin(cmake_format_bin, "cmake-format")
+        self.paths = paths
+
+    @classmethod
+    def from_patterns(cls, base_path, include_patterns, exclude_patterns):
+        paths = {
+            str(path.as_posix())
+            for pattern in include_patterns
+            for path in base_path.glob(pattern)
+        }
+        for pattern in exclude_patterns:
+            pattern = (base_path / pattern).as_posix()
+            paths -= set(fnmatch.filter(paths, str(pattern)))
+        return cls(paths)
+
+    @staticmethod
+    def check_version():
+        try:
+            # cmake_format is part of the cmakelang package
+            import cmakelang
+        except ImportError:
+            raise ImportError(
+
+            )
+        # pin a specific version of cmake_format, must be updated in setup.py
+        if cmakelang.__version__ != "0.6.13":
+            raise LintValidationException(
+                f"Wrong version of cmake_format is detected. "
+                f"{_archery_install_msg}"
+            )
+
+    def check(self):
+        return self.run("-l", "error", "--check", *self.paths, check=False)
+
+    def fix(self):
+        return self.run("--in-place", *self.paths, check=False)
 
 
 def cmake_linter(src, fix=False):
-    """ Run cmake-format.py on all CMakeFiles.txt """
+    """
+    Run cmake-format on all CMakeFiles.txt
+    """
     logger.info("Running cmake-format linters")
 
-    if not fix:
-        logger.warn("run-cmake-format modifies files, regardless of --fix")
+    cmake_format = CMakeFormat.from_patterns(
+        src.path,
+        include_patterns=[
+            'ci/**/*.cmake',
+            'cpp/CMakeLists.txt',
+            'cpp/src/**/*.cmake',
+            'cpp/src/**/*.cmake.in',
+            'cpp/src/**/CMakeLists.txt',
+            'cpp/examples/**/CMakeLists.txt',
+            'cpp/cmake_modules/*.cmake',
+            'go/**/CMakeLists.txt',
+            'java/**/CMakeLists.txt',
+            'matlab/**/CMakeLists.txt',
+            'python/**/CMakeLists.txt',
+        ],
+        exclude_patterns=[
+            'cpp/cmake_modules/FindNumPy.cmake',
+            'cpp/cmake_modules/FindPythonLibsNew.cmake',
+            'cpp/cmake_modules/UseCython.cmake',
+            'cpp/src/arrow/util/*.h.cmake',
+        ]
+    )
+    method = cmake_format.fix if fix else cmake_format.check
 
-    arrow_cmake_format = os.path.join(src.path, "run-cmake-format.py")
-    cmake_format = CMakeFormat(cmake_format_bin=arrow_cmake_format)
-    yield LintResult.from_cmd(cmake_format("--check"))
+    yield LintResult.from_cmd(method())
 
 
 def python_linter(src, fix=False):
@@ -119,17 +183,19 @@ def python_linter(src, fix=False):
     if not autopep8.available:
         logger.error(
             "Python formatter requested but autopep8 binary not found. "
-            "Please run `pip install -r dev/archery/requirements-lint.txt`")
+            f"{_archery_install_msg}")
         return
 
     # Gather files for autopep8
-    patterns = ["python/pyarrow/**/*.py",
+    patterns = ["python/benchmarks/**/*.py",
+                "python/examples/**/*.py",
+                "python/pyarrow/**/*.py",
                 "python/pyarrow/**/*.pyx",
                 "python/pyarrow/**/*.pxd",
                 "python/pyarrow/**/*.pxi",
-                "python/examples/**/*.py",
+                "dev/*.py",
                 "dev/archery/**/*.py",
-                ]
+                "dev/release/**/*.py"]
     files = [setup_py]
     for pattern in patterns:
         files += list(map(str, Path(src.path).glob(pattern)))
@@ -159,18 +225,68 @@ def python_linter(src, fix=False):
     if not flake8.available:
         logger.error(
             "Python linter requested but flake8 binary not found. "
-            "Please run `pip install -r dev/archery/requirements-lint.txt`")
+            f"{_archery_install_msg}")
         return
 
-    yield LintResult.from_cmd(flake8(setup_py, src.pyarrow,
-                                     os.path.join(src.python, "examples"),
-                                     src.dev, check=False))
-    config = os.path.join(src.python, ".flake8.cython")
-    yield LintResult.from_cmd(flake8("--config=" + config, src.pyarrow,
-                                     check=False))
+    flake8_exclude = ['.venv*', 'vendored']
+
+    yield LintResult.from_cmd(
+        flake8("--extend-exclude=" + ','.join(flake8_exclude),
+               "--config=" + os.path.join(src.python, "setup.cfg"),
+               setup_py, src.pyarrow, os.path.join(src.python, "benchmarks"),
+               os.path.join(src.python, "examples"), src.dev, check=False))
+
+    logger.info("Running Cython linter (cython-lint)")
+
+    cython_lint = CythonLint()
+    if not cython_lint.available:
+        logger.error(
+            "Cython linter requested but cython-lint binary not found. "
+            f"{_archery_install_msg}")
+        return
+
+    # Gather files for cython-lint
+    patterns = ["python/pyarrow/**/*.pyx",
+                "python/pyarrow/**/*.pxd",
+                "python/pyarrow/**/*.pxi",
+                "python/examples/**/*.pyx",
+                "python/examples/**/*.pxd",
+                "python/examples/**/*.pxi",
+                ]
+    files = []
+    for pattern in patterns:
+        files += list(map(str, Path(src.path).glob(pattern)))
+    args = ['--no-pycodestyle']
+    args += sorted(files)
+    yield LintResult.from_cmd(cython_lint(*args))
 
 
-def python_numpydoc(symbols=None, whitelist=None, blacklist=None):
+def python_cpp_linter(src, clang_format=True, fix=False):
+    """Run C++ linters on python/pyarrow/src/arrow/python."""
+    cpp_src = os.path.join(src.python, "pyarrow", "src", "arrow", "python")
+
+    python = PythonCommand()
+
+    if clang_format:
+        logger.info("Running clang-format for python/pyarrow/src/arrow/python")
+
+        if "CLANG_TOOLS_PATH" in os.environ:
+            clang_format_binary = os.path.join(
+                os.environ["CLANG_TOOLS_PATH"], "clang-format")
+        else:
+            clang_format_binary = "clang-format-14"
+
+        run_clang_format = os.path.join(src.cpp, "build-support",
+                                        "run_clang_format.py")
+        args = [run_clang_format, "--source_dir", cpp_src,
+                "--clang_format_binary", clang_format_binary]
+        if fix:
+            args += ["--fix"]
+
+        yield LintResult.from_cmd(python.run(*args))
+
+
+def python_numpydoc(symbols=None, allow_rules=None, disallow_rules=None):
     """Run numpydoc linter on python.
 
     Pyarrow must be available for import.
@@ -183,14 +299,13 @@ def python_numpydoc(symbols=None, whitelist=None, blacklist=None):
         'pyarrow.csv',
         'pyarrow.dataset',
         'pyarrow.feather',
-        'pyarrow.flight',
+        # 'pyarrow.flight',
         'pyarrow.fs',
         'pyarrow.gandiva',
         'pyarrow.ipc',
         'pyarrow.json',
         'pyarrow.orc',
         'pyarrow.parquet',
-        'pyarrow.plasma',
         'pyarrow.types',
     }
     try:
@@ -203,8 +318,8 @@ def python_numpydoc(symbols=None, whitelist=None, blacklist=None):
     results = numpydoc.validate(
         # limit the validation scope to the pyarrow package
         from_package='pyarrow',
-        rules_whitelist=whitelist,
-        rules_blacklist=blacklist
+        allow_rules=allow_rules,
+        disallow_rules=disallow_rules
     )
 
     if len(results) == 0:
@@ -220,7 +335,7 @@ def python_numpydoc(symbols=None, whitelist=None, blacklist=None):
         doc = getattr(obj, '__doc__', '')
         name = getattr(obj, '__name__', '')
         qualname = getattr(obj, '__qualname__', '')
-        module = getattr(obj, '__module__', '')
+        module = _get_module(obj, default='')
         instance = getattr(obj, '__self__', '')
         if instance:
             klass = instance.__class__.__name__
@@ -289,20 +404,6 @@ def r_linter(src):
     yield LintResult.from_cmd(Bash().run(r_lint_sh, check=False))
 
 
-def rust_linter(src):
-    """Run Rust linter."""
-    logger.info("Running Rust linter")
-    cargo = Cargo()
-
-    if not cargo.available:
-        logger.error("Rust linter requested but cargo executable not found.")
-        return
-
-    yield LintResult.from_cmd(cargo.run("+stable", "fmt", "--all", "--",
-                                        "--check", cwd=src.rust,
-                                        check=False))
-
-
 class Hadolint(Command):
     def __init__(self, hadolint_bin=None):
         self.bin = default_bin(hadolint_bin, "hadolint")
@@ -335,10 +436,55 @@ def docker_linter(src):
                                                    cwd=src.path))
 
 
-def linter(src, fix=False, *, clang_format=False, cpplint=False,
+class SphinxLint(Command):
+    def __init__(self, src, path=None, sphinx_lint_bin=None, disable=None, enable=None):
+        self.src = src
+        self.path = path
+        self.bin = default_bin(sphinx_lint_bin, "sphinx-lint")
+        self.disable = disable or "all"
+        self.enable = enable
+
+    def lint(self, *args, check=False):
+        docs_path = os.path.join(self.src.path, "docs")
+
+        args = []
+
+        if self.disable:
+            args.extend(["--disable", self.disable])
+
+        if self.enable:
+            args.extend(["--enable", self.enable])
+
+        if self.path is not None:
+            args.extend([self.path])
+        else:
+            args.extend([docs_path])
+
+        return self.run(*args, check=check)
+
+
+def docs_linter(src, path=None):
+    """Run sphinx-lint on docs."""
+    logger.info("Running docs linter (sphinx-lint)")
+
+    sphinx_lint = SphinxLint(
+        src,
+        path=path,
+        disable="all",
+        enable="trailing-whitespace,missing-final-newline"
+    )
+
+    if not sphinx_lint.available:
+        logger.error("sphinx-lint linter requested but sphinx-lint binary not found")
+        return
+
+    yield LintResult.from_cmd(sphinx_lint.lint())
+
+
+def linter(src, fix=False, path=None, *, clang_format=False, cpplint=False,
            clang_tidy=False, iwyu=False, iwyu_all=False,
            python=False, numpydoc=False, cmake_format=False, rat=False,
-           r=False, rust=False, docker=False):
+           r=False, docker=False, docs=False):
     """Run all linters."""
     with tmpdir(prefix="arrow-lint-") as root:
         build_dir = os.path.join(root, "cpp-build")
@@ -360,6 +506,11 @@ def linter(src, fix=False, *, clang_format=False, cpplint=False,
         if python:
             results.extend(python_linter(src, fix=fix))
 
+        if python and clang_format:
+            results.extend(python_cpp_linter(src,
+                                             clang_format=clang_format,
+                                             fix=fix))
+
         if numpydoc:
             results.extend(python_numpydoc())
 
@@ -372,11 +523,11 @@ def linter(src, fix=False, *, clang_format=False, cpplint=False,
         if r:
             results.extend(r_linter(src))
 
-        if rust:
-            results.extend(rust_linter(src))
-
         if docker:
             results.extend(docker_linter(src))
+
+        if docs:
+            results.extend(docs_linter(src, path))
 
         # Raise error if one linter failed, ensuring calling code can exit with
         # non-zero.

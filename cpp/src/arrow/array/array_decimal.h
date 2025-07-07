@@ -28,6 +28,42 @@
 
 namespace arrow {
 
+/// \addtogroup numeric-arrays
+///
+/// @{
+
+// ----------------------------------------------------------------------
+// Decimal32Array
+
+/// Concrete Array class for 32-bit decimal data
+class ARROW_EXPORT Decimal32Array : public FixedSizeBinaryArray {
+ public:
+  using TypeClass = Decimal32Type;
+
+  using FixedSizeBinaryArray::FixedSizeBinaryArray;
+
+  /// \brief Construct Decimal32Array from ArrayData instance
+  explicit Decimal32Array(const std::shared_ptr<ArrayData>& data);
+
+  std::string FormatValue(int64_t i) const;
+};
+
+// ----------------------------------------------------------------------
+// Decimal64Array
+
+/// Concrete Array class for 64-bit decimal data
+class ARROW_EXPORT Decimal64Array : public FixedSizeBinaryArray {
+ public:
+  using TypeClass = Decimal64Type;
+
+  using FixedSizeBinaryArray::FixedSizeBinaryArray;
+
+  /// \brief Construct Decimal64Array from ArrayData instance
+  explicit Decimal64Array(const std::shared_ptr<ArrayData>& data);
+
+  std::string FormatValue(int64_t i) const;
+};
+
 // ----------------------------------------------------------------------
 // Decimal128Array
 
@@ -46,5 +82,23 @@ class ARROW_EXPORT Decimal128Array : public FixedSizeBinaryArray {
 
 // Backward compatibility
 using DecimalArray = Decimal128Array;
+
+// ----------------------------------------------------------------------
+// Decimal256Array
+
+/// Concrete Array class for 256-bit decimal data
+class ARROW_EXPORT Decimal256Array : public FixedSizeBinaryArray {
+ public:
+  using TypeClass = Decimal256Type;
+
+  using FixedSizeBinaryArray::FixedSizeBinaryArray;
+
+  /// \brief Construct Decimal256Array from ArrayData instance
+  explicit Decimal256Array(const std::shared_ptr<ArrayData>& data);
+
+  std::string FormatValue(int64_t i) const;
+};
+
+/// @}
 
 }  // namespace arrow

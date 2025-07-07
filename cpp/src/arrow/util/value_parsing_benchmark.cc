@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -32,7 +33,6 @@
 #include "arrow/testing/random.h"
 #include "arrow/type.h"
 #include "arrow/util/formatting.h"
-#include "arrow/util/string_view.h"
 #include "arrow/util/value_parsing.h"
 
 namespace arrow {
@@ -49,6 +49,26 @@ static std::vector<std::string> MakeIntStrings(int32_t num_items) {
                                            c_int_limits::is_signed ? "-111" : "111",
                                            std::to_string(c_int_limits::min()),
                                            std::to_string(c_int_limits::max())};
+  std::vector<std::string> strings;
+  for (int32_t i = 0; i < num_items; ++i) {
+    strings.push_back(base_strings[i % base_strings.size()]);
+  }
+  return strings;
+}
+
+template <typename c_int>
+static std::vector<std::string> MakeHexStrings(int32_t num_items) {
+  int32_t num_bytes = sizeof(c_int);
+  const char* kAsciiTable = "0123456789ABCDEF";
+  std::vector<char> large_hex_chars(num_bytes * 2 + 2);
+  large_hex_chars[0] = '0';
+  large_hex_chars[1] = 'x';
+  for (int32_t i = 0; i < num_bytes * 2; ++i) {
+    large_hex_chars[i + 2] = kAsciiTable[i];
+  }
+  std::string large_hex(&large_hex_chars[0], large_hex_chars.size());
+
+  std::vector<std::string> base_strings = {"0x0", "0xA5", "0x5E", large_hex};
   std::vector<std::string> strings;
   for (int32_t i = 0; i < num_items; ++i) {
     strings.push_back(base_strings[i % base_strings.size()]);
@@ -124,6 +144,25 @@ static void IntegerParsing(benchmark::State& state) {  // NOLINT non-const refer
 }
 
 template <typename ARROW_TYPE, typename C_TYPE = typename ARROW_TYPE::c_type>
+static void HexParsing(benchmark::State& state) {  // NOLINT non-const reference
+  auto strings = MakeHexStrings<C_TYPE>(1000);
+
+  while (state.KeepRunning()) {
+    C_TYPE total = 0;
+    for (const auto& s : strings) {
+      C_TYPE value;
+      if (!ParseValue<ARROW_TYPE>(s.data(), s.length(), &value)) {
+        std::cerr << "Conversion failed for '" << s << "'";
+        std::abort();
+      }
+      total = static_cast<C_TYPE>(total + value);
+    }
+    benchmark::DoNotOptimize(total);
+  }
+  state.SetItemsProcessed(state.iterations() * strings.size());
+}
+
+template <typename ARROW_TYPE, typename C_TYPE = typename ARROW_TYPE::c_type>
 static void FloatParsing(benchmark::State& state) {  // NOLINT non-const reference
   auto strings = MakeFloatStrings(1000);
 
@@ -179,7 +218,7 @@ static void TimestampParsingStrptime(
 }
 
 struct DummyAppender {
-  Status operator()(util::string_view v) {
+  Status operator()(std::string_view v) {
     if (pos_ >= static_cast<int32_t>(v.size())) {
       pos_ = 0;
     }
@@ -229,6 +268,15 @@ BENCHMARK_TEMPLATE(IntegerParsing, UInt8Type);
 BENCHMARK_TEMPLATE(IntegerParsing, UInt16Type);
 BENCHMARK_TEMPLATE(IntegerParsing, UInt32Type);
 BENCHMARK_TEMPLATE(IntegerParsing, UInt64Type);
+
+BENCHMARK_TEMPLATE(HexParsing, Int8Type);
+BENCHMARK_TEMPLATE(HexParsing, Int16Type);
+BENCHMARK_TEMPLATE(HexParsing, Int32Type);
+BENCHMARK_TEMPLATE(HexParsing, Int64Type);
+BENCHMARK_TEMPLATE(HexParsing, UInt8Type);
+BENCHMARK_TEMPLATE(HexParsing, UInt16Type);
+BENCHMARK_TEMPLATE(HexParsing, UInt32Type);
+BENCHMARK_TEMPLATE(HexParsing, UInt64Type);
 
 BENCHMARK_TEMPLATE(FloatParsing, FloatType);
 BENCHMARK_TEMPLATE(FloatParsing, DoubleType);

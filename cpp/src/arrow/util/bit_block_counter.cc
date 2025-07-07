@@ -21,12 +21,18 @@
 #include <cstdint>
 #include <type_traits>
 
+<<<<<<< HEAD
 #include "arrow/util/bit_util.h"
 #include "arrow/util/ubsan.h"
+=======
+#include "arrow/buffer.h"
+#include "arrow/util/bitmap_ops.h"
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 namespace arrow {
 namespace internal {
 
+<<<<<<< HEAD
 BitBlockCount BitBlockCounter::NextWord() { return NextWordInline(); }
 
 BitBlockCount BitBlockCounter::NextFourWords() {
@@ -68,20 +74,38 @@ BitBlockCount BitBlockCounter::NextFourWords() {
   bitmap_ += BitUtil::BytesForBits(kTargetBlockLength);
   bits_remaining_ -= 256;
   return {256, static_cast<int16_t>(total_popcount)};
+=======
+BitBlockCount BitBlockCounter::GetBlockSlow(int64_t block_size) noexcept {
+  const int16_t run_length = static_cast<int16_t>(std::min(bits_remaining_, block_size));
+  int16_t popcount = static_cast<int16_t>(CountSetBits(bitmap_, offset_, run_length));
+  bits_remaining_ -= run_length;
+  // This code path should trigger _at most_ 2 times. In the "two times"
+  // case, the first time the run length will be a multiple of 8 by construction
+  bitmap_ += run_length / 8;
+  return {run_length, popcount};
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(const uint8_t* validity_bitmap,
                                                  int64_t offset, int64_t length)
+<<<<<<< HEAD
     : counter_(validity_bitmap, offset, length),
       position_(0),
       length_(length),
       has_bitmap_(validity_bitmap != nullptr) {}
+=======
+    : has_bitmap_(validity_bitmap != nullptr),
+      position_(0),
+      length_(length),
+      counter_(util::MakeNonNull(validity_bitmap), offset, length) {}
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(
     const std::shared_ptr<Buffer>& validity_bitmap, int64_t offset, int64_t length)
     : OptionalBitBlockCounter(validity_bitmap ? validity_bitmap->data() : nullptr, offset,
                               length) {}
 
+<<<<<<< HEAD
 BitBlockCount BinaryBitBlockCounter::NextAndWord() {
   auto load_word = [](const uint8_t* bytes) -> uint64_t {
     return BitUtil::ToLittleEndian(util::SafeLoadAs<uint64_t>(bytes));
@@ -124,6 +148,28 @@ BitBlockCount BinaryBitBlockCounter::NextAndWord() {
   bits_remaining_ -= 64;
   return {64, static_cast<int16_t>(popcount)};
 }
+=======
+OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(const uint8_t* left_bitmap,
+                                                             int64_t left_offset,
+                                                             const uint8_t* right_bitmap,
+                                                             int64_t right_offset,
+                                                             int64_t length)
+    : has_bitmap_(HasBitmapFromBitmaps(left_bitmap != nullptr, right_bitmap != nullptr)),
+      position_(0),
+      length_(length),
+      unary_counter_(
+          util::MakeNonNull(left_bitmap != nullptr ? left_bitmap : right_bitmap),
+          left_bitmap != nullptr ? left_offset : right_offset, length),
+      binary_counter_(util::MakeNonNull(left_bitmap), left_offset,
+                      util::MakeNonNull(right_bitmap), right_offset, length) {}
+
+OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(
+    const std::shared_ptr<Buffer>& left_bitmap, int64_t left_offset,
+    const std::shared_ptr<Buffer>& right_bitmap, int64_t right_offset, int64_t length)
+    : OptionalBinaryBitBlockCounter(
+          left_bitmap ? left_bitmap->data() : nullptr, left_offset,
+          right_bitmap ? right_bitmap->data() : nullptr, right_offset, length) {}
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 }  // namespace internal
 }  // namespace arrow

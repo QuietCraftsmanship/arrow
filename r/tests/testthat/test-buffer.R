@@ -15,43 +15,41 @@
 # specific language governing permissions and limitations
 # under the License.
 
-context("Buffer")
-
 test_that("Buffer can be created from raw vector", {
   vec <- raw(123)
   buf <- buffer(vec)
-  expect_is(buf, "Buffer")
+  expect_r6_class(buf, "Buffer")
   expect_equal(buf$size, 123)
 })
 
 test_that("Buffer can be created from integer vector", {
   vec <- integer(17)
   buf <- buffer(vec)
-  expect_is(buf, "Buffer")
+  expect_r6_class(buf, "Buffer")
   expect_equal(buf$size, 17 * 4)
 })
 
 test_that("Buffer can be created from numeric vector", {
   vec <- numeric(17)
   buf <- buffer(vec)
-  expect_is(buf, "Buffer")
+  expect_r6_class(buf, "Buffer")
   expect_equal(buf$size, 17 * 8)
 })
 
 test_that("Buffer can be created from complex vector", {
   vec <- complex(3)
   buf <- buffer(vec)
-  expect_is(buf, "Buffer")
+  expect_r6_class(buf, "Buffer")
   expect_equal(buf$size, 3 * 16)
 })
 
 test_that("buffer buffer buffers buffers", {
-  expect_is(buffer(buffer(42)), "Buffer")
+  expect_r6_class(buffer(buffer(42)), "Buffer")
 })
 
 test_that("Other types can't be converted to Buffers", {
   expect_error(
-    buffer(data.frame(a="asdf")),
+    buffer(data.frame(a = "asdf")),
     "Cannot convert object of class data.frame to arrow::Buffer"
   )
 })
@@ -70,7 +68,7 @@ test_that("can read remaining bytes of a RandomAccessFile", {
   tab <- Table$create(!!!tbl)
 
   tf <- tempfile()
-  all_bytes <- write_arrow(tab, tf)
+  all_bytes <- write_feather(tab, tf)
 
   file <- ReadableFile$create(tf)
   expect_equal(file$tell(), 0)

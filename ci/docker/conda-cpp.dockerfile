@@ -15,70 +15,72 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG arch=amd64
-FROM ${arch}/ubuntu:18.04
+ARG repo
+ARG arch
+FROM ${repo}:${arch}-conda
 
-# arch is unset after the FROM statement, so need to define it again
-ARG arch=amd64
-ARG prefix=/opt/conda
+COPY ci/scripts/install_minio.sh /arrow/ci/scripts
+RUN /arrow/ci/scripts/install_minio.sh latest /opt/conda
 
-# install build essentials
-RUN export DEBIAN_FRONTEND=noninteractive && \
-    apt-get update -y -q && \
-    apt-get install -y -q wget tzdata libc6-dbg \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV PATH=${prefix}/bin:$PATH
-# install conda and minio
-COPY ci/scripts/install_conda.sh \
-     ci/scripts/install_minio.sh \
-     /arrow/ci/scripts/
-RUN /arrow/ci/scripts/install_conda.sh ${arch} linux latest ${prefix}
-RUN /arrow/ci/scripts/install_minio.sh ${arch} linux latest ${prefix}
+# Unless overridden use Python 3.10
+# Google GCS fails building with Python 3.11 at the moment.
+ARG python=3.10
 
 # install the required conda packages into the test environment
-COPY ci/conda_env_cpp.yml \
-     ci/conda_env_gandiva.yml \
-     ci/conda_env_unix.yml \
+COPY ci/conda_env_cpp.txt \
+     ci/conda_env_gandiva.txt \
      /arrow/ci/
-RUN conda create -n arrow -q \
-        --file arrow/ci/conda_env_unix.yml \
-        --file arrow/ci/conda_env_cpp.yml \
-        --file arrow/ci/conda_env_gandiva.yml \
+RUN mamba install -q -y \
+        --file arrow/ci/conda_env_cpp.txt \
+        --file arrow/ci/conda_env_gandiva.txt \
         compilers \
-        gdb \
-        git \
+        doxygen \
+        libnuma \
+        python=${python} \
         valgrind && \
-    conda clean --all
+    mamba clean --all
 
-# activate the created environment by default
-RUN echo "conda activate arrow" >> ~/.profile
-ENV CONDA_PREFIX=${prefix}/envs/arrow
+# We want to install the GCS testbench using the Conda base environment's Python,
+# because the test environment's Python may later change.
+ENV PIPX_BASE_PYTHON=/opt/conda/bin/python3
+COPY ci/scripts/install_gcs_testbench.sh /arrow/ci/scripts
+RUN /arrow/ci/scripts/install_gcs_testbench.sh default
 
-# use login shell to activate arrow environment un the RUN commands
-SHELL [ "/bin/bash", "-c", "-l" ]
+# Ensure npm, node and azurite are on path. npm and node are required to install azurite, which will then need to
+# be on the path for the tests to run.
+ENV PATH=/opt/conda/envs/arrow/bin:$PATH
 
-# use login shell when running the container
-ENTRYPOINT [ "/bin/bash", "-c", "-l" ]
+COPY ci/scripts/install_azurite.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_azurite.sh
 
-ENV ARROW_BUILD_TESTS=ON \
+COPY ci/scripts/install_sccache.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_sccache.sh unknown-linux-musl /usr/local/bin
+
+ENV ARROW_ACERO=ON \
+    ARROW_AZURE=ON \
+    ARROW_BUILD_TESTS=ON \
     ARROW_DATASET=ON \
     ARROW_DEPENDENCY_SOURCE=CONDA \
     ARROW_FLIGHT=ON \
+    ARROW_FLIGHT_SQL=ON \
     ARROW_GANDIVA=ON \
+    ARROW_GCS=ON \
     ARROW_HOME=$CONDA_PREFIX \
+    ARROW_JEMALLOC=ON \
     ARROW_ORC=ON \
     ARROW_PARQUET=ON \
-    ARROW_PLASMA=ON \
     ARROW_S3=ON \
+    ARROW_SUBSTRAIT=ON \
     ARROW_USE_CCACHE=ON \
     ARROW_WITH_BROTLI=ON \
     ARROW_WITH_BZ2=ON \
     ARROW_WITH_LZ4=ON \
+    # Blocked on https://issues.apache.org/jira/browse/ARROW-15066
+    ARROW_WITH_OPENTELEMETRY=OFF \
     ARROW_WITH_SNAPPY=ON \
     ARROW_WITH_ZLIB=ON \
     ARROW_WITH_ZSTD=ON \
+    GTest_SOURCE=BUNDLED \
     PARQUET_BUILD_EXAMPLES=ON \
     PARQUET_BUILD_EXECUTABLES=ON \
     PARQUET_HOME=$CONDA_PREFIX

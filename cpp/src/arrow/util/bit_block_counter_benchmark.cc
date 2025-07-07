@@ -77,7 +77,11 @@ struct UnaryBitBlockBenchmark {
         } else if (block.popcount > 0) {
           // Some but not all not-null
           for (int64_t i = 0; i < block.length; ++i) {
+<<<<<<< HEAD
             if (BitUtil::GetBit(bitmap, position + i)) {
+=======
+            if (bit_util::GetBit(bitmap, position + i)) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
               result += int8_arr.Value(position + i);
             }
           }
@@ -165,8 +169,13 @@ struct BinaryBitBlockBenchmark {
         } else if (block.popcount > 0) {
           // Some but not all not-null
           for (int64_t i = 0; i < block.length; ++i) {
+<<<<<<< HEAD
             if (BitUtil::GetBit(left_bitmap, position + i) &&
                 BitUtil::GetBit(right_bitmap, position + i)) {
+=======
+            if (bit_util::GetBit(left_bitmap, position + i) &&
+                bit_util::GetBit(right_bitmap, position + i)) {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
               result += left_int8->Value(position + i) + right_int8->Value(position + i);
             }
           }
@@ -204,6 +213,7 @@ struct BinaryBitBlockBenchmark {
   }
 };
 
+<<<<<<< HEAD
 static void BitBlockCounterInlineSum(benchmark::State& state) {
   UnaryBitBlockBenchmark(state, /*offset=*/0)
       .BenchBitBlockCounter(
@@ -216,6 +226,8 @@ static void BitBlockCounterInlineSumWithOffset(benchmark::State& state) {
           [](BitBlockCounter* counter) { return counter->NextWordInline(); });
 }
 
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 static void BitBlockCounterSum(benchmark::State& state) {
   UnaryBitBlockBenchmark(state, /*offset=*/0)
       .BenchBitBlockCounter([](BitBlockCounter* counter) { return counter->NextWord(); });
@@ -263,6 +275,7 @@ static void BinaryBitmapReaderSumWithOffset(benchmark::State& state) {
 }
 
 // Range value: average number of total values per null
+<<<<<<< HEAD
 BENCHMARK(BitBlockCounterSum)->Range(8, 1 << 16);
 BENCHMARK(BitBlockCounterSumWithOffset)->Range(8, 1 << 16);
 BENCHMARK(BitBlockCounterInlineSum)->Range(8, 1 << 16);
@@ -275,6 +288,18 @@ BENCHMARK(BinaryBitBlockCounterSum)->Range(8, 1 << 16);
 BENCHMARK(BinaryBitBlockCounterSumWithOffset)->Range(8, 1 << 16);
 BENCHMARK(BinaryBitmapReaderSum)->Range(8, 1 << 16);
 BENCHMARK(BinaryBitmapReaderSumWithOffset)->Range(8, 1 << 16);
+=======
+BENCHMARK(BitBlockCounterSum)->Range(2, 1 << 16);
+BENCHMARK(BitBlockCounterSumWithOffset)->Range(2, 1 << 16);
+BENCHMARK(BitBlockCounterFourWordsSum)->Range(2, 1 << 16);
+BENCHMARK(BitBlockCounterFourWordsSumWithOffset)->Range(2, 1 << 16);
+BENCHMARK(BitmapReaderSum)->Range(2, 1 << 16);
+BENCHMARK(BitmapReaderSumWithOffset)->Range(2, 1 << 16);
+BENCHMARK(BinaryBitBlockCounterSum)->Range(2, 1 << 16);
+BENCHMARK(BinaryBitBlockCounterSumWithOffset)->Range(2, 1 << 16);
+BENCHMARK(BinaryBitmapReaderSum)->Range(2, 1 << 16);
+BENCHMARK(BinaryBitmapReaderSumWithOffset)->Range(2, 1 << 16);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 }  // namespace internal
 }  // namespace arrow

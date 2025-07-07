@@ -20,13 +20,18 @@ import os
 import sys
 import tempfile
 import pytest
+import hypothesis as h
+import hypothesis.strategies as st
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 import pyarrow as pa
+import pyarrow.tests.strategies as past
 from pyarrow.feather import (read_feather, write_feather, read_table,
                              FeatherDataset)
-
 
 try:
     from pandas.testing import assert_frame_equal
@@ -36,12 +41,25 @@ except ImportError:
     pass
 
 
+@pytest.fixture(scope='module')
+def datadir(base_datadir):
+    return base_datadir / 'feather'
+
+
 def random_path(prefix='feather_'):
     return tempfile.mktemp(prefix=prefix)
 
 
 @pytest.fixture(scope="module", params=[1, 2])
 def version(request):
+    yield request.param
+
+
+@pytest.fixture(scope="module", params=[None, "uncompressed", "lz4", "zstd"])
+def compression(request):
+    if request.param in ['lz4', 'zstd'] and not pa.Codec.is_available(
+            request.param):
+        pytest.skip(f'{request.param} is not available')
     yield request.param
 
 
@@ -74,25 +92,30 @@ def _check_pandas_roundtrip(df, expected=None, path=None,
     if path is None:
         path = random_path()
 
+    if version is None:
+        version = 2
+
     TEST_FILES.append(path)
     write_feather(df, path, compression=compression,
                   compression_level=compression_level, version=version)
+
     if not os.path.exists(path):
         raise Exception('file not written')
 
     result = read_feather(path, columns, use_threads=use_threads)
+
     if expected is None:
         expected = df
 
     assert_frame_equal(result, expected)
 
 
-def _check_arrow_roundtrip(table, path=None):
+def _check_arrow_roundtrip(table, path=None, compression=None):
     if path is None:
         path = random_path()
 
     TEST_FILES.append(path)
-    write_feather(table, path)
+    write_feather(table, path, compression=compression)
     if not os.path.exists(path):
         raise Exception('file not written')
 
@@ -115,24 +138,28 @@ def _assert_error_on_write(df, exc, path=None, version=2):
     pytest.raises(exc, f)
 
 
-@pytest.mark.pandas
+@pytest.mark.numpy
 def test_dataset(version):
     num_values = (100, 100)
     num_files = 5
     paths = [random_path() for i in range(num_files)]
-    df = pd.DataFrame(np.random.randn(*num_values),
-                      columns=['col_' + str(i)
-                               for i in range(num_values[1])])
+    data = {
+        "col_" + str(i): np.random.randn(num_values[0])
+        for i in range(num_values[1])
+    }
+    table = pa.table(data)
 
     TEST_FILES.extend(paths)
     for index, path in enumerate(paths):
-        rows = (index * (num_values[0] // num_files),
-                (index + 1) * (num_values[0] // num_files))
+        rows = (
+            index * (num_values[0] // num_files),
+            (index + 1) * (num_values[0] // num_files),
+        )
 
-        write_feather(df.iloc[rows[0]:rows[1]], path, version=version)
+        write_feather(table[rows[0]: rows[1]], path, version=version)
 
-    data = FeatherDataset(paths).read_pandas()
-    assert_frame_equal(data, df)
+    data = FeatherDataset(paths).read_table()
+    assert data.equals(table)
 
 
 @pytest.mark.pandas
@@ -157,24 +184,46 @@ def test_read_table(version):
     TEST_FILES.append(path)
 
     values = np.random.randint(0, 100, size=num_values)
+    columns = ['col_' + str(i) for i in range(100)]
+    table = pa.Table.from_arrays(values, columns)
 
-    df = pd.DataFrame(values, columns=['col_' + str(i)
-                                       for i in range(100)])
-    write_feather(df, path, version=version)
-
-    data = pd.DataFrame(values,
-                        columns=['col_' + str(i) for i in range(100)])
-    table = pa.Table.from_pandas(data)
+    write_feather(table, path, version=version)
 
     result = read_table(path)
-    assert_frame_equal(table.to_pandas(), result.to_pandas())
+    assert result.equals(table)
 
     # Test without memory mapping
     result = read_table(path, memory_map=False)
-    assert_frame_equal(table.to_pandas(), result.to_pandas())
+    assert result.equals(table)
 
     result = read_feather(path, memory_map=False)
     assert_frame_equal(table.to_pandas(), result)
+
+
+@pytest.mark.pandas
+def test_use_threads(version):
+    # ARROW-14470
+    num_values = (10, 10)
+    path = random_path()
+
+    TEST_FILES.append(path)
+
+    values = np.random.randint(0, 10, size=num_values)
+    columns = ['col_' + str(i) for i in range(10)]
+    table = pa.Table.from_arrays(values, columns)
+
+    write_feather(table, path, version=version)
+
+    result = read_feather(path)
+    assert_frame_equal(table.to_pandas(), result)
+
+    # Test read_feather with use_threads=False
+    result = read_feather(path, use_threads=False)
+    assert_frame_equal(table.to_pandas(), result)
+
+    # Test read_table with use_threads=False
+    result = read_table(path, use_threads=False)
+    assert result.equals(table)
 
 
 @pytest.mark.pandas
@@ -198,18 +247,15 @@ def test_float_nulls(version):
         expected_cols.append(values)
 
     table = pa.table(arrays, names=dtypes)
-    write_feather(table, path, version=version)
+    _check_arrow_roundtrip(table)
 
-    ex_frame = pd.DataFrame(dict(zip(dtypes, expected_cols)),
-                            columns=dtypes)
-
-    result = read_feather(path)
-    assert_frame_equal(result, ex_frame)
+    df = table.to_pandas()
+    _check_pandas_roundtrip(df, version=version)
 
 
 @pytest.mark.pandas
 def test_integer_no_nulls(version):
-    data = {}
+    data, arr = {}, []
 
     numpy_dtypes = ['i1', 'i2', 'i4', 'i8',
                     'u1', 'u2', 'u4', 'u8']
@@ -218,9 +264,13 @@ def test_integer_no_nulls(version):
     for dtype in numpy_dtypes:
         values = np.random.randint(0, 100, size=num_values)
         data[dtype] = values.astype(dtype)
+        arr.append(values.astype(dtype))
 
     df = pd.DataFrame(data)
     _check_pandas_roundtrip(df, version=version)
+
+    table = pa.table(arr, names=numpy_dtypes)
+    _check_arrow_roundtrip(table)
 
 
 @pytest.mark.pandas
@@ -260,13 +310,10 @@ def test_integer_with_nulls(version):
         expected_cols.append(expected)
 
     table = pa.table(arrays, names=int_dtypes)
-    write_feather(table, path, version=version)
+    _check_arrow_roundtrip(table)
 
-    ex_frame = pd.DataFrame(dict(zip(int_dtypes, expected_cols)),
-                            columns=int_dtypes)
-
-    result = read_feather(path)
-    assert_frame_equal(result, ex_frame)
+    df = table.to_pandas()
+    _check_pandas_roundtrip(df, version=version)
 
 
 @pytest.mark.pandas
@@ -292,41 +339,33 @@ def test_boolean_nulls(version):
     values = np.random.randint(0, 10, size=num_values) < 5
 
     table = pa.table([pa.array(values, mask=mask)], names=['bools'])
-    write_feather(table, path, version=version)
+    _check_arrow_roundtrip(table)
 
-    expected = values.astype(object)
-    expected[mask] = None
-
-    ex_frame = pd.DataFrame({'bools': expected})
-
-    result = read_feather(path)
-    assert_frame_equal(result, ex_frame)
+    df = table.to_pandas()
+    _check_pandas_roundtrip(df, version=version)
 
 
-@pytest.mark.pandas
 def test_buffer_bounds_error(version):
     # ARROW-1676
     path = random_path()
     TEST_FILES.append(path)
 
     for i in range(16, 256):
-        values = pa.array([None] + list(range(i)), type=pa.float64())
-
-        write_feather(pa.table([values], names=['arr']), path,
-                      version=version)
-        result = read_feather(path)
-        expected = pd.DataFrame({'arr': values.to_pandas()})
-        assert_frame_equal(result, expected)
-
-        _check_pandas_roundtrip(expected, version=version)
+        table = pa.Table.from_arrays(
+            [pa.array([None] + list(range(i)), type=pa.float64())],
+            names=["arr"]
+        )
+        _check_arrow_roundtrip(table)
 
 
-@pytest.mark.pandas
+@pytest.mark.numpy
 def test_boolean_object_nulls(version):
     repeats = 100
-    arr = np.array([False, None, True] * repeats, dtype=object)
-    df = pd.DataFrame({'bools': arr})
-    _check_pandas_roundtrip(df, version=version)
+    table = pa.Table.from_arrays(
+        [np.array([False, None, True] * repeats, dtype=object)],
+        names=["arr"]
+    )
+    _check_arrow_roundtrip(table)
 
 
 @pytest.mark.pandas
@@ -361,7 +400,7 @@ def test_strings(version):
     values = [b'foo', None, 'bar', 'qux', np.nan]
     df = pd.DataFrame({'strings': values * repeats})
 
-    ex_values = [b'foo', None, b'bar', b'qux', np.nan]
+    ex_values = [b'foo', None, b'bar', b'qux', None]
     expected = pd.DataFrame({'strings': ex_values * repeats})
     _check_pandas_roundtrip(df, expected, version=version)
 
@@ -373,7 +412,8 @@ def test_strings(version):
 
     values = ['foo', None, 'bar', 'qux', np.nan]
     df = pd.DataFrame({'strings': values * repeats})
-    expected = pd.DataFrame({'strings': values * repeats})
+    ex_values = ['foo', None, 'bar', 'qux', None]
+    expected = pd.DataFrame({'strings': ex_values * repeats})
     _check_pandas_roundtrip(df, expected, version=version)
 
 
@@ -386,7 +426,11 @@ def test_empty_strings(version):
 @pytest.mark.pandas
 def test_all_none(version):
     df = pd.DataFrame({'all_none': [None] * 10})
-    _check_pandas_roundtrip(df, version=version)
+    if version == 1 and pa.pandas_compat._pandas_api.uses_string_dtype():
+        expected = df.astype("str")
+    else:
+        expected = df
+    _check_pandas_roundtrip(df, version=version, expected=expected)
 
 
 @pytest.mark.pandas
@@ -474,8 +518,10 @@ def test_out_of_float64_timestamp_with_nulls(version):
 def test_non_string_columns(version):
     df = pd.DataFrame({0: [1, 2, 3, 4],
                        1: [True, False, True, False]})
+    expected = df
 
-    expected = df.rename(columns=str)
+    if version == 1:
+        expected = df.rename(columns=str)
     _check_pandas_roundtrip(df, expected, version=version)
 
 
@@ -503,7 +549,7 @@ def test_read_columns(version):
                             columns=['boo', 'woo'])
 
 
-@pytest.mark.pandas
+@pytest.mark.numpy
 def test_overwritten_file(version):
     path = random_path()
     TEST_FILES.append(path)
@@ -512,10 +558,12 @@ def test_overwritten_file(version):
     np.random.seed(0)
 
     values = np.random.randint(0, 10, size=num_values)
-    write_feather(pd.DataFrame({'ints': values}), path, version=version)
 
-    df = pd.DataFrame({'ints': values[0: num_values//2]})
-    _check_pandas_roundtrip(df, path=path, version=version)
+    table = pa.table({'ints': values})
+    write_feather(table, path)
+
+    table = pa.table({'more_ints': values[0:num_values//2]})
+    _check_arrow_roundtrip(table, path=path)
 
 
 @pytest.mark.pandas
@@ -597,6 +645,9 @@ def test_v2_set_chunksize():
 
 
 @pytest.mark.pandas
+@pytest.mark.lz4
+@pytest.mark.snappy
+@pytest.mark.zstd
 def test_v2_compression_options():
     df = pd.DataFrame({'A': np.arange(1000)})
 
@@ -604,6 +655,8 @@ def test_v2_compression_options():
         # compression, compression_level
         ('uncompressed', None),
         ('lz4', None),
+        ('lz4', 1),
+        ('lz4', 12),
         ('zstd', 1),
         ('zstd', 10)
     ]
@@ -613,11 +666,6 @@ def test_v2_compression_options():
                                 compression_level=compression_level)
 
     buf = io.BytesIO()
-
-    # LZ4 doesn't support compression_level
-    with pytest.raises(pa.ArrowInvalid,
-                       match="doesn't support setting a compression level"):
-        write_feather(df, buf, compression='lz4', compression_level=10)
 
     # Trying to compress with V1
     with pytest.raises(
@@ -637,6 +685,7 @@ def test_v2_compression_options():
         write_feather(df, buf, compression='snappy')
 
 
+@pytest.mark.numpy
 def test_v2_lz4_default_compression():
     # ARROW-8750: Make sure that the compression=None option selects lz4 if
     # it's available
@@ -702,9 +751,8 @@ def test_chunked_binary_error_message():
 def test_feather_without_pandas(tempdir, version):
     # ARROW-8345
     table = pa.table([pa.array([1, 2, 3])], names=['f0'])
-    write_feather(table, str(tempdir / "data.feather"), version=version)
-    result = read_table(str(tempdir / "data.feather"))
-    assert result.equals(table)
+    path = str(tempdir / "data.feather")
+    _check_arrow_roundtrip(table, path)
 
 
 @pytest.mark.pandas
@@ -731,9 +779,11 @@ def test_read_column_duplicated_selection(tempdir, version):
     path = str(tempdir / "data.feather")
     write_feather(table, path, version=version)
 
+    expected = pa.table([[1, 2, 3], [4, 5, 6], [1, 2, 3]],
+                        names=['a', 'b', 'a'])
     for col_selection in [['a', 'b', 'a'], [0, 1, 0]]:
         result = read_table(path, columns=col_selection)
-        assert result.column_names == ['a', 'b', 'a']
+        assert result.equals(expected)
 
 
 def test_read_column_duplicated_in_file(tempdir):
@@ -753,3 +803,73 @@ def test_read_column_duplicated_in_file(tempdir):
     # selection with column names errors
     with pytest.raises(ValueError):
         read_table(path, columns=['a', 'b'])
+
+
+def test_nested_types(compression):
+    # https://issues.apache.org/jira/browse/ARROW-8860
+    table = pa.table({'col': pa.StructArray.from_arrays(
+        [[0, 1, 2], [1, 2, 3]], names=["f1", "f2"])})
+    _check_arrow_roundtrip(table, compression=compression)
+
+    table = pa.table({'col': pa.array([[1, 2], [3, 4]])})
+    _check_arrow_roundtrip(table, compression=compression)
+
+    table = pa.table({'col': pa.array([[[1, 2], [3, 4]], [[5, 6], None]])})
+    _check_arrow_roundtrip(table, compression=compression)
+
+
+@pytest.mark.numpy
+@h.given(past.all_tables, st.sampled_from(["uncompressed", "lz4", "zstd"]))
+def test_roundtrip(table, compression):
+    _check_arrow_roundtrip(table, compression=compression)
+
+
+@pytest.mark.lz4
+def test_feather_v017_experimental_compression_backward_compatibility(datadir):
+    # ARROW-11163 - ensure newer pyarrow versions can read the old feather
+    # files from version 0.17.0 with experimental compression support (before
+    # it was officially added to IPC format in 1.0.0)
+
+    # file generated with:
+    #     table = pa.table({'a': range(5)})
+    #     from pyarrow import feather
+    #     feather.write_feather(
+    #         table, "v0.17.0.version.2-compression.lz4.feather",
+    #         compression="lz4", version=2)
+    expected = pa.table({'a': range(5)})
+    result = read_table(datadir / "v0.17.0.version.2-compression.lz4.feather")
+    assert result.equals(expected)
+
+
+@pytest.mark.pandas
+def test_preserve_index_pandas(version):
+    df = pd.DataFrame({'a': [1, 2, 3]}, index=['a', 'b', 'c'])
+
+    if version == 1:
+        expected = df.reset_index(drop=True).rename(columns=str)
+    else:
+        expected = df
+
+    _check_pandas_roundtrip(df, expected, version=version)
+
+
+@pytest.mark.pandas
+def test_feather_datetime_resolution_arrow_to_pandas(tempdir):
+    # ARROW-17192 - ensure timestamp_as_object=True (together with other
+    # **kwargs) can be passed in read_feather to to_pandas.
+
+    from datetime import datetime
+    df = pd.DataFrame({"date": [
+        datetime.fromisoformat("1654-01-01"),
+        datetime.fromisoformat("1920-01-01"), ],
+    })
+    write_feather(df, tempdir / "test_resolution.feather")
+
+    expected_0 = datetime.fromisoformat("1654-01-01")
+    expected_1 = datetime.fromisoformat("1920-01-01")
+
+    result = read_feather(tempdir / "test_resolution.feather",
+                          timestamp_as_object=True)
+
+    assert expected_0 == result['date'][0]
+    assert expected_1 == result['date'][1]

@@ -18,11 +18,38 @@
 # cython: language_level = 3
 
 from pyarrow.includes.libarrow cimport *
+from pyarrow.lib cimport _Weakrefable
 
 
-cdef class ParseOptions:
+cdef class ConvertOptions(_Weakrefable):
     cdef:
-        CCSVParseOptions options
+        unique_ptr[CCSVConvertOptions] options
+
+    @staticmethod
+    cdef ConvertOptions wrap(CCSVConvertOptions options)
+
+
+cdef class ParseOptions(_Weakrefable):
+    cdef:
+        unique_ptr[CCSVParseOptions] options
+        object _invalid_row_handler
 
     @staticmethod
     cdef ParseOptions wrap(CCSVParseOptions options)
+
+
+cdef class ReadOptions(_Weakrefable):
+    cdef:
+        unique_ptr[CCSVReadOptions] options
+        public object encoding
+
+    @staticmethod
+    cdef ReadOptions wrap(CCSVReadOptions options)
+
+
+cdef class WriteOptions(_Weakrefable):
+    cdef:
+        unique_ptr[CCSVWriteOptions] options
+
+    @staticmethod
+    cdef WriteOptions wrap(CCSVWriteOptions options)

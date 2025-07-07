@@ -55,11 +55,24 @@ FieldDescriptorPtr Annotator::MakeDesc(FieldPtr field, bool is_output) {
   }
   return std::make_shared<FieldDescriptor>(field, data_idx, validity_idx, offsets_idx,
                                            data_buffer_ptr_idx);
+<<<<<<< HEAD
+}
+
+int Annotator::AddHolderPointer(void* holder) {
+  int size = static_cast<int>(holder_pointers_.size());
+  holder_pointers_.push_back(holder);
+  return size;
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 void Annotator::PrepareBuffersForField(const FieldDescriptor& desc,
                                        const arrow::ArrayData& array_data,
+<<<<<<< HEAD
+                                       EvalBatch* eval_batch, bool is_output) const {
+=======
                                        EvalBatch* eval_batch, bool is_output) {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   int buffer_idx = 0;
 
   // The validity buffer is optional. Use nullptr if it does not have one.
@@ -96,7 +109,7 @@ void Annotator::PrepareBuffersForField(const FieldDescriptor& desc,
 }
 
 EvalBatchPtr Annotator::PrepareEvalBatch(const arrow::RecordBatch& record_batch,
-                                         const ArrayDataVector& out_vector) {
+                                         const ArrayDataVector& out_vector) const {
   EvalBatchPtr eval_batch = std::make_shared<EvalBatch>(
       record_batch.num_rows(), buffer_count_, local_bitmap_count_);
 
@@ -109,7 +122,11 @@ EvalBatchPtr Annotator::PrepareEvalBatch(const arrow::RecordBatch& record_batch,
       continue;
     }
 
+<<<<<<< HEAD
+    PrepareBuffersForField(*(found->second), *(record_batch.column_data(i)),
+=======
     PrepareBuffersForField(*(found->second), *(record_batch.column(i))->data(),
+>>>>>>> 5588-Better-support-for-building-UnionArrays
                            eval_batch.get(), false /*is_output*/);
   }
 

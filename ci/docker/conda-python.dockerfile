@@ -20,18 +20,29 @@ ARG arch
 FROM ${repo}:${arch}-conda-cpp
 
 # install python specific packages
-ARG python=3.6
-COPY ci/conda_env_python.yml /arrow/ci/
-RUN conda install -q \
-        --file arrow/ci/conda_env_python.yml \
-        $([ "$python" == "3.6" -o "$python" == "3.7" ] && echo "pickle5") \
-        python=${python} \
+ARG python=3.9
+COPY ci/conda_env_python.txt \
+     /arrow/ci/
+# If the Python version being tested is the same as the Python used by the system gdb,
+# we need to install the conda-forge gdb instead (GH-38323).
+RUN mamba install -q -y \
+        --file arrow/ci/conda_env_python.txt \
+        $([ "$python" == $(gdb --batch --eval-command 'python import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")') ] && echo "gdb") \
+        "python=${python}.*=*_cp*" \
         nomkl && \
-    conda clean --all
+    mamba clean --all
 
-ENV ARROW_PYTHON=ON \
+ENV ARROW_ACERO=ON \
     ARROW_BUILD_STATIC=OFF \
     ARROW_BUILD_TESTS=OFF \
     ARROW_BUILD_UTILITIES=OFF \
+    ARROW_COMPUTE=ON \
+    ARROW_CSV=ON \
+    ARROW_DATASET=ON \
+    ARROW_FILESYSTEM=ON \
+    ARROW_GDB=ON \
+    ARROW_HDFS=ON \
+    ARROW_JSON=ON \
+    ARROW_SUBSTRAIT=OFF \
     ARROW_TENSORFLOW=ON \
     ARROW_USE_GLOG=OFF

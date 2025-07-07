@@ -21,6 +21,8 @@
 #include <cstring>
 #include <memory>
 
+#include "arrow/type_fwd.h"
+#include "arrow/util/compression.h"
 #include "parquet/exception.h"
 #include "parquet/platform.h"
 #include "parquet/types.h"
@@ -29,12 +31,13 @@ namespace arrow {
 
 class Array;
 
-namespace BitUtil {
+namespace bit_util {
 class BitWriter;
-}  // namespace BitUtil
+}  // namespace bit_util
 
 namespace util {
 class RleEncoder;
+class CodecOptions;
 }  // namespace util
 
 }  // namespace arrow
@@ -42,11 +45,13 @@ class RleEncoder;
 namespace parquet {
 
 struct ArrowWriteContext;
+class ColumnChunkMetaDataBuilder;
 class ColumnDescriptor;
+class ColumnIndexBuilder;
 class DataPage;
 class DictionaryPage;
-class ColumnChunkMetaDataBuilder;
 class Encryptor;
+class OffsetIndexBuilder;
 class WriterProperties;
 
 class PARQUET_EXPORT LevelEncoder {
@@ -76,7 +81,7 @@ class PARQUET_EXPORT LevelEncoder {
   int rle_length_;
   Encoding::type encoding_;
   std::unique_ptr<::arrow::util::RleEncoder> rle_encoder_;
-  std::unique_ptr<::arrow::BitUtil::BitWriter> bit_packed_encoder_;
+  std::unique_ptr<::arrow::bit_util::BitWriter> bit_packed_encoder_;
 };
 
 class PARQUET_EXPORT PageWriter {
@@ -85,28 +90,39 @@ class PARQUET_EXPORT PageWriter {
 
   static std::unique_ptr<PageWriter> Open(
       std::shared_ptr<ArrowOutputStream> sink, Compression::type codec,
-      int compression_level, ColumnChunkMetaDataBuilder* metadata,
-      int16_t row_group_ordinal = -1, int16_t column_chunk_ordinal = -1,
+      ColumnChunkMetaDataBuilder* metadata, int16_t row_group_ordinal = -1,
+      int16_t column_chunk_ordinal = -1,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
       bool buffered_row_group = false,
       std::shared_ptr<Encryptor> header_encryptor = NULLPTR,
-      std::shared_ptr<Encryptor> data_encryptor = NULLPTR);
+      std::shared_ptr<Encryptor> data_encryptor = NULLPTR,
+      bool page_write_checksum_enabled = false,
+      // column_index_builder MUST outlive the PageWriter
+      ColumnIndexBuilder* column_index_builder = NULLPTR,
+      // offset_index_builder MUST outlive the PageWriter
+      OffsetIndexBuilder* offset_index_builder = NULLPTR,
+      const CodecOptions& codec_options = CodecOptions{});
 
   // The Column Writer decides if dictionary encoding is used if set and
   // if the dictionary encoding has fallen back to default encoding on reaching dictionary
   // page limit
   virtual void Close(bool has_dictionary, bool fallback) = 0;
 
+  // Return the number of uncompressed bytes written (including header size)
   virtual int64_t WriteDataPage(const DataPage& page) = 0;
 
+  // Return the number of uncompressed bytes written (including header size)
   virtual int64_t WriteDictionaryPage(const DictionaryPage& page) = 0;
+
+  /// \brief The total number of bytes written as serialized data and
+  /// dictionary pages to the sink so far.
+  virtual int64_t total_compressed_bytes_written() const = 0;
 
   virtual bool has_compressor() = 0;
 
   virtual void Compress(const Buffer& src_buffer, ResizableBuffer* dest_buffer) = 0;
 };
 
-static constexpr int WRITE_BATCH_SIZE = 1000;
 class PARQUET_EXPORT ColumnWriter {
  public:
   virtual ~ColumnWriter() = default;
@@ -128,23 +144,51 @@ class PARQUET_EXPORT ColumnWriter {
   /// \brief The number of rows written so far
   virtual int64_t rows_written() const = 0;
 
-  /// \brief The total size of the compressed pages + page headers. Some values
-  /// might be still buffered and not written to a page yet
+  /// \brief The total size of the compressed pages + page headers. Values
+  /// are still buffered and not written to a pager yet
+  ///
+  /// So in un-buffered mode, it always returns 0
   virtual int64_t total_compressed_bytes() const = 0;
 
   /// \brief The total number of bytes written as serialized data and
   /// dictionary pages to the ColumnChunk so far
+  /// These bytes are uncompressed bytes.
   virtual int64_t total_bytes_written() const = 0;
+
+  /// \brief The total number of bytes written as serialized data and
+  /// dictionary pages to the ColumnChunk so far.
+  /// If the column is uncompressed, the value would be equal to
+  /// total_bytes_written().
+  virtual int64_t total_compressed_bytes_written() const = 0;
+
+  /// \brief Estimated size of the values that are not written to a page yet.
+  virtual int64_t estimated_buffered_value_bytes() const = 0;
 
   /// \brief The file-level writer properties
   virtual const WriterProperties* properties() = 0;
 
+  /// \brief Add key-value metadata to the ColumnChunk.
+  /// \param[in] key_value_metadata the metadata to add.
+  /// \note This will overwrite any existing metadata with the same key.
+  /// \throw ParquetException if Close() has been called.
+  virtual void AddKeyValueMetadata(
+      const std::shared_ptr<const ::arrow::KeyValueMetadata>& key_value_metadata) = 0;
+
+  /// \brief Reset the ColumnChunk key-value metadata.
+  /// \throw ParquetException if Close() has been called.
+  virtual void ResetKeyValueMetadata() = 0;
+
   /// \brief Write Apache Arrow columnar data directly to ColumnWriter. Returns
   /// error status if the array data type is not compatible with the concrete
-  /// writer type
+  /// writer type.
+  ///
+  /// leaf_array is always a primitive (possibly dictionary encoded type).
+  /// Leaf_field_nullable indicates whether the leaf array is considered nullable
+  /// according to its schema in a Table or its parent array.
   virtual ::arrow::Status WriteArrow(const int16_t* def_levels, const int16_t* rep_levels,
-                                     int64_t num_levels, const ::arrow::Array& array,
-                                     ArrowWriteContext* ctx) = 0;
+                                     int64_t num_levels, const ::arrow::Array& leaf_array,
+                                     ArrowWriteContext* ctx,
+                                     bool leaf_field_nullable) = 0;
 };
 
 // API to write values to a single column. This is the main client facing API.
@@ -155,8 +199,16 @@ class TypedColumnWriter : public ColumnWriter {
 
   // Write a batch of repetition levels, definition levels, and values to the
   // column.
-  virtual void WriteBatch(int64_t num_values, const int16_t* def_levels,
-                          const int16_t* rep_levels, const T* values) = 0;
+  // `num_values` is the number of logical leaf values.
+  // `def_levels` (resp. `rep_levels`) can be null if the column's max definition level
+  // (resp. max repetition level) is 0.
+  // If not null, each of `def_levels` and `rep_levels` must have at least
+  // `num_values`.
+  //
+  // The number of physical values written (taken from `values`) is returned.
+  // It can be smaller than `num_values` is there are some undefined values.
+  virtual int64_t WriteBatch(int64_t num_values, const int16_t* def_levels,
+                             const int16_t* rep_levels, const T* values) = 0;
 
   /// Write a batch of repetition levels, definition levels, and values to the
   /// column.
@@ -187,9 +239,6 @@ class TypedColumnWriter : public ColumnWriter {
   virtual void WriteBatchSpaced(int64_t num_values, const int16_t* def_levels,
                                 const int16_t* rep_levels, const uint8_t* valid_bits,
                                 int64_t valid_bits_offset, const T* values) = 0;
-
-  // Estimated size of the values that are not written to a page yet
-  virtual int64_t EstimatedBufferedValueBytes() const = 0;
 };
 
 using BoolWriter = TypedColumnWriter<BooleanType>;

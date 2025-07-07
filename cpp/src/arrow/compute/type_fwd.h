@@ -17,19 +17,43 @@
 
 #pragma once
 
+#include "arrow/util/visibility.h"
+
 namespace arrow {
 
 struct Datum;
+struct TypeHolder;
 
 namespace compute {
 
+class Function;
+class ScalarAggregateFunction;
+class FunctionExecutor;
+class FunctionOptions;
+class FunctionRegistry;
+
+/// \brief Return the process-global function registry.
+// Defined in registry.cc
+ARROW_EXPORT FunctionRegistry* GetFunctionRegistry();
+
+class CastOptions;
+
+struct ExecBatch;
 class ExecContext;
+struct ExecValue;
 class KernelContext;
 
 struct Kernel;
 struct ScalarKernel;
 struct ScalarAggregateKernel;
 struct VectorKernel;
+
+struct KernelState;
+
+class Expression;
+
+ARROW_EXPORT ExecContext* default_exec_context();
+ARROW_EXPORT ExecContext* threaded_exec_context();
 
 }  // namespace compute
 }  // namespace arrow

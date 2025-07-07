@@ -31,17 +31,16 @@
 #include "arrow/array/array_base.h"
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_primitive.h"
+#include "arrow/chunked_array.h"
 #include "arrow/compute/api.h"
-#include "arrow/compute/kernels/test_util.h"
-#include "arrow/memory_pool.h"
+#include "arrow/compute/kernels/test_util_internal.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/table.h"
 #include "arrow/testing/gtest_compat.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/type.h"
+#include "arrow/type_fwd.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/decimal.h"
 
 namespace arrow {
 namespace compute {
@@ -49,26 +48,178 @@ namespace compute {
 // ----------------------------------------------------------------------
 // IsIn tests
 
-template <typename Type, typename T = typename TypeTraits<Type>::c_type>
-void CheckIsIn(const std::shared_ptr<DataType>& type, const std::vector<T>& in_values,
-               const std::vector<bool>& in_is_valid,
-               const std::vector<T>& member_set_values,
-               const std::vector<bool>& member_set_is_valid,
-               const std::vector<bool>& out_values,
-               const std::vector<bool>& out_is_valid) {
-  std::shared_ptr<Array> input = _MakeArray<Type, T>(type, in_values, in_is_valid);
-  std::shared_ptr<Array> member_set =
-      _MakeArray<Type, T>(type, member_set_values, member_set_is_valid);
-  std::shared_ptr<Array> expected =
-      _MakeArray<BooleanType, bool>(boolean(), out_values, out_is_valid);
+void CheckIsIn(const std::shared_ptr<Array> input,
+               const std::shared_ptr<Array>& value_set, const std::string& expected_json,
+               SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                   SetLookupOptions::MATCH) {
+  auto expected = ArrayFromJSON(boolean(), expected_json);
 
-  ASSERT_OK_AND_ASSIGN(Datum datum_out, IsIn(input, member_set));
-  std::shared_ptr<Array> result = datum_out.make_array();
-  ASSERT_OK(result->ValidateFull());
-  AssertArraysEqual(*expected, *result, /*verbose=*/true);
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, null_matching_behavior)));
+  std::shared_ptr<Array> actual = actual_datum.make_array();
+  ValidateOutput(actual_datum);
+  AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+}
+
+void CheckIsIn(const std::shared_ptr<DataType>& type, const std::string& input_json,
+               const std::string& value_set_json, const std::string& expected_json,
+               SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                   SetLookupOptions::MATCH) {
+  auto input = ArrayFromJSON(type, input_json);
+  auto value_set = ArrayFromJSON(type, value_set_json);
+  CheckIsIn(input, value_set, expected_json, null_matching_behavior);
+}
+
+void CheckIsInChunked(const std::shared_ptr<ChunkedArray>& input,
+                      const std::shared_ptr<ChunkedArray>& value_set,
+                      const std::shared_ptr<ChunkedArray>& expected,
+                      SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                          SetLookupOptions::MATCH) {
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, null_matching_behavior)));
+  auto actual = actual_datum.chunked_array();
+  ValidateOutput(actual_datum);
+
+  // Output contiguous in a single chunk
+  ASSERT_EQ(1, actual->num_chunks());
+  ASSERT_TRUE(actual->Equals(*expected));
+}
+
+void CheckIsInDictionary(const std::shared_ptr<DataType>& type,
+                         const std::shared_ptr<DataType>& index_type,
+                         const std::string& input_dictionary_json,
+                         const std::string& input_index_json,
+                         const std::string& value_set_json,
+                         const std::string& expected_json,
+                         SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                             SetLookupOptions::MATCH) {
+  auto dict_type = dictionary(index_type, type);
+  auto indices = ArrayFromJSON(index_type, input_index_json);
+  auto dict = ArrayFromJSON(type, input_dictionary_json);
+
+  ASSERT_OK_AND_ASSIGN(auto input, DictionaryArray::FromArrays(dict_type, indices, dict));
+  auto value_set = ArrayFromJSON(type, value_set_json);
+  auto expected = ArrayFromJSON(boolean(), expected_json);
+
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, null_matching_behavior)));
+  std::shared_ptr<Array> actual = actual_datum.make_array();
+  ValidateOutput(actual_datum);
+  AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+}
+
+void CheckIsIn(const std::shared_ptr<Array> input,
+               const std::shared_ptr<Array>& value_set, const std::string& expected_json,
+               bool skip_nulls) {
+  auto expected = ArrayFromJSON(boolean(), expected_json);
+
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, skip_nulls)));
+  std::shared_ptr<Array> actual = actual_datum.make_array();
+  ValidateOutput(actual_datum);
+  AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+}
+
+void CheckIsIn(const std::shared_ptr<DataType>& type, const std::string& input_json,
+               const std::string& value_set_json, const std::string& expected_json,
+               bool skip_nulls) {
+  auto input = ArrayFromJSON(type, input_json);
+  auto value_set = ArrayFromJSON(type, value_set_json);
+  CheckIsIn(input, value_set, expected_json, skip_nulls);
+}
+
+void CheckIsInChunked(const std::shared_ptr<ChunkedArray>& input,
+                      const std::shared_ptr<ChunkedArray>& value_set,
+                      const std::shared_ptr<ChunkedArray>& expected, bool skip_nulls) {
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, skip_nulls)));
+  auto actual = actual_datum.chunked_array();
+  ValidateOutput(actual_datum);
+
+  // Output contiguous in a single chunk
+  ASSERT_EQ(1, actual->num_chunks());
+  ASSERT_TRUE(actual->Equals(*expected));
+}
+
+void CheckIsInDictionary(const std::shared_ptr<DataType>& type,
+                         const std::shared_ptr<DataType>& index_type,
+                         const std::string& input_dictionary_json,
+                         const std::string& input_index_json,
+                         const std::string& value_set_json,
+                         const std::string& expected_json, bool skip_nulls) {
+  auto dict_type = dictionary(index_type, type);
+  auto indices = ArrayFromJSON(index_type, input_index_json);
+  auto dict = ArrayFromJSON(type, input_dictionary_json);
+
+  ASSERT_OK_AND_ASSIGN(auto input, DictionaryArray::FromArrays(dict_type, indices, dict));
+  auto value_set = ArrayFromJSON(type, value_set_json);
+  auto expected = ArrayFromJSON(boolean(), expected_json);
+
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum,
+                       IsIn(input, SetLookupOptions(value_set, skip_nulls)));
+  std::shared_ptr<Array> actual = actual_datum.make_array();
+  ValidateOutput(actual_datum);
+  AssertArraysEqual(*expected, *actual, /*verbose=*/true);
 }
 
 class TestIsInKernel : public ::testing::Test {};
+
+TEST_F(TestIsInKernel, CallBinary) {
+  auto input = ArrayFromJSON(int8(), "[0, 1, 2, 3, 4, 5, 6, 7, 8]");
+  auto value_set = ArrayFromJSON(int8(), "[2, 3, 5, 7]");
+  ASSERT_RAISES(Invalid, CallFunction("is_in", {input, value_set}));
+
+  ASSERT_OK_AND_ASSIGN(Datum out, CallFunction("is_in_meta_binary", {input, value_set}));
+  auto expected = ArrayFromJSON(boolean(), ("[false, false, true, true, false,"
+                                            "true, false, true, false]"));
+  AssertArraysEqual(*expected, *out.make_array());
+}
+
+TEST_F(TestIsInKernel, ImplicitlyCastValueSet) {
+  auto input = ArrayFromJSON(int8(), "[0, 1, 2, 3, 4, 5, 6, 7, 8]");
+
+  SetLookupOptions opts{ArrayFromJSON(int32(), "[2, 3, 5, 7]")};
+  ASSERT_OK_AND_ASSIGN(Datum out, CallFunction("is_in", {input}, &opts));
+
+  auto expected = ArrayFromJSON(boolean(), ("[false, false, true, true, false,"
+                                            "true, false, true, false]"));
+  AssertArraysEqual(*expected, *out.make_array());
+
+  // value_set cannot be casted to int8, but int8 is castable to float
+  CheckIsIn(input, ArrayFromJSON(float32(), "[1.0, 2.5, 3.1, 5.0]"),
+            "[false, true, false, false, false, true, false, false, false]");
+
+  // Allow implicit casts between binary types...
+  CheckIsIn(ArrayFromJSON(binary(), R"(["aaa", "bb", "ccc", null, "bbb"])"),
+            ArrayFromJSON(fixed_size_binary(3), R"(["aaa", "bbb"])"),
+            "[true, false, false, false, true]");
+  CheckIsIn(ArrayFromJSON(fixed_size_binary(3), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+            ArrayFromJSON(binary(), R"(["aa", "bbb"])"),
+            "[false, true, false, false, true]");
+  CheckIsIn(ArrayFromJSON(utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+            ArrayFromJSON(large_utf8(), R"(["aaa", "bbb"])"),
+            "[true, true, false, false, true]");
+  CheckIsIn(ArrayFromJSON(large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+            ArrayFromJSON(utf8(), R"(["aaa", "bbb"])"),
+            "[true, true, false, false, true]");
+
+  // But explicitly deny implicit casts from non-binary to utf8 to
+  // avoid surprises
+  ASSERT_RAISES(TypeError,
+                IsIn(ArrayFromJSON(utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+                     SetLookupOptions(ArrayFromJSON(float64(), "[1.0, 2.0]"))));
+  ASSERT_RAISES(TypeError, IsIn(ArrayFromJSON(float64(), "[1.0, 2.0]"),
+                                SetLookupOptions(ArrayFromJSON(
+                                    utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"))));
+
+  ASSERT_RAISES(TypeError,
+                IsIn(ArrayFromJSON(large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+                     SetLookupOptions(ArrayFromJSON(float64(), "[1.0, 2.0]"))));
+  ASSERT_RAISES(TypeError,
+                IsIn(ArrayFromJSON(float64(), "[1.0, 2.0]"),
+                     SetLookupOptions(ArrayFromJSON(
+                         large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"))));
+}
 
 template <typename Type>
 class TestIsInKernelPrimitive : public ::testing::Test {};
@@ -76,544 +227,1302 @@ class TestIsInKernelPrimitive : public ::testing::Test {};
 template <typename Type>
 class TestIsInKernelBinary : public ::testing::Test {};
 
-typedef ::testing::Types<Int8Type, UInt8Type, Int16Type, UInt16Type, Int32Type,
-                         UInt32Type, Int64Type, UInt64Type, FloatType, DoubleType,
-                         Date32Type, Date64Type>
-    PrimitiveDictionaries;
+using PrimitiveTypes = ::testing::Types<Int8Type, UInt8Type, Int16Type, UInt16Type,
+                                        Int32Type, UInt32Type, Int64Type, UInt64Type,
+                                        FloatType, DoubleType, Date32Type, Date64Type>;
 
-TYPED_TEST_SUITE(TestIsInKernelPrimitive, PrimitiveDictionaries);
+TYPED_TEST_SUITE(TestIsInKernelPrimitive, PrimitiveTypes);
 
 TYPED_TEST(TestIsInKernelPrimitive, IsIn) {
-  using T = typename TypeParam::c_type;
   auto type = TypeTraits<TypeParam>::type_singleton();
 
   // No Nulls
-  CheckIsIn<TypeParam, T>(type, {2, 1, 2, 1, 2, 3}, {true, true, true, true, true, true},
-                          {2, 1, 2, 3}, {true, true, true, true, true},
-                          {true, true, true, true, true, true}, {});
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, 1]", "[false, true, true, false, true]");
 
   // Nulls in left array
-  CheckIsIn<TypeParam, T>(type, {2, 1, 2, 1, 2, 3},
-                          {false, false, false, false, false, false}, {2, 1, 2, 1, 3}, {},
-                          {false, false, false, false, false, false},
-                          {false, false, false, false, false, false});
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[false, true, true, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[false, true, true, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[null, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, 1]", "[null, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
   // Nulls in right array
-  CheckIsIn<TypeParam, T>(type, {2, 1, 2, 1, 2, 3}, {}, {2, 1, 2, 3},
-                          {false, false, false, false},
-                          {false, false, false, false, false, false}, {});
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[false, true, true, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[false, true, true, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[0, 1, 2, 3, 2]", "[2, null, 1]", "[null, true, true, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
   // Nulls in both the arrays
-  CheckIsIn<TypeParam, T>(
-      type, {2, 1, 2, 3}, {false, false, false, false}, {2, 1, 2, 1, 2, 3, 3},
-      {false, false, false, false, false, false, false}, {true, true, true, true}, {});
-  // No Match
-  CheckIsIn<TypeParam, T>(
-      type, {2, 1, 7, 3, 8}, {true, false, true, true, true}, {2, 1, 2, 1, 6, 3, 3},
-      {true, false, true, false, true, true, true}, {true, true, false, true, false}, {});
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]", "[true, true, true, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]",
+            "[false, true, true, false, true]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]", "[true, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]",
+            "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]", "[null, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[2, null, 1]", "[null, true, true, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  // Duplicates in right array
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[true, true, true, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[false, true, true, false, true]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[true, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[null, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, 1, 2, 3, 2]", "[null, 2, 2, null, 1, 1]",
+            "[null, true, true, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
   // Empty Arrays
-  CheckIsIn<TypeParam, T>(type, {}, {}, {}, {}, {}, {});
+  CheckIsIn(type, "[]", "[]", "[]");
 }
 
-TYPED_TEST(TestIsInKernelPrimitive, PrimitiveResizeTable) {
-  using T = typename TypeParam::c_type;
+TEST_F(TestIsInKernel, NullType) {
+  auto type = null();
 
-  const int64_t kTotalValues = std::min<int64_t>(INT16_MAX, 1UL << sizeof(T) / 2);
-  const int64_t kRepeats = 5;
+  CheckIsIn(type, "[null, null, null]", "[null]", "[true, true, true]");
+  CheckIsIn(type, "[null, null, null]", "[]", "[false, false, false]");
+  CheckIsIn(type, "[]", "[]", "[]");
 
-  std::vector<T> values;
-  std::vector<T> member_set;
-  std::vector<bool> expected;
-  for (int64_t i = 0; i < kTotalValues * kRepeats; i++) {
-    const auto val = static_cast<T>(i % kTotalValues);
-    values.push_back(val);
-    member_set.push_back(val);
-    expected.push_back(static_cast<bool>(true));
+  CheckIsIn(type, "[null, null]", "[null]", "[false, false]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, null]", "[null]", "[false, false]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, null]", "[null]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, null]", "[null]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  CheckIsIn(type, "[null, null]", "[]", "[false, false]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, null]", "[]", "[false, false]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, null]", "[]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, null]", "[]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  // Duplicates in right array
+  CheckIsIn(type, "[null, null, null]", "[null, null]", "[true, true, true]");
+  CheckIsIn(type, "[null, null]", "[null, null]", "[false, false]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[null, null]", "[null, null]", "[false, false]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[null, null]", "[null, null]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[null, null]", "[null, null]", "[null, null]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+}
+
+TEST_F(TestIsInKernel, TimeTimestamp) {
+  for (const auto& type :
+       {time32(TimeUnit::SECOND), time64(TimeUnit::NANO), timestamp(TimeUnit::MICRO),
+        timestamp(TimeUnit::NANO, "UTC")}) {
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, true, false, true, true]", /*skip_nulls=*/false);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, false, false, true, true]", /*skip_nulls=*/true);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, true, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, false, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, null, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, null, null, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+    // Duplicates in right array
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, true, false, true, true]", /*skip_nulls=*/false);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, false, false, true, true]", /*skip_nulls=*/true);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, true, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, false, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, null, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, null, null, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
   }
 
-  auto type = TypeTraits<TypeParam>::type_singleton();
-  CheckIsIn<TypeParam, T>(type, values, {}, member_set, {}, expected, {});
+  // Disallow mixing timezone-aware and timezone-naive values
+  ASSERT_RAISES(TypeError, IsIn(ArrayFromJSON(timestamp(TimeUnit::SECOND), "[0, 1, 2]"),
+                                SetLookupOptions(ArrayFromJSON(
+                                    timestamp(TimeUnit::SECOND, "UTC"), "[0, 2]"))));
+  ASSERT_RAISES(
+      TypeError,
+      IsIn(ArrayFromJSON(timestamp(TimeUnit::SECOND, "UTC"), "[0, 1, 2]"),
+           SetLookupOptions(ArrayFromJSON(timestamp(TimeUnit::SECOND), "[0, 2]"))));
+  // However, mixed timezones are allowed (underlying value is UTC)
+  CheckIsIn(ArrayFromJSON(timestamp(TimeUnit::SECOND, "UTC"), "[0, 1, 2]"),
+            ArrayFromJSON(timestamp(TimeUnit::SECOND, "America/New_York"), "[0, 2]"),
+            "[true, false, true]");
 }
 
-TEST_F(TestIsInKernel, IsInNull) {
-  CheckIsIn<NullType, std::nullptr_t>(null(), {0, 0, 0}, {false, false, false}, {0, 0, 0},
-                                      {false, false, false}, {true, true, true}, {});
+TEST_F(TestIsInKernel, TimeDuration) {
+  for (const auto& type : DurationTypes()) {
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, true, false, true, true]", /*skip_nulls=*/false);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, false, false, true, true]", /*skip_nulls=*/true);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, true, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, false, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, null, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, null]",
+              "[true, null, null, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  CheckIsIn<NullType, std::nullptr_t>(null(), {NULL, NULL, NULL}, {},
-                                      {NULL, NULL, NULL, NULL}, {}, {true, true, true},
-                                      {});
-
-  CheckIsIn<NullType, std::nullptr_t>(null(), {nullptr, nullptr, nullptr}, {}, {nullptr},
-                                      {}, {true, true, true}, {});
-
-  // Empty left array
-  CheckIsIn<NullType, std::nullptr_t>(null(), {}, {}, {nullptr, nullptr, nullptr}, {}, {},
-                                      {});
-
-  // Empty right array
-  CheckIsIn<NullType, std::nullptr_t>(null(), {nullptr, nullptr, nullptr}, {}, {}, {},
-                                      {false, false, false}, {false, false, false});
-
-  // Empty arrays
-  CheckIsIn<NullType, std::nullptr_t>(null(), {}, {}, {}, {}, {}, {});
-}
-
-TEST_F(TestIsInKernel, IsInTimeTimestamp) {
-  CheckIsIn<Time32Type, int32_t>(
-      time32(TimeUnit::SECOND), {2, 1, 5, 1}, {true, false, true, true}, {2, 1, 2, 1},
-      {true, false, true, true}, {true, true, false, true}, {});
-
-  // Right array has no Nulls
-  CheckIsIn<Time32Type, int32_t>(time32(TimeUnit::SECOND), {2, 1, 5, 1},
-                                 {true, false, true, true}, {2, 1, 1}, {true, true, true},
-                                 {true, false, false, true}, {true, false, true, true});
-
-  // No match
-  CheckIsIn<Time32Type, int32_t>(time32(TimeUnit::SECOND), {3, 5, 5, 3},
-                                 {true, false, true, true}, {2, 1, 2, 1, 2},
-                                 {true, true, true, true, true},
-                                 {false, false, false, false}, {true, false, true, true});
-
-  // Empty arrays
-  CheckIsIn<Time32Type, int32_t>(time32(TimeUnit::SECOND), {}, {}, {}, {}, {}, {});
-
-  CheckIsIn<Time64Type, int64_t>(time64(TimeUnit::NANO), {2, 1, 2, 1},
-                                 {true, false, true, true}, {2, 1, 1},
-                                 {true, false, true}, {true, true, true, true}, {});
-
-  CheckIsIn<TimestampType, int64_t>(
-      timestamp(TimeUnit::NANO), {2, 1, 2, 1}, {true, false, true, true}, {2, 1, 2, 1},
-      {true, false, true, true}, {true, true, true, true}, {});
-
-  // Empty left array
-  CheckIsIn<TimestampType, int64_t>(timestamp(TimeUnit::NANO), {}, {}, {2, 1, 2, 1},
-                                    {true, false, true, true}, {}, {});
-
-  // Empty right array
-  CheckIsIn<TimestampType, int64_t>(
-      timestamp(TimeUnit::NANO), {2, 1, 2, 1}, {true, false, true, true}, {}, {},
-      {false, false, false, false}, {true, false, true, true});
-
-  // Both array have Nulls
-  CheckIsIn<Time32Type, int32_t>(time32(TimeUnit::SECOND), {2, 1, 2, 1},
-                                 {false, false, false, false}, {2, 1}, {false, false},
-                                 {true, true, true, true}, {});
-}
-
-TEST_F(TestIsInKernel, IsInBoolean) {
-  CheckIsIn<BooleanType, bool>(boolean(), {false, true, false, true},
-                               {true, false, true, true}, {true, false, true},
-                               {false, true, true}, {true, true, true, true}, {});
-
-  CheckIsIn<BooleanType, bool>(
-      boolean(), {false, true, false, true}, {true, false, true, true},
-      {false, true, false, true, false}, {true, true, false, true, false},
-      {true, true, true, true}, {});
-
-  // No Nulls
-  CheckIsIn<BooleanType, bool>(boolean(), {true, true, false, true}, {}, {false, true},
-                               {}, {true, true, true, true}, {});
-
-  CheckIsIn<BooleanType, bool>(boolean(), {false, true, false, true}, {},
-                               {true, true, true, true}, {}, {false, true, false, true},
-                               {});
-
-  // No match
-  CheckIsIn<BooleanType, bool>(boolean(), {true, true, true, true}, {},
-                               {false, false, false, false, false}, {},
-                               {false, false, false, false}, {});
-
-  // Nulls in left array
-  CheckIsIn<BooleanType, bool>(
-      boolean(), {false, true, false, true}, {false, false, false, false}, {true, true},
-      {}, {false, false, false, false}, {false, false, false, false});
-
-  // Nulls in right array
-  CheckIsIn<BooleanType, bool>(
-      boolean(), {true, true, false, true}, {}, {true, true, false, true, true},
-      {false, false, false, false, false}, {false, false, false, false}, {});
-
-  // Both array have Nulls
-  CheckIsIn<BooleanType, bool>(boolean(), {false, true, false, true},
-                               {false, false, false, false}, {true, true, true, true},
-                               {false, false, false, false}, {true, true, true, true},
-                               {});
-}
-
-using BinaryTypes = ::testing::Types<BinaryType, StringType>;
-TYPED_TEST_SUITE(TestIsInKernelBinary, BinaryTypes);
-
-TYPED_TEST(TestIsInKernelBinary, IsInBinary) {
-  auto type = TypeTraits<TypeParam>::type_singleton();
-  CheckIsIn<TypeParam, std::string>(type, {"test", "", "test2", "test"},
-                                    {true, false, true, true}, {"test", "", "test2"},
-                                    {true, false, true}, {true, true, true, true}, {});
-
-  // No match
-  CheckIsIn<TypeParam, std::string>(
-      type, {"test", "", "test2", "test"}, {true, false, true, true},
-      {"test3", "test4", "test3", "test4"}, {true, true, true, true},
-      {false, false, false, false}, {true, false, true, true});
-
-  // Nulls in left array
-  CheckIsIn<TypeParam, std::string>(
-      type, {"test", "", "test2", "test"}, {false, false, false, false},
-      {"test", "test2", "test"}, {true, true, true}, {false, false, false, false},
-      {false, false, false, false});
-
-  // Nulls in right array
-  CheckIsIn<TypeParam, std::string>(
-      type, {"test", "test2", "test"}, {true, true, true}, {"test", "", "test2", "test"},
-      {false, false, false, false}, {false, false, false}, {});
-
-  // Both array have Nulls
-  CheckIsIn<TypeParam, std::string>(
-      type, {"test", "", "test2", "test"}, {false, false, false, false},
-      {"test", "", "test2", "test"}, {false, false, false, false},
-      {true, true, true, true}, {});
-
-  // Empty arrays
-  CheckIsIn<TypeParam, std::string>(type, {}, {}, {}, {}, {}, {});
-
-  // Empty left array
-  CheckIsIn<TypeParam, std::string>(type, {}, {}, {"test", "", "test2", "test"},
-                                    {true, false, true, false}, {}, {});
-
-  // Empty right array
-  CheckIsIn<TypeParam, std::string>(
-      type, {"test", "", "test2", "test"}, {true, false, true, true}, {}, {},
-      {false, false, false, false}, {true, false, true, true});
-}
-
-TEST_F(TestIsInKernel, BinaryResizeTable) {
-  const int32_t kTotalValues = 10000;
-#if !defined(ARROW_VALGRIND)
-  const int32_t kRepeats = 10;
-#else
-  // Mitigate Valgrind's slowness
-  const int32_t kRepeats = 3;
-#endif
-
-  std::vector<std::string> values;
-  std::vector<std::string> member_set;
-  std::vector<bool> expected;
-  char buf[20] = "test";
-
-  for (int32_t i = 0; i < kTotalValues * kRepeats; i++) {
-    int32_t index = i % kTotalValues;
-
-    ASSERT_GE(snprintf(buf + 4, sizeof(buf) - 4, "%d", index), 0);
-    values.emplace_back(buf);
-    member_set.emplace_back(buf);
-    expected.push_back(true);
+    // Duplicates in right array
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, true, false, true, true]", /*skip_nulls=*/false);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, false, false, true, true]", /*skip_nulls=*/true);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, true, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, false, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, null, false, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, "[1, null, 5, 1, 2]", "[2, 1, 1, null, 2]",
+              "[true, null, null, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
   }
 
-  CheckIsIn<BinaryType, std::string>(binary(), values, {}, member_set, {}, expected, {});
+  // Different units, cast value_set to values will fail, then cast values to value_set
+  CheckIsIn(ArrayFromJSON(duration(TimeUnit::SECOND), "[0, 1, 2]"),
+            ArrayFromJSON(duration(TimeUnit::MILLI), "[1, 2, 2000]"),
+            "[false, false, true]");
 
-  CheckIsIn<StringType, std::string>(utf8(), values, {}, member_set, {}, expected, {});
+  // Different units, cast value_set to values
+  CheckIsIn(ArrayFromJSON(duration(TimeUnit::MILLI), "[0, 1, 2000]"),
+            ArrayFromJSON(duration(TimeUnit::SECOND), "[0, 2]"), "[true, false, true]");
 }
 
-TEST_F(TestIsInKernel, IsInFixedSizeBinary) {
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbb", "", "aaaaa", "ccccc"}, {true, false, true, true},
-      {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"}, {true, false, true, true, true},
-      {true, true, true, true}, {});
+TEST_F(TestIsInKernel, Boolean) {
+  auto type = boolean();
 
-  // Nulls in left
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"},
-      {false, false, false, false, false}, {"bbbbb", "aabbb", "bbbbb", "aaaaa", "ccccc"},
-      {true, true, true, true, true}, {false, false, false, false, false},
-      {false, false, false, false, false});
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, false, false, true]", /*skip_nulls=*/false);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, false, false, true]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, null, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false]",
+            "[false, true, null, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  // Nulls in right
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"},
-      {true, false, true, true, true}, {"bbbbb", "", "bbbbb"}, {false, false, false},
-      {false, true, false, false, false}, {});
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[false, true, true, false, true]", /*skip_nulls=*/false);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[false, true, false, false, true]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[false, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[false, true, null, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[true, false, null, true, false]", "[false, null]",
+            "[null, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  // Both array have Nulls
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"},
-      {false, false, false, false, false}, {"", "", "bbbbb", "aaaaa"},
-      {false, false, false, false}, {true, true, true, true, true}, {});
-
-  // No match
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbc", "bbbbc", "aaaad", "cccca"},
-      {true, true, true, true}, {"bbbbb", "", "bbbbb", "aaaaa", "ddddd"},
-      {true, false, true, true, true}, {false, false, false, false}, {});
-
-  // Empty left array
-  CheckIsIn<FixedSizeBinaryType, std::string>(fixed_size_binary(5), {}, {},
-                                              {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"},
-                                              {true, false, true, true, true}, {}, {});
-
-  // Empty right array
-  CheckIsIn<FixedSizeBinaryType, std::string>(
-      fixed_size_binary(5), {"bbbbb", "", "bbbbb", "aaaaa", "ccccc"},
-      {true, false, true, true, true}, {}, {}, {false, false, false, false, false},
-      {true, false, true, true, true});
-
-  // Empty arrays
-  CheckIsIn<FixedSizeBinaryType, std::string>(fixed_size_binary(0), {}, {}, {}, {}, {},
-                                              {});
+  // Duplicates in right array
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[false, true, true, false, true]", /*skip_nulls=*/false);
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[false, true, false, false, true]", /*skip_nulls=*/true);
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[false, true, true, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[false, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[false, true, null, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, "[true, false, null, true, false]", "[null, false, false, null]",
+            "[null, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 }
 
-TEST_F(TestIsInKernel, IsInDecimal) {
-  std::vector<Decimal128> input{12, 12, 11, 12};
-  std::vector<Decimal128> member_set{12, 12, 11, 12};
-  std::vector<bool> expected{true, true, true, true};
+TYPED_TEST_SUITE(TestIsInKernelBinary, BaseBinaryArrowTypes);
 
-  CheckIsIn<Decimal128Type, Decimal128>(decimal(2, 0), input, {true, false, true, true},
-                                        member_set, {true, false, true, true}, expected,
-                                        {});
+TYPED_TEST(TestIsInKernelBinary, Binary) {
+  auto type = TypeTraits<TypeParam>::type_singleton();
+
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", ""])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, false, true, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, false, true, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])", R"(["aaa", "", null])",
+            "[true, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  // Duplicates in right array
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, false, true, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, false, true, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "", "cc", null, ""])",
+            R"([null, "aaa", "aaa", "", "", null])", "[true, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 }
-TEST_F(TestIsInKernel, IsInChunkedArrayInvoke) {
-  std::vector<std::string> values1 = {"foo", "bar", "foo"};
-  std::vector<std::string> values2 = {"bar", "baz", "quuux", "foo"};
-  std::vector<std::string> values3 = {"foo", "bar", "foo"};
-  std::vector<std::string> values4 = {"bar", "baz", "barr", "foo"};
 
-  auto type = utf8();
-  auto a1 = _MakeArray<StringType, std::string>(type, values1, {});
-  auto a2 = _MakeArray<StringType, std::string>(type, values2, {true, true, true, false});
-  auto a3 = _MakeArray<StringType, std::string>(type, values3, {});
-  auto a4 = _MakeArray<StringType, std::string>(type, values4, {});
+TEST_F(TestIsInKernel, FixedSizeBinary) {
+  auto type = fixed_size_binary(3);
 
-  ArrayVector array1 = {a1, a2};
-  auto carr = std::make_shared<ChunkedArray>(array1);
-  ArrayVector array2 = {a3, a4};
-  auto member_set = std::make_shared<ChunkedArray>(array2);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb"])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  auto i1 = _MakeArray<BooleanType, bool>(boolean(), {true, true, true}, {});
-  auto i2 = _MakeArray<BooleanType, bool>(boolean(), {true, true, false, false},
-                                          {true, true, true, false});
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, false, true, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, false, true, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])", R"(["aaa", "bbb", null])",
+            "[true, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  ArrayVector expected = {i1, i2};
-  auto expected_carr = std::make_shared<ChunkedArray>(expected);
+  // Duplicates in right array
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, false, true, true]",
+            /*skip_nulls=*/false);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, false, false, true]",
+            /*skip_nulls=*/true);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, false, true, true]",
+            /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, false, false, true]",
+            /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, false, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  CheckIsIn(type, R"(["aaa", "bbb", "ccc", null, "bbb"])",
+            R"(["aaa", null, "aaa", "bbb", "bbb", null])",
+            "[true, true, null, null, true]",
+            /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
 
-  ASSERT_OK_AND_ASSIGN(Datum encoded_out, IsIn(carr, member_set));
-  ASSERT_EQ(Datum::CHUNKED_ARRAY, encoded_out.kind());
-
-  AssertChunkedEquivalent(*expected_carr, *encoded_out.chunked_array());
+  ASSERT_RAISES(Invalid,
+                IsIn(ArrayFromJSON(fixed_size_binary(3), R"(["abc"])"),
+                     SetLookupOptions(ArrayFromJSON(fixed_size_binary(2), R"(["ab"])"))));
 }
+
+TEST_F(TestIsInKernel, Decimal) {
+  for (auto type : {decimal128(3, 1), decimal256(3, 1)}) {
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, false, true]",
+              /*skip_nulls=*/false);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, false, true]",
+              /*skip_nulls=*/true);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, false, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, false, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])", R"(["12.3", "78.9"])",
+              "[true, false, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, false, true, true, true]",
+              /*skip_nulls=*/false);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, false, true, false, true]",
+              /*skip_nulls=*/true);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, false, true, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, false, true, false, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, false, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"(["12.3", "78.9", null])", "[true, null, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+    // Duplicates in right array
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, false, true, true, true]",
+              /*skip_nulls=*/false);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, false, true, false, true]",
+              /*skip_nulls=*/true);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, false, true, true, true]",
+              /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, false, true, false, true]",
+              /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, false, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsIn(type, R"(["12.3", "45.6", "78.9", null, "12.3"])",
+              R"([null, "12.3", "12.3", "78.9", "78.9", null])",
+              "[true, null, true, null, true]",
+              /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+    CheckIsIn(ArrayFromJSON(decimal128(4, 2), R"(["12.30", "45.60", "78.90"])"),
+              ArrayFromJSON(type, R"(["12.3", "78.9"])"), "[true, false, true]");
+  }
+}
+
+TEST_F(TestIsInKernel, DictionaryArray) {
+  for (auto index_ty : all_dictionary_index_types()) {
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/R"(["A", "B", "C"])",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/float32(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/"[4.1, -1.0, 42, 9.8]",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/"[4.1, 42, -1.0]",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/R"(["A", "B", "C"])",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsInDictionary(/*type=*/float32(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/"[4.1, -1.0, 42, 9.8]",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/"[4.1, 42, -1.0]",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+
+    // With nulls and skip_nulls=false
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+
+    // With nulls and skip_nulls=true
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, false, true, true]",
+                        /*skip_nulls=*/true);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*skip_nulls=*/true);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*skip_nulls=*/true);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, false, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[false, false, false, true, false]",
+                        /*null_matching_behavior=*/SetLookupOptions::SKIP);
+
+    // With nulls and null_matching_behavior=EMIT_NULL
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, false, null, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[null, false, null, true, null]",
+                        /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[null, false, null, true, null]",
+                        /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+
+    // With nulls and null_matching_behavior=INCONCLUSIVE
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[true, null, null, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A", null])",
+                        /*expected_json=*/"[null, null, null, true, null]",
+                        /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "B", "A"])",
+                        /*expected_json=*/"[null, false, null, true, null]",
+                        /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+    // With duplicates in value_set
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/R"(["A", "A", "B", "A", "B", "C"])",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*skip_nulls=*/false);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, false, false, true, true]",
+                        /*skip_nulls=*/true);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 2, null, 0]",
+                        /*value_set_json=*/R"(["A", "A", "B", "A", "B", "C"])",
+                        /*expected_json=*/"[true, true, false, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, false, true, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, false, false, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, false, null, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+    CheckIsInDictionary(/*type=*/utf8(),
+                        /*index_type=*/index_ty,
+                        /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                        /*input_index_json=*/"[1, 3, null, 0, 1]",
+                        /*value_set_json=*/R"(["C", "C", "B", "A", null, null, "B"])",
+                        /*expected_json=*/"[true, null, null, true, true]",
+                        /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+  }
+}
+
+TEST_F(TestIsInKernel, ChunkedArrayInvoke) {
+  auto input = ChunkedArrayFromJSON(
+      utf8(), {R"(["abc", "def", "", "abc", "jkl"])", R"(["def", null, "abc", "zzz"])"});
+  // No null in value_set
+  auto value_set = ChunkedArrayFromJSON(utf8(), {R"(["", "def"])", R"(["abc"])"});
+  auto expected = ChunkedArrayFromJSON(
+      boolean(), {"[true, true, true, true, false]", "[true, false, true, false]"});
+
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[true, true, true, true, false]", "[true, null, true, false]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[true, true, true, true, false]", "[true, null, true, false]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  value_set = ChunkedArrayFromJSON(utf8(), {R"(["", "def"])", R"([null])"});
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, true, false, false]"});
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, false, false, false]"});
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, null, false, false]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[null, true, true, null, null]", "[true, null, null, null]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+
+  // Duplicates in value_set
+  value_set =
+      ChunkedArrayFromJSON(utf8(), {R"(["", null, "", "def"])", R"(["def", null])"});
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, true, false, false]"});
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, false, false, false]"});
+  CheckIsInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[false, true, true, false, false]", "[true, null, false, false]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::EMIT_NULL);
+  expected = ChunkedArrayFromJSON(
+      boolean(), {"[null, true, true, null, null]", "[true, null, null, null]"});
+  CheckIsInChunked(input, value_set, expected,
+                   /*null_matching_behavior=*/SetLookupOptions::INCONCLUSIVE);
+}
+
 // ----------------------------------------------------------------------
-// Match tests
+// IndexIn tests
 
-class TestMatchKernel : public ::testing::Test {
+class TestIndexInKernel : public ::testing::Test {
  public:
-  void CheckMatch(const std::shared_ptr<DataType>& type, const std::string& haystack_json,
-                  const std::string& needles_json, const std::string& expected_json) {
-    std::shared_ptr<Array> haystack = ArrayFromJSON(type, haystack_json);
-    std::shared_ptr<Array> needles = ArrayFromJSON(type, needles_json);
+  void CheckIndexIn(const std::shared_ptr<Array>& input,
+                    const std::shared_ptr<Array>& value_set,
+                    const std::string& expected_json,
+                    SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                        SetLookupOptions::MATCH) {
     std::shared_ptr<Array> expected = ArrayFromJSON(int32(), expected_json);
 
-    ASSERT_OK_AND_ASSIGN(Datum actual_datum, Match(haystack, needles));
+    SetLookupOptions options(value_set, null_matching_behavior);
+    ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
     std::shared_ptr<Array> actual = actual_datum.make_array();
+    ValidateOutput(actual_datum);
+    AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+  }
+
+  void CheckIndexIn(const std::shared_ptr<DataType>& type, const std::string& input_json,
+                    const std::string& value_set_json, const std::string& expected_json,
+                    SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                        SetLookupOptions::MATCH) {
+    std::shared_ptr<Array> input = ArrayFromJSON(type, input_json);
+    std::shared_ptr<Array> value_set = ArrayFromJSON(type, value_set_json);
+    return CheckIndexIn(input, value_set, expected_json, null_matching_behavior);
+  }
+
+  void CheckIndexInChunked(const std::shared_ptr<ChunkedArray>& input,
+                           const std::shared_ptr<ChunkedArray>& value_set,
+                           const std::shared_ptr<ChunkedArray>& expected,
+                           SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+                               SetLookupOptions::MATCH) {
+    ASSERT_OK_AND_ASSIGN(
+        Datum actual,
+        IndexIn(input, SetLookupOptions(value_set, null_matching_behavior)));
+    ASSERT_EQ(Datum::CHUNKED_ARRAY, actual.kind());
+    ValidateOutput(actual);
+
+    auto actual_chunked = actual.chunked_array();
+
+    // Output contiguous in a single chunk
+    ASSERT_EQ(1, actual_chunked->num_chunks());
+    ASSERT_TRUE(actual_chunked->Equals(*expected));
+  }
+
+  void CheckIndexInDictionary(
+      const std::shared_ptr<DataType>& type, const std::shared_ptr<DataType>& index_type,
+      const std::string& input_dictionary_json, const std::string& input_index_json,
+      const std::string& value_set_json, const std::string& expected_json,
+      SetLookupOptions::NullMatchingBehavior null_matching_behavior =
+          SetLookupOptions::MATCH) {
+    auto dict_type = dictionary(index_type, type);
+    auto indices = ArrayFromJSON(index_type, input_index_json);
+    auto dict = ArrayFromJSON(type, input_dictionary_json);
+
+    ASSERT_OK_AND_ASSIGN(auto input,
+                         DictionaryArray::FromArrays(dict_type, indices, dict));
+    auto value_set = ArrayFromJSON(type, value_set_json);
+    auto expected = ArrayFromJSON(int32(), expected_json);
+
+    SetLookupOptions options(value_set, null_matching_behavior);
+    ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
+    std::shared_ptr<Array> actual = actual_datum.make_array();
+    ValidateOutput(actual_datum);
+    AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+  }
+
+  void CheckIndexIn(const std::shared_ptr<Array>& input,
+                    const std::shared_ptr<Array>& value_set,
+                    const std::string& expected_json, bool skip_nulls) {
+    std::shared_ptr<Array> expected = ArrayFromJSON(int32(), expected_json);
+
+    SetLookupOptions options(value_set, skip_nulls);
+    ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
+    std::shared_ptr<Array> actual = actual_datum.make_array();
+    ValidateOutput(actual_datum);
+    AssertArraysEqual(*expected, *actual, /*verbose=*/true);
+  }
+
+  void CheckIndexIn(const std::shared_ptr<DataType>& type, const std::string& input_json,
+                    const std::string& value_set_json, const std::string& expected_json,
+                    bool skip_nulls) {
+    std::shared_ptr<Array> input = ArrayFromJSON(type, input_json);
+    std::shared_ptr<Array> value_set = ArrayFromJSON(type, value_set_json);
+    return CheckIndexIn(input, value_set, expected_json, skip_nulls);
+  }
+
+  void CheckIndexInChunked(const std::shared_ptr<ChunkedArray>& input,
+                           const std::shared_ptr<ChunkedArray>& value_set,
+                           const std::shared_ptr<ChunkedArray>& expected,
+                           bool skip_nulls) {
+    ASSERT_OK_AND_ASSIGN(Datum actual,
+                         IndexIn(input, SetLookupOptions(value_set, skip_nulls)));
+    ASSERT_EQ(Datum::CHUNKED_ARRAY, actual.kind());
+    ValidateOutput(actual);
+
+    auto actual_chunked = actual.chunked_array();
+
+    // Output contiguous in a single chunk
+    ASSERT_EQ(1, actual_chunked->num_chunks());
+    ASSERT_TRUE(actual_chunked->Equals(*expected));
+  }
+
+  void CheckIndexInDictionary(const std::shared_ptr<DataType>& type,
+                              const std::shared_ptr<DataType>& index_type,
+                              const std::string& input_dictionary_json,
+                              const std::string& input_index_json,
+                              const std::string& value_set_json,
+                              const std::string& expected_json, bool skip_nulls) {
+    auto dict_type = dictionary(index_type, type);
+    auto indices = ArrayFromJSON(index_type, input_index_json);
+    auto dict = ArrayFromJSON(type, input_dictionary_json);
+
+    ASSERT_OK_AND_ASSIGN(auto input,
+                         DictionaryArray::FromArrays(dict_type, indices, dict));
+    auto value_set = ArrayFromJSON(type, value_set_json);
+    auto expected = ArrayFromJSON(int32(), expected_json);
+
+    SetLookupOptions options(value_set, skip_nulls);
+    ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
+    std::shared_ptr<Array> actual = actual_datum.make_array();
+    ValidateOutput(actual_datum);
     AssertArraysEqual(*expected, *actual, /*verbose=*/true);
   }
 };
 
+TEST_F(TestIndexInKernel, CallBinary) {
+  auto input = ArrayFromJSON(int8(), "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
+  auto value_set = ArrayFromJSON(int8(), "[2, 3, 5, 7]");
+  ASSERT_RAISES(Invalid, CallFunction("index_in", {input, value_set}));
+
+  ASSERT_OK_AND_ASSIGN(Datum out,
+                       CallFunction("index_in_meta_binary", {input, value_set}));
+  auto expected = ArrayFromJSON(int32(), ("[null, null, 0, 1, null, 2, null, 3, null,"
+                                          " null, null]"));
+  AssertArraysEqual(*expected, *out.make_array());
+}
+
 template <typename Type>
-class TestMatchKernelPrimitive : public TestMatchKernel {};
+class TestIndexInKernelPrimitive : public TestIndexInKernel {};
 
 using PrimitiveDictionaries =
     ::testing::Types<Int8Type, UInt8Type, Int16Type, UInt16Type, Int32Type, UInt32Type,
                      Int64Type, UInt64Type, FloatType, DoubleType, Date32Type,
                      Date64Type>;
 
-TYPED_TEST_SUITE(TestMatchKernelPrimitive, PrimitiveDictionaries);
+TYPED_TEST_SUITE(TestIndexInKernelPrimitive, PrimitiveDictionaries);
 
-TYPED_TEST(TestMatchKernelPrimitive, Match) {
+TYPED_TEST(TestIndexInKernelPrimitive, IndexIn) {
   auto type = TypeTraits<TypeParam>::type_singleton();
 
   // No Nulls
-  this->CheckMatch(type,
-                   /* haystack= */ "[2, 1, 2, 1, 2, 3]",
-                   /* needles= */ "[2, 1, 2, 3]",
-                   /* expected= */ "[0, 1, 0, 1, 0, 2]");
+  this->CheckIndexIn(type,
+                     /* input= */ "[2, 1, 2, 1, 2, 3]",
+                     /* value_set= */ "[2, 1, 3]",
+                     /* expected= */ "[0, 1, 0, 1, 0, 2]");
 
   // Haystack array all null
-  this->CheckMatch(type,
-                   /* haystack= */ "[null, null, null, null, null, null]",
-                   /* needles= */ "[2, 1, 3]",
-                   /* expected= */ "[null, null, null, null, null, null]");
+  this->CheckIndexIn(type,
+                     /* input= */ "[null, null, null, null, null, null]",
+                     /* value_set= */ "[2, 1, 3]",
+                     /* expected= */ "[null, null, null, null, null, null]");
 
   // Needles array all null
-  this->CheckMatch(type,
-                   /* haystack= */ "[2, 1, 2, 1, 2, 3]",
-                   /* needles= */ "[null, null, null, null]",
-                   /* expected= */ "[null, null, null, null, null, null]");
+  this->CheckIndexIn(type,
+                     /* input= */ "[2, 1, 2, 1, 2, 3]",
+                     /* value_set= */ "[null]",
+                     /* expected= */ "[null, null, null, null, null, null]");
 
   // Both arrays all null
-  this->CheckMatch(type,
-                   /* haystack= */ "[null, null, null, null]",
-                   /* needles= */ "[null, null]",
-                   /* expected= */ "[0, 0, 0, 0]");
+  this->CheckIndexIn(type,
+                     /* input= */ "[null, null, null, null]",
+                     /* value_set= */ "[null]",
+                     /* expected= */ "[0, 0, 0, 0]");
+
+  // Duplicates in value_set
+  this->CheckIndexIn(type,
+                     /* input= */ "[2, 1, 2, 1, 2, 3]",
+                     /* value_set= */ "[2, 2, 1, 1, 1, 3, 3]",
+                     /* expected= */ "[0, 2, 0, 2, 0, 5]");
+
+  // Duplicates and nulls in value_set
+  this->CheckIndexIn(type,
+                     /* input= */ "[2, 1, 2, 1, 2, 3]",
+                     /* value_set= */ "[2, 2, null, null, 1, 1, 1, 3, 3]",
+                     /* expected= */ "[0, 4, 0, 4, 0, 7]");
 
   // No Match
-  this->CheckMatch(type,
-                   /* haystack= */ "[2, null, 7, 3, 8]",
-                   /* needles= */ "[2, null, 2, null, 6, 3, 3]",
-                   /* expected= */ "[0, 1, null, 3, null]");
+  this->CheckIndexIn(type,
+                     /* input= */ "[2, null, 7, 3, 8]",
+                     /* value_set= */ "[2, null, 6, 3]",
+                     /* expected= */ "[0, 1, null, 3, null]");
 
   // Empty Arrays
-  this->CheckMatch(type, "[]", "[]", "[]");
+  this->CheckIndexIn(type, "[]", "[]", "[]");
 }
 
-TYPED_TEST(TestMatchKernelPrimitive, PrimitiveResizeTable) {
-  using T = typename TypeParam::c_type;
+TYPED_TEST(TestIndexInKernelPrimitive, SkipNulls) {
+  auto type = TypeTraits<TypeParam>::type_singleton();
 
-  const int64_t kTotalValues = std::min<int64_t>(INT16_MAX, 1UL << sizeof(T) / 2);
-  const int64_t kRepeats = 5;
+  // No nulls in value_set
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 3]",
+                     /*expected=*/"[null, 0, null, 1, null]",
+                     /*skip_nulls=*/false);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 3]",
+                     /*expected=*/"[null, 0, null, 1, null]",
+                     /*skip_nulls=*/true);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 3]",
+                     /*expected=*/"[null, 0, null, 1, null]",
+                     /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 3]",
+                     /*expected=*/"[null, 0, null, 1, null]",
+                     /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  // Same with duplicates in value_set
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, 3, 3]",
+                     /*expected=*/"[null, 0, null, 2, null]",
+                     /*skip_nulls=*/false);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, 3, 3]",
+                     /*expected=*/"[null, 0, null, 2, null]",
+                     /*skip_nulls=*/true);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, 3, 3]",
+                     /*expected=*/"[null, 0, null, 2, null]",
+                     /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, 3, 3]",
+                     /*expected=*/"[null, 0, null, 2, null]",
+                     /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  Int32Builder expected_builder;
-  NumericBuilder<TypeParam> haystack_builder;
-  ASSERT_OK(expected_builder.Resize(kTotalValues * kRepeats));
-  ASSERT_OK(haystack_builder.Resize(kTotalValues * kRepeats));
-
-  for (int64_t i = 0; i < kTotalValues * kRepeats; i++) {
-    const auto index = i % kTotalValues;
-
-    haystack_builder.UnsafeAppend(static_cast<T>(index));
-    expected_builder.UnsafeAppend(static_cast<int32_t>(index));
-  }
-
-  std::shared_ptr<Array> haystack, needles, expected;
-  ASSERT_OK(haystack_builder.Finish(&haystack));
-  needles = haystack;
-  ASSERT_OK(expected_builder.Finish(&expected));
-
-  ASSERT_OK_AND_ASSIGN(Datum actual_datum, Match(haystack, needles));
-  std::shared_ptr<Array> actual = actual_datum.make_array();
-  ASSERT_ARRAYS_EQUAL(*expected, *actual);
+  // Nulls in value_set
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, null, 3]",
+                     /*expected=*/"[null, 0, null, 2, 1]",
+                     /*skip_nulls=*/false);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, null, null, 3, 3]",
+                     /*expected=*/"[null, 0, null, 4, null]",
+                     /*skip_nulls=*/true);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, null, 3]",
+                     /*expected=*/"[null, 0, null, 2, 1]",
+                     /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, null, null, 3, 3]",
+                     /*expected=*/"[null, 0, null, 4, null]",
+                     /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  // Same with duplicates in value_set
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, null, null, 3, 3]",
+                     /*expected=*/"[null, 0, null, 4, 2]",
+                     /*skip_nulls=*/false);
+  this->CheckIndexIn(type,
+                     /*input=*/"[0, 1, 2, 3, null]",
+                     /*value_set=*/"[1, 1, null, null, 3, 3]",
+                     /*expected=*/"[null, 0, null, 4, 2]",
+                     /*null_matching_behavior=*/SetLookupOptions::MATCH);
 }
 
-TEST_F(TestMatchKernel, MatchNull) {
-  CheckMatch(null(), "[null, null, null]", "[null, null]", "[0, 0, 0]");
+TEST_F(TestIndexInKernel, NullType) {
+  CheckIndexIn(null(), "[null, null, null]", "[null]", "[0, 0, 0]");
+  CheckIndexIn(null(), "[null, null, null]", "[]", "[null, null, null]");
+  CheckIndexIn(null(), "[]", "[null, null]", "[]");
+  CheckIndexIn(null(), "[]", "[]", "[]");
 
-  CheckMatch(null(), "[null, null, null]", "[]", "[null, null, null]");
-
-  CheckMatch(null(), "[]", "[null, null]", "[]");
-
-  CheckMatch(null(), "[]", "[]", "[]");
+  CheckIndexIn(null(), "[null, null]", "[null]", "[null, null]", /*skip_nulls=*/true);
+  CheckIndexIn(null(), "[null, null]", "[]", "[null, null]", /*skip_nulls=*/true);
+  CheckIndexIn(null(), "[null, null]", "[null]", "[null, null]",
+               /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  CheckIndexIn(null(), "[null, null]", "[]", "[null, null]",
+               /*null_matching_behavior=*/SetLookupOptions::SKIP);
 }
 
-TEST_F(TestMatchKernel, MatchTimeTimestamp) {
-  CheckMatch(time32(TimeUnit::SECOND),
-             /* haystack= */ "[1, null, 5, 1, 2]",
-             /* needles= */ "[2, 1, null, 1]",
-             /* expected= */ "[1, 2, null, 1, 0]");
+TEST_F(TestIndexInKernel, TimeTimestamp) {
+  CheckIndexIn(time32(TimeUnit::SECOND),
+               /* input= */ "[1, null, 5, 1, 2]",
+               /* value_set= */ "[2, 1, null]",
+               /* expected= */ "[1, 2, null, 1, 0]");
+
+  // Duplicates in value_set
+  CheckIndexIn(time32(TimeUnit::SECOND),
+               /* input= */ "[1, null, 5, 1, 2]",
+               /* value_set= */ "[2, 2, 1, 1, null, null]",
+               /* expected= */ "[2, 4, null, 2, 0]");
 
   // Needles array has no nulls
-  CheckMatch(time32(TimeUnit::SECOND),
-             /* haystack= */ "[2, null, 5, 1]",
-             /* needles= */ "[2, 1, 1]",
-             /* expected= */ "[0, null, null, 1]");
+  CheckIndexIn(time32(TimeUnit::SECOND),
+               /* input= */ "[2, null, 5, 1]",
+               /* value_set= */ "[2, 1]",
+               /* expected= */ "[0, null, null, 1]");
 
   // No match
-  CheckMatch(time32(TimeUnit::SECOND), "[3, null, 5, 3]", "[2, 1, 2, 1, 2]",
-             "[null, null, null, null]");
+  CheckIndexIn(time32(TimeUnit::SECOND), "[3, null, 5, 3]", "[2, 1]",
+               "[null, null, null, null]");
 
   // Empty arrays
-  CheckMatch(time32(TimeUnit::SECOND), "[]", "[]", "[]");
+  CheckIndexIn(time32(TimeUnit::SECOND), "[]", "[]", "[]");
 
-  CheckMatch(time64(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 1]", "[0, 1, 0, 2]");
+  CheckIndexIn(time64(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 1]", "[0, 1, 0, 2]");
 
-  CheckMatch(timestamp(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 2, 1]",
-             "[0, 1, 0, 2]");
+  CheckIndexIn(timestamp(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 1]",
+               "[0, 1, 0, 2]");
 
-  // Empty haystack array
-  CheckMatch(timestamp(TimeUnit::NANO), "[]", "[2, null, 2, 1]", "[]");
+  CheckIndexIn(timestamp(TimeUnit::SECOND, "UTC"), "[2, null, 2, 1]", "[2, null, 1]",
+               "[0, 1, 0, 2]");
 
-  // Empty needles array
-  CheckMatch(timestamp(TimeUnit::NANO), "[2, null, 2, 1]", "[]",
-             "[null, null, null, null]");
+  // Empty input array
+  CheckIndexIn(timestamp(TimeUnit::NANO), "[]", "[2, null, 1]", "[]");
+
+  // Empty value_set array
+  CheckIndexIn(timestamp(TimeUnit::NANO), "[2, null, 1]", "[]", "[null, null, null]");
 
   // Both array are all null
-  CheckMatch(time32(TimeUnit::SECOND), "[null, null, null, null]", "[null, null]",
-             "[0, 0, 0, 0]");
+  CheckIndexIn(time32(TimeUnit::SECOND), "[null, null, null, null]", "[null]",
+               "[0, 0, 0, 0]");
+
+  // Disallow mixing timezone-aware and timezone-naive values
+  ASSERT_RAISES(TypeError,
+                IndexIn(ArrayFromJSON(timestamp(TimeUnit::SECOND), "[0, 1, 2]"),
+                        SetLookupOptions(ArrayFromJSON(timestamp(TimeUnit::SECOND, "UTC"),
+                                                       "[0, 2]"))));
+  ASSERT_RAISES(
+      TypeError,
+      IndexIn(ArrayFromJSON(timestamp(TimeUnit::SECOND, "UTC"), "[0, 1, 2]"),
+              SetLookupOptions(ArrayFromJSON(timestamp(TimeUnit::SECOND), "[0, 2]"))));
+  // However, mixed timezones are allowed (underlying value is UTC)
+  CheckIndexIn(ArrayFromJSON(timestamp(TimeUnit::SECOND, "UTC"), "[0, 1, 2]"),
+               ArrayFromJSON(timestamp(TimeUnit::SECOND, "America/New_York"), "[0, 2]"),
+               "[0, null, 1]");
 }
 
-TEST_F(TestMatchKernel, MatchBoolean) {
-  CheckMatch(boolean(),
-             /* haystack= */ "[false, null, false, true]",
-             /* needles= */ "[null, false, true]",
-             /* expected= */ "[1, 0, 1, 2]");
+TEST_F(TestIndexInKernel, TimeDuration) {
+  CheckIndexIn(duration(TimeUnit::SECOND),
+               /* input= */ "[1, null, 5, 1, 2]",
+               /* value_set= */ "[2, 1, null]",
+               /* expected= */ "[1, 2, null, 1, 0]");
 
-  CheckMatch(boolean(), "[false, null, false, true]", "[false, true, null, true, null]",
-             "[0, 2, 0, 1]");
+  // Duplicates in value_set
+  CheckIndexIn(duration(TimeUnit::SECOND),
+               /* input= */ "[1, null, 5, 1, 2]",
+               /* value_set= */ "[2, 2, 1, 1, null, null]",
+               /* expected= */ "[2, 4, null, 2, 0]");
 
-  // No Nulls
-  CheckMatch(boolean(), "[true, true, false, true]", "[false, true]", "[1, 1, 0, 1]");
-
-  CheckMatch(boolean(), "[false, true, false, true]", "[true, true, true, true]",
-             "[null, 0, null, 0]");
+  // Needles array has no nulls
+  CheckIndexIn(duration(TimeUnit::SECOND),
+               /* input= */ "[2, null, 5, 1]",
+               /* value_set= */ "[2, 1]",
+               /* expected= */ "[0, null, null, 1]");
 
   // No match
-  CheckMatch(boolean(), "[true, true, true, true]", "[false, false, false]",
-             "[null, null, null, null]");
+  CheckIndexIn(duration(TimeUnit::SECOND), "[3, null, 5, 3]", "[2, 1]",
+               "[null, null, null, null]");
 
-  // Nulls in haystack array
-  CheckMatch(boolean(), "[null, null, null, null]", "[true, true]",
-             "[null, null, null, null]");
+  // Empty arrays
+  CheckIndexIn(duration(TimeUnit::SECOND), "[]", "[]", "[]");
 
-  // Nulls in needles array
-  CheckMatch(boolean(), "[true, true, false, true]",
-             "[null, null, null, null, null, null]", "[null, null, null, null]");
+  CheckIndexIn(duration(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 1]",
+               "[0, 1, 0, 2]");
+
+  CheckIndexIn(duration(TimeUnit::NANO), "[2, null, 2, 1]", "[2, null, 1]",
+               "[0, 1, 0, 2]");
+
+  // Empty input array
+  CheckIndexIn(duration(TimeUnit::NANO), "[]", "[2, null, 1]", "[]");
+
+  // Empty value_set array
+  CheckIndexIn(duration(TimeUnit::NANO), "[2, null, 1]", "[]", "[null, null, null]");
+
+  // Both array are all null
+  CheckIndexIn(duration(TimeUnit::SECOND), "[null, null, null, null]", "[null]",
+               "[0, 0, 0, 0]");
+
+  // Different units, cast value_set to values will fail, then cast values to value_set
+  CheckIndexIn(ArrayFromJSON(duration(TimeUnit::SECOND), "[0, 1, 2]"),
+               ArrayFromJSON(duration(TimeUnit::MILLI), "[1, 2, 2000]"),
+               "[null, null, 2]");
+
+  // Different units, cast value_set to values
+  CheckIndexIn(ArrayFromJSON(duration(TimeUnit::MILLI), "[0, 1, 2000]"),
+               ArrayFromJSON(duration(TimeUnit::SECOND), "[0, 2]"), "[0, null, 1]");
+}
+
+TEST_F(TestIndexInKernel, Boolean) {
+  CheckIndexIn(boolean(),
+               /* input= */ "[false, null, false, true]",
+               /* value_set= */ "[null, false, true]",
+               /* expected= */ "[1, 0, 1, 2]");
+
+  CheckIndexIn(boolean(), "[false, null, false, true]", "[false, true, null]",
+               "[0, 2, 0, 1]");
+
+  // Duplicates in value_set
+  CheckIndexIn(boolean(), "[false, null, false, true]",
+               "[false, false, true, true, null, null]", "[0, 4, 0, 2]");
+
+  // No Nulls
+  CheckIndexIn(boolean(), "[true, true, false, true]", "[false, true]", "[1, 1, 0, 1]");
+
+  CheckIndexIn(boolean(), "[false, true, false, true]", "[true]", "[null, 0, null, 0]");
+
+  // No match
+  CheckIndexIn(boolean(), "[true, true, true, true]", "[false]",
+               "[null, null, null, null]");
+
+  // Nulls in input array
+  CheckIndexIn(boolean(), "[null, null, null, null]", "[true]",
+               "[null, null, null, null]");
+
+  // Nulls in value_set array
+  CheckIndexIn(boolean(), "[true, true, false, true]", "[null]",
+               "[null, null, null, null]");
 
   // Both array have Nulls
-  CheckMatch(boolean(), "[null, null, null, null]", "[null, null, null, null]",
-             "[0, 0, 0, 0]");
+  CheckIndexIn(boolean(), "[null, null, null, null]", "[null]", "[0, 0, 0, 0]");
+}
+
+TEST_F(TestIndexInKernel, ImplicitlyCastValueSet) {
+  auto input = ArrayFromJSON(int8(), "[0, 1, 2, 3, 4, 5, 6, 7, 8]");
+
+  SetLookupOptions opts{ArrayFromJSON(int32(), "[2, 3, 5, 7]")};
+  ASSERT_OK_AND_ASSIGN(Datum out, CallFunction("index_in", {input}, &opts));
+
+  auto expected = ArrayFromJSON(int32(), ("[null, null, 0, 1, null,"
+                                          "2, null, 3, null]"));
+  AssertArraysEqual(*expected, *out.make_array());
+
+  // Although value_set cannot be cast to int8, but int8 is castable to float
+  CheckIndexIn(input, ArrayFromJSON(float32(), "[1.0, 2.5, 3.1, 5.0]"),
+               "[null, 0, null, null, null, 3, null, null, null]");
+
+  // Allow implicit casts between binary types...
+  CheckIndexIn(ArrayFromJSON(binary(), R"(["aaa", "bb", "ccc", null, "bbb"])"),
+               ArrayFromJSON(fixed_size_binary(3), R"(["aaa", "bbb"])"),
+               "[0, null, null, null, 1]");
+  CheckIndexIn(
+      ArrayFromJSON(fixed_size_binary(3), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+      ArrayFromJSON(binary(), R"(["aa", "bbb"])"), "[null, 1, null, null, 1]");
+  CheckIndexIn(ArrayFromJSON(utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+               ArrayFromJSON(large_utf8(), R"(["aaa", "bbb"])"), "[0, 1, null, null, 1]");
+  CheckIndexIn(ArrayFromJSON(large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+               ArrayFromJSON(utf8(), R"(["aaa", "bbb"])"), "[0, 1, null, null, 1]");
+  // But explicitly deny implicit casts from non-binary to utf8 to
+  // avoid surprises
+  ASSERT_RAISES(TypeError,
+                IndexIn(ArrayFromJSON(utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+                        SetLookupOptions(ArrayFromJSON(float64(), "[1.0, 2.0]"))));
+  ASSERT_RAISES(TypeError,
+                IndexIn(ArrayFromJSON(float64(), "[1.0, 2.0]"),
+                        SetLookupOptions(ArrayFromJSON(
+                            utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"))));
+
+  ASSERT_RAISES(
+      TypeError,
+      IndexIn(ArrayFromJSON(large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"),
+              SetLookupOptions(ArrayFromJSON(float64(), "[1.0, 2.0]"))));
+  ASSERT_RAISES(TypeError,
+                IndexIn(ArrayFromJSON(float64(), "[1.0, 2.0]"),
+                        SetLookupOptions(ArrayFromJSON(
+                            large_utf8(), R"(["aaa", "bbb", "ccc", null, "bbb"])"))));
 }
 
 template <typename Type>
-class TestMatchKernelBinary : public TestMatchKernel {};
+class TestIndexInKernelBinary : public TestIndexInKernel {};
 
-using BinaryTypes = ::testing::Types<BinaryType, StringType>;
-TYPED_TEST_SUITE(TestMatchKernelBinary, BinaryTypes);
+TYPED_TEST_SUITE(TestIndexInKernelBinary, BaseBinaryArrowTypes);
 
-TYPED_TEST(TestMatchKernelBinary, MatchBinary) {
+TYPED_TEST(TestIndexInKernelBinary, Binary) {
   auto type = TypeTraits<TypeParam>::type_singleton();
-  this->CheckMatch(type, R"(["foo", null, "bar", "foo"])", R"(["foo", null, "bar"])",
-                   R"([0, 1, 2, 0])");
+  this->CheckIndexIn(type, R"(["foo", null, "bar", "foo"])", R"(["foo", null, "bar"])",
+                     R"([0, 1, 2, 0])");
+
+  // Duplicates in value_set
+  this->CheckIndexIn(type, R"(["foo", null, "bar", "foo"])",
+                     R"(["foo", "foo", null, null, "bar", "bar"])", R"([0, 2, 4, 0])");
 
   // No match
-  this->CheckMatch(type,
-                   /* haystack= */ R"(["foo", null, "bar", "foo"])",
-                   /* needles= */ R"(["baz", "bazzz", "baz", "bazzz"])",
-                   /* expected= */ R"([null, null, null, null])");
+  this->CheckIndexIn(type,
+                     /* input= */ R"(["foo", null, "bar", "foo"])",
+                     /* value_set= */ R"(["baz", "bazzz"])",
+                     /* expected= */ R"([null, null, null, null])");
 
-  // Nulls in haystack array
-  this->CheckMatch(type,
-                   /* haystack= */ R"([null, null, null, null])",
-                   /* needles= */ R"(["foo", "bar", "foo"])",
-                   /* expected= */ R"([null, null, null, null])");
+  // Nulls in input array
+  this->CheckIndexIn(type,
+                     /* input= */ R"([null, null, null, null])",
+                     /* value_set= */ R"(["foo", "bar"])",
+                     /* expected= */ R"([null, null, null, null])");
 
-  // Nulls in needles array
-  this->CheckMatch(type, R"(["foo", "bar", "foo"])", R"([null, null, null])",
-                   R"([null, null, null])");
+  // Nulls in value_set array
+  this->CheckIndexIn(type, R"(["foo", "bar", "foo"])", R"([null])",
+                     R"([null, null, null])");
 
   // Both array have Nulls
-  this->CheckMatch(type,
-                   /* haystack= */ R"([null, null, null, null])",
-                   /* needles= */ R"([null, null, null, null])",
-                   /* expected= */ R"([0, 0, 0, 0])");
+  this->CheckIndexIn(type,
+                     /* input= */ R"([null, null, null, null])",
+                     /* value_set= */ R"([null])",
+                     /* expected= */ R"([0, 0, 0, 0])");
 
   // Empty arrays
-  this->CheckMatch(type, R"([])", R"([])", R"([])");
+  this->CheckIndexIn(type, R"([])", R"([])", R"([])");
 
-  // Empty haystack array
-  this->CheckMatch(type, R"([])", R"(["foo", null, "bar", null])", "[]");
+  // Empty input array
+  this->CheckIndexIn(type, R"([])", R"(["foo", null, "bar"])", "[]");
 
-  // Empty needles array
-  this->CheckMatch(type, R"(["foo", null, "bar", "foo"])", "[]",
-                   R"([null, null, null, null])");
+  // Empty value_set array
+  this->CheckIndexIn(type, R"(["foo", null, "bar", "foo"])", "[]",
+                     R"([null, null, null, null])");
 }
 
-TEST_F(TestMatchKernel, BinaryResizeTable) {
+TEST_F(TestIndexInKernel, BinaryResizeTable) {
   const int32_t kTotalValues = 10000;
 #if !defined(ARROW_VALGRIND)
   const int32_t kRepeats = 10;
@@ -625,10 +1534,10 @@ TEST_F(TestMatchKernel, BinaryResizeTable) {
   const int32_t kBufSize = 20;
 
   Int32Builder expected_builder;
-  StringBuilder haystack_builder;
+  StringBuilder input_builder;
   ASSERT_OK(expected_builder.Resize(kTotalValues * kRepeats));
-  ASSERT_OK(haystack_builder.Resize(kTotalValues * kRepeats));
-  ASSERT_OK(haystack_builder.ReserveData(kBufSize * kTotalValues * kRepeats));
+  ASSERT_OK(input_builder.Resize(kTotalValues * kRepeats));
+  ASSERT_OK(input_builder.ReserveData(kBufSize * kTotalValues * kRepeats));
 
   for (int32_t i = 0; i < kTotalValues * kRepeats; i++) {
     int32_t index = i % kTotalValues;
@@ -636,101 +1545,411 @@ TEST_F(TestMatchKernel, BinaryResizeTable) {
     char buf[kBufSize] = "test";
     ASSERT_GE(snprintf(buf + 4, sizeof(buf) - 4, "%d", index), 0);
 
-    haystack_builder.UnsafeAppend(util::string_view(buf));
+    input_builder.UnsafeAppend(std::string_view(buf));
     expected_builder.UnsafeAppend(index);
   }
 
-  std::shared_ptr<Array> haystack, needles, expected;
-  ASSERT_OK(haystack_builder.Finish(&haystack));
-  needles = haystack;
+  std::shared_ptr<Array> input, value_set, expected;
+  ASSERT_OK(input_builder.Finish(&input));
+  value_set = input->Slice(0, kTotalValues);
   ASSERT_OK(expected_builder.Finish(&expected));
 
-  ASSERT_OK_AND_ASSIGN(Datum actual_datum, Match(haystack, needles));
+  ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, value_set));
   std::shared_ptr<Array> actual = actual_datum.make_array();
   ASSERT_ARRAYS_EQUAL(*expected, *actual);
 }
 
-TEST_F(TestMatchKernel, MatchFixedSizeBinary) {
-  CheckMatch(fixed_size_binary(5),
-             /* haystack= */ R"(["bbbbb", null, "aaaaa", "ccccc"])",
-             /* needles= */ R"(["bbbbb", null, "bbbbb", "aaaaa", "ccccc"])",
-             /* expected= */ R"([0, 1, 2, 3])");
+TEST_F(TestIndexInKernel, FixedSizeBinary) {
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", null, "bbb", "ccc"])",
+               /*expected=*/R"([2, 1, null, 0, 3, 0])");
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", null, "bbb", "ccc"])",
+               /*expected=*/R"([2, null, null, 0, 3, 0])",
+               /*skip_nulls=*/true);
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", null, "bbb", "ccc"])",
+               /*expected=*/R"([2, null, null, 0, 3, 0])",
+               /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  // Nulls in haystack
-  CheckMatch(fixed_size_binary(5),
-             /* haystack= */ R"([null, null, null, null, null])",
-             /* needles= */ R"(["bbbbb", "aabbb", "bbbbb", "aaaaa", "ccccc"])",
-             /* expected= */ R"([null, null, null, null, null])");
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "bbb", "ccc"])",
+               /*expected=*/R"([1, null, null, 0, 2, 0])");
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "bbb", "ccc"])",
+               /*expected=*/R"([1, null, null, 0, 2, 0])",
+               /*skip_nulls=*/true);
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "bbb", "ccc"])",
+               /*expected=*/R"([1, null, null, 0, 2, 0])",
+               /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  // Nulls in needles
-  CheckMatch(fixed_size_binary(5),
-             /* haystack= */ R"(["bbbbb", null, "bbbbb", "aaaaa", "ccccc"])",
-             /* needles= */ R"([null, null, null])",
-             /* expected= */ R"([null, 0, null, null, null])");
+  // Duplicates in value_set
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "aaa", null, null, "bbb", "bbb", "ccc"])",
+               /*expected=*/R"([4, 2, null, 0, 6, 0])");
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "aaa", null, null, "bbb", "bbb", "ccc"])",
+               /*expected=*/R"([4, null, null, 0, 6, 0])",
+               /*skip_nulls=*/true);
+  CheckIndexIn(fixed_size_binary(3),
+               /*input=*/R"(["bbb", null, "ddd", "aaa", "ccc", "aaa"])",
+               /*value_set=*/R"(["aaa", "aaa", null, null, "bbb", "bbb", "ccc"])",
+               /*expected=*/R"([4, null, null, 0, 6, 0])",
+               /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  // Both array have Nulls
-  CheckMatch(fixed_size_binary(5),
-             /* haystack= */ R"([null, null, null, null, null])",
-             /* needles= */ R"([null, null, null, null])",
-             /* expected= */ R"([0, 0, 0, 0, 0])");
+  // Empty input array
+  CheckIndexIn(fixed_size_binary(5), R"([])", R"(["bbbbb", null, "aaaaa", "ccccc"])",
+               R"([])");
 
-  // No match
-  CheckMatch(fixed_size_binary(5),
-             /* haystack= */ R"(["bbbbc", "bbbbc", "aaaad", "cccca"])",
-             /* needles= */ R"(["bbbbb", null, "bbbbb", "aaaaa", "ddddd"])",
-             /* expected= */ R"([null, null, null, null])");
-
-  // Empty haystack array
-  CheckMatch(fixed_size_binary(5), R"([])",
-             R"(["bbbbb", null, "bbbbb", "aaaaa", "ccccc"])", R"([])");
-
-  // Empty needles array
-  CheckMatch(fixed_size_binary(5), R"(["bbbbb", null, "bbbbb", "aaaaa", "ccccc"])",
-             R"([])", R"([null, null, null, null, null])");
+  // Empty value_set array
+  CheckIndexIn(fixed_size_binary(5), R"(["bbbbb", null, "bbbbb"])", R"([])",
+               R"([null, null, null])");
 
   // Empty arrays
-  CheckMatch(fixed_size_binary(0), R"([])", R"([])", R"([])");
+  CheckIndexIn(fixed_size_binary(0), R"([])", R"([])", R"([])");
+
+  ASSERT_RAISES(
+      Invalid,
+      IndexIn(ArrayFromJSON(fixed_size_binary(3), R"(["abc"])"),
+              SetLookupOptions(ArrayFromJSON(fixed_size_binary(2), R"(["ab"])"))));
 }
 
-TEST_F(TestMatchKernel, MatchDecimal) {
-  std::vector<Decimal128> input{12, 12, 11, 12};
-  std::vector<Decimal128> member_set{12, 12, 11, 12};
-  std::vector<int32_t> expected{0, 1, 2, 0};
+TEST_F(TestIndexInKernel, MonthDayNanoInterval) {
+  auto type = month_day_nano_interval();
 
-  CheckMatch(decimal(2, 0),
-             /* haystack= */ R"(["12", null, "11", "12"])",
-             /* needles= */ R"(["12", null, "11", "12"])",
-             /* expected= */ R"([0, 1, 2, 0])");
+  CheckIndexIn(type,
+               /*input=*/R"([[5, -1, 5], null, [4, 5, 6], [5, -1, 5], [1, 2, 3]])",
+               /*value_set=*/R"([null, [4, 5, 6], [5, -1, 5]])",
+               /*expected=*/R"([2, 0, 1, 2, null])",
+               /*skip_nulls=*/false);
+  CheckIndexIn(type,
+               /*input=*/R"([[5, -1, 5], null, [4, 5, 6], [5, -1, 5], [1, 2, 3]])",
+               /*value_set=*/R"([null, [4, 5, 6], [5, -1, 5]])",
+               /*expected=*/R"([2, 0, 1, 2, null])",
+               /*null_matching_behavior=*/SetLookupOptions::MATCH);
+
+  // Duplicates in value_set
+  CheckIndexIn(
+      type,
+      /*input=*/R"([[7, 8, 0], null, [0, 0, 0], [7, 8, 0], [0, 0, 1]])",
+      /*value_set=*/R"([null, null, [0, 0, 0], [0, 0, 0], [7, 8, 0], [7, 8, 0]])",
+      /*expected=*/R"([4, 0, 2, 4, null])",
+      /*skip_nulls=*/false);
+  CheckIndexIn(
+      type,
+      /*input=*/R"([[7, 8, 0], null, [0, 0, 0], [7, 8, 0], [0, 0, 1]])",
+      /*value_set=*/R"([null, null, [0, 0, 0], [0, 0, 0], [7, 8, 0], [7, 8, 0]])",
+      /*expected=*/R"([4, 0, 2, 4, null])",
+      /*null_matching_behavior=*/SetLookupOptions::MATCH);
 }
 
-TEST_F(TestMatchKernel, MatchChunkedArrayInvoke) {
-  std::vector<std::string> values1 = {"foo", "bar", "foo"};
-  std::vector<std::string> values2 = {"bar", "baz", "quuux", "foo"};
-  std::vector<std::string> values3 = {"foo", "bar", "foo"};
-  std::vector<std::string> values4 = {"bar", "baz", "barr", "foo"};
+TEST_F(TestIndexInKernel, Decimal) {
+  for (const auto& type : {decimal128(2, 0), decimal256(2, 0)}) {
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, 0, 1, 2, null])",
+                 /*skip_nulls=*/false);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, null, 1, 2, null])",
+                 /*skip_nulls=*/true);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, 0, 1, 2, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, null, 1, 2, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  auto type = utf8();
-  auto a1 = _MakeArray<StringType, std::string>(type, values1, {});
-  auto a2 = _MakeArray<StringType, std::string>(type, values2, {true, true, true, false});
-  auto a3 = _MakeArray<StringType, std::string>(type, values3, {});
-  auto a4 = _MakeArray<StringType, std::string>(type, values4, {});
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"(["11", "12"])",
+                 /*expected=*/R"([1, null, 0, 1, null])",
+                 /*skip_nulls=*/false);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"(["11", "12"])",
+                 /*expected=*/R"([1, null, 0, 1, null])",
+                 /*skip_nulls=*/true);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"(["11", "12"])",
+                 /*expected=*/R"([1, null, 0, 1, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"(["11", "12"])",
+                 /*expected=*/R"([1, null, 0, 1, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::SKIP);
 
-  ArrayVector array1 = {a1, a2};
-  auto carr = std::make_shared<ChunkedArray>(array1);
-  ArrayVector array2 = {a3, a4};
-  auto member_set = std::make_shared<ChunkedArray>(array2);
+    // Duplicates in value_set
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, null, "11", "11", "12", "12"])",
+                 /*expected=*/R"([4, 0, 2, 4, null])",
+                 /*skip_nulls=*/false);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, null, "11", "11", "12", "12"])",
+                 /*expected=*/R"([4, null, 2, 4, null])",
+                 /*skip_nulls=*/true);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, 0, 1, 2, null])",
+                 /*skip_nulls=*/false);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, null, "11", "11", "12", "12"])",
+                 /*expected=*/R"([4, 0, 2, 4, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, null, "11", "11", "12", "12"])",
+                 /*expected=*/R"([4, null, 2, 4, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIndexIn(type,
+                 /*input=*/R"(["12", null, "11", "12", "13"])",
+                 /*value_set=*/R"([null, "11", "12"])",
+                 /*expected=*/R"([2, 0, 1, 2, null])",
+                 /*null_matching_behavior=*/SetLookupOptions::MATCH);
 
-  auto i1 = _MakeArray<Int32Type, int32_t>(int32(), {0, 1, 0}, {});
-  auto i2 =
-      _MakeArray<Int32Type, int32_t>(int32(), {1, 2, 2, 2}, {true, true, false, false});
+    CheckIndexIn(
+        ArrayFromJSON(decimal256(3, 1), R"(["12.0", null, "11.0", "12.0", "13.0"])"),
+        ArrayFromJSON(type, R"([null, "11", "12"])"), R"([2, 0, 1, 2, null])");
+  }
+}
 
-  ArrayVector expected = {i1, i2};
-  auto expected_carr = std::make_shared<ChunkedArray>(expected);
+TEST_F(TestIndexInKernel, DictionaryArray) {
+  for (auto index_ty : all_dictionary_index_types()) {
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/R"(["A", "B", "C"])",
+                           /*expected_json=*/"[1, 2, null, 0]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/float32(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/"[4.1, -1.0, 42, 9.8]",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/"[4.1, 42, -1.0]",
+                           /*expected_json=*/"[2, 1, null, 0]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/R"(["A", "B", "C"])",
+                           /*expected_json=*/"[1, 2, null, 0]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexInDictionary(/*type=*/float32(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/"[4.1, -1.0, 42, 9.8]",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/"[4.1, 42, -1.0]",
+                           /*expected_json=*/"[2, 1, null, 0]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
 
-  ASSERT_OK_AND_ASSIGN(Datum encoded_out, Match(carr, Datum(member_set)));
-  ASSERT_EQ(Datum::CHUNKED_ARRAY, encoded_out.kind());
+    // With nulls and skip_nulls=false
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[1, null, 3, 2, 1]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[3, null, 3, 2, 3]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A"])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[1, null, 3, 2, 1]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[3, null, 3, 2, 3]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A"])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
 
-  AssertChunkedEquivalent(*expected_carr, *encoded_out.chunked_array());
+    // With nulls and skip_nulls=true
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[1, null, null, 2, 1]",
+                           /*skip_nulls=*/true);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*skip_nulls=*/true);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A"])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*skip_nulls=*/true);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[1, null, null, 2, 1]",
+                           /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A", null])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*null_matching_behavior=*/SetLookupOptions::SKIP);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "B", "A"])",
+                           /*expected_json=*/"[null, null, null, 2, null]",
+                           /*null_matching_behavior=*/SetLookupOptions::SKIP);
+
+    // With duplicates in value_set
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/R"(["A", "A", "B", "B", "C", "C"])",
+                           /*expected_json=*/"[2, 4, null, 0]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "C", "B", "B", "A", "A", null])",
+                           /*expected_json=*/"[6, null, 6, 4, 6]",
+                           /*skip_nulls=*/false);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "C", "B", "B", "A", "A", null])",
+                           /*expected_json=*/"[null, null, null, 4, null]",
+                           /*skip_nulls=*/true);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", "B", "C", "D"])",
+                           /*input_index_json=*/"[1, 2, null, 0]",
+                           /*value_set_json=*/R"(["A", "A", "B", "B", "C", "C"])",
+                           /*expected_json=*/"[2, 4, null, 0]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "C", "B", "B", "A", "A", null])",
+                           /*expected_json=*/"[6, null, 6, 4, 6]",
+                           /*null_matching_behavior=*/SetLookupOptions::MATCH);
+    CheckIndexInDictionary(/*type=*/utf8(),
+                           /*index_type=*/index_ty,
+                           /*input_dictionary_json=*/R"(["A", null, "C", "D"])",
+                           /*input_index_json=*/"[1, 3, null, 0, 1]",
+                           /*value_set_json=*/R"(["C", "C", "B", "B", "A", "A", null])",
+                           /*expected_json=*/"[null, null, null, 4, null]",
+                           /*null_matching_behavior=*/SetLookupOptions::SKIP);
+  }
+}
+
+TEST_F(TestIndexInKernel, ChunkedArrayInvoke) {
+  auto input = ChunkedArrayFromJSON(utf8(), {R"(["abc", "def", "ghi", "abc", "jkl"])",
+                                             R"(["def", null, "abc", "zzz"])"});
+  // No null in value_set
+  auto value_set = ChunkedArrayFromJSON(utf8(), {R"(["ghi", "def"])", R"(["abc"])"});
+  auto expected =
+      ChunkedArrayFromJSON(int32(), {"[2, 1, 0, 2, null]", "[1, null, 2, null]"});
+
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::SKIP);
+
+  // Null in value_set
+  value_set = ChunkedArrayFromJSON(utf8(), {R"(["ghi", "def"])", R"([null, "abc"])"});
+  expected = ChunkedArrayFromJSON(int32(), {"[3, 1, 0, 3, null]", "[1, 2, 3, null]"});
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  expected = ChunkedArrayFromJSON(int32(), {"[3, 1, 0, 3, null]", "[1, null, 3, null]"});
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::SKIP);
+
+  // Duplicates in value_set
+  value_set = ChunkedArrayFromJSON(
+      utf8(), {R"(["ghi", "ghi", "def"])", R"(["def", null, null, "abc"])"});
+  expected = ChunkedArrayFromJSON(int32(), {"[6, 2, 0, 6, null]", "[2, 4, 6, null]"});
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/false);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::MATCH);
+  expected = ChunkedArrayFromJSON(int32(), {"[6, 2, 0, 6, null]", "[2, null, 6, null]"});
+  CheckIndexInChunked(input, value_set, expected, /*skip_nulls=*/true);
+  CheckIndexInChunked(input, value_set, expected,
+                      /*null_matching_behavior=*/SetLookupOptions::SKIP);
+}
+
+TEST(TestSetLookup, DispatchBest) {
+  for (std::string name : {"is_in", "index_in"}) {
+    CheckDispatchBest(name, {int32()}, {int32()});
+    CheckDispatchBest(name, {dictionary(int32(), utf8())}, {utf8()});
+  }
+}
+
+TEST(TestSetLookup, IsInWithImplicitCasts) {
+  SetLookupOptions opts{ArrayFromJSON(utf8(), R"(["b", null])")};
+  CheckScalarUnary("is_in",
+                   ArrayFromJSON(dictionary(int32(), utf8()), R"(["a", "b", "c", null])"),
+                   ArrayFromJSON(boolean(), "[0, 1, 0, 1]"), &opts);
 }
 
 }  // namespace compute

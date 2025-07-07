@@ -26,15 +26,15 @@ G_BEGIN_DECLS
 /**
  * GArrowType:
  * @GARROW_TYPE_NA: A degenerate NULL type represented as 0 bytes/bits.
- * @GARROW_TYPE_BOOLEAN: A boolean value represented as 1 bit.
- * @GARROW_TYPE_UINT8: Little-endian 8bit unsigned integer.
- * @GARROW_TYPE_INT8: Little-endian 8bit signed integer.
- * @GARROW_TYPE_UINT16: Little-endian 16bit unsigned integer.
- * @GARROW_TYPE_INT16: Little-endian 16bit signed integer.
- * @GARROW_TYPE_UINT32: Little-endian 32bit unsigned integer.
- * @GARROW_TYPE_INT32: Little-endian 32bit signed integer.
- * @GARROW_TYPE_UINT64: Little-endian 64bit unsigned integer.
- * @GARROW_TYPE_INT64: Little-endian 64bit signed integer.
+ * @GARROW_TYPE_BOOLEAN: A boolean value represented as 1-bit.
+ * @GARROW_TYPE_UINT8: Little-endian 8-bit unsigned integer.
+ * @GARROW_TYPE_INT8: Little-endian 8-bit signed integer.
+ * @GARROW_TYPE_UINT16: Little-endian 16-bit unsigned integer.
+ * @GARROW_TYPE_INT16: Little-endian 16-bit signed integer.
+ * @GARROW_TYPE_UINT32: Little-endian 32-bit unsigned integer.
+ * @GARROW_TYPE_INT32: Little-endian 32-bit signed integer.
+ * @GARROW_TYPE_UINT64: Little-endian 64-bit unsigned integer.
+ * @GARROW_TYPE_INT64: Little-endian 64-bit signed integer.
  * @GARROW_TYPE_HALF_FLOAT: 2-byte floating point value.
  * @GARROW_TYPE_FLOAT: 4-byte floating point value.
  * @GARROW_TYPE_DOUBLE: 8-byte floating point value.
@@ -48,13 +48,16 @@ G_BEGIN_DECLS
  *   Default unit millisecond.
  * @GARROW_TYPE_TIME32: Exact time encoded with int32, supporting seconds or milliseconds
  * @GARROW_TYPE_TIME64: Exact time encoded with int64, supporting micro- or nanoseconds
- * @GARROW_TYPE_INTERVAL_MONTHS: YEAR_MONTH interval in SQL style.
- * @GARROW_TYPE_INTERVAL_DAY_TIME: DAY_TIME interval in SQL style.
- * @GARROW_TYPE_DECIMAL: Precision- and scale-based decimal
- *   type. Storage type depends on the parameters.
+ * @GARROW_TYPE_MONTH_INTERVAL: YEAR_MONTH interval in SQL style.
+ * @GARROW_TYPE_DAY_TIME_INTERVAL: DAY_TIME interval in SQL style.
+ * @GARROW_TYPE_DECIMAL128: Precision- and scale-based decimal
+ *   type with 128-bit. Storage type depends on the parameters.
+ * @GARROW_TYPE_DECIMAL256: Precision- and scale-based decimal
+ *   type with 256-bit. Storage type depends on the parameters.
  * @GARROW_TYPE_LIST: A list of some logical data type.
  * @GARROW_TYPE_STRUCT: Struct of logical types.
- * @GARROW_TYPE_UNION: Unions of logical types.
+ * @GARROW_TYPE_SPARSE_UNION: Sparse unions of logical types.
+ * @GARROW_TYPE_DENSE_UNION: Dense unions of logical types.
  * @GARROW_TYPE_DICTIONARY: Dictionary aka Category type.
  * @GARROW_TYPE_MAP: A repeated struct logical type.
  * @GARROW_TYPE_EXTENSION: Custom data type, implemented by user.
@@ -62,8 +65,18 @@ G_BEGIN_DECLS
  * @GARROW_TYPE_DURATION: Measure of elapsed time in either seconds,
  *   milliseconds, microseconds or nanoseconds.
  * @GARROW_TYPE_LARGE_STRING: 64bit offsets UTF-8 variable-length string.
- * @GARROW_TYPE_LARGE_BINARY: 64bit offsets Variable-length bytes (no guarantee of UTF-8-ness).
+ * @GARROW_TYPE_LARGE_BINARY: 64bit offsets Variable-length bytes (no guarantee of
+ * UTF-8-ness).
  * @GARROW_TYPE_LARGE_LIST: A list of some logical data type with 64-bit offsets.
+ * @GARROW_TYPE_MONTH_DAY_NANO_INTERVAL: MONTH_DAY_NANO interval in SQL style.
+ * @GARROW_TYPE_RUN_END_ENCODED: Run-end encoded data.
+ * @GARROW_TYPE_STRING_VIEW: String (UTF8) view type with 4-byte prefix and inline small
+ *   string optimization.
+ * @GARROW_TYPE_BINARY_VIEW: Bytes view type with 4-byte prefix and inline small string
+ *   optimization.
+ * @GARROW_TYPE_DECIMAL32: Precision- and scale-based decimal
+ * @GARROW_TYPE_DECIMAL64: Precision- and scale-based decimal
+ *   type with 64-bit. Storage type depends on the parameters.
  *
  * They are corresponding to `arrow::Type::type` values.
  */
@@ -89,12 +102,14 @@ typedef enum {
   GARROW_TYPE_TIMESTAMP,
   GARROW_TYPE_TIME32,
   GARROW_TYPE_TIME64,
-  GARROW_TYPE_INTERVAL_MONTHS,
-  GARROW_TYPE_INTERVAL_DAY_TIME,
-  GARROW_TYPE_DECIMAL,
+  GARROW_TYPE_MONTH_INTERVAL,
+  GARROW_TYPE_DAY_TIME_INTERVAL,
+  GARROW_TYPE_DECIMAL128,
+  GARROW_TYPE_DECIMAL256,
   GARROW_TYPE_LIST,
   GARROW_TYPE_STRUCT,
-  GARROW_TYPE_UNION,
+  GARROW_TYPE_SPARSE_UNION,
+  GARROW_TYPE_DENSE_UNION,
   GARROW_TYPE_DICTIONARY,
   GARROW_TYPE_MAP,
   GARROW_TYPE_EXTENSION,
@@ -102,7 +117,14 @@ typedef enum {
   GARROW_TYPE_DURATION,
   GARROW_TYPE_LARGE_STRING,
   GARROW_TYPE_LARGE_BINARY,
-  GARROW_TYPE_LARGE_LIST
+  GARROW_TYPE_LARGE_LIST,
+  GARROW_TYPE_MONTH_DAY_NANO_INTERVAL,
+  GARROW_TYPE_RUN_END_ENCODED,
+  GARROW_TYPE_STRING_VIEW,
+  GARROW_TYPE_BINARY_VIEW,
+  /* TODO: Remove = 43 when we add LIST_VIEW(41)..LARGE_LIST_VIEW(42). */
+  GARROW_TYPE_DECIMAL32 = 43,
+  GARROW_TYPE_DECIMAL64,
 } GArrowType;
 
 /**
@@ -120,5 +142,23 @@ typedef enum {
   GARROW_TIME_UNIT_MICRO,
   GARROW_TIME_UNIT_NANO
 } GArrowTimeUnit;
+
+/**
+ * GArrowIntervalType:
+ * @GARROW_INTERVAL_TYPE_MONTH: A number of months.
+ * @GARROW_INTERVAL_TYPE_DAY_TIME: A number of days and
+ *   milliseconds (fraction of day).
+ * @GARROW_INTERVAL_TYPE_MONTH_DAY_NANO: A number of months, days and
+ *   nanoseconds between two dates.
+ *
+ * They are corresponding to `arrow::IntervalType::type` values.
+ *
+ * Since 7.0.0
+ */
+typedef enum {
+  GARROW_INTERVAL_TYPE_MONTH,
+  GARROW_INTERVAL_TYPE_DAY_TIME,
+  GARROW_INTERVAL_TYPE_MONTH_DAY_NANO,
+} GArrowIntervalType;
 
 G_END_DECLS

@@ -17,10 +17,6 @@
  * under the License.
  */
 
-#ifdef HAVE_CONFIG_H
-#  include <config.h>
-#endif
-
 #include <arrow-glib/array.hpp>
 #include <arrow-glib/chunked-array.hpp>
 #include <arrow-glib/enums.h>
@@ -43,6 +39,9 @@ G_BEGIN_DECLS
  * @short_description: Table class
  * @include: arrow-glib/arrow-glib.h
  *
+ * #GArrowTableConcatenateOptions is a class for customizing
+ * garrow_table_concatenate() behavior.
+ *
  * #GArrowTable is a class for table. Table has zero or more
  * #GArrowChunkedArrays and zero or more records.
  *
@@ -50,23 +49,161 @@ G_BEGIN_DECLS
  * Feather data.
  */
 
-typedef struct GArrowTablePrivate_ {
+typedef struct GArrowTableConcatenateOptionsPrivate_
+{
+  arrow::ConcatenateTablesOptions options;
+} GArrowTableConcatenateOptionsPrivate;
+
+enum {
+  PROP_UNIFY_SCHEMAS = 1,
+  PROP_PROMOTE_NULLABILITY,
+};
+
+G_DEFINE_TYPE_WITH_PRIVATE(GArrowTableConcatenateOptions,
+                           garrow_table_concatenate_options,
+                           G_TYPE_OBJECT)
+
+#define GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(obj)                                \
+  static_cast<GArrowTableConcatenateOptionsPrivate *>(                                   \
+    garrow_table_concatenate_options_get_instance_private(                               \
+      GARROW_TABLE_CONCATENATE_OPTIONS(obj)))
+
+static void
+garrow_table_concatenate_options_finalize(GObject *object)
+{
+  auto priv = GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(object);
+  priv->options.~ConcatenateTablesOptions();
+  G_OBJECT_CLASS(garrow_table_concatenate_options_parent_class)->finalize(object);
+}
+
+static void
+garrow_table_concatenate_options_set_property(GObject *object,
+                                              guint prop_id,
+                                              const GValue *value,
+                                              GParamSpec *pspec)
+{
+  auto priv = GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(object);
+
+  switch (prop_id) {
+  case PROP_UNIFY_SCHEMAS:
+    priv->options.unify_schemas = g_value_get_boolean(value);
+    break;
+  case PROP_PROMOTE_NULLABILITY:
+    priv->options.field_merge_options.promote_nullability = g_value_get_boolean(value);
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+garrow_table_concatenate_options_get_property(GObject *object,
+                                              guint prop_id,
+                                              GValue *value,
+                                              GParamSpec *pspec)
+{
+  auto priv = GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(object);
+
+  switch (prop_id) {
+  case PROP_UNIFY_SCHEMAS:
+    g_value_set_boolean(value, priv->options.unify_schemas);
+    break;
+  case PROP_PROMOTE_NULLABILITY:
+    g_value_set_boolean(value, priv->options.field_merge_options.promote_nullability);
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+garrow_table_concatenate_options_init(GArrowTableConcatenateOptions *object)
+{
+  auto priv = GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(object);
+  new (&(priv->options)) arrow::ConcatenateTablesOptions;
+}
+
+static void
+garrow_table_concatenate_options_class_init(GArrowTableConcatenateOptionsClass *klass)
+{
+  auto gobject_class = G_OBJECT_CLASS(klass);
+  gobject_class->finalize = garrow_table_concatenate_options_finalize;
+  gobject_class->set_property = garrow_table_concatenate_options_set_property;
+  gobject_class->get_property = garrow_table_concatenate_options_get_property;
+
+  GParamSpec *spec;
+
+  auto default_options = arrow::ConcatenateTablesOptions::Defaults();
+
+  /**
+   * GArrowTableConcatenateOptions:unify-schemas:
+   *
+   * If true, the schemas of the tables will be first unified with
+   * fields of the same name being merged, according to
+   * #GArrowTableConcatenateOptions:promote-nullability, then each
+   * table will be promoted to the unified schema before being
+   * concatenated.
+   *
+   * Otherwise, all tables should have the same schema. Each column in
+   * the output table is the result of concatenating the corresponding
+   * columns in all input tables.
+   *
+   * Since: 6.0.0
+   */
+  spec = g_param_spec_boolean("unify-schemas",
+                              "Unify schemas",
+                              "Whether unifying schemas or not",
+                              default_options.unify_schemas,
+                              static_cast<GParamFlags>(G_PARAM_READWRITE));
+  g_object_class_install_property(gobject_class, PROP_UNIFY_SCHEMAS, spec);
+
+  /**
+   * GArrowTableConcatenateOptions:promote-nullability:
+   *
+   * If true, a #GArrowField of #GArrowNullDataType can be unified
+   * with a #GArrowField of another type. The unified field will be of
+   * the other type and become nullable. Nullability will be promoted
+   * to the looser option (nullable if one is not nullable).
+   *
+   * Since: 6.0.0
+   */
+  spec = g_param_spec_boolean("promote-nullability",
+                              "Promote nullability",
+                              "Whether promoting nullability or not",
+                              default_options.field_merge_options.promote_nullability,
+                              static_cast<GParamFlags>(G_PARAM_READWRITE));
+  g_object_class_install_property(gobject_class, PROP_PROMOTE_NULLABILITY, spec);
+}
+
+/**
+ * garrow_table_concatenate_options_new:
+ *
+ * Returns: A newly created #GArrowTableConcatenateOptions.
+ *
+ * Since: 6.0.0
+ */
+GArrowTableConcatenateOptions *
+garrow_table_concatenate_options_new(void)
+{
+  return GARROW_TABLE_CONCATENATE_OPTIONS(
+    g_object_new(GARROW_TYPE_TABLE_CONCATENATE_OPTIONS, NULL));
+}
+
+typedef struct GArrowTablePrivate_
+{
   std::shared_ptr<arrow::Table> table;
 } GArrowTablePrivate;
 
 enum {
-  PROP_0,
-  PROP_TABLE
+  PROP_TABLE = 1,
 };
 
-G_DEFINE_TYPE_WITH_PRIVATE(GArrowTable,
-                           garrow_table,
-                           G_TYPE_OBJECT)
+G_DEFINE_TYPE_WITH_PRIVATE(GArrowTable, garrow_table, G_TYPE_OBJECT)
 
-#define GARROW_TABLE_GET_PRIVATE(obj)         \
-  static_cast<GArrowTablePrivate *>(          \
-     garrow_table_get_instance_private(       \
-       GARROW_TABLE(obj)))
+#define GARROW_TABLE_GET_PRIVATE(obj)                                                    \
+  static_cast<GArrowTablePrivate *>(garrow_table_get_instance_private(GARROW_TABLE(obj)))
 
 static void
 garrow_table_finalize(GObject *object)
@@ -114,7 +251,7 @@ static void
 garrow_table_init(GArrowTable *object)
 {
   auto priv = GARROW_TABLE_GET_PRIVATE(object);
-  new(&priv->table) std::shared_ptr<arrow::Table>;
+  new (&priv->table) std::shared_ptr<arrow::Table>;
 }
 
 static void
@@ -125,15 +262,15 @@ garrow_table_class_init(GArrowTableClass *klass)
 
   gobject_class = G_OBJECT_CLASS(klass);
 
-  gobject_class->finalize     = garrow_table_finalize;
+  gobject_class->finalize = garrow_table_finalize;
   gobject_class->set_property = garrow_table_set_property;
   gobject_class->get_property = garrow_table_get_property;
 
-  spec = g_param_spec_pointer("table",
-                              "Table",
-                              "The raw std::shared_ptr<arrow::Table> *",
-                              static_cast<GParamFlags>(G_PARAM_WRITABLE |
-                                                       G_PARAM_CONSTRUCT_ONLY));
+  spec = g_param_spec_pointer(
+    "table",
+    "Table",
+    "The raw std::shared_ptr<arrow::Table> *",
+    static_cast<GParamFlags>(G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY));
   g_object_class_install_property(gobject_class, PROP_TABLE, spec);
 }
 
@@ -150,9 +287,7 @@ garrow_table_class_init(GArrowTableClass *klass)
  * Since: 0.12.0
  */
 GArrowTable *
-garrow_table_new_values(GArrowSchema *schema,
-                        GList *values,
-                        GError **error)
+garrow_table_new_values(GArrowSchema *schema, GList *values, GError **error)
 {
   const auto context = "[table][new][values]";
   auto arrow_schema = garrow_schema_get_raw(schema);
@@ -203,25 +338,14 @@ garrow_table_new_values(GArrowSchema *schema,
   }
 
   if (!arrow_chunked_arrays.empty()) {
-    auto arrow_table = arrow::Table::Make(arrow_schema,
-                                          std::move(arrow_chunked_arrays));
-    auto status = arrow_table->Validate();
-    if (garrow_error_check(error, status, context)) {
-      return garrow_table_new_raw(&arrow_table);
-    } else {
-      return NULL;
-    }
+    auto arrow_table = arrow::Table::Make(arrow_schema, std::move(arrow_chunked_arrays));
+    return garrow_table_new_raw(&arrow_table);
   } else if (!arrow_arrays.empty()) {
     auto arrow_table = arrow::Table::Make(arrow_schema, std::move(arrow_arrays));
-    auto status = arrow_table->Validate();
-    if (garrow_error_check(error, status, context)) {
-      return garrow_table_new_raw(&arrow_table);
-    } else {
-      return NULL;
-    }
+    return garrow_table_new_raw(&arrow_table);
   } else {
-    auto maybe_table = arrow::Table::FromRecordBatches(
-      arrow_schema, std::move(arrow_record_batches));
+    auto maybe_table =
+      arrow::Table::FromRecordBatches(arrow_schema, std::move(arrow_record_batches));
     if (garrow::check(error, maybe_table, context)) {
       return garrow_table_new_raw(&(*maybe_table));
     } else {
@@ -256,12 +380,7 @@ garrow_table_new_chunked_arrays(GArrowSchema *schema,
   }
 
   auto arrow_table = arrow::Table::Make(arrow_schema, arrow_chunked_arrays);
-  auto status = arrow_table->Validate();
-  if (garrow_error_check(error, status, "[table][new][chunked-arrays]")) {
-    return garrow_table_new_raw(&arrow_table);
-  } else {
-    return NULL;
-  }
+  return garrow_table_new_raw(&arrow_table);
 }
 
 /**
@@ -288,12 +407,7 @@ garrow_table_new_arrays(GArrowSchema *schema,
   }
 
   auto arrow_table = arrow::Table::Make(arrow_schema, arrow_arrays);
-  auto status = arrow_table->Validate();
-  if (garrow_error_check(error, status, "[table][new][arrays]")) {
-    return garrow_table_new_raw(&arrow_table);
-  } else {
-    return NULL;
-  }
+  return garrow_table_new_raw(&arrow_table);
 }
 
 /**
@@ -321,8 +435,7 @@ garrow_table_new_record_batches(GArrowSchema *schema,
     arrow_record_batches.push_back(arrow_record_batch);
   }
 
-  auto maybe_table = arrow::Table::FromRecordBatches(arrow_schema,
-                                                     arrow_record_batches);
+  auto maybe_table = arrow::Table::FromRecordBatches(arrow_schema, arrow_record_batches);
   if (garrow::check(error, maybe_table, "[table][new][record-batches]")) {
     return garrow_table_new_raw(&(*maybe_table));
   } else {
@@ -395,8 +508,7 @@ garrow_table_get_schema(GArrowTable *table)
  * Since: 0.15.0
  */
 GArrowChunkedArray *
-garrow_table_get_column_data(GArrowTable *table,
-                             gint i)
+garrow_table_get_column_data(GArrowTable *table, gint i)
 {
   const auto &arrow_table = garrow_table_get_raw(table);
   if (!garrow_internal_index_adjust(i, arrow_table->num_columns())) {
@@ -455,9 +567,7 @@ garrow_table_add_column(GArrowTable *table,
   const auto arrow_table = garrow_table_get_raw(table);
   const auto arrow_field = garrow_field_get_raw(field);
   const auto arrow_chunked_array = garrow_chunked_array_get_raw(chunked_array);
-  auto maybe_new_table = arrow_table->AddColumn(i,
-                                                arrow_field,
-                                                arrow_chunked_array);
+  auto maybe_new_table = arrow_table->AddColumn(i, arrow_field, arrow_chunked_array);
   if (garrow::check(error, maybe_new_table, "[table][add-column]")) {
     return garrow_table_new_raw(&(*maybe_new_table));
   } else {
@@ -477,9 +587,7 @@ garrow_table_add_column(GArrowTable *table,
  * Since: 0.3.0
  */
 GArrowTable *
-garrow_table_remove_column(GArrowTable *table,
-                           guint i,
-                           GError **error)
+garrow_table_remove_column(GArrowTable *table, guint i, GError **error)
 {
   const auto arrow_table = garrow_table_get_raw(table);
   auto maybe_new_table = arrow_table->RemoveColumn(i);
@@ -514,9 +622,7 @@ garrow_table_replace_column(GArrowTable *table,
   const auto arrow_table = garrow_table_get_raw(table);
   const auto arrow_field = garrow_field_get_raw(field);
   const auto arrow_chunked_array = garrow_chunked_array_get_raw(chunked_array);
-  auto maybe_new_table = arrow_table->SetColumn(i,
-                                                arrow_field,
-                                                arrow_chunked_array);
+  auto maybe_new_table = arrow_table->SetColumn(i, arrow_field, arrow_chunked_array);
   if (garrow::check(error, maybe_new_table, "[table][replace-column]")) {
     return garrow_table_new_raw(&(*maybe_new_table));
   } else {
@@ -529,11 +635,10 @@ garrow_table_replace_column(GArrowTable *table,
  * @table: A #GArrowTable.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
- * Returns: (nullable) (transfer full):
+ * Returns: (nullable):
  *   The formatted table content or %NULL on error.
  *
- *   The returned string should be freed when with g_free() when no
- *   longer needed.
+ *   It should be freed with g_free() when no longer needed.
  *
  * Since: 0.12.0
  */
@@ -541,13 +646,15 @@ gchar *
 garrow_table_to_string(GArrowTable *table, GError **error)
 {
   const auto arrow_table = garrow_table_get_raw(table);
-  return g_strdup(arrow_table->ToString().c_str());
+  const auto string = arrow_table->ToString();
+  return g_strdup(string.c_str());
 }
 
 /**
  * garrow_table_concatenate:
  * @table: A #GArrowTable.
  * @other_tables: (element-type GArrowTable): The tables to be concatenated.
+ * @options: (nullable): The options to customize concatenation.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: (nullable) (transfer full): The table concatenated vertically.
@@ -557,17 +664,25 @@ garrow_table_to_string(GArrowTable *table, GError **error)
 GArrowTable *
 garrow_table_concatenate(GArrowTable *table,
                          GList *other_tables,
+                         GArrowTableConcatenateOptions *options,
                          GError **error)
 {
   auto arrow_table = garrow_table_get_raw(table);
-  std::vector<std::shared_ptr<arrow::Table>> arrow_tables = { arrow_table };
+  std::vector<std::shared_ptr<arrow::Table>> arrow_tables = {arrow_table};
   for (auto node = other_tables; node; node = g_list_next(node)) {
     auto arrow_other_table = garrow_table_get_raw(GARROW_TABLE(node->data));
     arrow_tables.push_back(arrow_other_table);
   }
-  auto arrow_concatenated_table = arrow::ConcatenateTables(arrow_tables);
-  if (garrow::check(error, arrow_concatenated_table, "[table][concatenate]")) {
-    return garrow_table_new_raw(&arrow_concatenated_table.ValueOrDie());
+  auto arrow_options = arrow::ConcatenateTablesOptions::Defaults();
+  if (options) {
+    auto options_priv = GARROW_TABLE_CONCATENATE_OPTIONS_GET_PRIVATE(options);
+    arrow_options = options_priv->options;
+  }
+  auto arrow_concatenated_table_result =
+    arrow::ConcatenateTables(arrow_tables, arrow_options);
+  if (garrow::check(error, arrow_concatenated_table_result, "[table][concatenate]")) {
+    auto arrow_concatenated_table = std::move(*arrow_concatenated_table_result);
+    return garrow_table_new_raw(&arrow_concatenated_table);
   } else {
     return NULL;
   }
@@ -588,9 +703,7 @@ garrow_table_concatenate(GArrowTable *table,
  * Since: 0.14.0
  */
 GArrowTable *
-garrow_table_slice(GArrowTable *table,
-                   gint64 offset,
-                   gint64 length)
+garrow_table_slice(GArrowTable *table, gint64 offset, gint64 length)
 {
   const auto arrow_table = garrow_table_get_raw(table);
   if (offset < 0) {
@@ -611,8 +724,7 @@ garrow_table_slice(GArrowTable *table,
  * Since: 0.16.0
  */
 GArrowTable *
-garrow_table_combine_chunks(GArrowTable *table,
-                            GError **error)
+garrow_table_combine_chunks(GArrowTable *table, GError **error)
 {
   const auto arrow_table = garrow_table_get_raw(table);
 
@@ -624,8 +736,44 @@ garrow_table_combine_chunks(GArrowTable *table,
   }
 }
 
+/**
+ * garrow_table_validate
+ * @table: A #GArrowTable
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Validate the given table. This is a cheap validation.
+ *
+ * Returns: %TRUE on success, %FALSE on error.
+ *
+ * Since: 20.0.0
+ */
+gboolean
+garrow_table_validate(GArrowTable *table, GError **error)
+{
+  const auto arrow_table = garrow_table_get_raw(table);
+  return garrow::check(error, arrow_table->Validate(), "[table][validate]");
+}
 
-typedef struct GArrowFeatherWritePropertiesPrivate_ {
+/**
+ * garrow_table_validate_full
+ * @table: A #GArrowTable
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Validate the given table. This is an extensive validation.
+ *
+ * Returns: %TRUE on success, %FALSE on error.
+ *
+ * Since: 20.0.0
+ */
+gboolean
+garrow_table_validate_full(GArrowTable *table, GError **error)
+{
+  const auto arrow_table = garrow_table_get_raw(table);
+  return garrow::check(error, arrow_table->ValidateFull(), "[table][validate-full]");
+}
+
+typedef struct GArrowFeatherWritePropertiesPrivate_
+{
   arrow::ipc::feather::WriteProperties properties;
 } GArrowFeatherWritePropertiesPrivate;
 
@@ -640,9 +788,9 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowFeatherWriteProperties,
                            garrow_feather_write_properties,
                            G_TYPE_OBJECT)
 
-#define GARROW_FEATHER_WRITE_PROPERTIES_GET_PRIVATE(obj)        \
-  static_cast<GArrowFeatherWritePropertiesPrivate *>(           \
-    garrow_feather_write_properties_get_instance_private(       \
+#define GARROW_FEATHER_WRITE_PROPERTIES_GET_PRIVATE(obj)                                 \
+  static_cast<GArrowFeatherWritePropertiesPrivate *>(                                    \
+    garrow_feather_write_properties_get_instance_private(                                \
       GARROW_FEATHER_WRITE_PROPERTIES(obj)))
 
 static void
@@ -696,7 +844,7 @@ static void
 garrow_feather_write_properties_init(GArrowFeatherWriteProperties *object)
 {
   auto priv = GARROW_FEATHER_WRITE_PROPERTIES_GET_PRIVATE(object);
-  new(&priv->properties) arrow::ipc::feather::WriteProperties;
+  new (&priv->properties) arrow::ipc::feather::WriteProperties;
   priv->properties = arrow::ipc::feather::WriteProperties::Defaults();
 }
 
@@ -776,9 +924,8 @@ garrow_table_write_as_feather(GArrowTable *table,
   arrow::Status status;
   if (properties) {
     auto arrow_properties = garrow_feather_write_properties_get_raw(properties);
-    status = arrow::ipc::feather::WriteTable(*arrow_table,
-                                             arrow_sink.get(),
-                                             *arrow_properties);
+    status =
+      arrow::ipc::feather::WriteTable(*arrow_table, arrow_sink.get(), *arrow_properties);
   } else {
     status = arrow::ipc::feather::WriteTable(*arrow_table, arrow_sink.get());
   }
@@ -790,9 +937,7 @@ G_END_DECLS
 GArrowTable *
 garrow_table_new_raw(std::shared_ptr<arrow::Table> *arrow_table)
 {
-  auto table = GARROW_TABLE(g_object_new(GARROW_TYPE_TABLE,
-                                         "table", arrow_table,
-                                         NULL));
+  auto table = GARROW_TABLE(g_object_new(GARROW_TYPE_TABLE, "table", arrow_table, NULL));
   return table;
 }
 

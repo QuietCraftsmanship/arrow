@@ -15,26 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import '../../jest-extensions';
+import * as fs from 'node:fs';
+import { fs as memfs } from 'memfs';
+import { PassThrough, Readable } from 'node:stream';
 
 import {
-    Table,
-    RecordBatchWriter,
     RecordBatchFileWriter,
     RecordBatchJSONWriter,
     RecordBatchStreamWriter,
-} from '../../Arrow';
+    RecordBatchWriter,
+    Table
+} from 'apache-arrow';
 
-import * as fs from 'fs';
-import { fs as memfs } from 'memfs';
-import { Readable, PassThrough } from 'stream';
-
-/* tslint:disable */
-const randomatic = require('randomatic');
+import '../../jest-extensions.js';
+import { LOWER, NUMBER, randomString } from '../../random-string.js';
 
 export abstract class ArrowIOTestHelper {
 
-    constructor(public table: Table) {}
+    constructor(public table: Table) { }
 
     public static file(table: Table) { return new ArrowFileIOTestHelper(table); }
     public static json(table: Table) { return new ArrowJsonIOTestHelper(table); }
@@ -42,7 +40,7 @@ export abstract class ArrowIOTestHelper {
 
     protected abstract writer(table: Table): RecordBatchWriter;
     protected async filepath(table: Table): Promise<fs.PathLike> {
-        const path = `/${randomatic('a0', 20)}.arrow`;
+        const path = `/${randomString(20, LOWER + NUMBER)}.arrow`;
         const data = await this.writer(table).toUint8Array();
         await memfs.promises.writeFile(path, data);
         return path;
@@ -54,13 +52,13 @@ export abstract class ArrowIOTestHelper {
             await testFn(await this.writer(this.table).toUint8Array());
         };
     }
-    iterable(testFn: (iterable: Iterable<Uint8Array>) => void | Promise<void>) {
+    iterable(testFn: (iterable: Generator<Uint8Array>) => void | Promise<void>) {
         return async () => {
             expect.hasAssertions();
             await testFn(chunkedIterable(await this.writer(this.table).toUint8Array()));
         };
     }
-    asyncIterable(testFn: (asyncIterable: AsyncIterable<Uint8Array>) => void | Promise<void>) {
+    asyncIterable(testFn: (asyncIterable: AsyncGenerator<Uint8Array>) => void | Promise<void>) {
         return async () => {
             expect.hasAssertions();
             await testFn(asyncChunkedIterable(await this.writer(this.table).toUint8Array()));
@@ -70,7 +68,7 @@ export abstract class ArrowIOTestHelper {
         return async () => {
             expect.hasAssertions();
             const path = await this.filepath(this.table);
-            await testFn(<any> await memfs.promises.open(path, 'r'));
+            await testFn(<any>await memfs.promises.open(path, 'r'));
             await memfs.promises.unlink(path);
         };
     }
@@ -78,7 +76,7 @@ export abstract class ArrowIOTestHelper {
         return async () => {
             expect.hasAssertions();
             const path = await this.filepath(this.table);
-            await testFn(<any> memfs.createReadStream(path));
+            await testFn(<any>memfs.createReadStream(path));
             await memfs.promises.unlink(path);
         };
     }
@@ -133,7 +131,7 @@ export function* chunkedIterable(buffer: Uint8Array) {
     let offset = 0, size = 0;
     while (offset < buffer.byteLength) {
         size = yield buffer.subarray(offset, offset +=
-            (isNaN(+size) ? buffer.byteLength - offset : size));
+            (Number.isNaN(+size) ? buffer.byteLength - offset : size));
     }
 }
 
@@ -141,7 +139,7 @@ export async function* asyncChunkedIterable(buffer: Uint8Array) {
     let offset = 0, size = 0;
     while (offset < buffer.byteLength) {
         size = yield buffer.subarray(offset, offset +=
-            (isNaN(+size) ? buffer.byteLength - offset : size));
+            (Number.isNaN(+size) ? buffer.byteLength - offset : size));
     }
 }
 
@@ -173,10 +171,8 @@ export async function* readableDOMStreamToAsyncIterator<T>(stream: ReadableStrea
             // Else yield the chunk
             yield value as T;
         }
-    } catch (e) {
-        throw e;
     } finally {
-        try { stream.locked && reader.releaseLock(); } catch (e) {}
+        try { stream.locked && reader.releaseLock(); } catch { }
     }
 }
 

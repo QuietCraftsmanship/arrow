@@ -24,7 +24,6 @@
 #include "arrow/memory_pool.h"
 #include "arrow/result.h"
 #include "arrow/util/bit_util.h"
-#include "arrow/util/bitmap_reader.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
@@ -40,8 +39,8 @@ void GenerateBits(uint8_t* bitmap, int64_t start_offset, int64_t length, Generat
     return;
   }
   uint8_t* cur = bitmap + start_offset / 8;
-  uint8_t bit_mask = BitUtil::kBitmask[start_offset % 8];
-  uint8_t current_byte = *cur & BitUtil::kPrecedingBitmask[start_offset % 8];
+  uint8_t bit_mask = bit_util::kBitmask[start_offset % 8];
+  uint8_t current_byte = *cur & bit_util::kPrecedingBitmask[start_offset % 8];
 
   for (int64_t index = 0; index < length; ++index) {
     const bool bit = g();
@@ -63,19 +62,22 @@ void GenerateBits(uint8_t* bitmap, int64_t start_offset, int64_t length, Generat
 template <class Generator>
 void GenerateBitsUnrolled(uint8_t* bitmap, int64_t start_offset, int64_t length,
                           Generator&& g) {
+  static_assert(std::is_same<decltype(std::declval<Generator>()()), bool>::value,
+                "Functor passed to GenerateBitsUnrolled must return bool");
+
   if (length == 0) {
     return;
   }
   uint8_t current_byte;
   uint8_t* cur = bitmap + start_offset / 8;
   const uint64_t start_bit_offset = start_offset % 8;
-  uint8_t bit_mask = BitUtil::kBitmask[start_bit_offset];
+  uint8_t bit_mask = bit_util::kBitmask[start_bit_offset];
   int64_t remaining = length;
 
   if (bit_mask != 0x01) {
-    current_byte = *cur & BitUtil::kPrecedingBitmask[start_bit_offset];
+    current_byte = *cur & bit_util::kPrecedingBitmask[start_bit_offset];
     while (bit_mask != 0 && remaining > 0) {
-      current_byte = g() ? (current_byte | bit_mask) : current_byte;
+      current_byte |= g() * bit_mask;
       bit_mask = static_cast<uint8_t>(bit_mask << 1);
       --remaining;
     }
@@ -83,17 +85,15 @@ void GenerateBitsUnrolled(uint8_t* bitmap, int64_t start_offset, int64_t length,
   }
 
   int64_t remaining_bytes = remaining / 8;
+  uint8_t out_results[8];
   while (remaining_bytes-- > 0) {
-    current_byte = 0;
-    current_byte = g() ? current_byte | 0x01 : current_byte;
-    current_byte = g() ? current_byte | 0x02 : current_byte;
-    current_byte = g() ? current_byte | 0x04 : current_byte;
-    current_byte = g() ? current_byte | 0x08 : current_byte;
-    current_byte = g() ? current_byte | 0x10 : current_byte;
-    current_byte = g() ? current_byte | 0x20 : current_byte;
-    current_byte = g() ? current_byte | 0x40 : current_byte;
-    current_byte = g() ? current_byte | 0x80 : current_byte;
-    *cur++ = current_byte;
+    for (int i = 0; i < 8; ++i) {
+      out_results[i] = g();
+    }
+    *cur++ = static_cast<uint8_t>(out_results[0] | out_results[1] << 1 |
+                                  out_results[2] << 2 | out_results[3] << 3 |
+                                  out_results[4] << 4 | out_results[5] << 5 |
+                                  out_results[6] << 6 | out_results[7] << 7);
   }
 
   int64_t remaining_bits = remaining % 8;
@@ -101,7 +101,7 @@ void GenerateBitsUnrolled(uint8_t* bitmap, int64_t start_offset, int64_t length,
     current_byte = 0;
     bit_mask = 0x01;
     while (remaining_bits-- > 0) {
-      current_byte = g() ? (current_byte | bit_mask) : current_byte;
+      current_byte |= g() * bit_mask;
       bit_mask = static_cast<uint8_t>(bit_mask << 1);
     }
     *cur++ = current_byte;

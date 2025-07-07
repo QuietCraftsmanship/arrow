@@ -18,8 +18,23 @@
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 
+from .command import Command
 from .git import git
+
+
+ARROW_ROOT_DEFAULT = os.environ.get(
+    'ARROW_ROOT',
+    Path(__file__).resolve().parents[4]
+)
+
+
+def arrow_path(path):
+    """
+    Return full path to a file given its path inside the Arrow repo.
+    """
+    return os.path.join(ARROW_ROOT_DEFAULT, path)
 
 
 class InvalidArrowSource(Exception):
@@ -69,6 +84,11 @@ class ArrowSources:
         return self.path / "dev"
 
     @property
+    def java(self):
+        """ Returns the java directory of an Arrow sources. """
+        return self.path / "java"
+
+    @property
     def python(self):
         """ Returns the python directory of an Arrow sources. """
         return self.path / "python"
@@ -82,11 +102,6 @@ class ArrowSources:
     def r(self):
         """ Returns the r directory of an Arrow sources. """
         return self.path / "r"
-
-    @property
-    def rust(self):
-        """ Returns the rust directory of an Arrow sources. """
-        return self.path / "rust"
 
     @property
     def git_backed(self):
@@ -104,10 +119,20 @@ class ArrowSources:
             raise ValueError("{} is not backed by git".format(self))
 
         rev = revision if revision else "HEAD"
-        archive = git.archive("--prefix=apache-arrow/", rev,
+        archive = git.archive("--prefix=apache-arrow.tmp/", rev,
                               git_dir=self.path)
-
-        # TODO(fsaintjacques): fix dereference for
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            tar_path = tmp / "apache-arrow.tar"
+            with open(tar_path, "wb") as tar:
+                tar.write(archive)
+            Command("tar").run("xf", tar_path, "-C", tmp)
+            # Must use the same logic in dev/release/02-source.sh
+            Command("cp").run("-R", "-L", tmp /
+                              "apache-arrow.tmp", tmp / "apache-arrow")
+            Command("tar").run("cf", tar_path, "-C", tmp, "apache-arrow")
+            with open(tar_path, "rb") as tar:
+                archive = tar.read()
 
         if compressor:
             archive = compressor(archive)
@@ -143,7 +168,9 @@ class ArrowSources:
         # A local clone is required to leave the current sources intact such
         # that builds depending on said sources are not invalidated (or worse
         # slightly affected when re-invoking the generator).
-        git.clone("--local", self.path, clone_dir)
+        # "--local" only works when dest dir is on same volume of source dir.
+        # "--shared" works even if dest dir is on different volume.
+        git.clone("--shared", self.path, clone_dir)
 
         # Revision can reference "origin/" (or any remotes) that are not found
         # in the local clone. Thus, revisions are dereferenced in the source
@@ -180,7 +207,10 @@ class ArrowSources:
         cwd = Path.cwd()
 
         # Implicit via current file
-        this = Path(__file__).parents[4]
+        try:
+            this = Path(__file__).parents[4]
+        except IndexError:
+            this = None
 
         # Implicit via git repository (if archery is installed system wide)
         try:
@@ -203,4 +233,4 @@ class ArrowSources:
         )
 
     def __repr__(self):
-        return self.path
+        return os.fspath(self.path)

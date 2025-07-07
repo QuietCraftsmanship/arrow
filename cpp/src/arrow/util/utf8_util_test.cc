@@ -24,7 +24,7 @@
 
 #include "arrow/testing/gtest_util.h"
 #include "arrow/util/string.h"
-#include "arrow/util/utf8.h"
+#include "arrow/util/utf8_internal.h"
 
 namespace arrow {
 namespace util {
@@ -65,7 +65,8 @@ class UTF8Test : public ::testing::Test {
   static std::vector<std::string> invalid_sequences_ascii;
 };
 
-std::vector<std::string> UTF8Test::valid_sequences_1 = {"a", "\x7f"};
+std::vector<std::string> UTF8Test::valid_sequences_1 = {"a", "\x7f",
+                                                        std::string("\0", 1)};
 std::vector<std::string> UTF8Test::valid_sequences_2 = {"\xc2\x80", "\xc3\xbf",
                                                         "\xdf\xbf"};
 std::vector<std::string> UTF8Test::valid_sequences_3 = {"\xe0\xa0\x80", "\xe8\x9d\xa5",
@@ -140,13 +141,31 @@ class ASCIIValidationTest : public UTF8Test {};
   }
 }
 
+template <typename ValidationFunc>
+void ValidateWithPrefixes(ValidationFunc&& validate, const std::string& s) {
+  // Exercise SIMD optimizations
+  for (int prefix_size = 1; prefix_size < 64; ++prefix_size) {
+    std::string longer(prefix_size, 'x');
+    longer.append(s);
+    ASSERT_TRUE(validate(longer));
+    longer.append(prefix_size, 'y');
+    ASSERT_TRUE(validate(longer));
+  }
+}
+
 void AssertValidUTF8(const std::string& s) { ASSERT_TRUE(IsValidUTF8(s)); }
 
 void AssertInvalidUTF8(const std::string& s) { ASSERT_TRUE(IsInvalidUTF8(s)); }
 
-void AssertValidASCII(const std::string& s) { ASSERT_TRUE(IsValidASCII(s)); }
+void AssertValidASCII(const std::string& s) {
+  ASSERT_TRUE(IsValidASCII(s));
+  ValidateWithPrefixes(IsValidASCII, s);
+}
 
-void AssertInvalidASCII(const std::string& s) { ASSERT_TRUE(IsInvalidASCII(s)); }
+void AssertInvalidASCII(const std::string& s) {
+  ASSERT_TRUE(IsInvalidASCII(s));
+  ValidateWithPrefixes(IsInvalidASCII, s);
+}
 
 TEST_F(ASCIIValidationTest, AsciiValid) {
   for (const auto& s : valid_sequences_ascii) {
@@ -327,6 +346,9 @@ TEST(SkipUTF8BOM, Basics) {
   CheckTruncated("\xef\xbb");
 }
 
+// Currently a known issue with Valgrind and wide string AVX2 instructions
+// https://sourceware.org/bugzilla/show_bug.cgi?id=22954
+#ifndef ARROW_VALGRIND
 TEST(UTF8ToWideString, Basics) {
   auto CheckOk = [](const std::string& s, const std::wstring& expected) -> void {
     ASSERT_OK_AND_ASSIGN(std::wstring ws, UTF8ToWideString(s));
@@ -347,6 +369,7 @@ TEST(UTF8ToWideString, Basics) {
   CheckInvalid("\xff");
   CheckInvalid("h\xc3");
 }
+#endif
 
 TEST(WideStringToUTF8, Basics) {
   auto CheckOk = [](const std::wstring& ws, const std::string& expected) -> void {
@@ -372,6 +395,171 @@ TEST(WideStringToUTF8, Basics) {
 #if WCHAR_MAX > 0xFFFF
   CheckInvalid({0x110000});
 #endif
+}
+
+TEST(UTF8StringToUTF16, Basics) {
+  auto CheckOk = [](const std::string& s, const std::u16string& expected) -> void {
+    ASSERT_OK_AND_ASSIGN(std::u16string u16s, UTF8StringToUTF16(s));
+    ASSERT_EQ(u16s, expected);
+  };
+
+  auto CheckInvalid = [](const std::string& s) -> void {
+    ASSERT_RAISES(Invalid, UTF8StringToUTF16(s));
+  };
+
+  CheckOk("", u"");
+  CheckOk("foo", u"foo");
+  CheckOk("h\xc3\xa9h\xc3\xa9", u"h\u00e9h\u00e9");
+  CheckOk("\xf0\x9f\x98\x80", u"\U0001F600");
+  CheckOk("\xf4\x8f\xbf\xbf", u"\U0010FFFF");
+  CheckOk({0, 'x'}, {0, u'x'});
+
+  CheckInvalid("\xff");
+  CheckInvalid("h\xc3");
+
+  // lone high-code point
+  CheckInvalid("\xed\xa0\x80");
+
+  // lone low-code point
+  CheckInvalid("\xed\xb0\x81");
+}
+
+TEST(UTF16StringToUTF8, Basics) {
+  auto CheckOk = [](const std::u16string& u16s, const std::string& expected) -> void {
+    ASSERT_OK_AND_ASSIGN(std::string s, UTF16StringToUTF8(u16s));
+    ASSERT_EQ(s, expected);
+  };
+
+  auto CheckInvalid = [](const std::u16string& u16s) -> void {
+    ASSERT_RAISES(Invalid, UTF16StringToUTF8(u16s));
+  };
+
+  CheckOk(u"", "");
+  CheckOk(u"foo", "foo");
+  CheckOk(u"h\u00e9h\u00e9", "h\xc3\xa9h\xc3\xa9");
+  CheckOk(u"\U0001F600", "\xf0\x9f\x98\x80");
+  CheckOk(u"\U0010FFFF", "\xf4\x8f\xbf\xbf");
+  CheckOk({0, u'x'}, {0, 'x'});
+
+  // Lone surrogate
+  CheckInvalid({0xD800});
+  CheckInvalid({0xDFFF});
+}
+
+TEST(UTF8DecodeReverse, Basics) {
+  auto CheckOk = [](const std::string& s) -> void {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(s.c_str());
+    const uint8_t* end = begin + s.length();
+    const uint8_t* i = end - 1;
+    uint32_t codepoint;
+    EXPECT_TRUE(UTF8DecodeReverse(&i, &codepoint));
+    EXPECT_EQ(i, begin - 1);
+  };
+
+  // 0x80 == 0b10000000
+  // 0xC0 == 0b11000000
+  // 0xE0 == 0b11100000
+  // 0xF0 == 0b11110000
+  CheckOk("a");
+  CheckOk("\xC0\x80");
+  CheckOk("\xE0\x80\x80");
+  CheckOk("\xF0\x80\x80\x80");
+
+  auto CheckInvalid = [](const std::string& s) -> void {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(s.c_str());
+    const uint8_t* end = begin + s.length();
+    const uint8_t* i = end - 1;
+    uint32_t codepoint;
+    EXPECT_FALSE(UTF8DecodeReverse(&i, &codepoint));
+  };
+
+  // too many continuation code units
+  CheckInvalid("a\x80");
+  CheckInvalid("\xC0\x80\x80");
+  CheckInvalid("\xE0\x80\x80\x80");
+  CheckInvalid("\xF0\x80\x80\x80\x80");
+  // not enough continuation code units
+  CheckInvalid("\xC0");
+  CheckInvalid("\xE0\x80");
+  CheckInvalid("\xF0\x80\x80");
+}
+
+TEST(UTF8FindIf, Basics) {
+  auto CheckOk = [](const std::string& s, unsigned char test, int64_t offset_left,
+                    int64_t offset_right) -> void {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(s.c_str());
+    const uint8_t* end = begin + s.length();
+    std::reverse_iterator<const uint8_t*> rbegin(end);
+    std::reverse_iterator<const uint8_t*> rend(begin);
+    const uint8_t* left = nullptr;
+    const uint8_t* right = nullptr;
+    auto predicate = [&](uint32_t c) { return c == test; };
+    EXPECT_TRUE(UTF8FindIf(begin, end, predicate, &left));
+    EXPECT_TRUE(UTF8FindIfReverse(begin, end, predicate, &right));
+    EXPECT_EQ(offset_left, left - begin);
+    EXPECT_EQ(offset_right, right - begin);
+    EXPECT_EQ(std::find_if(begin, end, predicate) - begin, left - begin);
+    EXPECT_EQ(std::find_if(rbegin, rend, predicate).base() - begin, right - begin);
+  };
+  auto CheckOkUTF8 = [](const std::string& s, uint32_t test, int64_t offset_left,
+                        int64_t offset_right) -> void {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(s.c_str());
+    const uint8_t* end = begin + s.length();
+    std::reverse_iterator<const uint8_t*> rbegin(end);
+    std::reverse_iterator<const uint8_t*> rend(begin);
+    const uint8_t* left = nullptr;
+    const uint8_t* right = nullptr;
+    auto predicate = [&](uint32_t c) { return c == test; };
+    EXPECT_TRUE(UTF8FindIf(begin, end, predicate, &left));
+    EXPECT_TRUE(UTF8FindIfReverse(begin, end, predicate, &right));
+    EXPECT_EQ(offset_left, left - begin);
+    EXPECT_EQ(offset_right, right - begin);
+    // we cannot check the unicode version with find_if semantics, because it's byte based
+    // EXPECT_EQ(std::find_if(begin, end, predicate) - begin, left - begin);
+    // EXPECT_EQ(std::find_if(rbegin, rend, predicate).base() - begin, right - begin);
+  };
+
+  CheckOk("aaaba", 'a', 0, 5);
+  CheckOkUTF8("aaaβa", 'a', 0, 6);
+
+  CheckOk("aaaba", 'b', 3, 4);
+  CheckOkUTF8("aaaβa", U'β', 3, 5);
+
+  CheckOk("aaababa", 'b', 3, 6);
+  CheckOkUTF8("aaaβaβa", U'β', 3, 8);
+
+  CheckOk("aaababa", 'c', 7, 0);
+  CheckOk("aaaβaβa", 'c', 9, 0);
+  CheckOkUTF8("aaaβaβa", U'ɑ', 9, 0);
+
+  CheckOk("a", 'a', 0, 1);
+  CheckOkUTF8("ɑ", U'ɑ', 0, 2);
+
+  CheckOk("a", 'b', 1, 0);
+  CheckOkUTF8("ɑ", 'b', 2, 0);
+
+  CheckOk("", 'b', 0, 0);
+  CheckOkUTF8("", U'β', 0, 0);
+}
+
+TEST(UTF8Length, Basics) {
+  auto length = [](const std::string& s) {
+    const auto* p = reinterpret_cast<const uint8_t*>(s.data());
+    return UTF8Length(p, p + s.length());
+  };
+  ASSERT_EQ(length("abcde"), 5);
+  // accented a encoded as a single codepoint
+  ASSERT_EQ(length("\xc3\x81"
+                   "bcde"),
+            5);
+  // accented a encoded as two codepoints via combining character
+  ASSERT_EQ(length("a\xcc\x81"
+                   "bcde"),
+            6);
+  // hiragana a (3 bytes)
+  ASSERT_EQ(length("\xe3\x81\x81"), 1);
+  // raised hands emoji (4 bytes)
+  ASSERT_EQ(length("\xf0\x9f\x99\x8c"), 1);
 }
 
 }  // namespace util

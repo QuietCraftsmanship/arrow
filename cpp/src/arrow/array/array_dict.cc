@@ -29,15 +29,19 @@
 #include "arrow/array/dict_internal.h"
 #include "arrow/array/util.h"
 #include "arrow/buffer.h"
+#include "arrow/chunked_array.h"
+#include "arrow/compute/api.h"
+#include "arrow/datum.h"
 #include "arrow/status.h"
+#include "arrow/table.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/int_util.h"
-#include "arrow/util/logging.h"
-#include "arrow/visitor_inline.h"
+#include "arrow/util/logging_internal.h"
+#include "arrow/visit_type_inline.h"
 
 namespace arrow {
 
@@ -47,56 +51,31 @@ using internal::CopyBitmap;
 // ----------------------------------------------------------------------
 // DictionaryArray
 
-/// \brief Perform validation check to determine if all dictionary indices
-/// are within valid range (0 <= index < upper_bound)
-///
-/// \param[in] indices array of dictionary indices
-/// \param[in] upper_bound upper bound of valid range for indices
-/// \return Status
-template <typename ArrowType>
-Status ValidateDictionaryIndices(const std::shared_ptr<Array>& indices,
-                                 const int64_t upper_bound) {
-  using ArrayType = typename TypeTraits<ArrowType>::ArrayType;
-  const auto& array = checked_cast<const ArrayType&>(*indices);
-  const typename ArrowType::c_type* data = array.raw_values();
-  const int64_t size = array.length();
-
-  if (array.null_count() == 0) {
-    for (int64_t idx = 0; idx < size; ++idx) {
-      if (data[idx] < 0 || data[idx] >= upper_bound) {
-        return Status::Invalid("Dictionary has out-of-bound index [0, dict.length)");
-      }
-    }
-  } else {
-    for (int64_t idx = 0; idx < size; ++idx) {
-      if (!array.IsNull(idx)) {
-        if (data[idx] < 0 || data[idx] >= upper_bound) {
-          return Status::Invalid("Dictionary has out-of-bound index [0, dict.length)");
-        }
-      }
-    }
-  }
-
-  return Status::OK();
-}
-
-std::shared_ptr<Array> DictionaryArray::indices() const { return indices_; }
+const std::shared_ptr<Array>& DictionaryArray::indices() const { return indices_; }
 
 int64_t DictionaryArray::GetValueIndex(int64_t i) const {
+  const uint8_t* indices_data = data_->buffers[1]->data();
+  // If the value is non-negative then we can use the unsigned path
   switch (indices_->type_id()) {
+    case Type::UINT8:
     case Type::INT8:
-      return checked_cast<const Int8Array&>(*indices_).Value(i);
+      return static_cast<int64_t>(indices_data[data_->offset + i]);
+    case Type::UINT16:
     case Type::INT16:
-      return checked_cast<const Int16Array&>(*indices_).Value(i);
+      return static_cast<int64_t>(
+          reinterpret_cast<const uint16_t*>(indices_data)[data_->offset + i]);
+    case Type::UINT32:
     case Type::INT32:
-      return checked_cast<const Int32Array&>(*indices_).Value(i);
+      return static_cast<int64_t>(
+          reinterpret_cast<const uint32_t*>(indices_data)[data_->offset + i]);
+    case Type::UINT64:
     case Type::INT64:
-      return checked_cast<const Int64Array&>(*indices_).Value(i);
+      return static_cast<int64_t>(
+          reinterpret_cast<const uint64_t*>(indices_data)[data_->offset + i]);
     default:
-      break;
+      ARROW_CHECK(false) << "unreachable";
+      return -1;
   }
-  ARROW_CHECK(false) << "unreachable";
-  return -1;
 }
 
 DictionaryArray::DictionaryArray(const std::shared_ptr<ArrayData>& data)
@@ -128,8 +107,9 @@ DictionaryArray::DictionaryArray(const std::shared_ptr<DataType>& type,
   SetData(data);
 }
 
-std::shared_ptr<Array> DictionaryArray::dictionary() const {
+const std::shared_ptr<Array>& DictionaryArray::dictionary() const {
   if (!dictionary_) {
+    // TODO(GH-36503) this isn't thread safe
     dictionary_ = MakeArray(data_->dictionary);
   }
   return dictionary_;
@@ -142,29 +122,13 @@ Result<std::shared_ptr<Array>> DictionaryArray::FromArrays(
     return Status::TypeError("Expected a dictionary type");
   }
   const auto& dict = checked_cast<const DictionaryType&>(*type);
-  ARROW_CHECK_EQ(indices->type_id(), dict.index_type()->id());
-
-  int64_t upper_bound = dictionary->length();
-  Status is_valid;
-
-  switch (indices->type_id()) {
-    case Type::INT8:
-      is_valid = ValidateDictionaryIndices<Int8Type>(indices, upper_bound);
-      break;
-    case Type::INT16:
-      is_valid = ValidateDictionaryIndices<Int16Type>(indices, upper_bound);
-      break;
-    case Type::INT32:
-      is_valid = ValidateDictionaryIndices<Int32Type>(indices, upper_bound);
-      break;
-    case Type::INT64:
-      is_valid = ValidateDictionaryIndices<Int64Type>(indices, upper_bound);
-      break;
-    default:
-      return Status::NotImplemented("Dictionary index type not supported: ",
-                                    indices->type()->ToString());
+  if (indices->type_id() != dict.index_type()->id()) {
+    return Status::TypeError(
+        "Dictionary type's index type does not match "
+        "indices array's type");
   }
-  RETURN_NOT_OK(is_valid);
+  RETURN_NOT_OK(internal::CheckIndexBounds(*indices->data(),
+                                           static_cast<uint64_t>(dictionary->length())));
   return std::make_shared<DictionaryArray>(type, indices, dictionary);
 }
 
@@ -182,7 +146,200 @@ bool DictionaryArray::CanCompareIndices(const DictionaryArray& other) const {
 }
 
 // ----------------------------------------------------------------------
-// DictionaryType unification
+// Dictionary transposition
+
+namespace {
+
+inline bool IsTrivialTransposition(const int32_t* transpose_map,
+                                   int64_t input_dict_size) {
+  for (int64_t i = 0; i < input_dict_size; ++i) {
+    if (transpose_map[i] != i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Result<std::shared_ptr<ArrayData>> TransposeDictIndices(
+    const std::shared_ptr<ArrayData>& data, const std::shared_ptr<DataType>& in_type,
+    const std::shared_ptr<DataType>& out_type,
+    const std::shared_ptr<ArrayData>& dictionary, const int32_t* transpose_map,
+    MemoryPool* pool) {
+  // Note that in_type may be different from data->type if data is of type ExtensionType
+  if (in_type->id() != Type::DICTIONARY || out_type->id() != Type::DICTIONARY) {
+    return Status::TypeError("Expected dictionary type");
+  }
+  const int64_t in_dict_len = data->dictionary->length;
+  const auto& in_dict_type = checked_cast<const DictionaryType&>(*in_type);
+  const auto& out_dict_type = checked_cast<const DictionaryType&>(*out_type);
+
+  const auto& in_index_type = *in_dict_type.index_type();
+  const auto& out_index_type =
+      checked_cast<const FixedWidthType&>(*out_dict_type.index_type());
+
+  if (in_index_type.id() == out_index_type.id() &&
+      IsTrivialTransposition(transpose_map, in_dict_len)) {
+    // Index type and values will be identical => we can simply reuse
+    // the existing buffers.
+    auto out_data =
+        ArrayData::Make(out_type, data->length, {data->buffers[0], data->buffers[1]},
+                        data->null_count, data->offset);
+    out_data->dictionary = dictionary;
+    return out_data;
+  }
+
+  // Default path: compute a buffer of transposed indices.
+  ARROW_ASSIGN_OR_RAISE(
+      auto out_buffer,
+      AllocateBuffer(data->length * (out_index_type.bit_width() / CHAR_BIT), pool));
+
+  // Shift null buffer if the original offset is non-zero
+  std::shared_ptr<Buffer> null_bitmap;
+  if (data->offset != 0 && data->null_count != 0) {
+    ARROW_ASSIGN_OR_RAISE(null_bitmap, CopyBitmap(pool, data->buffers[0]->data(),
+                                                  data->offset, data->length));
+  } else {
+    null_bitmap = data->buffers[0];
+  }
+
+  auto out_data = ArrayData::Make(out_type, data->length,
+                                  {null_bitmap, std::move(out_buffer)}, data->null_count);
+  out_data->dictionary = dictionary;
+  RETURN_NOT_OK(internal::TransposeInts(
+      in_index_type, out_index_type, data->GetValues<uint8_t>(1, 0),
+      out_data->GetMutableValues<uint8_t>(1, 0), data->offset, out_data->offset,
+      data->length, transpose_map));
+  return out_data;
+}
+
+struct CompactTransposeMapVisitor {
+  const std::shared_ptr<ArrayData>& data;
+  arrow::MemoryPool* pool;
+  std::unique_ptr<Buffer> output_map;
+  std::shared_ptr<Array> out_compact_dictionary;
+
+  template <typename IndexArrowType>
+  Status CompactTransposeMapImpl() {
+    int64_t index_length = data->length;
+    int64_t dict_length = data->dictionary->length;
+    if (dict_length == 0) {
+      output_map = nullptr;
+      out_compact_dictionary = nullptr;
+      return Status::OK();
+    } else if (index_length == 0) {
+      ARROW_ASSIGN_OR_RAISE(out_compact_dictionary,
+                            MakeEmptyArray(data->dictionary->type, pool));
+      ARROW_ASSIGN_OR_RAISE(output_map, AllocateBuffer(0, pool))
+      return Status::OK();
+    }
+
+    using CType = typename IndexArrowType::c_type;
+    const CType* indices_data = data->GetValues<CType>(1);
+    std::vector<bool> dict_used(dict_length, false);
+    CType dict_len = static_cast<CType>(dict_length);
+    int64_t dict_used_count = 0;
+    for (int64_t i = 0; i < index_length; i++) {
+      if (data->IsNull(i)) {
+        continue;
+      }
+
+      CType current_index = indices_data[i];
+      if (current_index < 0 || current_index >= dict_len) {
+        return Status::IndexError(
+            "Index out of bounds while compacting dictionary array: ", current_index,
+            "(dictionary is ", dict_length, " long) at position ", i);
+      }
+      if (dict_used[current_index]) continue;
+      dict_used[current_index] = true;
+      dict_used_count++;
+
+      if (dict_used_count == dict_length) {
+        // The dictionary is already compact, so just return here
+        output_map = nullptr;
+        out_compact_dictionary = nullptr;
+        return Status::OK();
+      }
+    }
+
+    using BuilderType = NumericBuilder<IndexArrowType>;
+    using arrow::compute::Take;
+    using arrow::compute::TakeOptions;
+    BuilderType dict_indices_builder(pool);
+    ARROW_RETURN_NOT_OK(dict_indices_builder.Reserve(dict_used_count));
+    ARROW_ASSIGN_OR_RAISE(output_map,
+                          AllocateBuffer(dict_length * sizeof(int32_t), pool));
+    auto* output_map_raw = output_map->mutable_data_as<int32_t>();
+    int32_t current_index = 0;
+    for (CType i = 0; i < dict_len; i++) {
+      if (dict_used[i]) {
+        dict_indices_builder.UnsafeAppend(i);
+        output_map_raw[i] = current_index;
+        current_index++;
+      } else {
+        output_map_raw[i] = -1;
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> compacted_dict_indices,
+                          dict_indices_builder.Finish());
+    ARROW_ASSIGN_OR_RAISE(auto compacted_dict_res,
+                          Take(Datum(data->dictionary), compacted_dict_indices,
+                               TakeOptions::NoBoundsCheck()));
+    out_compact_dictionary = compacted_dict_res.make_array();
+    return Status::OK();
+  }
+
+  template <typename Type>
+  enable_if_integer<Type, Status> Visit(const Type&) {
+    return CompactTransposeMapImpl<Type>();
+  }
+
+  Status Visit(const DataType& type) {
+    return Status::TypeError("Expected an Index Type of Int or UInt");
+  }
+};
+
+Result<std::unique_ptr<Buffer>> CompactTransposeMap(
+    const std::shared_ptr<ArrayData>& data, MemoryPool* pool,
+    std::shared_ptr<Array>& out_compact_dictionary) {
+  if (data->type->id() != Type::DICTIONARY) {
+    return Status::TypeError("Expected dictionary type");
+  }
+
+  const auto& dict_type = checked_cast<const DictionaryType&>(*data->type);
+  CompactTransposeMapVisitor visitor{data, pool, nullptr, nullptr};
+  RETURN_NOT_OK(VisitTypeInline(*dict_type.index_type(), &visitor));
+
+  out_compact_dictionary = visitor.out_compact_dictionary;
+  return std::move(visitor.output_map);
+}
+}  // namespace
+
+Result<std::shared_ptr<Array>> DictionaryArray::Transpose(
+    const std::shared_ptr<DataType>& type, const std::shared_ptr<Array>& dictionary,
+    const int32_t* transpose_map, MemoryPool* pool) const {
+  ARROW_ASSIGN_OR_RAISE(auto transposed,
+                        TransposeDictIndices(data_, data_->type, type, dictionary->data(),
+                                             transpose_map, pool));
+  return MakeArray(std::move(transposed));
+}
+
+Result<std::shared_ptr<Array>> DictionaryArray::Compact(MemoryPool* pool) const {
+  std::shared_ptr<Array> compact_dictionary;
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Buffer> transpose_map,
+                        CompactTransposeMap(this->data_, pool, compact_dictionary));
+
+  if (transpose_map == nullptr) {
+    return std::make_shared<DictionaryArray>(this->data_);
+  } else {
+    return this->Transpose(this->type(), compact_dictionary,
+                           transpose_map->data_as<int32_t>(), pool);
+  }
+}
+
+// ----------------------------------------------------------------------
+// Dictionary unification
+
+namespace {
 
 template <typename T>
 class DictionaryUnifierImpl : public DictionaryUnifier {
@@ -192,7 +349,7 @@ class DictionaryUnifierImpl : public DictionaryUnifier {
   using MemoTableType = typename DictTraits::MemoTableType;
 
   DictionaryUnifierImpl(MemoryPool* pool, std::shared_ptr<DataType> value_type)
-      : pool_(pool), value_type_(value_type), memo_table_(pool) {}
+      : pool_(pool), value_type_(std::move(value_type)), memo_table_(pool) {}
 
   Status Unify(const Array& dictionary, std::shared_ptr<Buffer>* out) override {
     if (dictionary.null_count() > 0) {
@@ -239,9 +396,26 @@ class DictionaryUnifierImpl : public DictionaryUnifier {
     *out_type = arrow::dictionary(index_type, value_type_);
 
     // Build unified dictionary array
-    std::shared_ptr<ArrayData> data;
-    RETURN_NOT_OK(DictTraits::GetDictionaryArrayData(pool_, value_type_, memo_table_,
-                                                     0 /* start_offset */, &data));
+    ARROW_ASSIGN_OR_RAISE(
+        auto data, DictTraits::GetDictionaryArrayData(pool_, value_type_, memo_table_,
+                                                      0 /* start_offset */));
+    *out_dict = MakeArray(data);
+    return Status::OK();
+  }
+
+  Status GetResultWithIndexType(const std::shared_ptr<DataType>& index_type,
+                                std::shared_ptr<Array>* out_dict) override {
+    Int64Scalar dict_length(memo_table_.size());
+    if (!internal::IntegersCanFit(dict_length, *index_type).ok()) {
+      return Status::Invalid(
+          "These dictionaries cannot be combined.  The unified dictionary requires a "
+          "larger index type.");
+    }
+
+    // Build unified dictionary array
+    ARROW_ASSIGN_OR_RAISE(
+        auto data, DictTraits::GetDictionaryArrayData(pool_, value_type_, memo_table_,
+                                                      0 /* start_offset */));
     *out_dict = MakeArray(data);
     return Status::OK();
   }
@@ -258,12 +432,12 @@ struct MakeUnifier {
   std::unique_ptr<DictionaryUnifier> result;
 
   MakeUnifier(MemoryPool* pool, std::shared_ptr<DataType> value_type)
-      : pool(pool), value_type(value_type) {}
+      : pool(pool), value_type(std::move(value_type)) {}
 
   template <typename T>
   enable_if_no_memoize<T, Status> Visit(const T&) {
     // Default implementation for non-dictionary-supported datatypes
-    return Status::NotImplemented("Unification of ", value_type,
+    return Status::NotImplemented("Unification of ", *value_type,
                                   " dictionaries is not implemented");
   }
 
@@ -274,6 +448,76 @@ struct MakeUnifier {
   }
 };
 
+struct RecursiveUnifier {
+  MemoryPool* pool;
+
+  // Return true if any of the arrays was changed (including descendents)
+  Result<bool> Unify(std::shared_ptr<DataType> type, ArrayDataVector* chunks) {
+    DCHECK(!chunks->empty());
+    bool changed = false;
+    std::shared_ptr<DataType> ext_type = nullptr;
+
+    if (type->id() == Type::EXTENSION) {
+      ext_type = std::move(type);
+      type = checked_cast<const ExtensionType&>(*ext_type).storage_type();
+    }
+
+    // Unify all child dictionaries (if any)
+    if (type->num_fields() > 0) {
+      ArrayDataVector children(chunks->size());
+      for (int i = 0; i < type->num_fields(); ++i) {
+        std::transform(chunks->begin(), chunks->end(), children.begin(),
+                       [i](const std::shared_ptr<ArrayData>& array) {
+                         return array->child_data[i];
+                       });
+        ARROW_ASSIGN_OR_RAISE(bool child_changed,
+                              Unify(type->field(i)->type(), &children));
+        if (child_changed) {
+          // Only do this when unification actually occurred
+          for (size_t j = 0; j < chunks->size(); ++j) {
+            (*chunks)[j]->child_data[i] = std::move(children[j]);
+          }
+          changed = true;
+        }
+      }
+    }
+
+    // Unify this dictionary
+    if (type->id() == Type::DICTIONARY) {
+      const auto& dict_type = checked_cast<const DictionaryType&>(*type);
+      // XXX Ideally, we should unify dictionaries nested in value_type first,
+      // but DictionaryUnifier doesn't supported nested dictionaries anyway,
+      // so this will fail.
+      ARROW_ASSIGN_OR_RAISE(auto unifier,
+                            DictionaryUnifier::Make(dict_type.value_type(), this->pool));
+      // Unify all dictionary array chunks
+      BufferVector transpose_maps(chunks->size());
+      for (size_t j = 0; j < chunks->size(); ++j) {
+        DCHECK_NE((*chunks)[j]->dictionary, nullptr);
+        RETURN_NOT_OK(
+            unifier->Unify(*MakeArray((*chunks)[j]->dictionary), &transpose_maps[j]));
+      }
+      std::shared_ptr<Array> dictionary;
+      RETURN_NOT_OK(unifier->GetResultWithIndexType(dict_type.index_type(), &dictionary));
+      for (size_t j = 0; j < chunks->size(); ++j) {
+        ARROW_ASSIGN_OR_RAISE(
+            (*chunks)[j],
+            TransposeDictIndices(
+                (*chunks)[j], type, type, dictionary->data(),
+                reinterpret_cast<const int32_t*>(transpose_maps[j]->data()), this->pool));
+        if (ext_type) {
+          (*chunks)[j]->type = ext_type;
+        }
+      }
+      changed = true;
+    }
+
+    return changed;
+  }
+};
+
+}  // namespace
+
 Result<std::unique_ptr<DictionaryUnifier>> DictionaryUnifier::Make(
     std::shared_ptr<DataType> value_type, MemoryPool* pool) {
   MakeUnifier maker(pool, value_type);
@@ -281,104 +525,33 @@ Result<std::unique_ptr<DictionaryUnifier>> DictionaryUnifier::Make(
   return std::move(maker.result);
 }
 
-// ----------------------------------------------------------------------
-// DictionaryArray transposition
-
-namespace {
-
-inline bool IsTrivialTransposition(const int32_t* transpose_map,
-                                   int64_t input_dict_size) {
-  for (int64_t i = 0; i < input_dict_size; ++i) {
-    if (transpose_map[i] != i) {
-      return false;
-    }
+Result<std::shared_ptr<ChunkedArray>> DictionaryUnifier::UnifyChunkedArray(
+    const std::shared_ptr<ChunkedArray>& array, MemoryPool* pool) {
+  if (array->num_chunks() <= 1) {
+    return array;
   }
-  return true;
+
+  ArrayDataVector data_chunks(array->num_chunks());
+  std::transform(array->chunks().begin(), array->chunks().end(), data_chunks.begin(),
+                 [](const std::shared_ptr<Array>& array) { return array->data(); });
+  ARROW_ASSIGN_OR_RAISE(bool changed,
+                        RecursiveUnifier{pool}.Unify(array->type(), &data_chunks));
+  if (!changed) {
+    return array;
+  }
+  ArrayVector chunks(array->num_chunks());
+  std::transform(data_chunks.begin(), data_chunks.end(), chunks.begin(),
+                 [](const std::shared_ptr<ArrayData>& data) { return MakeArray(data); });
+  return std::make_shared<ChunkedArray>(std::move(chunks), array->type());
 }
 
-template <typename InType, typename OutType>
-Result<std::shared_ptr<Array>> TransposeDictIndices(
-    MemoryPool* pool, const ArrayData& in_data, const int32_t* transpose_map,
-    const std::shared_ptr<ArrayData>& out_data) {
-  using in_c_type = typename InType::c_type;
-  using out_c_type = typename OutType::c_type;
-  internal::TransposeInts(in_data.GetValues<in_c_type>(1),
-                          out_data->GetMutableValues<out_c_type>(1), in_data.length,
-                          transpose_map);
-  return MakeArray(out_data);
-}
-
-}  // namespace
-
-Result<std::shared_ptr<Array>> DictionaryArray::Transpose(
-    const std::shared_ptr<DataType>& type, const std::shared_ptr<Array>& dictionary,
-    const int32_t* transpose_map, MemoryPool* pool) const {
-  if (type->id() != Type::DICTIONARY) {
-    return Status::TypeError("Expected dictionary type");
+Result<std::shared_ptr<Table>> DictionaryUnifier::UnifyTable(const Table& table,
+                                                             MemoryPool* pool) {
+  ChunkedArrayVector columns = table.columns();
+  for (auto& col : columns) {
+    ARROW_ASSIGN_OR_RAISE(col, DictionaryUnifier::UnifyChunkedArray(col, pool));
   }
-  const int64_t in_dict_len = data_->dictionary->length;
-  const auto& out_dict_type = checked_cast<const DictionaryType&>(*type);
-
-  const auto& out_index_type =
-      static_cast<const FixedWidthType&>(*out_dict_type.index_type());
-
-  auto in_type_id = dict_type_->index_type()->id();
-  auto out_type_id = out_index_type.id();
-
-  if (in_type_id == out_type_id && IsTrivialTransposition(transpose_map, in_dict_len)) {
-    // Index type and values will be identical => we can simply reuse
-    // the existing buffers.
-    auto out_data =
-        ArrayData::Make(type, data_->length, {data_->buffers[0], data_->buffers[1]},
-                        data_->null_count, data_->offset);
-    out_data->dictionary = dictionary->data();
-    return MakeArray(out_data);
-  }
-
-  // Default path: compute a buffer of transposed indices.
-  ARROW_ASSIGN_OR_RAISE(
-      auto out_buffer,
-      AllocateBuffer(data_->length * out_index_type.bit_width() * CHAR_BIT, pool));
-
-  // Shift null buffer if the original offset is non-zero
-  std::shared_ptr<Buffer> null_bitmap;
-  if (data_->offset != 0 && data_->null_count != 0) {
-    ARROW_ASSIGN_OR_RAISE(
-        null_bitmap, CopyBitmap(pool, null_bitmap_data_, data_->offset, data_->length));
-  } else {
-    null_bitmap = data_->buffers[0];
-  }
-
-  auto out_data = ArrayData::Make(
-      type, data_->length, {null_bitmap, std::move(out_buffer)}, data_->null_count);
-  out_data->dictionary = dictionary->data();
-
-#define TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, OUT_INDEX_TYPE)                 \
-  case OUT_INDEX_TYPE::type_id:                                              \
-    return TransposeDictIndices<IN_INDEX_TYPE, OUT_INDEX_TYPE>(pool, *data_, \
-                                                               transpose_map, out_data);
-
-#define TRANSPOSE_IN_CASE(IN_INDEX_TYPE)                        \
-  case IN_INDEX_TYPE::type_id:                                  \
-    switch (out_type_id) {                                      \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int8Type)            \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int16Type)           \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int32Type)           \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int64Type)           \
-      default:                                                  \
-        return Status::NotImplemented("unexpected index type"); \
-    }
-
-  switch (in_type_id) {
-    TRANSPOSE_IN_CASE(Int8Type)
-    TRANSPOSE_IN_CASE(Int16Type)
-    TRANSPOSE_IN_CASE(Int32Type)
-    TRANSPOSE_IN_CASE(Int64Type)
-    default:
-      return Status::NotImplemented("unexpected index type");
-  }
-#undef TRANSPOSE_IN_CASE
-#undef TRANSPOSE_IN_OUT_CASE
+  return Table::Make(table.schema(), std::move(columns), table.num_rows());
 }
 
 }  // namespace arrow

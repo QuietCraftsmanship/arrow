@@ -27,6 +27,10 @@
 #include "arrow/array/builder_dict.h"       // IWYU pragma: keep
 #include "arrow/array/builder_nested.h"     // IWYU pragma: keep
 #include "arrow/array/builder_primitive.h"  // IWYU pragma: keep
+<<<<<<< HEAD
+=======
+#include "arrow/array/builder_run_end.h"    // IWYU pragma: keep
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #include "arrow/array/builder_time.h"       // IWYU pragma: keep
 #include "arrow/array/builder_union.h"      // IWYU pragma: keep
 =======
@@ -42,30 +46,3 @@
 >>>>>>> 5588-Better-support-for-building-UnionArrays
 #include "arrow/status.h"
 #include "arrow/util/visibility.h"
-
-namespace arrow {
-
-class DataType;
-class MemoryPool;
-
-/// \brief Construct an empty ArrayBuilder corresponding to the data
-/// type
-/// \param[in] pool the MemoryPool to use for allocations
-/// \param[in] type an instance of DictionaryType
-/// \param[out] out the created ArrayBuilder
-ARROW_EXPORT
-Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
-                   std::unique_ptr<ArrayBuilder>* out);
-
-/// \brief Construct an empty DictionaryBuilder initialized optionally
-/// with a pre-existing dictionary
-/// \param[in] pool the MemoryPool to use for allocations
-/// \param[in] type an instance of DictionaryType
-/// \param[in] dictionary the initial dictionary, if any. May be nullptr
-/// \param[out] out the created ArrayBuilder
-ARROW_EXPORT
-Status MakeDictionaryBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
-                             const std::shared_ptr<Array>& dictionary,
-                             std::unique_ptr<ArrayBuilder>* out);
-
-}  // namespace arrow

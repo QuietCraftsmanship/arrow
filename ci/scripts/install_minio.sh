@@ -17,33 +17,77 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <version> <prefix>"
+  exit 1
+fi
+
+version=$1
+prefix=$2
 
 declare -A archs
-archs=([amd64]=amd64)
+archs=([x86_64]=amd64
+       [arm64]=arm64
+       [aarch64]=arm64
+       [s390x]=s390x)
 
-declare -A platforms
-platforms=([macos]=darwin
-           [linux]=linux)
+arch=$(uname -m)
+if [ -z ${archs[$arch]} ]; then
+  echo "Unsupported architecture: ${arch}"
+  exit 0
+fi
+arch=${archs[$arch]}
 
-arch=${archs[$1]}
-platform=${platforms[$2]}
-version=$3
-prefix=$4
+platform=$(uname)
+case ${platform} in
+  Linux)
+    platform=linux
+    ;;
+  Darwin)
+    platform=darwin
+    ;;
+  MSYS_NT*|MINGW64_NT*)
+    platform=windows
+    ;;
+  *)
+    echo "Unsupported platform: ${platform}"
+    exit 0
+    ;;
+esac
 
-if [ "$#" -ne 4 ]; then
-  echo "Usage: $0 <architecture> <platform> <version> <prefix>"
-  exit 1
-elif [[ -z ${archs[$1]} ]]; then
-  echo "Unexpected architecture: ${1}"
-  exit 1
-elif [[ -z ${platforms[$2]} ]]; then
-  echo "Unexpected platform: ${2}"
-  exit 1
-elif [[ ${version} != "latest" ]]; then
+if [ "${version}" != "latest" ]; then
   echo "Cannot fetch specific versions of minio, only latest is supported."
   exit 1
 fi
 
-wget -nv -P ${prefix}/bin https://dl.min.io/server/minio/release/linux-${arch}/minio
-chmod +x ${prefix}/bin/minio
+# Use specific versions for minio server and client to avoid CI failures on new releases.
+minio_version="minio.RELEASE.2025-01-20T14-49-07Z"
+mc_version="mc.RELEASE.2024-09-16T17-43-14Z"
+
+download()
+{
+  local output=$1
+  local url=$2
+
+  mkdir -p $(dirname ${output})
+  if type wget > /dev/null 2>&1; then
+    wget -nv --output-document ${output} ${url}
+  else
+    curl --fail --location --output ${output} ${url}
+  fi
+}
+
+if [[ ! -x ${prefix}/bin/minio ]]; then
+  url="https://dl.min.io/server/minio/release/${platform}-${arch}/archive/${minio_version}"
+  echo "Fetching ${url}..."
+  download ${prefix}/bin/minio ${url}
+  chmod +x ${prefix}/bin/minio
+fi
+if [[ ! -x ${prefix}/bin/mc ]]; then
+  url="https://dl.min.io/client/mc/release/${platform}-${arch}/archive/${mc_version}"
+  echo "Fetching ${url}..."
+  download ${prefix}/bin/mc ${url}
+  chmod +x ${prefix}/bin/mc
+fi

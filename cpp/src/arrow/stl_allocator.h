@@ -100,17 +100,22 @@ class STLMemoryPool : public MemoryPool {
   /// \brief Construct a memory pool from the given allocator
   explicit STLMemoryPool(const Allocator& alloc) : alloc_(alloc) {}
 
-  Status Allocate(int64_t size, uint8_t** out) override {
+  using MemoryPool::Allocate;
+  using MemoryPool::Free;
+  using MemoryPool::Reallocate;
+
+  Status Allocate(int64_t size, int64_t /*alignment*/, uint8_t** out) override {
     try {
       *out = alloc_.allocate(size);
     } catch (std::bad_alloc& e) {
       return Status::OutOfMemory(e.what());
     }
-    stats_.UpdateAllocatedBytes(size);
+    stats_.DidAllocateBytes(size);
     return Status::OK();
   }
 
-  Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override {
+  Status Reallocate(int64_t old_size, int64_t new_size, int64_t /*alignment*/,
+                    uint8_t** ptr) override {
     uint8_t* old_ptr = *ptr;
     try {
       *ptr = alloc_.allocate(new_size);
@@ -119,18 +124,24 @@ class STLMemoryPool : public MemoryPool {
     }
     memcpy(*ptr, old_ptr, std::min(old_size, new_size));
     alloc_.deallocate(old_ptr, old_size);
-    stats_.UpdateAllocatedBytes(new_size - old_size);
+    stats_.DidReallocateBytes(old_size, new_size);
     return Status::OK();
   }
 
-  void Free(uint8_t* buffer, int64_t size) override {
+  void Free(uint8_t* buffer, int64_t size, int64_t /*alignment*/) override {
     alloc_.deallocate(buffer, size);
-    stats_.UpdateAllocatedBytes(-size);
+    stats_.DidFreeBytes(size);
   }
 
   int64_t bytes_allocated() const override { return stats_.bytes_allocated(); }
 
   int64_t max_memory() const override { return stats_.max_memory(); }
+
+  int64_t total_bytes_allocated() const override {
+    return stats_.total_bytes_allocated();
+  }
+
+  int64_t num_allocations() const override { return stats_.num_allocations(); }
 
   std::string backend_name() const override { return "stl"; }
 

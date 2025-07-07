@@ -21,4 +21,12 @@
 
 #include <arrow-glib/arrow-glib.h>
 
+#include <arrow-dataset-glib/version.h>
+
+#include <arrow-dataset-glib/dataset-factory.h>
+#include <arrow-dataset-glib/dataset.h>
+#include <arrow-dataset-glib/enums.h>
+#include <arrow-dataset-glib/file-format.h>
+#include <arrow-dataset-glib/fragment.h>
+#include <arrow-dataset-glib/partitioning.h>
 #include <arrow-dataset-glib/scanner.h>

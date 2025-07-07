@@ -18,42 +18,48 @@
 #include "arrow/json/converter.h"
 
 #include <memory>
+#include <string_view>
 #include <utility>
 
 #include "arrow/array.h"
-#include "arrow/builder.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_decimal.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/array/builder_time.h"
 #include "arrow/json/parser.h"
 #include "arrow/type.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/string_view.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/decimal.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/value_parsing.h"
 
 namespace arrow {
-namespace json {
 
-using util::string_view;
+using internal::checked_cast;
+using std::string_view;
+
+namespace json {
 
 template <typename... Args>
 Status GenericConversionError(const DataType& type, Args&&... args) {
-  return Status::Invalid("Failed of conversion of JSON to ", type,
-                         std::forward<Args>(args)...);
+  return Status::Invalid("Failed to convert JSON to ", type, std::forward<Args>(args)...);
 }
 
 namespace {
 
 const DictionaryArray& GetDictionaryArray(const std::shared_ptr<Array>& in) {
   DCHECK_EQ(in->type_id(), Type::DICTIONARY);
-  auto dict_type = static_cast<const DictionaryType*>(in->type().get());
+  auto dict_type = checked_cast<const DictionaryType*>(in->type().get());
   DCHECK_EQ(dict_type->index_type()->id(), Type::INT32);
   DCHECK_EQ(dict_type->value_type()->id(), Type::STRING);
-  return static_cast<const DictionaryArray&>(*in);
+  return checked_cast<const DictionaryArray&>(*in);
 }
 
 template <typename ValidVisitor, typename NullVisitor>
 Status VisitDictionaryEntries(const DictionaryArray& dict_array,
                               ValidVisitor&& visit_valid, NullVisitor&& visit_null) {
-  const StringArray& dict = static_cast<const StringArray&>(*dict_array.dictionary());
-  const Int32Array& indices = static_cast<const Int32Array&>(*dict_array.indices());
+  const StringArray& dict = checked_cast<const StringArray&>(*dict_array.dictionary());
+  const Int32Array& indices = checked_cast<const Int32Array&>(*dict_array.indices());
   for (int64_t i = 0; i < indices.length(); ++i) {
     if (indices.IsValid(i)) {
       RETURN_NOT_OK(visit_valid(dict.GetView(indices.GetView(i))));
@@ -103,38 +109,12 @@ class BooleanConverter : public PrimitiveConverter {
 };
 
 template <typename T>
-struct ParserAdapter {
-  using value_type = typename T::c_type;
-
-  void InitParser(const DataType& type) {}
-
-  bool ConvertOne(const char* s, size_t length, value_type* out) {
-    return internal::ParseValue<T>(s, length, out);
-  }
-};
-
-template <>
-struct ParserAdapter<TimestampType> {
-  void InitParser(const DataType& type) {
-    this->unit = internal::checked_cast<const TimestampType&>(type).unit();
-  }
-
-  bool ConvertOne(const char* s, size_t length, int64_t* out) {
-    return internal::ParseTimestampISO8601(s, length, unit, out);
-  }
-
-  TimeUnit::type unit;
-};
-
-template <typename T>
-class NumericConverter : public PrimitiveConverter, public ParserAdapter<T> {
+class NumericConverter : public PrimitiveConverter {
  public:
   using value_type = typename T::c_type;
 
   NumericConverter(MemoryPool* pool, const std::shared_ptr<DataType>& type)
-      : PrimitiveConverter(pool, type) {
-    ParserAdapter<T>::InitParser(*type);
-  }
+      : PrimitiveConverter(pool, type), numeric_type_(checked_cast<const T&>(*type)) {}
 
   Status Convert(const std::shared_ptr<Array>& in, std::shared_ptr<Array>* out) override {
     if (in->type_id() == Type::NA) {
@@ -148,7 +128,7 @@ class NumericConverter : public PrimitiveConverter, public ParserAdapter<T> {
 
     auto visit_valid = [&](string_view repr) {
       value_type value;
-      if (!ParserAdapter<T>::ConvertOne(repr.data(), repr.size(), &value)) {
+      if (!arrow::internal::ParseValue(numeric_type_, repr.data(), repr.size(), &value)) {
         return GenericConversionError(*out_type_, ", couldn't parse:", repr);
       }
 
@@ -157,6 +137,61 @@ class NumericConverter : public PrimitiveConverter, public ParserAdapter<T> {
     };
 
     auto visit_null = [&]() {
+      builder.UnsafeAppendNull();
+      return Status::OK();
+    };
+
+    RETURN_NOT_OK(VisitDictionaryEntries(dict_array, visit_valid, visit_null));
+    return builder.Finish(out);
+  }
+
+  const T& numeric_type_;
+};
+
+template <typename T>
+class DecimalConverter : public PrimitiveConverter {
+ public:
+  using value_type = typename TypeTraits<T>::BuilderType::ValueType;
+
+  DecimalConverter(MemoryPool* pool, const std::shared_ptr<DataType>& type)
+      : PrimitiveConverter(pool, type) {}
+
+  Status Convert(const std::shared_ptr<Array>& in, std::shared_ptr<Array>* out) override {
+    if (in->type_id() == Type::NA) {
+      return MakeArrayOfNull(out_type_, in->length(), pool_).Value(out);
+    }
+    const auto& dict_array = GetDictionaryArray(in);
+
+    using Builder = typename TypeTraits<T>::BuilderType;
+    Builder builder(out_type_, pool_);
+    RETURN_NOT_OK(builder.Resize(dict_array.indices()->length()));
+    const auto& decimal_type(checked_cast<const DecimalType&>(*out_type_));
+    int32_t out_precision = decimal_type.precision();
+    int32_t out_scale = decimal_type.scale();
+
+    auto visit_valid = [&](string_view repr) {
+      value_type value;
+      int32_t precision, scale;
+      RETURN_NOT_OK(TypeTraits<T>::BuilderType::ValueType::FromString(
+          repr, &value, &precision, &scale));
+      if (precision > out_precision) {
+        return GenericConversionError(*out_type_, ": ", repr, " requires precision ",
+                                      precision);
+      }
+      if (scale != out_scale) {
+        auto result = value.Rescale(scale, out_scale);
+        if (ARROW_PREDICT_FALSE(!result.ok())) {
+          return GenericConversionError(*out_type_, ": ", repr, " requires scale ",
+                                        scale);
+        } else {
+          value = result.MoveValueUnsafe();
+        }
+      }
+      builder.UnsafeAppend(value);
+      return Status::OK();
+    };
+
+    auto visit_null = [&builder]() {
       builder.UnsafeAppendNull();
       return Status::OK();
     };
@@ -269,6 +304,12 @@ Status MakeConverter(const std::shared_ptr<DataType>& out_type, MemoryPool* pool
     CONVERTER_CASE(Type::STRING, BinaryConverter<StringType>);
     CONVERTER_CASE(Type::LARGE_BINARY, BinaryConverter<LargeBinaryType>);
     CONVERTER_CASE(Type::LARGE_STRING, BinaryConverter<LargeStringType>);
+    CONVERTER_CASE(Type::BINARY_VIEW, BinaryConverter<BinaryViewType>);
+    CONVERTER_CASE(Type::STRING_VIEW, BinaryConverter<StringViewType>);
+    CONVERTER_CASE(Type::DECIMAL32, DecimalConverter<Decimal32Type>);
+    CONVERTER_CASE(Type::DECIMAL64, DecimalConverter<Decimal64Type>);
+    CONVERTER_CASE(Type::DECIMAL128, DecimalConverter<Decimal128Type>);
+    CONVERTER_CASE(Type::DECIMAL256, DecimalConverter<Decimal256Type>);
     default:
       return Status::NotImplemented("JSON conversion to ", *out_type,
                                     " is not supported");
@@ -300,8 +341,8 @@ const PromotionGraph* GetPromotionGraph() {
           return timestamp(TimeUnit::SECOND);
 
         case Kind::kArray: {
-          auto type = static_cast<const ListType*>(unexpected_field->type().get());
-          auto value_field = type->value_field();
+          const auto& type = checked_cast<const ListType&>(*unexpected_field->type());
+          auto value_field = type.value_field();
           return list(value_field->WithType(Infer(value_field)));
         }
         case Kind::kObject: {

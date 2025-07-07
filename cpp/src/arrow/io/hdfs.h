@@ -111,8 +111,8 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   Status MakeDirectory(const std::string& path) override;
 
   // Delete file or directory
-  // @param path: absolute path to data
-  // @param recursive: if path is a directory, delete contents as well
+  // @param path absolute path to data
+  // @param recursive if path is a directory, delete contents as well
   // @returns error status on failure
   Status Delete(const std::string& path, bool recursive = false);
 
@@ -173,6 +173,10 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   // current filesystem
   Status Rename(const std::string& src, const std::string& dst) override;
 
+  Status Copy(const std::string& src, const std::string& dst);
+
+  Status Move(const std::string& src, const std::string& dst);
+
   Status Stat(const std::string& path, FileStatistics* stat) override;
 
   // TODO(wesm): GetWorkingDirectory, SetWorkingDirectory
@@ -184,13 +188,20 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   Status OpenReadable(const std::string& path, int32_t buffer_size,
                       std::shared_ptr<HdfsReadableFile>* file);
 
+  Status OpenReadable(const std::string& path, int32_t buffer_size,
+                      const io::IOContext& io_context,
+                      std::shared_ptr<HdfsReadableFile>* file);
+
   Status OpenReadable(const std::string& path, std::shared_ptr<HdfsReadableFile>* file);
+
+  Status OpenReadable(const std::string& path, const io::IOContext& io_context,
+                      std::shared_ptr<HdfsReadableFile>* file);
 
   // FileMode::WRITE options
   // @param path complete file path
-  // @param buffer_size, 0 for default
-  // @param replication, 0 for default
-  // @param default_block_size, 0 for default
+  // @param buffer_size 0 by default
+  // @param replication 0 by default
+  // @param default_block_size 0 by default
   Status OpenWritable(const std::string& path, bool append, int32_t buffer_size,
                       int16_t replication, int64_t default_block_size,
                       std::shared_ptr<HdfsOutputStream>* file);
@@ -228,10 +239,8 @@ class ARROW_EXPORT HdfsReadableFile : public RandomAccessFile {
   Result<int64_t> Tell() const override;
   Result<int64_t> GetSize() override;
 
-  void set_memory_pool(MemoryPool* pool);
-
  private:
-  explicit HdfsReadableFile(MemoryPool* pool = NULLPTR);
+  explicit HdfsReadableFile(const io::IOContext&);
 
   class ARROW_NO_EXPORT HdfsReadableFileImpl;
   std::unique_ptr<HdfsReadableFileImpl> impl_;
@@ -253,7 +262,6 @@ class ARROW_EXPORT HdfsOutputStream : public OutputStream {
 
   using OutputStream::Write;
   Status Write(const void* buffer, int64_t nbytes) override;
-  Status Write(const void* buffer, int64_t nbytes, int64_t* bytes_written);
 
   Status Flush() override;
 
@@ -270,7 +278,7 @@ class ARROW_EXPORT HdfsOutputStream : public OutputStream {
   ARROW_DISALLOW_COPY_AND_ASSIGN(HdfsOutputStream);
 };
 
-Status ARROW_EXPORT HaveLibHdfs();
+ARROW_EXPORT Status HaveLibHdfs();
 
 }  // namespace io
 }  // namespace arrow

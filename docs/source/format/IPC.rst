@@ -15,8 +15,11 @@
 .. specific language governing permissions and limitations
 .. under the License.
 
+:orphan:
+
 IPC
 ===
 
-The contents of this document have relocated to the main :ref:`Columnar
-Specification <format_columnar>` page.
+The contents of this document have relocated to the :ref:`Serialization and
+Interprocess Communication (IPC) <format-ipc>` section on the main
+:ref:`Columnar Specification <format_columnar>` page.

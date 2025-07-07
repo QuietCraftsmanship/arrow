@@ -21,10 +21,13 @@
 #include <memory>
 
 #include "arrow/result.h"
-#include "arrow/type_fwd.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
+
+class Buffer;
+class MemoryPool;
+
 namespace internal {
 
 // ----------------------------------------------------------------------
@@ -36,11 +39,13 @@ namespace internal {
 /// \param[in] bitmap source data
 /// \param[in] offset bit offset into the source data
 /// \param[in] length number of bits to copy
+/// \param[in] out_offset bit offset into the output buffer
 ///
 /// \return Status message
 ARROW_EXPORT
 Result<std::shared_ptr<Buffer>> CopyBitmap(MemoryPool* pool, const uint8_t* bitmap,
-                                           int64_t offset, int64_t length);
+                                           int64_t offset, int64_t length,
+                                           int64_t out_offset = 0);
 
 /// Copy a bit range of an existing bitmap into an existing bitmap
 ///
@@ -48,12 +53,11 @@ Result<std::shared_ptr<Buffer>> CopyBitmap(MemoryPool* pool, const uint8_t* bitm
 /// \param[in] offset bit offset into the source data
 /// \param[in] length number of bits to copy
 /// \param[in] dest_offset bit offset into the destination
-/// \param[in] restore_trailing_bits don't clobber bits outside the destination range
 /// \param[out] dest the destination buffer, must have at least space for
 /// (offset + length) bits
 ARROW_EXPORT
 void CopyBitmap(const uint8_t* bitmap, int64_t offset, int64_t length, uint8_t* dest,
-                int64_t dest_offset, bool restore_trailing_bits = true);
+                int64_t dest_offset);
 
 /// Invert a bit range of an existing bitmap into an existing bitmap
 ///
@@ -79,6 +83,30 @@ ARROW_EXPORT
 Result<std::shared_ptr<Buffer>> InvertBitmap(MemoryPool* pool, const uint8_t* bitmap,
                                              int64_t offset, int64_t length);
 
+/// Reverse a bit range of an existing bitmap into an existing bitmap
+///
+/// \param[in] bitmap source data
+/// \param[in] offset bit offset into the source data
+/// \param[in] length number of bits to reverse
+/// \param[in] dest_offset bit offset into the destination
+/// \param[out] dest the destination buffer, must have at least space for
+/// (offset + length) bits
+ARROW_EXPORT
+void ReverseBitmap(const uint8_t* bitmap, int64_t offset, int64_t length, uint8_t* dest,
+                   int64_t dest_offset);
+
+/// Reverse a bit range of an existing bitmap
+///
+/// \param[in] pool memory pool to allocate memory from
+/// \param[in] bitmap source data
+/// \param[in] offset bit offset into the source data
+/// \param[in] length number of bits to reverse
+///
+/// \return Status message
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> ReverseBitmap(MemoryPool* pool, const uint8_t* bitmap,
+                                              int64_t offset, int64_t length);
+
 /// Compute the number of 1's in the given data array
 ///
 /// \param[in] data a packed LSB-ordered bitmap as a byte array
@@ -90,9 +118,34 @@ Result<std::shared_ptr<Buffer>> InvertBitmap(MemoryPool* pool, const uint8_t* bi
 ARROW_EXPORT
 int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length);
 
+/// Compute the number of 1's in the result of an "and" (&) of two bitmaps
+///
+/// \param[in] left_bitmap a packed LSB-ordered bitmap as a byte array
+/// \param[in] left_offset a bitwise offset into the left bitmap
+/// \param[in] right_bitmap a packed LSB-ordered bitmap as a byte array
+/// \param[in] right_offset a bitwise offset into the right bitmap
+/// \param[in] length the length of the bitmaps (must be the same)
+///
+/// \return The number of set (1) bits in the "and" of the two bitmaps
+ARROW_EXPORT
+int64_t CountAndSetBits(const uint8_t* left_bitmap, int64_t left_offset,
+                        const uint8_t* right_bitmap, int64_t right_offset,
+                        int64_t length);
+
 ARROW_EXPORT
 bool BitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right,
                   int64_t right_offset, int64_t length);
+
+// Same as BitmapEquals, but considers a NULL bitmap pointer the same as an
+// all-ones bitmap.
+ARROW_EXPORT
+bool OptionalBitmapEquals(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                          int64_t right_offset, int64_t length);
+
+ARROW_EXPORT
+bool OptionalBitmapEquals(const std::shared_ptr<Buffer>& left, int64_t left_offset,
+                          const std::shared_ptr<Buffer>& right, int64_t right_offset,
+                          int64_t length);
 
 /// \brief Do a "bitmap and" on right and left buffers starting at
 /// their respective bit-offsets for the given bit-length and put
@@ -150,6 +203,44 @@ Result<std::shared_ptr<Buffer>> BitmapXor(MemoryPool* pool, const uint8_t* left,
 ARROW_EXPORT
 void BitmapXor(const uint8_t* left, int64_t left_offset, const uint8_t* right,
                int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
+
+/// \brief Do a "bitmap and not" on right and left buffers starting at
+/// their respective bit-offsets for the given bit-length and put
+/// the results in out_buffer starting at the given bit-offset.
+///
+/// out_buffer will be allocated and initialized to zeros using pool before
+/// the operation.
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> BitmapAndNot(MemoryPool* pool, const uint8_t* left,
+                                             int64_t left_offset, const uint8_t* right,
+                                             int64_t right_offset, int64_t length,
+                                             int64_t out_offset);
+
+/// \brief Do a "bitmap and not" on right and left buffers starting at
+/// their respective bit-offsets for the given bit-length and put
+/// the results in out starting at the given bit-offset.
+ARROW_EXPORT
+void BitmapAndNot(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                  int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
+
+/// \brief Do a "bitmap or not" on right and left buffers starting at
+/// their respective bit-offsets for the given bit-length and put
+/// the results in out_buffer starting at the given bit-offset.
+///
+/// out_buffer will be allocated and initialized to zeros using pool before
+/// the operation.
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> BitmapOrNot(MemoryPool* pool, const uint8_t* left,
+                                            int64_t left_offset, const uint8_t* right,
+                                            int64_t right_offset, int64_t length,
+                                            int64_t out_offset);
+
+/// \brief Do a "bitmap or not" on right and left buffers starting at
+/// their respective bit-offsets for the given bit-length and put
+/// the results in out starting at the given bit-offset.
+ARROW_EXPORT
+void BitmapOrNot(const uint8_t* left, int64_t left_offset, const uint8_t* right,
+                 int64_t right_offset, int64_t length, int64_t out_offset, uint8_t* out);
 
 }  // namespace internal
 }  // namespace arrow

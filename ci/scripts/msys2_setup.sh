@@ -24,41 +24,62 @@ target=$1
 packages=()
 case "${target}" in
   cpp|c_glib|ruby)
-    packages+=(${MINGW_PACKAGE_PREFIX}-ccache)
+    packages+=(${MINGW_PACKAGE_PREFIX}-aws-sdk-cpp)
     packages+=(${MINGW_PACKAGE_PREFIX}-boost)
     packages+=(${MINGW_PACKAGE_PREFIX}-brotli)
+    packages+=(${MINGW_PACKAGE_PREFIX}-bzip2)
+    packages+=(${MINGW_PACKAGE_PREFIX}-c-ares)
+    packages+=(${MINGW_PACKAGE_PREFIX}-cc)
+    packages+=(${MINGW_PACKAGE_PREFIX}-ccache)
+    packages+=(${MINGW_PACKAGE_PREFIX}-clang)
     packages+=(${MINGW_PACKAGE_PREFIX}-cmake)
-    packages+=(${MINGW_PACKAGE_PREFIX}-gcc)
+    packages+=(${MINGW_PACKAGE_PREFIX}-double-conversion)
     packages+=(${MINGW_PACKAGE_PREFIX}-gflags)
     packages+=(${MINGW_PACKAGE_PREFIX}-grpc)
     packages+=(${MINGW_PACKAGE_PREFIX}-gtest)
+    packages+=(${MINGW_PACKAGE_PREFIX}-libutf8proc)
+    packages+=(${MINGW_PACKAGE_PREFIX}-libxml2)
     packages+=(${MINGW_PACKAGE_PREFIX}-lz4)
+    packages+=(${MINGW_PACKAGE_PREFIX}-ninja)
+    packages+=(${MINGW_PACKAGE_PREFIX}-nlohmann-json)
     packages+=(${MINGW_PACKAGE_PREFIX}-protobuf)
-    packages+=(${MINGW_PACKAGE_PREFIX}-python3-numpy)
     packages+=(${MINGW_PACKAGE_PREFIX}-rapidjson)
+    packages+=(${MINGW_PACKAGE_PREFIX}-re2)
     packages+=(${MINGW_PACKAGE_PREFIX}-snappy)
+    packages+=(${MINGW_PACKAGE_PREFIX}-sqlite3)
     packages+=(${MINGW_PACKAGE_PREFIX}-thrift)
-    packages+=(${MINGW_PACKAGE_PREFIX}-zlib)
+    packages+=(${MINGW_PACKAGE_PREFIX}-xsimd)
+    packages+=(${MINGW_PACKAGE_PREFIX}-uriparser)
     packages+=(${MINGW_PACKAGE_PREFIX}-zstd)
+
+    if [ "${target}" != "ruby" ]; then
+      # We don't update the exiting packages for Ruby because
+      # RubyInstaller for Windows bundles some DLLs such as libffi,
+      # OpenSSL and zlib separately. They should be ABI compatible
+      # with packages installed by MSYS2. If we specify packages
+      # explicitly here, the existing packages may be updated.
+      packages+=(${MINGW_PACKAGE_PREFIX}-openssl)
+      packages+=(${MINGW_PACKAGE_PREFIX}-zlib)
+    fi
   ;;
 esac
 
 case "${target}" in
   c_glib|ruby)
     packages+=(${MINGW_PACKAGE_PREFIX}-gobject-introspection)
-    packages+=(${MINGW_PACKAGE_PREFIX}-gtk-doc)
     packages+=(${MINGW_PACKAGE_PREFIX}-meson)
+    packages+=(${MINGW_PACKAGE_PREFIX}-vala)
     ;;
 esac
 
-# Ensure removing unused gcc related sub packages
-pacman \
-  --noconfirm \
-  --remove \
-  "${MINGW_PACKAGE_PREFIX}-gcc-ada" \
-  "${MINGW_PACKAGE_PREFIX}-gcc-fortran" \
-  "${MINGW_PACKAGE_PREFIX}-gcc-libgfortran" \
-  "${MINGW_PACKAGE_PREFIX}-gcc-objc" || :
+case "${target}" in
+  cgo)
+    packages+=(${MINGW_PACKAGE_PREFIX}-arrow)
+    packages+=(${MINGW_PACKAGE_PREFIX}-gcc)
+    packages+=(${MINGW_PACKAGE_PREFIX}-toolchain)
+    packages+=(base-devel)
+    ;;
+esac
 
 pacman \
   --needed \
@@ -66,9 +87,6 @@ pacman \
   --sync \
   "${packages[@]}"
 
-echo "::set-env name=ARROW_USE_CCACHE::ON"
-echo "::set-env name=CCACHE_COMPILERCHECK::content"
-echo "::set-env name=CCACHE_COMPRESS::1"
-echo "::set-env name=CCACHE_COMPRESSLEVEL::6"
-echo "::set-env name=CCACHE_MAXSIZE::500M"
-echo "::set-env name=CCACHE_DIR::$(cygpath --absolute --windows ccache)"
+"$(dirname $0)/ccache_setup.sh"
+echo "CCACHE_DIR=$(cygpath --absolute --windows ccache)" >> $GITHUB_ENV
+echo "PIP_CACHE_DIR=$(pip cache dir)" >> $GITHUB_ENV

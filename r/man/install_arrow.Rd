@@ -9,6 +9,7 @@ install_arrow(
   binary = Sys.getenv("LIBARROW_BINARY", TRUE),
   use_system = Sys.getenv("ARROW_USE_PKG_CONFIG", FALSE),
   minimal = Sys.getenv("LIBARROW_MINIMAL", FALSE),
+  verbose = Sys.getenv("ARROW_R_DEV", FALSE),
   repos = getOption("repos"),
   ...
 )
@@ -23,16 +24,21 @@ The default value, \code{TRUE}, tells the installation script to detect the
 Linux distribution and version and find an appropriate C++ library. \code{FALSE}
 would tell the script not to retrieve a binary and instead build Arrow C++
 from source. Other valid values are strings corresponding to a Linux
-distribution-version, to override the value that would be detected.
-See \code{vignette("install", package = "arrow")} for further details.}
+distribution-version, to override the value that would be detected. See the
+\href{https://arrow.apache.org/docs/r/articles/install.html}{install guide}
+for further details.}
 
 \item{use_system}{logical: Should we use \code{pkg-config} to look for Arrow
 system packages? Default is \code{FALSE}. If \code{TRUE}, source installation may be
-faster, but there is a risk of version mismatch.}
+faster, but there is a risk of version mismatch. This sets the
+\code{ARROW_USE_PKG_CONFIG} environment variable.}
 
 \item{minimal}{logical: If building from source, should we build without
 optional dependencies (compression libraries, for example)? Default is
-\code{FALSE}.}
+\code{FALSE}. This sets the \code{LIBARROW_MINIMAL} environment variable.}
+
+\item{verbose}{logical: Print more debugging output when installing? Default
+is \code{FALSE}. This sets the \code{ARROW_R_DEV} environment variable.}
 
 \item{repos}{character vector of base URLs of the repositories to install
 from (passed to \code{install.packages()})}
@@ -44,8 +50,14 @@ Use this function to install the latest release of \code{arrow}, to switch to or
 from a nightly development version, or on Linux to try reinstalling with
 all necessary C++ dependencies.
 }
+\details{
+Note that, unlike packages like \code{tensorflow}, \code{blogdown}, and others that
+require external dependencies, you do not need to run \code{install_arrow()}
+after a successful \code{arrow} installation.
+}
 \seealso{
-\code{\link[=arrow_available]{arrow_available()}} to see if the package was configured with
-necessary C++ dependencies. \code{vignette("install", package = "arrow")} for
-more ways to tune installation on Linux.
+\code{\link[=arrow_info]{arrow_info()}} to see if the package was configured with
+necessary C++ dependencies.
+\href{https://arrow.apache.org/docs/r/articles/install.html}{install guide}
+for more ways to tune installation on Linux.
 }

@@ -15,37 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The central type in Apache Arrow are arrays, represented
-//! by the [`Array` trait](crate::array::Array).
-//! An array represents a known-length sequence of values all
-//! having the same type.
+//! Defines public types representing Apache Arrow arrays. Arrow's specification defines
+//! an array as "a sequence of values with known length all having the same type." For
+//! example, the type `Int16Array` represents an Apache Arrow array of 16-bit integers.
 //!
-//! Internally, those values are represented by one or several
-//! [buffers](crate::buffer::Buffer), the number and meaning
-//! of which depend on the array’s data type, as documented in
-//! [the Arrow data layout specification](https://arrow.apache.org/docs/format/Columnar.html).
-//! For example, the type `Int16Array` represents an Apache
-//! Arrow array of 16-bit integers.
-//!
-//! Those buffers consist of the value data itself and an
-//! optional [bitmap buffer](crate::bitmap::Bitmap) that
-//! indicates which array entries are null values.
-//! The bitmap buffer can be entirely omitted if the array is
-//! known to have zero null values.
-//!
-//! There are concrete implementations of this trait for each
-//! data type, that help you access individual values of the
-//! array.
-//!
-//! # Building an Array
-//!
-//! Arrow's `Arrays` are immutable, but there is the trait
-//! [`ArrayBuilder`](crate::array::ArrayBuilder)
-//! that helps you with constructing new `Arrays`. As with the
-//! `Array` trait, there are builder implementations for all
-//! concrete array types.
-//!
-//! # Example
 //! ```
 //! extern crate arrow;
 //!
@@ -83,15 +56,17 @@
 
 mod array;
 mod builder;
-mod cast;
 mod data;
 mod equal;
+<<<<<<< HEAD
 <<<<<<< HEAD
 mod null;
 mod ord;
 mod union;
 =======
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 use crate::datatypes::*;
 
@@ -105,6 +80,7 @@ pub use self::data::ArrayDataRef;
 
 pub use self::array::BinaryArray;
 <<<<<<< HEAD
+<<<<<<< HEAD
 pub use self::array::DictionaryArray;
 pub use self::array::FixedSizeBinaryArray;
 pub use self::array::FixedSizeListArray;
@@ -114,6 +90,11 @@ pub use self::array::StringArray;
 pub use self::array::StructArray;
 pub use self::null::NullArray;
 pub use self::union::UnionArray;
+=======
+pub use self::array::ListArray;
+pub use self::array::PrimitiveArray;
+pub use self::array::StructArray;
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 pub(crate) use self::array::make_array;
 
@@ -129,6 +110,7 @@ pub type UInt64Array = PrimitiveArray<UInt64Type>;
 pub type Float32Array = PrimitiveArray<Float32Type>;
 pub type Float64Array = PrimitiveArray<Float64Type>;
 
+<<<<<<< HEAD
 pub type Int8DictionaryArray = DictionaryArray<Int8Type>;
 pub type Int16DictionaryArray = DictionaryArray<Int16Type>;
 pub type Int32DictionaryArray = DictionaryArray<Int32Type>;
@@ -254,6 +236,8 @@ pub use self::cast::{
     as_boolean_array, as_null_array, as_primitive_array, as_string_array,
 };
 =======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 pub type TimestampSecondArray = PrimitiveArray<TimestampSecondType>;
 pub type TimestampMillisecondArray = PrimitiveArray<TimestampMillisecondType>;
 pub type TimestampMicrosecondArray = PrimitiveArray<TimestampMicrosecondType>;
@@ -329,4 +313,7 @@ pub type Time64NanosecondBuilder = PrimitiveBuilder<Time64NanosecondType>;
 // --------------------- Array Equality ---------------------
 
 pub use self::equal::ArrayEqual;
+<<<<<<< HEAD
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a

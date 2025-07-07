@@ -27,14 +27,14 @@ import org.apache.arrow.gandiva.expression.ArrowTypeHelper;
 import org.apache.arrow.gandiva.expression.ExpressionTree;
 import org.apache.arrow.gandiva.ipc.GandivaTypes;
 import org.apache.arrow.gandiva.ipc.GandivaTypes.SelectionVectorType;
-import org.apache.arrow.memory.ArrowBuf;
-import org.apache.arrow.vector.BaseVariableWidthVector;
 import org.apache.arrow.vector.FixedWidthVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VariableWidthVector;
 import org.apache.arrow.vector.ipc.message.ArrowBuffer;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import io.netty.buffer.ArrowBuf;
 
 /**
  * This class provides a mechanism to evaluate a set of expressions against a RecordBatch.
@@ -64,7 +64,7 @@ public class Projector {
 
   /**
    * Invoke this function to generate LLVM code to evaluate the list of project expressions.
-   * Invoke Projector::Evaluate() against a RecordBatch to evaluate the record batch
+   * Invoke Projector::Evalute() against a RecordBatch to evaluate the record batch
    * against these projections.
    *
    * @param schema Table schema. The field names in the schema should match the fields used
@@ -80,7 +80,7 @@ public class Projector {
 
   /**
    * Invoke this function to generate LLVM code to evaluate the list of project expressions.
-   * Invoke Projector::Evaluate() against a RecordBatch to evaluate the record batch
+   * Invoke Projector::Evalute() against a RecordBatch to evaluate the record batch
    * against these projections.
    *
    * @param schema Table schema. The field names in the schema should match the fields used
@@ -98,7 +98,7 @@ public class Projector {
 
   /**
    * Invoke this function to generate LLVM code to evaluate the list of project expressions.
-   * Invoke Projector::Evaluate() against a RecordBatch to evaluate the record batch
+   * Invoke Projector::Evalute() against a RecordBatch to evaluate the record batch
    * against these projections.
    *
    * @param schema Table schema. The field names in the schema should match the fields used
@@ -237,24 +237,30 @@ public class Projector {
     }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     boolean hasVariableWidthColumns = false;
     BaseVariableWidthVector[] resizableVectors = new BaseVariableWidthVector[outColumns.size()];
 =======
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     long[] outAddrs = new long[3 * outColumns.size()];
     long[] outSizes = new long[3 * outColumns.size()];
     idx = 0;
-    int outColumnIdx = 0;
     for (ValueVector valueVector : outColumns) {
       boolean isFixedWith = valueVector instanceof FixedWidthVector;
       boolean isVarWidth = valueVector instanceof VariableWidthVector;
       if (!isFixedWith && !isVarWidth) {
+<<<<<<< HEAD
 <<<<<<< HEAD
         throw new UnsupportedTypeException(
             "Unsupported value vector type " + valueVector.getField().getFieldType());
 =======
         throw new UnsupportedTypeException("Unsupported value vector type " + valueVector.getField().getFieldType());
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        throw new UnsupportedTypeException("Unsupported value vector type " + valueVector.getField().getFieldType());
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       }
 
       outAddrs[idx] = valueVector.getValidityBuffer().memoryAddress();
@@ -263,26 +269,26 @@ public class Projector {
         outAddrs[idx] = valueVector.getOffsetBuffer().memoryAddress();
         outSizes[idx++] = valueVector.getOffsetBuffer().capacity();
 <<<<<<< HEAD
+<<<<<<< HEAD
         hasVariableWidthColumns = true;
 
         // save vector to allow for resizing.
         resizableVectors[outColumnIdx] = (BaseVariableWidthVector) valueVector;
 =======
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       }
       outAddrs[idx] = valueVector.getDataBuffer().memoryAddress();
       outSizes[idx++] = valueVector.getDataBuffer().capacity();
 
       valueVector.setValueCount(selectionVectorRecordCount);
-      outColumnIdx++;
     }
 
-    wrapper.evaluateProjector(
-        hasVariableWidthColumns ? new VectorExpander(resizableVectors) : null,
-        this.moduleId, numRows, bufAddrs, bufSizes,
-        selectionVectorType, selectionVectorRecordCount,
-        selectionVectorAddr, selectionVectorSize,
-        outAddrs, outSizes);
+    wrapper.evaluateProjector(this.moduleId, numRows, bufAddrs, bufSizes,
+            selectionVectorType, selectionVectorRecordCount,
+            selectionVectorAddr, selectionVectorSize, 
+            outAddrs, outSizes);
   }
 
   /**

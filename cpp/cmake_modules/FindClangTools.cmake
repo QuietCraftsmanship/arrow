@@ -40,9 +40,23 @@ set(CLANG_TOOLS_SEARCH_PATHS
     /usr/local/bin
     /usr/bin
     "C:/Program Files/LLVM/bin" # Windows, non-conda
-    "$ENV{CONDA_PREFIX}/Library/bin") # Windows, conda
-if(CLANG_TOOLS_BREW_PREFIX)
-  list(APPEND CLANG_TOOLS_SEARCH_PATHS "${CLANG_TOOLS_BREW}/bin")
+    "$ENV{CONDA_PREFIX}/Library/bin" # Windows, conda
+    "$ENV{CONDA_PREFIX}/bin") # Unix, conda
+if(APPLE)
+  find_program(BREW brew)
+  if(BREW)
+    execute_process(COMMAND ${BREW} --prefix "llvm@${ARROW_CLANG_TOOLS_VERSION_MAJOR}"
+                    OUTPUT_VARIABLE CLANG_TOOLS_BREW_PREFIX
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT CLANG_TOOLS_BREW_PREFIX)
+      execute_process(COMMAND ${BREW} --prefix llvm
+                      OUTPUT_VARIABLE CLANG_TOOLS_BREW_PREFIX
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+    if(CLANG_TOOLS_BREW_PREFIX)
+      list(APPEND CLANG_TOOLS_SEARCH_PATHS "${CLANG_TOOLS_BREW_PREFIX}/bin")
+    endif()
+  endif()
 endif()
 
 function(FIND_CLANG_TOOL NAME OUTPUT VERSION_CHECK_PATTERN)
@@ -64,20 +78,25 @@ function(FIND_CLANG_TOOL NAME OUTPUT VERSION_CHECK_PATTERN)
                       OUTPUT_VARIABLE CLANG_TOOL_VERSION_MESSAGE
                       OUTPUT_STRIP_TRAILING_WHITESPACE)
       if(NOT (${CLANG_TOOL_VERSION_MESSAGE} MATCHES ${VERSION_CHECK_PATTERN}))
+        message(STATUS "${NAME} found, but version did not match \"${VERSION_CHECK_PATTERN}\""
+        )
         set(CLANG_TOOL_BIN "CLANG_TOOL_BIN-NOTFOUND")
       endif()
     endif()
   endif()
   if(CLANG_TOOL_BIN)
-    set(${OUTPUT} ${CLANG_TOOL_BIN} PARENT_SCOPE)
+    set(${OUTPUT}
+        ${CLANG_TOOL_BIN}
+        PARENT_SCOPE)
   else()
-    set(${OUTPUT} "${OUTPUT}-NOTFOUND" PARENT_SCOPE)
+    set(${OUTPUT}
+        "${OUTPUT}-NOTFOUND"
+        PARENT_SCOPE)
   endif()
 endfunction()
 
-string(REGEX
-       REPLACE "\\." "\\\\." ARROW_CLANG_TOOLS_VERSION_ESCAPED
-               "${ARROW_CLANG_TOOLS_VERSION}")
+string(REGEX REPLACE "\\." "\\\\." ARROW_CLANG_TOOLS_VERSION_ESCAPED
+                     "${ARROW_CLANG_TOOLS_VERSION}")
 
 find_clang_tool(clang-tidy CLANG_TIDY_BIN
                 "LLVM version ${ARROW_CLANG_TOOLS_VERSION_ESCAPED}")
@@ -86,18 +105,18 @@ if(CLANG_TIDY_BIN)
   message(STATUS "clang-tidy found at ${CLANG_TIDY_BIN}")
 else()
   set(CLANG_TIDY_FOUND 0)
-  message(STATUS "clang-tidy not found")
+  message(STATUS "clang-tidy ${ARROW_CLANG_TOOLS_VERSION} not found")
 endif()
 
 find_clang_tool(clang-format CLANG_FORMAT_BIN
-                "^clang-format version ${ARROW_CLANG_TOOLS_VERSION_ESCAPED}")
+                "clang-format version ${ARROW_CLANG_TOOLS_VERSION_ESCAPED}")
 if(CLANG_FORMAT_BIN)
   set(CLANG_FORMAT_FOUND 1)
   message(STATUS "clang-format found at ${CLANG_FORMAT_BIN}")
 else()
   set(CLANG_FORMAT_FOUND 0)
-  message(STATUS "clang-format not found")
+  message(STATUS "clang-format ${ARROW_CLANG_TOOLS_VERSION} not found")
 endif()
 
 find_package_handle_standard_args(ClangTools REQUIRED_VARS CLANG_FORMAT_BIN
-                                  CLANG_TIDY_BIN)
+                                                           CLANG_TIDY_BIN)

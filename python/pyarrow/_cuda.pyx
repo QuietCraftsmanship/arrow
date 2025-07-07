@@ -16,15 +16,14 @@
 # under the License.
 
 
-from pyarrow.compat import tobytes
 from pyarrow.lib cimport *
 from pyarrow.includes.libarrow_cuda cimport *
-from pyarrow.lib import py_buffer, allocate_buffer, as_buffer, ArrowTypeError
+from pyarrow.lib import allocate_buffer, as_buffer, ArrowTypeError
 from pyarrow.util import get_contiguous_span
 cimport cpython as cp
 
 
-cdef class Context:
+cdef class Context(_Weakrefable):
     """
     CUDA driver context.
     """
@@ -186,8 +185,31 @@ cdef class Context:
             cudabuf = GetResultValue(self.context.get().Allocate(nbytes))
         return pyarrow_wrap_cudabuffer(cudabuf)
 
+    @property
+    def memory_manager(self):
+        """
+        The default memory manager tied to this context's device.
+
+        Returns
+        -------
+        MemoryManager
+        """
+        return MemoryManager.wrap(self.context.get().memory_manager())
+
+    @property
+    def device(self):
+        """
+        The device instance associated with this context.
+
+        Returns
+        -------
+        Device
+        """
+        return Device.wrap(self.context.get().device())
+
     def foreign_buffer(self, address, size, base=None):
-        """Create device buffer from address and size as a view.
+        """
+        Create device buffer from address and size as a view.
 
         The caller is responsible for allocating and freeing the
         memory. When `address==size==0` then a new zero-sized buffer
@@ -327,7 +349,7 @@ cdef class Context:
                              ' `%s` object' % (type(obj)))
 
 
-cdef class IpcMemHandle:
+cdef class IpcMemHandle(_Weakrefable):
     """A serializable container for a CUDA IPC handle.
     """
     cdef void init(self, shared_ptr[CCudaIpcMemHandle]& h):
@@ -343,7 +365,7 @@ cdef class IpcMemHandle:
         opaque_handle :
           a CUipcMemHandle as a const void*
 
-        Results
+        Returns
         -------
         ipc_handle : IpcMemHandle
         """
@@ -493,7 +515,7 @@ cdef class CudaBuffer(Buffer):
                     raise ValueError(
                         'requested more to copy than available from '
                         'device buffer')
-                # copy nbytes starting from position to new host buffeer
+                # copy nbytes starting from position to new host buffer
                 c_nbytes = nbytes
             buf = allocate_buffer(c_nbytes, memory_pool=memory_pool,
                                   resizable=resizable)
@@ -754,7 +776,6 @@ cdef class BufferReader(NativeFile):
         """
         cdef:
             int64_t c_nbytes
-            int64_t bytes_read = 0
             shared_ptr[CCudaBuffer] output
 
         if nbytes is None:
@@ -922,7 +943,8 @@ def read_message(object source, pool=None):
     return result
 
 
-def read_record_batch(object buffer, object schema, pool=None):
+def read_record_batch(object buffer, object schema, *,
+                      DictionaryMemo dictionary_memo=None, pool=None):
     """Construct RecordBatch referencing IPC message located on CUDA device.
 
     While the metadata is copied to host memory for deserialization,
@@ -934,6 +956,9 @@ def read_record_batch(object buffer, object schema, pool=None):
       Device buffer containing the complete IPC message
     schema : Schema
       The schema for the record batch
+    dictionary_memo : DictionaryMemo, optional
+        If message contains dictionaries, must pass a populated
+        DictionaryMemo
     pool : MemoryPool (optional)
       Pool to allocate metadata from
 
@@ -943,12 +968,22 @@ def read_record_batch(object buffer, object schema, pool=None):
       Reconstructed record batch, with device pointers
 
     """
-    cdef shared_ptr[CSchema] schema_ = pyarrow_unwrap_schema(schema)
-    cdef shared_ptr[CCudaBuffer] buffer_ = pyarrow_unwrap_cudabuffer(buffer)
-    cdef CMemoryPool* pool_ = maybe_unbox_memory_pool(pool)
-    cdef shared_ptr[CRecordBatch] batch
+    cdef:
+        shared_ptr[CSchema] schema_ = pyarrow_unwrap_schema(schema)
+        shared_ptr[CCudaBuffer] buffer_ = pyarrow_unwrap_cudabuffer(buffer)
+        CDictionaryMemo temp_memo
+        CDictionaryMemo* arg_dict_memo
+        CMemoryPool* pool_ = maybe_unbox_memory_pool(pool)
+        shared_ptr[CRecordBatch] batch
+
+    if dictionary_memo is not None:
+        arg_dict_memo = dictionary_memo.memo
+    else:
+        arg_dict_memo = &temp_memo
+
     with nogil:
-        batch = GetResultValue(CudaReadRecordBatch(schema_, buffer_, pool_))
+        batch = GetResultValue(CudaReadRecordBatch(
+            schema_, arg_dict_memo, buffer_, pool_))
     return pyarrow_wrap_batch(batch)
 
 

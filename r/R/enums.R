@@ -16,11 +16,11 @@
 # under the License.
 
 #' @export
-`print.arrow-enum` <- function(x, ...){
+`print.arrow-enum` <- function(x, ...) {
   NextMethod()
 }
 
-enum <- function(class, ..., .list = list(...)){
+enum <- function(class, ..., .list = list(...)) {
   structure(
     .list,
     class = c(class, "arrow-enum")
@@ -65,13 +65,32 @@ Type <- enum("Type::type",
   TIME64 = 20L,
   INTERVAL_MONTHS = 21L,
   INTERVAL_DAY_TIME = 22L,
-  DECIMAL = 23L,
-  LIST = 24L,
-  STRUCT = 25L,
-  UNION = 26L,
-  DICTIONARY = 27L,
-  MAP = 28L
+  DECIMAL128 = 23L,
+  DECIMAL256 = 24L,
+  LIST = 25L,
+  STRUCT = 26L,
+  SPARSE_UNION = 27L,
+  DENSE_UNION = 28L,
+  DICTIONARY = 29L,
+  MAP = 30L,
+  EXTENSION = 31L,
+  FIXED_SIZE_LIST = 32L,
+  DURATION = 33L,
+  LARGE_STRING = 34L,
+  LARGE_BINARY = 35L,
+  LARGE_LIST = 36L,
+  INTERVAL_MONTH_DAY_NANO = 37L,
+  RUN_END_ENCODED = 38L
 )
+
+TYPES_WITH_NAN <- Type[c("HALF_FLOAT", "FLOAT", "DOUBLE")]
+TYPES_NUMERIC <- Type[
+  c(
+    "INT8", "UINT8", "INT16", "UINT16", "INT32", "UINT32",
+    "INT64", "UINT64", "HALF_FLOAT", "FLOAT", "DOUBLE",
+    "DECIMAL128", "DECIMAL256"
+    )
+  ]
 
 #' @rdname enums
 #' @export
@@ -79,9 +98,7 @@ StatusCode <- enum("StatusCode",
   OK = 0L, OutOfMemory = 1L, KeyError = 2L, TypeError = 3L,
   Invalid = 4L, IOError = 5L, CapacityError = 6L, IndexError = 7L,
   UnknownError = 9L, NotImplemented = 10L, SerializationError = 11L,
-  PythonError = 12L, RError = 13L,
-  PlasmaObjectExists = 20L, PlasmaObjectNotFound = 21L,
-  PlasmaStoreFull = 22L, PlasmaObjectAlreadySealed = 23L
+  PythonError = 12L, RError = 13L
 )
 
 #' @rdname enums
@@ -92,7 +109,7 @@ FileMode <- enum("FileMode",
 
 #' @rdname enums
 #' @export
-MessageType <- enum("Message::Type",
+MessageType <- enum("MessageType",
   NONE = 0L, SCHEMA = 1L, DICTIONARY_BATCH = 2L, RECORD_BATCH = 3L, TENSOR = 4L
 )
 
@@ -112,5 +129,57 @@ FileType <- enum("FileType",
 #' @export
 #' @rdname enums
 ParquetVersionType <- enum("ParquetVersionType",
-  PARQUET_1_0 = 0L, PARQUET_2_0 = 1L
+  PARQUET_1_0 = 0L, PARQUET_2_4 = 2L, PARQUET_2_6 = 3L
+)
+
+#' @export
+#' @rdname enums
+MetadataVersion <- enum("MetadataVersion",
+  V1 = 0L, V2 = 1L, V3 = 2L, V4 = 3L, V5 = 4L
+)
+
+#' @export
+#' @rdname enums
+QuantileInterpolation <- enum("QuantileInterpolation",
+  LINEAR = 0L, LOWER = 1L, HIGHER = 2L, NEAREST = 3L, MIDPOINT = 4L
+)
+
+#' @export
+#' @rdname enums
+NullEncodingBehavior <- enum("NullEncodingBehavior",
+  ENCODE = 0L, MASK = 1L
+)
+
+#' @export
+#' @rdname enums
+NullHandlingBehavior <- enum("NullHandlingBehavior",
+  EMIT_NULL = 0L, SKIP = 1L, REPLACE = 2L
+)
+
+#' @export
+#' @rdname enums
+RoundMode <- enum("RoundMode",
+  DOWN = 0L,
+  UP = 1L,
+  TOWARDS_ZERO = 2L,
+  TOWARDS_INFINITY = 3L,
+  HALF_DOWN = 4L,
+  HALF_UP = 5L,
+  HALF_TOWARDS_ZERO = 6L,
+  HALF_TOWARDS_INFINITY = 7L,
+  HALF_TO_EVEN = 8L,
+  HALF_TO_ODD = 9L
+)
+
+#' @export
+#' @rdname enums
+JoinType <- enum("JoinType",
+  LEFT_SEMI = 0L,
+  RIGHT_SEMI = 1L,
+  LEFT_ANTI = 2L,
+  RIGHT_ANTI = 3L,
+  INNER = 4L,
+  LEFT_OUTER = 5L,
+  RIGHT_OUTER = 6L,
+  FULL_OUTER = 7L
 )

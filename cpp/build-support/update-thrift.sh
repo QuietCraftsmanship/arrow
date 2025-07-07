@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -20,4 +20,4 @@
 
 # Run this from cpp/ directory. thrift is expected to be in your path
 
-thrift --gen cpp -out src/generated src/parquet/parquet.thrift
+thrift --gen cpp:moveable_types,templates -out src/generated src/parquet/parquet.thrift

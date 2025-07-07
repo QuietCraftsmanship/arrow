@@ -25,10 +25,19 @@
 #include <utility>
 
 #include "arrow/array/util.h"
+#include "arrow/chunked_array.h"
+#include "arrow/config.h"
+#include "arrow/extension/bool8.h"
+#ifdef ARROW_JSON
+#  include "arrow/extension/fixed_shape_tensor.h"
+#  include "arrow/extension/opaque.h"
+#endif
+#include "arrow/extension/json.h"
+#include "arrow/extension/uuid.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
@@ -36,10 +45,35 @@ using internal::checked_cast;
 
 DataTypeLayout ExtensionType::layout() const { return storage_type_->layout(); }
 
-std::string ExtensionType::ToString() const {
+std::string ExtensionType::ToString(bool show_metadata) const {
   std::stringstream ss;
   ss << "extension<" << this->extension_name() << ">";
   return ss.str();
+}
+
+std::shared_ptr<Array> ExtensionType::WrapArray(const std::shared_ptr<DataType>& type,
+                                                const std::shared_ptr<Array>& storage) {
+  DCHECK_EQ(type->id(), Type::EXTENSION);
+  const auto& ext_type = checked_cast<const ExtensionType&>(*type);
+  DCHECK_EQ(storage->type_id(), ext_type.storage_type()->id());
+  auto data = storage->data()->Copy();
+  data->type = type;
+  return ext_type.MakeArray(std::move(data));
+}
+
+std::shared_ptr<ChunkedArray> ExtensionType::WrapArray(
+    const std::shared_ptr<DataType>& type, const std::shared_ptr<ChunkedArray>& storage) {
+  DCHECK_EQ(type->id(), Type::EXTENSION);
+  const auto& ext_type = checked_cast<const ExtensionType&>(*type);
+  DCHECK_EQ(storage->type()->id(), ext_type.storage_type()->id());
+
+  ArrayVector out_chunks(storage->num_chunks());
+  for (int i = 0; i < storage->num_chunks(); i++) {
+    auto data = storage->chunk(i)->data()->Copy();
+    data->type = type;
+    out_chunks[i] = ext_type.MakeArray(std::move(data));
+  }
+  return std::make_shared<ChunkedArray>(std::move(out_chunks));
 }
 
 ExtensionArray::ExtensionArray(const std::shared_ptr<ArrayData>& data) { SetData(data); }
@@ -112,7 +146,21 @@ static std::once_flag registry_initialized;
 namespace internal {
 
 static void CreateGlobalRegistry() {
+  // Register canonical extension types
+
   g_registry = std::make_shared<ExtensionTypeRegistryImpl>();
+  std::vector<std::shared_ptr<DataType>> ext_types{extension::bool8(), extension::json(),
+                                                   extension::uuid()};
+
+#ifdef ARROW_JSON
+  ext_types.push_back(extension::fixed_shape_tensor(int64(), {}));
+  ext_types.push_back(extension::opaque(null(), "", ""));
+#endif
+
+  for (const auto& ext_type : ext_types) {
+    ARROW_CHECK_OK(
+        g_registry->RegisterType(checked_pointer_cast<ExtensionType>(ext_type)));
+  }
 }
 
 }  // namespace internal

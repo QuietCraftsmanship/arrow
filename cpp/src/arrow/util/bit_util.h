@@ -17,51 +17,24 @@
 
 #pragma once
 
-#ifdef _WIN32
-#define ARROW_LITTLE_ENDIAN 1
-#else
-#if defined(__APPLE__) || defined(__FreeBSD__)
-#include <machine/endian.h>  // IWYU pragma: keep
-#else
-#include <endian.h>  // IWYU pragma: keep
-#endif
-#
-#ifndef __BYTE_ORDER__
-#error "__BYTE_ORDER__ not defined"
-#endif
-#
-#ifndef __ORDER_LITTLE_ENDIAN__
-#error "__ORDER_LITTLE_ENDIAN__ not defined"
-#endif
-#
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#define ARROW_LITTLE_ENDIAN 1
-#else
-#define ARROW_LITTLE_ENDIAN 0
-#endif
-#endif
-
 #if defined(_MSC_VER)
-#include <intrin.h>  // IWYU pragma: keep
-#include <nmmintrin.h>
-#pragma intrinsic(_BitScanReverse)
-#pragma intrinsic(_BitScanForward)
-#define ARROW_BYTE_SWAP64 _byteswap_uint64
-#define ARROW_BYTE_SWAP32 _byteswap_ulong
-#define ARROW_POPCOUNT64 __popcnt64
-#define ARROW_POPCOUNT32 __popcnt
+#  if defined(_M_AMD64) || defined(_M_X64)
+#    include <intrin.h>  // IWYU pragma: keep
+#  endif
+
+#  pragma intrinsic(_BitScanReverse)
+#  pragma intrinsic(_BitScanForward)
+#  define ARROW_POPCOUNT64 __popcnt64
+#  define ARROW_POPCOUNT32 __popcnt
 #else
-#define ARROW_BYTE_SWAP64 __builtin_bswap64
-#define ARROW_BYTE_SWAP32 __builtin_bswap32
-#define ARROW_POPCOUNT64 __builtin_popcountll
-#define ARROW_POPCOUNT32 __builtin_popcount
+#  define ARROW_POPCOUNT64 __builtin_popcountll
+#  define ARROW_POPCOUNT32 __builtin_popcount
 #endif
 
 #include <cstdint>
 #include <type_traits>
 
 #include "arrow/util/macros.h"
-#include "arrow/util/type_traits.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
@@ -74,7 +47,7 @@ typename std::make_unsigned<Integer>::type as_unsigned(Integer x) {
 
 }  // namespace detail
 
-namespace BitUtil {
+namespace bit_util {
 
 // The number of set bits in a given unsigned byte value, pre-computed
 //
@@ -139,6 +112,12 @@ constexpr bool IsMultipleOf64(int64_t n) { return (n & 63) == 0; }
 
 constexpr bool IsMultipleOf8(int64_t n) { return (n & 7) == 0; }
 
+// Returns a mask for the bit_index lower order bits.
+// Only valid for bit_index in the range [0, 64).
+constexpr uint64_t LeastSignificantBitMask(int64_t bit_index) {
+  return (static_cast<uint64_t>(1) << bit_index) - 1;
+}
+
 // Returns 'value' rounded up to the nearest multiple of 'factor'
 constexpr int64_t RoundUp(int64_t value, int64_t factor) {
   return CeilDiv(value, factor) * factor;
@@ -182,7 +161,7 @@ constexpr int64_t RoundUpToMultipleOf64(int64_t num) {
 //
 // The covering bytes is the length (in bytes) of this new aligned slice.
 constexpr int64_t CoveringBytes(int64_t offset, int64_t length) {
-  return (BitUtil::RoundUp(length + offset, 8) - BitUtil::RoundDown(offset, 8)) / 8;
+  return (bit_util::RoundUp(length + offset, 8) - bit_util::RoundDown(offset, 8)) / 8;
 }
 
 // Returns the 'num_bits' least-significant bits of 'v'.
@@ -296,116 +275,6 @@ static inline int Log2(uint64_t x) {
 }
 
 //
-// Byte-swap 16-bit, 32-bit and 64-bit values
-//
-
-// Swap the byte order (i.e. endianness)
-static inline int64_t ByteSwap(int64_t value) { return ARROW_BYTE_SWAP64(value); }
-static inline uint64_t ByteSwap(uint64_t value) {
-  return static_cast<uint64_t>(ARROW_BYTE_SWAP64(value));
-}
-static inline int32_t ByteSwap(int32_t value) { return ARROW_BYTE_SWAP32(value); }
-static inline uint32_t ByteSwap(uint32_t value) {
-  return static_cast<uint32_t>(ARROW_BYTE_SWAP32(value));
-}
-static inline int16_t ByteSwap(int16_t value) {
-  constexpr auto m = static_cast<int16_t>(0xff);
-  return static_cast<int16_t>(((value >> 8) & m) | ((value & m) << 8));
-}
-static inline uint16_t ByteSwap(uint16_t value) {
-  return static_cast<uint16_t>(ByteSwap(static_cast<int16_t>(value)));
-}
-static inline uint8_t ByteSwap(uint8_t value) { return value; }
-
-// Write the swapped bytes into dst. Src and dst cannot overlap.
-static inline void ByteSwap(void* dst, const void* src, int len) {
-  switch (len) {
-    case 1:
-      *reinterpret_cast<int8_t*>(dst) = *reinterpret_cast<const int8_t*>(src);
-      return;
-    case 2:
-      *reinterpret_cast<int16_t*>(dst) = ByteSwap(*reinterpret_cast<const int16_t*>(src));
-      return;
-    case 4:
-      *reinterpret_cast<int32_t*>(dst) = ByteSwap(*reinterpret_cast<const int32_t*>(src));
-      return;
-    case 8:
-      *reinterpret_cast<int64_t*>(dst) = ByteSwap(*reinterpret_cast<const int64_t*>(src));
-      return;
-    default:
-      break;
-  }
-
-  auto d = reinterpret_cast<uint8_t*>(dst);
-  auto s = reinterpret_cast<const uint8_t*>(src);
-  for (int i = 0; i < len; ++i) {
-    d[i] = s[len - i - 1];
-  }
-}
-
-// Convert to little/big endian format from the machine's native endian format.
-#if ARROW_LITTLE_ENDIAN
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T ToBigEndian(T value) {
-  return ByteSwap(value);
-}
-
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T ToLittleEndian(T value) {
-  return value;
-}
-#else
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T ToBigEndian(T value) {
-  return value;
-}
-
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T ToLittleEndian(T value) {
-  return ByteSwap(value);
-}
-#endif
-
-// Convert from big/little endian format to the machine's native endian format.
-#if ARROW_LITTLE_ENDIAN
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T FromBigEndian(T value) {
-  return ByteSwap(value);
-}
-
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T FromLittleEndian(T value) {
-  return value;
-}
-#else
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T FromBigEndian(T value) {
-  return value;
-}
-
-template <typename T,
-          typename = internal::EnableIfIsOneOf<T, int64_t, uint64_t, int32_t, uint32_t,
-                                               int16_t, uint16_t, uint8_t>>
-static inline T FromLittleEndian(T value) {
-  return ByteSwap(value);
-}
-#endif
-
-//
 // Utilities for reading and writing individual bits by their index
 // in a memory area.
 //
@@ -423,12 +292,14 @@ static constexpr uint8_t kPrecedingWrappingBitmask[] = {255, 1, 3, 7, 15, 31, 63
 // the bitwise complement version of kPrecedingBitmask
 static constexpr uint8_t kTrailingBitmask[] = {255, 254, 252, 248, 240, 224, 192, 128};
 
-static inline bool GetBit(const uint8_t* bits, uint64_t i) {
+static constexpr bool GetBit(const uint8_t* bits, uint64_t i) {
   return (bits[i >> 3] >> (i & 0x07)) & 1;
 }
 
 // Gets the i-th bit from a byte. Should only be used with i <= 7.
-static inline bool GetBitFromByte(uint8_t byte, uint8_t i) { return byte & kBitmask[i]; }
+static constexpr bool GetBitFromByte(uint8_t byte, uint8_t i) {
+  return byte & kBitmask[i];
+}
 
 static inline void ClearBit(uint8_t* bits, int64_t i) {
   bits[i / 8] &= kFlippedBitmask[i % 8];
@@ -449,5 +320,50 @@ static inline void SetBitTo(uint8_t* bits, int64_t i, bool bit_is_set) {
 ARROW_EXPORT
 void SetBitsTo(uint8_t* bits, int64_t start_offset, int64_t length, bool bits_are_set);
 
-}  // namespace BitUtil
+/// \brief Sets all bits in the bitmap to true
+ARROW_EXPORT
+void SetBitmap(uint8_t* data, int64_t offset, int64_t length);
+
+/// \brief Clears all bits in the bitmap (set to false)
+ARROW_EXPORT
+void ClearBitmap(uint8_t* data, int64_t offset, int64_t length);
+
+/// Returns a mask with lower i bits set to 1. If i >= sizeof(Word)*8, all-ones will be
+/// returned
+/// ex:
+/// ref: https://stackoverflow.com/a/59523400
+template <typename Word>
+constexpr Word PrecedingWordBitmask(unsigned int const i) {
+  return static_cast<Word>(static_cast<Word>(i < sizeof(Word) * 8)
+                           << (i & (sizeof(Word) * 8 - 1))) -
+         1;
+}
+static_assert(PrecedingWordBitmask<uint8_t>(0) == 0x00, "");
+static_assert(PrecedingWordBitmask<uint8_t>(4) == 0x0f, "");
+static_assert(PrecedingWordBitmask<uint8_t>(8) == 0xff, "");
+static_assert(PrecedingWordBitmask<uint16_t>(8) == 0x00ff, "");
+
+/// \brief Create a word with low `n` bits from `low` and high `sizeof(Word)-n` bits
+/// from `high`.
+/// Word ret
+/// for (i = 0; i < sizeof(Word)*8; i++){
+///     ret[i]= i < n ? low[i]: high[i];
+/// }
+template <typename Word>
+constexpr Word SpliceWord(int n, Word low, Word high) {
+  return (high & ~PrecedingWordBitmask<Word>(n)) | (low & PrecedingWordBitmask<Word>(n));
+}
+
+/// \brief Pack integers into a bitmap in batches of 8
+template <int batch_size>
+void PackBits(const uint32_t* values, uint8_t* out) {
+  for (int i = 0; i < batch_size / 8; ++i) {
+    *out++ = static_cast<uint8_t>(values[0] | values[1] << 1 | values[2] << 2 |
+                                  values[3] << 3 | values[4] << 4 | values[5] << 5 |
+                                  values[6] << 6 | values[7] << 7);
+    values += 8;
+  }
+}
+
+}  // namespace bit_util
 }  // namespace arrow

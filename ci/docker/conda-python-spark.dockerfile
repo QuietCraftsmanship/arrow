@@ -17,28 +17,37 @@
 
 ARG repo
 ARG arch=amd64
-ARG python=3.6
+ARG python=3.9
 FROM ${repo}:${arch}-conda-python-${python}
 
-ARG jdk=8
-ARG maven=3.5
+ARG jdk=11
+ARG maven=3.8.7
 
-# The Spark tests currently break with pandas >= 1.0
-RUN conda install -q \
-        patch \
-        pandas=0.25.3 \
+ARG numpy=latest
+COPY ci/scripts/install_numpy.sh /arrow/ci/scripts/
+
+RUN mamba install -q -y \
         openjdk=${jdk} \
-        maven=${maven} && \
-    conda clean --all
+        maven=${maven} \
+        pandas && \
+    mamba clean --all && \
+    mamba uninstall -q -y numpy && \
+    /arrow/ci/scripts/install_numpy.sh ${numpy}
 
 # installing specific version of spark
 ARG spark=master
 COPY ci/scripts/install_spark.sh /arrow/ci/scripts/
-RUN /arrow/ci/scripts/install_spark.sh ${spark} /spark /arrow/ci/etc
+RUN /arrow/ci/scripts/install_spark.sh ${spark} /spark
 
 # build cpp with tests
 ENV CC=gcc \
     CXX=g++ \
-    ARROW_PYTHON=ON \
+    ARROW_ACERO=ON \
+    ARROW_BUILD_TESTS=OFF \
+    ARROW_COMPUTE=ON \
+    ARROW_CSV=ON \
+    ARROW_DATASET=ON \
+    ARROW_FILESYSTEM=ON \
     ARROW_HDFS=ON \
-    ARROW_BUILD_TESTS=OFF
+    ARROW_JSON=ON \
+    SPARK_VERSION=${spark}

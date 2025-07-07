@@ -17,8 +17,6 @@
 
 #include "./arrow_types.h"
 
-#if defined(ARROW_R_WITH_ARROW)
-
 // [[arrow::export]]
 bool Buffer__is_mutable(const std::shared_ptr<arrow::Buffer>& buffer) {
   return buffer->is_mutable();
@@ -30,36 +28,36 @@ void Buffer__ZeroPadding(const std::shared_ptr<arrow::Buffer>& buffer) {
 }
 
 // [[arrow::export]]
-int64_t Buffer__capacity(const std::shared_ptr<arrow::Buffer>& buffer) {
-  return buffer->capacity();
+r_vec_size Buffer__capacity(const std::shared_ptr<arrow::Buffer>& buffer) {
+  return r_vec_size(buffer->capacity());
 }
 
 // [[arrow::export]]
-int64_t Buffer__size(const std::shared_ptr<arrow::Buffer>& buffer) {
-  return buffer->size();
+r_vec_size Buffer__size(const std::shared_ptr<arrow::Buffer>& buffer) {
+  return r_vec_size(buffer->size());
 }
 
 // [[arrow::export]]
 std::shared_ptr<arrow::Buffer> r___RBuffer__initialize(SEXP x) {
   switch (TYPEOF(x)) {
     case RAWSXP:
-      return std::make_shared<arrow::r::RBuffer<RAWSXP>>(x);
+      return std::make_shared<arrow::r::RBuffer<cpp11::raws>>(x);
     case REALSXP:
-      return std::make_shared<arrow::r::RBuffer<REALSXP>>(x);
+      return std::make_shared<arrow::r::RBuffer<cpp11::doubles>>(x);
     case INTSXP:
-      return std::make_shared<arrow::r::RBuffer<INTSXP>>(x);
+      return std::make_shared<arrow::r::RBuffer<cpp11::integers>>(x);
     case CPLXSXP:
-      return std::make_shared<arrow::r::RBuffer<CPLXSXP>>(x);
+      return std::make_shared<arrow::r::RBuffer<arrow::r::complexs>>(
+          arrow::r::complexs(x));
     default:
-      Rcpp::stop(
-          tfm::format("R object of type %s not supported", Rf_type2char(TYPEOF(x))));
+      break;
   }
-  return nullptr;
+  cpp11::stop("R object of type <%s> not supported", Rf_type2char(TYPEOF(x)));
 }
 
 // [[arrow::export]]
-Rcpp::RawVector Buffer__data(const std::shared_ptr<arrow::Buffer>& buffer) {
-  return Rcpp::RawVector(buffer->data(), buffer->data() + buffer->size());
+cpp11::writable::raws Buffer__data(const std::shared_ptr<arrow::Buffer>& buffer) {
+  return cpp11::writable::raws(buffer->data(), buffer->data() + buffer->size());
 }
 
 // [[arrow::export]]
@@ -67,5 +65,3 @@ bool Buffer__Equals(const std::shared_ptr<arrow::Buffer>& x,
                     const std::shared_ptr<arrow::Buffer>& y) {
   return x->Equals(*y.get());
 }
-
-#endif

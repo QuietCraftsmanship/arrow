@@ -1,4 +1,5 @@
 #!/bin/bash
+# -*- indent-tabs-mode: nil; sh-indentation: 2; sh-basic-offset: 2 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -16,21 +17,33 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+#
 set -e
 set -u
 set -o pipefail
 
-SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 <version> <rc-num> <artifact-dir>"
+if [ "$#" -ne 4 ]; then
+  echo "Usage: $0 <version> <rc-num> <gpg-key-id> <artifact-dir>"
   exit
 fi
 
 version=$1
 rc=$2
-artifact_dir=$3
+gpg_key_id=$3
+artifact_dir=$4
+
+docker_image_name=apache-arrow/release-binary
+gpg_agent_extra_socket="$(gpgconf --list-dirs agent-extra-socket)"
+if [ $(uname) = "Darwin" ]; then
+  docker_uid=10000
+  docker_gid=10000
+else
+  docker_uid=$(id -u)
+  docker_gid=$(id -g)
+fi
+docker_ssh_key="${SOURCE_DIR}/binary/id_rsa"
 
 if [ -z "$artifact_dir" ]; then
   echo "artifact_dir is empty"
@@ -47,28 +60,23 @@ if [ ! -d "$artifact_dir" ]; then
   exit 1
 fi
 
-artifact_dir="$(pwd)/${artifact_dir}"
-
-cd "${SOURCE_DIR}"
-
-: ${BINTRAY_REPOSITORY_CUSTOM:=${BINTRAY_REPOSITORY:-}}
-: ${SOURCE_BINTRAY_REPOSITORY_CUSTOM:=${SOURCE_BINTRAY_REPOSITORY:-}}}
-
-if [ ! -f .env ]; then
-  echo "You must create $(pwd)/.env"
-  echo "You can use $(pwd)/.env.example as template"
+if [ -z "${BINTRAY_PASSWORD}" ]; then
+  echo "BINTRAY_PASSWORD is empty"
   exit 1
 fi
-. .env
 
-if [ -n "${BINTRAY_REPOSITORY_CUSTOM}" ]; then
-  BINTRAY_REPOSITORY=${BINTRAY_REPOSITORY_CUSTOM}
+if ! jq --help > /dev/null 2>&1; then
+  echo "jq is required"
+  exit 1
 fi
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 if [ -n "${SOURCE_BINTRAY_REPOSITORY_CUSTOM}" ]; then
   SOURCE_BINTRAY_REPOSITORY=${SOURCE_BINTRAY_REPOSITORY_CUSTOM}
 =======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 : ${BINTRAY_REPOSITORY:=apache/arrow}
 : ${SOURCE_BINTRAY_REPOSITORY:=${BINTRAY_REPOSITORY}}
 
@@ -122,12 +130,31 @@ docker_run_gpg_ready() {
 if [ \$(id -u) -ne ${docker_uid} ]; then
   usermod --uid ${docker_uid} arrow
   chown -R arrow: ~arrow
+<<<<<<< HEAD
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 fi
+/usr/sbin/sshd -D
+"
+  local container_id=$(cat ${container_id_file})
+  local ssh_port=$(docker port ${container_id} | grep -E -o '[0-9]+$')
+  # Wait for sshd available
+  while ! docker_gpg_ssh ${ssh_port} : > /dev/null 2>&1; do
+    sleep 0.1
+  done
+  gpg --export ${gpg_key_id} | docker_gpg_ssh ${ssh_port} gpg --import
+  docker_gpg_ssh ${ssh_port} "cd /host && $@"
+  docker kill ${container_id}
+  rm -rf ${container_id_dir}
+}
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 . binary-common.sh
 =======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 bintray() {
   local command=$1
   shift
@@ -514,7 +541,10 @@ upload_python() {
 docker build -t ${docker_image_name} ${SOURCE_DIR}/binary
 
 chmod go-rwx "${docker_ssh_key}"
+<<<<<<< HEAD
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 # By default upload all artifacts.
 # To deactivate one category, deactivate the category and all of its dependents.
@@ -524,60 +554,109 @@ chmod go-rwx "${docker_ssh_key}"
 : ${UPLOAD_CENTOS_YUM:=${UPLOAD_DEFAULT}}
 : ${UPLOAD_DEBIAN_APT:=${UPLOAD_DEFAULT}}
 : ${UPLOAD_DEBIAN_DEB:=${UPLOAD_DEFAULT}}
-: ${UPLOAD_NUGET:=${UPLOAD_DEFAULT}}
 : ${UPLOAD_PYTHON:=${UPLOAD_DEFAULT}}
 : ${UPLOAD_UBUNTU_APT:=${UPLOAD_DEFAULT}}
 : ${UPLOAD_UBUNTU_DEB:=${UPLOAD_DEFAULT}}
 
-rake_tasks=()
-apt_targets=()
-yum_targets=()
-if [ ${UPLOAD_DEBIAN_DEB} -gt 0 ]; then
-  rake_tasks+=(deb)
-  apt_targets+=(debian)
-fi
-if [ ${UPLOAD_DEBIAN_APT} -gt 0 ]; then
-  rake_tasks+=(apt:rc)
-  apt_targets+=(debian)
-fi
-if [ ${UPLOAD_UBUNTU_DEB} -gt 0 ]; then
-  rake_tasks+=(deb)
-  apt_targets+=(ubuntu)
-fi
-if [ ${UPLOAD_UBUNTU_APT} -gt 0 ]; then
-  rake_tasks+=(apt:rc)
-  apt_targets+=(ubuntu)
-fi
-if [ ${UPLOAD_CENTOS_RPM} -gt 0 ]; then
-  rake_tasks+=(rpm)
-  yum_targets+=(centos)
-fi
-if [ ${UPLOAD_CENTOS_YUM} -gt 0 ]; then
-  rake_tasks+=(yum:rc)
-  yum_targets+=(centos)
-fi
-if [ ${UPLOAD_NUGET} -gt 0 ]; then
-  rake_tasks+=(nuget:rc)
-fi
-if [ ${UPLOAD_PYTHON} -gt 0 ]; then
-  rake_tasks+=(python:rc)
-fi
-rake_tasks+=(summary:rc)
+have_debian=no
+have_ubuntu=no
+have_centos=no
+have_python=no
+pushd "${artifact_dir}"
+for dir in *; do
+  is_deb=no
+  is_rpm=no
+  is_python=no
+  case ${dir} in
+    debian-*)
+      distribution=debian
+      code_name=$(echo ${dir} | sed -e 's/^debian-//')
+      is_deb=yes
+      have_debian=yes
+      ;;
+    ubuntu-*)
+      distribution=ubuntu
+      code_name=$(echo ${dir} | sed -e 's/^ubuntu-//')
+      is_deb=yes
+      have_ubuntu=yes
+      ;;
+    centos-*)
+      distribution=centos
+      distribution_version=$(echo ${dir} | sed -e 's/^centos-//')
+      is_rpm=yes
+      have_centos=yes
+      ;;
+    conda-*|wheel-*)
+      is_python=yes
+      have_python=yes
+      ;;
+  esac
 
-tmp_dir=binary/tmp
-mkdir -p "${tmp_dir}"
-source_artifacts_dir="${tmp_dir}/artifacts"
-rm -rf "${source_artifacts_dir}"
-cp -a "${artifact_dir}" "${source_artifacts_dir}"
+  if [ ${is_deb} = "yes" ]; then
+    pushd ${dir}
+    case ${distribution} in
+      debian)
+        if [ ${UPLOAD_DEBIAN_DEB} -gt 0 ]; then
+          ensure_version ${version} ${rc} ${distribution}
+          upload_deb ${version} ${rc} ${distribution} ${code_name} &
+        fi
+        ;;
+      ubuntu)
+        if [ ${UPLOAD_UBUNTU_DEB} -gt 0 ]; then
+          ensure_version ${version} ${rc} ${distribution}
+          upload_deb ${version} ${rc} ${distribution} ${code_name} &
+        fi
+        ;;
+    esac
+    popd
+  elif [ ${is_rpm} = "yes" ]; then
+    pushd ${dir}
+    if [ ${UPLOAD_CENTOS_RPM} -gt 0 ]; then
+      ensure_version ${version} ${rc} ${distribution}
+      upload_rpm ${version} ${rc} ${distribution} ${distribution_version} &
+    fi
+    popd
+  elif [ ${is_python} = "yes" ]; then
+    pushd ${dir}
+    if [ ${UPLOAD_PYTHON} -gt 0 ]; then
+      ensure_version ${version} ${rc} python
+      upload_python ${version} ${rc} &
+    fi
+    popd
+  fi
+done
+wait
+popd
 
-docker_run \
-  ./runner.sh \
-  rake \
-    "${rake_tasks[@]}" \
-    APT_TARGETS=$(IFS=,; echo "${apt_targets[*]}") \
-    ARTIFACTS_DIR="${tmp_dir}/artifacts" \
-    BINTRAY_REPOSITORY=${BINTRAY_REPOSITORY} \
-    RC=${rc} \
-    SOURCE_BINTRAY_REPOSITORY=${SOURCE_BINTRAY_REPOSITORY} \
-    VERSION=${version} \
-    YUM_TARGETS=$(IFS=,; echo "${yum_targets[*]}")
+if [ ${have_debian} = "yes" ]; then
+  if [ ${UPLOAD_DEBIAN_APT} -gt 0 ]; then
+    ensure_version ${version} ${rc} debian
+    upload_apt ${version} ${rc} debian
+  fi
+fi
+if [ ${have_ubuntu} = "yes" ]; then
+  if [ ${UPLOAD_UBUNTU_APT} -gt 0 ]; then
+    ensure_version ${version} ${rc} ubuntu
+    upload_apt ${version} ${rc} ubuntu
+  fi
+fi
+if [ ${have_centos} = "yes" ]; then
+  if [ ${UPLOAD_CENTOS_YUM} -gt 0 ]; then
+    ensure_version ${version} ${rc} centos
+    upload_yum ${version} ${rc} centos
+  fi
+fi
+
+echo "Success! The release candidate binaries are available here:"
+if [ ${have_debian} = "yes" ]; then
+  echo "  https://bintray.com/${BINTRAY_REPOSITORY}/debian-rc/${version}-rc${rc}"
+fi
+if [ ${have_ubuntu} = "yes" ]; then
+  echo "  https://bintray.com/${BINTRAY_REPOSITORY}/ubuntu-rc/${version}-rc${rc}"
+fi
+if [ ${have_centos} = "yes" ]; then
+  echo "  https://bintray.com/${BINTRAY_REPOSITORY}/centos-rc/${version}-rc${rc}"
+fi
+if [ ${have_python} = "yes" ]; then
+  echo "  https://bintray.com/${BINTRAY_REPOSITORY}/python-rc/${version}-rc${rc}"
+fi

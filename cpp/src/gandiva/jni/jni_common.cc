@@ -72,11 +72,6 @@ jclass configuration_builder_class_;
 
 // refs for self.
 static jclass gandiva_exception_;
-static jclass vector_expander_class_;
-static jclass vector_expander_ret_class_;
-static jmethodID vector_expander_method_;
-static jfieldID vector_expander_ret_address_;
-static jfieldID vector_expander_ret_capacity_;
 
 // module maps
 gandiva::IdToModuleMap<std::shared_ptr<ProjectorHolder>> projector_modules_;
@@ -96,27 +91,10 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
   jclass localExceptionClass =
       env->FindClass("org/apache/arrow/gandiva/exceptions/GandivaException");
   gandiva_exception_ = (jclass)env->NewGlobalRef(localExceptionClass);
-  env->ExceptionDescribe();
   env->DeleteLocalRef(localExceptionClass);
 
-  jclass local_expander_class =
-      env->FindClass("org/apache/arrow/gandiva/evaluator/VectorExpander");
-  vector_expander_class_ = (jclass)env->NewGlobalRef(local_expander_class);
-  env->DeleteLocalRef(local_expander_class);
+  env->ExceptionDescribe();
 
-  vector_expander_method_ = env->GetMethodID(
-      vector_expander_class_, "expandOutputVectorAtIndex",
-      "(IJ)Lorg/apache/arrow/gandiva/evaluator/VectorExpander$ExpandResult;");
-
-  jclass local_expander_ret_class =
-      env->FindClass("org/apache/arrow/gandiva/evaluator/VectorExpander$ExpandResult");
-  vector_expander_ret_class_ = (jclass)env->NewGlobalRef(local_expander_ret_class);
-  env->DeleteLocalRef(local_expander_ret_class);
-
-  vector_expander_ret_address_ =
-      env->GetFieldID(vector_expander_ret_class_, "address", "J");
-  vector_expander_ret_capacity_ =
-      env->GetFieldID(vector_expander_ret_class_, "capacity", "J");
   return JNI_VERSION;
 }
 
@@ -125,8 +103,6 @@ void JNI_OnUnload(JavaVM* vm, void* reserved) {
   vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION);
   env->DeleteGlobalRef(configuration_builder_class_);
   env->DeleteGlobalRef(gandiva_exception_);
-  env->DeleteGlobalRef(vector_expander_class_);
-  env->DeleteGlobalRef(vector_expander_ret_class_);
 }
 
 DataTypePtr ProtoTypeToTime32(const types::ExtGandivaType& ext_type) {
@@ -165,18 +141,6 @@ DataTypePtr ProtoTypeToTimestamp(const types::ExtGandivaType& ext_type) {
       return arrow::timestamp(arrow::TimeUnit::NANO);
     default:
       std::cerr << "Unknown time unit: " << ext_type.timeunit() << " for timestamp\n";
-      return nullptr;
-  }
-}
-
-DataTypePtr ProtoTypeToInterval(const types::ExtGandivaType& ext_type) {
-  switch (ext_type.intervaltype()) {
-    case types::YEAR_MONTH:
-      return arrow::month_interval();
-    case types::DAY_TIME:
-      return arrow::day_time_interval();
-    default:
-      std::cerr << "Unknown interval type: " << ext_type.intervaltype() << "\n";
       return nullptr;
   }
 }
@@ -226,9 +190,9 @@ DataTypePtr ProtoTypeToDataType(const types::ExtGandivaType& ext_type) {
       return ProtoTypeToTime64(ext_type);
     case types::TIMESTAMP:
       return ProtoTypeToTimestamp(ext_type);
-    case types::INTERVAL:
-      return ProtoTypeToInterval(ext_type);
+
     case types::FIXED_SIZE_BINARY:
+    case types::INTERVAL:
     case types::LIST:
     case types::STRUCT:
     case types::UNION:
@@ -674,6 +638,7 @@ err_out:
 class JavaResizableBuffer : public arrow::ResizableBuffer {
  public:
 <<<<<<< HEAD
+<<<<<<< HEAD
   JavaResizableBuffer(JNIEnv* env, jobject jexpander, int32_t vector_idx, uint8_t* buffer,
                       int32_t len)
       : ResizableBuffer(buffer, len),
@@ -685,6 +650,8 @@ class JavaResizableBuffer : public arrow::ResizableBuffer {
 
   Status Resize(const int64_t new_size, bool shrink_to_fit) override;
 =======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   JavaResizableBuffer(uint8_t* buffer, int32_t len) : ResizableBuffer(buffer, len) {
     size_ = 0;
   }
@@ -700,11 +667,15 @@ class JavaResizableBuffer : public arrow::ResizableBuffer {
       return Status::NotImplemented("buffer expand not implemented");
     }
   }
+<<<<<<< HEAD
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
   Status Reserve(const int64_t new_capacity) override {
     return Status::NotImplemented("reserve not implemented");
   }
+<<<<<<< HEAD
 <<<<<<< HEAD
 
  private:
@@ -747,6 +718,10 @@ Status JavaResizableBuffer::Resize(const int64_t new_size, bool shrink_to_fit) {
 };
 
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+};
+
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #define CHECK_OUT_BUFFER_IDX_AND_BREAK(idx, len)                               \
   if (idx >= len) {                                                            \
     status = gandiva::Status::Invalid("insufficient number of out_buf_addrs"); \
@@ -755,10 +730,9 @@ Status JavaResizableBuffer::Resize(const int64_t new_size, bool shrink_to_fit) {
 
 JNIEXPORT void JNICALL
 Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
-    JNIEnv* env, jobject object, jobject jexpander, jlong module_id, jint num_rows,
-    jlongArray buf_addrs, jlongArray buf_sizes, jint sel_vec_type, jint sel_vec_rows,
-    jlong sel_vec_addr, jlong sel_vec_size, jlongArray out_buf_addrs,
-    jlongArray out_buf_sizes) {
+    JNIEnv* env, jobject cls, jlong module_id, jint num_rows, jlongArray buf_addrs,
+    jlongArray buf_sizes, jint sel_vec_type, jint sel_vec_rows, jlong sel_vec_addr,
+    jlong sel_vec_size, jlongArray out_buf_addrs, jlongArray out_buf_sizes) {
   Status status;
   std::shared_ptr<ProjectorHolder> holder = projector_modules_.Lookup(module_id);
   if (holder == nullptr) {
@@ -825,7 +799,6 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
     ArrayDataVector output;
     int buf_idx = 0;
     int sz_idx = 0;
-    int output_vector_idx = 0;
     for (FieldPtr field : ret_types) {
       std::vector<std::shared_ptr<arrow::Buffer>> buffers;
 
@@ -847,6 +820,7 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
       jlong data_sz = out_sizes[sz_idx++];
       if (arrow::is_binary_like(field->type()->id())) {
 <<<<<<< HEAD
+<<<<<<< HEAD
         if (jexpander == nullptr) {
           status = Status::Invalid(
               "expression has variable len output columns, but the expander object is "
@@ -858,16 +832,15 @@ Java_org_apache_arrow_gandiva_evaluator_JniWrapper_evaluateProjector(
 =======
         buffers.push_back(std::make_shared<JavaResizableBuffer>(value_buf, data_sz));
 >>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        buffers.push_back(std::make_shared<JavaResizableBuffer>(value_buf, data_sz));
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
       } else {
         buffers.push_back(std::make_shared<arrow::MutableBuffer>(value_buf, data_sz));
       }
 
       auto array_data = arrow::ArrayData::Make(field->type(), output_row_count, buffers);
       output.push_back(array_data);
-      ++output_vector_idx;
-    }
-    if (!status.ok()) {
-      break;
     }
     status = holder->projector()->Evaluate(*in_batch, selection_vector.get(), output);
   } while (0);

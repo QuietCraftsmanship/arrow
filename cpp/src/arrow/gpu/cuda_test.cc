@@ -23,6 +23,8 @@
 
 #include "gtest/gtest.h"
 
+#include "arrow/c/bridge.h"
+#include "arrow/c/util_internal.h"
 #include "arrow/io/memory.h"
 #include "arrow/ipc/api.h"
 #include "arrow/ipc/dictionary.h"
@@ -38,10 +40,15 @@
 
 namespace arrow {
 
+using internal::ArrayExportGuard;
+using internal::ArrayStreamExportGuard;
 using internal::checked_cast;
+using internal::checked_pointer_cast;
+using internal::SchemaExportGuard;
 
 namespace cuda {
 
+using internal::ContextSaver;
 using internal::StatusFromCuda;
 
 #define ASSERT_CUDA_OK(expr) ASSERT_OK(::arrow::cuda::internal::StatusFromCuda((expr)))
@@ -162,21 +169,39 @@ TEST_F(TestCudaDevice, Copy) {
   ASSERT_EQ(other_buffer->device(), device_);
   AssertCudaBufferEquals(*other_buffer, "some data");
 
+  // Copy non-owned
+  ASSERT_OK_AND_ASSIGN(other_buffer, Buffer::CopyNonOwned(*cpu_buffer, mm_));
+  ASSERT_EQ(other_buffer->device(), device_);
+  AssertCudaBufferEquals(*other_buffer, "some data");
+
   // device -> CPU
   ASSERT_OK_AND_ASSIGN(cpu_buffer, Buffer::Copy(other_buffer, cpu_mm_));
   ASSERT_TRUE(cpu_buffer->device()->is_cpu());
   AssertBufferEqual(*cpu_buffer, "some data");
 
+  // Copy non-owned
+  ASSERT_OK_AND_ASSIGN(cpu_buffer, Buffer::CopyNonOwned(*other_buffer, cpu_mm_));
+  ASSERT_TRUE(cpu_buffer->device()->is_cpu());
+  AssertBufferEqual(*cpu_buffer, "some data");
+
   // device -> device
-  const auto old_address = other_buffer->address();
+  auto old_address = other_buffer->address();
   ASSERT_OK_AND_ASSIGN(other_buffer, Buffer::Copy(other_buffer, mm_));
+  ASSERT_EQ(other_buffer->device(), device_);
+  ASSERT_NE(other_buffer->address(), old_address);
+  AssertCudaBufferEquals(*other_buffer, "some data");
+
+  // Copy non-owned
+  old_address = other_buffer->address();
+  ASSERT_OK_AND_ASSIGN(other_buffer, Buffer::CopyNonOwned(*other_buffer, mm_));
   ASSERT_EQ(other_buffer->device(), device_);
   ASSERT_NE(other_buffer->address(), old_address);
   AssertCudaBufferEquals(*other_buffer, "some data");
 
   // device (other context) -> device
   ASSERT_OK_AND_ASSIGN(auto other_context, NonPrimaryContext());
-  ASSERT_OK_AND_ASSIGN(auto cuda_buffer, other_context->Allocate(9));
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<CudaBuffer> cuda_buffer,
+                       other_context->Allocate(9));
   ASSERT_OK(cuda_buffer->CopyFromHost(0, "some data", 9));
   ASSERT_OK_AND_ASSIGN(other_buffer, Buffer::Copy(cuda_buffer, mm_));
   ASSERT_EQ(other_buffer->device(), device_);
@@ -192,6 +217,63 @@ TEST_F(TestCudaDevice, Copy) {
         other_buffer, Buffer::Copy(cuda_buffer, other_device->default_memory_manager()));
     ASSERT_EQ(other_buffer->device(), other_device);
     AssertCudaBufferEquals(*other_buffer, "some data");
+  }
+}
+
+TEST_F(TestCudaDevice, CreateSyncEvent) {
+  ASSERT_OK_AND_ASSIGN(auto ev, mm_->MakeDeviceSyncEvent());
+  ASSERT_TRUE(ev);
+  auto cuda_ev = checked_pointer_cast<CudaDevice::SyncEvent>(ev);
+  ASSERT_CUDA_OK(cuEventQuery(*cuda_ev));
+}
+
+TEST_F(TestCudaDevice, WrapDeviceSyncEvent) {
+  // need a context to call cuEventCreate
+  ContextSaver set_temporary(reinterpret_cast<CUcontext>(context_.get()->handle()));
+
+  CUevent event;
+  ASSERT_CUDA_OK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+  ASSERT_CUDA_OK(cuEventQuery(event));
+
+  {
+    // wrap event with no-op destructor
+    ASSERT_OK_AND_ASSIGN(auto ev, mm_->WrapDeviceSyncEvent(&event, [](void*) {}));
+    ASSERT_TRUE(ev);
+    // verify it's the same event we passed in
+    ASSERT_EQ(ev->get_raw(), &event);
+    auto cuda_ev = checked_pointer_cast<CudaDevice::SyncEvent>(ev);
+    ASSERT_CUDA_OK(cuEventQuery(*cuda_ev));
+  }
+
+  // verify that the event is still valid on the device when the shared_ptr
+  // goes away since we didn't give it ownership.
+  ASSERT_CUDA_OK(cuEventQuery(event));
+  ASSERT_CUDA_OK(cuEventDestroy(event));
+}
+
+TEST_F(TestCudaDevice, DefaultStream) {
+  ASSERT_OK_AND_ASSIGN(auto stream, device_->MakeStream());
+  ASSERT_OK_AND_ASSIGN(auto ev, mm_->MakeDeviceSyncEvent());
+
+  ASSERT_OK(ev->Record(*stream));
+  ASSERT_OK(stream->WaitEvent(*ev));
+  ASSERT_OK(ev->Wait());
+  ASSERT_OK(stream->Synchronize());
+}
+
+TEST_F(TestCudaDevice, ExplicitStream) {
+  // need a context to call cuEventCreate
+  ContextSaver set_temporary(reinterpret_cast<CUcontext>(context_.get()->handle()));
+
+  CUstream cu_stream = CU_STREAM_PER_THREAD;
+  {
+    ASSERT_OK_AND_ASSIGN(auto stream, device_->WrapStream(&cu_stream, nullptr));
+    ASSERT_OK_AND_ASSIGN(auto ev, mm_->MakeDeviceSyncEvent());
+
+    ASSERT_OK(ev->Record(*stream));
+    ASSERT_OK(stream->WaitEvent(*ev));
+    ASSERT_OK(ev->Wait());
+    ASSERT_OK(stream->Synchronize());
   }
 }
 
@@ -346,6 +428,7 @@ TEST_F(TestCudaHostBuffer, AllocateGlobal) {
 
   ASSERT_TRUE(host_buffer->is_cpu());
   ASSERT_EQ(host_buffer->memory_manager(), cpu_mm_);
+  ASSERT_EQ(host_buffer->device_type(), DeviceAllocationType::kCUDA_HOST);
 
   ASSERT_OK_AND_ASSIGN(auto device_address, host_buffer->GetDeviceAddress(context_));
   ASSERT_NE(device_address, 0);
@@ -358,6 +441,7 @@ TEST_F(TestCudaHostBuffer, ViewOnDevice) {
 
   ASSERT_TRUE(host_buffer->is_cpu());
   ASSERT_EQ(host_buffer->memory_manager(), cpu_mm_);
+  ASSERT_EQ(host_buffer->device_type(), DeviceAllocationType::kCUDA_HOST);
 
   // Try to view the host buffer on the device.  This should correspond to
   // GetDeviceAddress() in the previous test.
@@ -367,6 +451,7 @@ TEST_F(TestCudaHostBuffer, ViewOnDevice) {
   ASSERT_NE(device_buffer->address(), 0);
   ASSERT_EQ(device_buffer->size(), host_buffer->size());
   ASSERT_EQ(device_buffer->parent(), host_buffer);
+  ASSERT_EQ(device_buffer->device_type(), DeviceAllocationType::kCUDA);
 
   // View back the device buffer on the CPU.  This should roundtrip.
   ASSERT_OK_AND_ASSIGN(auto buffer, Buffer::View(device_buffer, cpu_mm_));
@@ -375,6 +460,7 @@ TEST_F(TestCudaHostBuffer, ViewOnDevice) {
   ASSERT_EQ(buffer->address(), host_buffer->address());
   ASSERT_EQ(buffer->size(), host_buffer->size());
   ASSERT_EQ(buffer->parent(), device_buffer);
+  ASSERT_EQ(buffer->device_type(), DeviceAllocationType::kCUDA_HOST);
 }
 
 // ------------------------------------------------------------------------
@@ -572,8 +658,12 @@ TEST_F(TestCudaArrowIpc, BasicWriteRead) {
   ASSERT_OK_AND_ASSIGN(device_serialized, SerializeRecordBatch(*batch, context_.get()));
 
   // Test that ReadRecordBatch works properly
+  ipc::DictionaryMemo unused_memo;
   std::shared_ptr<RecordBatch> device_batch;
-  ASSERT_OK_AND_ASSIGN(device_batch, ReadRecordBatch(batch->schema(), device_serialized));
+  ASSERT_OK_AND_ASSIGN(device_batch,
+                       ReadRecordBatch(batch->schema(), &unused_memo, device_serialized));
+
+  ASSERT_OK(device_batch->Validate());
 
   // Copy data from device, read batch, and compare
   int64_t size = device_serialized->size();
@@ -582,12 +672,185 @@ TEST_F(TestCudaArrowIpc, BasicWriteRead) {
 
   std::shared_ptr<RecordBatch> cpu_batch;
   io::BufferReader cpu_reader(std::move(host_buffer));
-  ipc::DictionaryMemo unused_memo;
   ASSERT_OK_AND_ASSIGN(
       cpu_batch, ipc::ReadRecordBatch(batch->schema(), &unused_memo,
                                       ipc::IpcReadOptions::Defaults(), &cpu_reader));
 
   CompareBatch(*batch, *cpu_batch);
+}
+
+TEST_F(TestCudaArrowIpc, WriteIpcString) {
+  auto values = ArrayFromJSON(utf8(), R"(["foo", null, "quux"])");
+  ASSERT_OK_AND_ASSIGN(auto values_device, values->CopyTo(mm_));
+  auto batch = RecordBatch::Make(schema({field("vals", utf8())}), 3,
+                                 {values_device->data()}, DeviceAllocationType::kCUDA);
+
+  ipc::IpcPayload payload;
+  ASSERT_OK(
+      ipc::GetRecordBatchPayload(*batch, ipc::IpcWriteOptions::Defaults(), &payload));
+
+  ASSERT_EQ(values_device->data()->buffers[0]->address(),
+            payload.body_buffers[0]->address());
+  ASSERT_EQ(values_device->data()->buffers[1]->address(),
+            payload.body_buffers[1]->address());
+}
+
+TEST_F(TestCudaArrowIpc, WriteIpcList) {
+  auto values =
+      ArrayFromJSON(list(utf8()), R"([["foo", null], null, ["quux", "bar", "baz"]])");
+  ASSERT_OK_AND_ASSIGN(auto values_device, values->CopyTo(mm_));
+  auto batch = RecordBatch::Make(schema({field("vals", list(utf8()))}), 3,
+                                 {values_device->data()}, DeviceAllocationType::kCUDA);
+
+  ipc::IpcPayload payload;
+  ASSERT_OK(
+      ipc::GetRecordBatchPayload(*batch, ipc::IpcWriteOptions::Defaults(), &payload));
+
+  ASSERT_EQ(values_device->data()->buffers[0]->address(),
+            payload.body_buffers[0]->address());
+}
+
+TEST_F(TestCudaArrowIpc, WriteIpcSlicedRecord) {
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeListRecordBatch(&batch));
+
+  ASSERT_OK_AND_ASSIGN(auto batch_device, batch->CopyTo(mm_));
+  auto sliced_batch_device = batch_device->Slice(10);
+
+  ipc::IpcPayload payload;
+  ASSERT_NOT_OK(ipc::GetRecordBatchPayload(*sliced_batch_device,
+                                           ipc::IpcWriteOptions::Defaults(), &payload));
+}
+
+TEST_F(TestCudaArrowIpc, DictionaryWriteRead) {
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeDictionary(&batch));
+
+  ipc::DictionaryMemo dictionary_memo;
+  ASSERT_OK(ipc::internal::CollectDictionaries(*batch, &dictionary_memo));
+
+  std::shared_ptr<CudaBuffer> device_serialized;
+  ASSERT_OK_AND_ASSIGN(device_serialized, SerializeRecordBatch(*batch, context_.get()));
+
+  // Test that ReadRecordBatch works properly
+  std::shared_ptr<RecordBatch> device_batch;
+  ASSERT_OK_AND_ASSIGN(device_batch, ReadRecordBatch(batch->schema(), &dictionary_memo,
+                                                     device_serialized));
+
+  // Copy data from device, read batch, and compare
+  int64_t size = device_serialized->size();
+  ASSERT_OK_AND_ASSIGN(auto host_buffer, AllocateBuffer(size, pool_));
+  ASSERT_OK(device_serialized->CopyToHost(0, size, host_buffer->mutable_data()));
+
+  std::shared_ptr<RecordBatch> cpu_batch;
+  io::BufferReader cpu_reader(std::move(host_buffer));
+  ASSERT_OK_AND_ASSIGN(
+      cpu_batch, ipc::ReadRecordBatch(batch->schema(), &dictionary_memo,
+                                      ipc::IpcReadOptions::Defaults(), &cpu_reader));
+
+  CompareBatch(*batch, *cpu_batch);
+}
+
+// ------------------------------------------------------------------------
+// Test C Device Interface export/import with CUDA
+// (equivalent tests for non-CUDA live in bridge_test.cc)
+
+class TestCudaDeviceArrayRoundtrip : public ::testing::Test {
+ public:
+  using ArrayFactory = std::function<Result<std::shared_ptr<Array>>()>;
+
+  static ArrayFactory JSONArrayFactory(std::shared_ptr<DataType> type, const char* json) {
+    return [=]() { return ArrayFromJSON(type, json); };
+  }
+
+  template <typename ArrayFactory>
+  void TestWithArrayFactory(ArrayFactory&& factory) {
+    TestWithArrayFactory(factory, factory);
+  }
+
+  template <typename ArrayFactory, typename ExpectedArrayFactory>
+  void TestWithArrayFactory(ArrayFactory&& factory,
+                            ExpectedArrayFactory&& factory_expected) {
+    ASSERT_OK_AND_ASSIGN(auto manager, cuda::CudaDeviceManager::Instance());
+    ASSERT_OK_AND_ASSIGN(auto device, manager->GetDevice(0));
+    auto mm = device->default_memory_manager();
+
+    std::shared_ptr<Array> array;
+    std::shared_ptr<Array> device_array;
+    ASSERT_OK_AND_ASSIGN(array, factory());
+    ASSERT_OK_AND_ASSIGN(device_array, array->CopyTo(mm));
+
+    struct ArrowDeviceArray c_array {};
+    struct ArrowSchema c_schema {};
+    ArrayExportGuard array_guard(&c_array.array);
+    SchemaExportGuard schema_guard(&c_schema);
+
+    ASSERT_OK(ExportType(*device_array->type(), &c_schema));
+    std::shared_ptr<Device::SyncEvent> sync{nullptr};
+    ASSERT_OK(ExportDeviceArray(*device_array, sync, &c_array));
+
+    std::shared_ptr<Array> device_array_roundtripped;
+    ASSERT_OK_AND_ASSIGN(device_array_roundtripped,
+                         ImportDeviceArray(&c_array, &c_schema));
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Check value of imported array (copy to CPU to assert equality)
+    std::shared_ptr<Array> array_roundtripped;
+    ASSERT_OK_AND_ASSIGN(array_roundtripped,
+                         device_array_roundtripped->CopyTo(default_cpu_memory_manager()));
+    ASSERT_OK(array_roundtripped->ValidateFull());
+    {
+      std::shared_ptr<Array> expected;
+      ASSERT_OK_AND_ASSIGN(expected, factory_expected());
+      AssertTypeEqual(*expected->type(), *array_roundtripped->type());
+      AssertArraysEqual(*expected, *array_roundtripped, true);
+    }
+
+    // Re-export and re-import, now both at once
+    ASSERT_OK(ExportDeviceArray(*device_array, sync, &c_array, &c_schema));
+    device_array_roundtripped.reset();
+    ASSERT_OK_AND_ASSIGN(device_array_roundtripped,
+                         ImportDeviceArray(&c_array, &c_schema));
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Check value of imported array (copy to CPU to assert equality)
+    array_roundtripped.reset();
+    ASSERT_OK_AND_ASSIGN(array_roundtripped,
+                         device_array_roundtripped->CopyTo(default_cpu_memory_manager()));
+    ASSERT_OK(array_roundtripped->ValidateFull());
+    {
+      std::shared_ptr<Array> expected;
+      ASSERT_OK_AND_ASSIGN(expected, factory_expected());
+      AssertTypeEqual(*expected->type(), *array_roundtripped->type());
+      AssertArraysEqual(*expected, *array_roundtripped, true);
+    }
+  }
+
+  void TestWithJSON(std::shared_ptr<DataType> type, const char* json) {
+    TestWithArrayFactory(JSONArrayFactory(type, json));
+  }
+};
+
+TEST_F(TestCudaDeviceArrayRoundtrip, Primitive) { TestWithJSON(int32(), "[4, 5, null]"); }
+
+TEST_F(TestCudaDeviceArrayRoundtrip, Struct) {
+  auto type = struct_({field("ints", int16()), field("strs", utf8())});
+
+  TestWithJSON(type, "[]");
+  TestWithJSON(type, R"([[4, "foo"], [5, "bar"]])");
+  TestWithJSON(type, R"([[4, null], null, [5, "foo"]])");
+}
+
+TEST_F(TestCudaDeviceArrayRoundtrip, Dictionary) {
+  auto factory = []() {
+    auto values = ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
+    auto indices = ArrayFromJSON(uint16(), "[0, 2, 1, null, 1]");
+    return DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
+                                       indices, values);
+  };
+  TestWithArrayFactory(factory);
 }
 
 }  // namespace cuda

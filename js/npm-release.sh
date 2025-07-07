@@ -19,8 +19,12 @@
 set -e
 
 # validate the targets pass all tests before publishing
-npm install
-npx gulp
+yarn --frozen-lockfile
+yarn gulp
 
-# publish the JS target modules to npm
-npx lerna exec --no-bail -- npm publish
+read -p "Please enter your npm 2FA one-time password (or leave empty if you don't have 2FA enabled): " NPM_OTP </dev/tty
+
+# collect targets by finding package.json files
+# skips any in a bin dir, see GH-44585
+find targets -type f -name package.json ! -path "*/bin/*" -execdir sh -c \
+  "npm publish \$(dirname \$(realpath {})) ${NPM_OTP:+ --otp=$NPM_OTP}" \;

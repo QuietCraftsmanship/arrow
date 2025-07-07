@@ -15,6 +15,8 @@
 .. specific language governing permissions and limitations
 .. under the License.
 
+.. _c-data-interface:
+
 ==========================
 The Arrow C data interface
 ==========================
@@ -37,7 +39,7 @@ corresponding C FFI declarations.
 Applications and libraries can therefore work with Arrow memory without
 necessarily using Arrow libraries or reinventing the wheel. Developers can
 choose between tight integration
-with the Arrow *software project* (benefitting from the growing array of
+with the Arrow *software project* (benefiting from the growing array of
 facilities exposed by e.g. the C++ or Java implementations of Apache Arrow,
 but with the cost of a dependency) or minimal integration with the Arrow
 *format* only.
@@ -89,6 +91,7 @@ Pros of the IPC format vs. the data interface:
   (such as integrity checks, compression...).
 * Does not require explicit C data access.
 
+
 Data type description -- format strings
 =======================================
 
@@ -130,21 +133,27 @@ strings:
 | ``g``           | float64                  |            |
 +-----------------+--------------------------+------------+
 
-+-----------------+---------------------------------------+------------+
-| Format string   | Arrow data type                       | Notes      |
-+=================+=======================================+============+
-| ``z``           | binary                                |            |
-+-----------------+---------------------------------------+------------+
-| ``Z``           | large binary                          |            |
-+-----------------+---------------------------------------+------------+
-| ``u``           | utf-8 string                          |            |
-+-----------------+---------------------------------------+------------+
-| ``U``           | large utf-8 string                    |            |
-+-----------------+---------------------------------------+------------+
-| ``d:19,10``     | decimal128 [precision 19, scale 10]   |            |
-+-----------------+---------------------------------------+------------+
-| ``w:42``        | fixed-width binary [42 bytes]         |            |
-+-----------------+---------------------------------------+------------+
++-----------------+---------------------------------------------------+------------+
+| Format string   | Arrow data type                                   | Notes      |
++=================+===================================================+============+
+| ``z``           | binary                                            |            |
++-----------------+---------------------------------------------------+------------+
+| ``Z``           | large binary                                      |            |
++-----------------+---------------------------------------------------+------------+
+| ``vz``          | binary view                                       |            |
++-----------------+---------------------------------------------------+------------+
+| ``u``           | utf-8 string                                      |            |
++-----------------+---------------------------------------------------+------------+
+| ``U``           | large utf-8 string                                |            |
++-----------------+---------------------------------------------------+------------+
+| ``vu``          | utf-8 view                                        |            |
++-----------------+---------------------------------------------------+------------+
+| ``d:19,10``     | decimal128 [precision 19, scale 10]               |            |
++-----------------+---------------------------------------------------+------------+
+| ``d:19,10,NNN`` | decimal bitwidth = NNN [precision 19, scale 10]   |            |
++-----------------+---------------------------------------------------+------------+
+| ``w:42``        | fixed-width binary [42 bytes]                     |            |
++-----------------+---------------------------------------------------+------------+
 
 Temporal types have multi-character format strings starting with ``t``:
 
@@ -183,6 +192,9 @@ Temporal types have multi-character format strings starting with ``t``:
 +-----------------+---------------------------------------------------+------------+
 | ``tiD``         | interval [days, time]                             |            |
 +-----------------+---------------------------------------------------+------------+
+| ``tin``         | interval [month, day, nanoseconds]                |            |
++-----------------+---------------------------------------------------+------------+
+
 
 Dictionary-encoded types do not have a specific format string.  Instead, the
 format string of the base array represents the dictionary index type, and the
@@ -199,6 +211,10 @@ names and types of child fields are read from the child arrays.
 +------------------------+---------------------------------------------------+------------+
 | ``+L``                 | large list                                        |            |
 +------------------------+---------------------------------------------------+------------+
+| ``+vl``                | list-view                                         |            |
++------------------------+---------------------------------------------------+------------+
+| ``+vL``                | large list-view                                   |            |
++------------------------+---------------------------------------------------+------------+
 | ``+w:123``             | fixed-sized list [123 items]                      |            |
 +------------------------+---------------------------------------------------+------------+
 | ``+s``                 | struct                                            |            |
@@ -208,6 +224,8 @@ names and types of child fields are read from the child arrays.
 | ``+ud:I,J,...``        | dense union with type ids I,J...                  |            |
 +------------------------+---------------------------------------------------+------------+
 | ``+us:I,J,...``        | sparse union with type ids I,J...                 |            |
++------------------------+---------------------------------------------------+------------+
+| ``+r``                 | run-end encoded                                   | \(3)       |
 +------------------------+---------------------------------------------------+------------+
 
 Notes:
@@ -220,6 +238,11 @@ Notes:
    As specified in the Arrow columnar format, the map type has a single child type
    named ``entries``, itself a 2-child struct type of ``(key, value)``.
 
+(3)
+   As specified in the Arrow columnar format, the run-end encoded type has two
+   children where the first is the (integral) ``run_ends`` and the second is the
+   ``values``.
+
 Examples
 --------
 
@@ -228,6 +251,8 @@ Examples
   array has format string ``d:12,5``.
 * A ``list<uint64>`` array has format string ``+l``, and its single child
   has format string ``L``.
+* A ``large_list_view<uint64>`` array has format string ``+vL``, and its single
+  child has format string ``L``.
 * A ``struct<ints: int32, floats: float32>`` has format string ``+s``; its two
   children have names ``ints`` and ``floats``, and format strings ``i`` and
   ``f`` respectively.
@@ -237,7 +262,11 @@ Examples
 * A ``sparse_union<ints: int32, floats: float32>`` with type ids ``4, 5``
   has format string ``+us:4,5``; its two children have names ``ints`` and
   ``floats``, and format strings ``i`` and ``f`` respectively.
+* A ``run_end_encoded<int32, float32>`` has format string ``+r``; its two
+  children have names ``run_ends`` and ``values``, and format strings
+  ``i`` and ``f`` respectively.
 
+.. _c-data-interface-struct-defs:
 
 Structure definitions
 =====================
@@ -247,6 +276,9 @@ C data interface in your project.  Like the rest of the Arrow project, they
 are available under the Apache License 2.0.
 
 .. code-block:: c
+
+   #ifndef ARROW_C_DATA_INTERFACE
+   #define ARROW_C_DATA_INTERFACE
 
    #define ARROW_FLAG_DICTIONARY_ORDERED 1
    #define ARROW_FLAG_NULLABLE 2
@@ -284,6 +316,15 @@ are available under the Apache License 2.0.
      // Opaque producer-specific data
      void* private_data;
    };
+
+   #endif  // ARROW_C_DATA_INTERFACE
+
+.. note::
+   The canonical guard ``ARROW_C_DATA_INTERFACE`` is meant to avoid
+   duplicate definitions if two projects copy the C data interface
+   definitions in their own headers, and a third-party project
+   includes from these two projects.  It is therefore important that
+   this guard is kept exactly as-is when these definitions are copied.
 
 The ArrowSchema structure
 -------------------------
@@ -426,7 +467,10 @@ It has the following fields:
 
    Mandatory.  The number of physical buffers backing this array.  The
    number of buffers is a function of the data type, as described in the
-   :ref:`Columnar format specification <format_columnar>`.
+   :ref:`Columnar format specification <format_columnar>`, except for the
+   the binary or utf-8 view type, which has one additional buffer compared
+   to the Columnar format specification (see
+   :ref:`c-data-interface-binary-view-arrays`).
 
    Buffers of children arrays are not included.
 
@@ -446,6 +490,12 @@ It has the following fields:
 
    The pointer to the null bitmap buffer, if the data type specifies one,
    MAY be NULL only if :c:member:`ArrowArray.null_count` is 0.
+
+   The buffer pointers MAY be null only in two situations:
+
+   1. for the null bitmap buffer, if :c:member:`ArrowArray.null_count` is 0;
+   2. for any buffer, if the size in bytes of the corresponding buffer would be 0.
+
 
    Buffers of children arrays are not included.
 
@@ -504,11 +554,25 @@ For extension arrays, the :c:member:`ArrowSchema.format` string encodes the
 metadata key ``ARROW:extension:name``  encodes the extension type name,
 and the metadata key ``ARROW:extension:metadata`` encodes the
 implementation-specific serialization of the extension type (for
-parameterized extension types).  The base64 encoding of metadata values
-ensures that any possible serialization is representable.
+parameterized extension types).
 
 The ``ArrowArray`` structure exported from an extension array simply points
 to the storage data of the extension array.
+
+.. _c-data-interface-binary-view-arrays:
+
+Binary view arrays
+------------------
+
+For binary or utf-8 view arrays, an extra buffer is appended which stores
+the lengths of each variadic data buffer as ``int64_t``. This buffer is
+necessary since these buffer lengths are not trivially extractable from
+other data in an array of binary or utf-8 view type.
+
+.. _c-data-interface-semantics:
+
+Semantics
+=========
 
 Memory management
 -----------------
@@ -532,6 +596,8 @@ of buffer and children pointers, etc.
 Therefore, the consumer MUST not try to interfere with the producer's
 handling of these members' lifetime.  The only way the consumer influences
 data lifetime is by calling the base structure's ``release`` callback.
+
+.. _c-data-interface-released:
 
 Released structure
 ''''''''''''''''''
@@ -581,7 +647,7 @@ TODO area must be filled with producer-specific deallocation code:
 
    static void ReleaseExportedArray(struct ArrowArray* array) {
      // This should not be called on already released array
-     assert(array->format != NULL);
+     assert(array->release != NULL);
 
      // Release children
      for (int64_t i = 0; i < array->n_children; ++i) {
@@ -643,8 +709,18 @@ while releasing the others.
 Record batches
 --------------
 
-A record batch can be trivially considered as an equivalent struct array with
-additional top-level metadata.
+A record batch can be trivially considered as an equivalent struct array. In
+this case the metadata of the top-level ``ArrowSchema`` can be used for the
+schema-level metadata of the record batch.
+
+Mutability
+----------
+
+Both the producer and the consumer SHOULD consider the exported data
+(that is, the data reachable through the ``buffers`` member of ``ArrowArray``)
+to be immutable, as either party could otherwise see inconsistent data while
+the other is mutating it.
+
 
 Example use case
 ================
@@ -666,6 +742,8 @@ C producer examples
 Exporting a simple ``int32`` array
 ----------------------------------
 
+.. _c-data-interface-export-int32-schema:
+
 Export a non-nullable ``int32`` type with empty metadata.  In this case,
 all ``ArrowSchema`` members point to statically-allocated data, so the
 release callback is trivial.
@@ -680,7 +758,7 @@ release callback is trivial.
    void export_int32_type(struct ArrowSchema* schema) {
       *schema = (struct ArrowSchema) {
          // Type description
-         .format = "l",
+         .format = "i",
          .name = "",
          .metadata = NULL,
          .flags = 0,
@@ -742,6 +820,7 @@ Export the array type as a ``ArrowSchema`` with C-malloc()ed children:
          if (child->release != NULL) {
             child->release(child);
          }
+         free(child);
       }
       free(schema->children);
       // Mark released
@@ -816,6 +895,7 @@ transferring ownership to the consumer:
          if (child->release != NULL) {
             child->release(child);
          }
+         free(child);
       }
       free(array->children);
       // Free buffers
@@ -870,7 +950,7 @@ transferring ownership to the consumer:
          // Bookkeeping
          .release = &release_malloced_array
       };
-      child->buffers = malloc(sizeof(void*) * array->n_buffers);
+      child->buffers = malloc(sizeof(void*) * child->n_buffers);
       child->buffers[0] = float32_nulls;
       child->buffers[1] = float32_data;
 
@@ -890,7 +970,7 @@ transferring ownership to the consumer:
          // Bookkeeping
          .release = &release_malloced_array
       };
-      child->buffers = malloc(sizeof(void*) * array->n_buffers);
+      child->buffers = malloc(sizeof(void*) * child->n_buffers);
       child->buffers[0] = utf8_nulls;
       child->buffers[1] = utf8_offsets;
       child->buffers[2] = utf8_data;
@@ -937,3 +1017,14 @@ adaptation cost.
 
 
 .. _Python buffer protocol: https://www.python.org/dev/peps/pep-3118/
+
+Language-specific protocols
+===========================
+
+Some languages may define additional protocols on top of the Arrow C data
+interface.
+
+.. toctree::
+   :maxdepth: 1
+
+   CDataInterface/PyCapsuleInterface

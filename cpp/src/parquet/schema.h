@@ -30,6 +30,7 @@
 
 #include "parquet/platform.h"
 #include "parquet/types.h"
+#include "parquet/windows_fixup.h"  // for OPTIONAL
 
 namespace parquet {
 
@@ -127,9 +128,6 @@ class PARQUET_EXPORT Node {
   /// Thrift.
   int field_id() const { return field_id_; }
 
-  PARQUET_DEPRECATED("id() is deprecated. Use field_id() instead")
-  int id() const { return field_id_; }
-
   const Node* parent() const { return parent_; }
 
   const std::shared_ptr<ColumnPath> path() const;
@@ -177,7 +175,7 @@ class PARQUET_EXPORT Node {
   Node::type type_;
   std::string name_;
   Repetition::type repetition_;
-  ConvertedType::type converted_type_;
+  ConvertedType::type converted_type_{ConvertedType::NONE};
   std::shared_ptr<const LogicalType> logical_type_;
   int field_id_;
   // Nodes should not be shared, they have a single parent.
@@ -191,8 +189,8 @@ class PARQUET_EXPORT Node {
 };
 
 // Save our breath all over the place with these typedefs
-typedef std::shared_ptr<Node> NodePtr;
-typedef std::vector<NodePtr> NodeVector;
+using NodePtr = std::shared_ptr<Node>;
+using NodeVector = std::vector<NodePtr>;
 
 // A type that is one of the primitive Parquet storage types. In addition to
 // the other type metadata (name, repetition level, logical type), also has the
@@ -200,8 +198,7 @@ typedef std::vector<NodePtr> NodeVector;
 // parameters)
 class PARQUET_EXPORT PrimitiveNode : public Node {
  public:
-  // The field_id here is the default to use if it is not set in the SchemaElement
-  static std::unique_ptr<Node> FromParquet(const void* opaque_element, int field_id = -1);
+  static std::unique_ptr<Node> FromParquet(const void* opaque_element);
 
   // A field_id -1 (or any negative value) will be serialized as null in Thrift
   static inline NodePtr Make(const std::string& name, Repetition::type repetition,
@@ -219,8 +216,8 @@ class PARQUET_EXPORT PrimitiveNode : public Node {
                              std::shared_ptr<const LogicalType> logical_type,
                              Type::type primitive_type, int primitive_length = -1,
                              int field_id = -1) {
-    return NodePtr(new PrimitiveNode(name, repetition, logical_type, primitive_type,
-                                     primitive_length, field_id));
+    return NodePtr(new PrimitiveNode(name, repetition, std::move(logical_type),
+                                     primitive_type, primitive_length, field_id));
   }
 
   bool Equals(const Node* other) const override;
@@ -266,9 +263,8 @@ class PARQUET_EXPORT PrimitiveNode : public Node {
 
 class PARQUET_EXPORT GroupNode : public Node {
  public:
-  // The field_id here is the default to use if it is not set in the SchemaElement
   static std::unique_ptr<Node> FromParquet(const void* opaque_element,
-                                           NodeVector fields = {}, int field_id = -1);
+                                           NodeVector fields = {});
 
   // A field_id -1 (or any negative value) will be serialized as null in Thrift
   static inline NodePtr Make(const std::string& name, Repetition::type repetition,
@@ -284,12 +280,13 @@ class PARQUET_EXPORT GroupNode : public Node {
                              const NodeVector& fields,
                              std::shared_ptr<const LogicalType> logical_type,
                              int field_id = -1) {
-    return NodePtr(new GroupNode(name, repetition, fields, logical_type, field_id));
+    return NodePtr(
+        new GroupNode(name, repetition, fields, std::move(logical_type), field_id));
   }
 
   bool Equals(const Node* other) const override;
 
-  NodePtr field(int i) const { return fields_[i]; }
+  const NodePtr& field(int i) const { return fields_[i]; }
   // Get the index of a field by its name, or negative value if not found.
   // If several fields share the same name, it is unspecified which one
   // is returned.
@@ -380,7 +377,7 @@ class PARQUET_EXPORT ColumnDescriptor {
   ColumnOrder column_order() const { return primitive_node_->column_order(); }
 
   SortOrder::type sort_order() const {
-    auto la = logical_type();
+    const auto& la = logical_type();
     auto pt = physical_type();
     return la ? GetSortOrder(la, pt) : GetSortOrder(converted_type(), pt);
   }
@@ -420,8 +417,8 @@ class PARQUET_EXPORT ColumnDescriptor {
 // TODO(wesm): this object can be recomputed from a Schema
 class PARQUET_EXPORT SchemaDescriptor {
  public:
-  SchemaDescriptor() {}
-  ~SchemaDescriptor() {}
+  SchemaDescriptor() = default;
+  ~SchemaDescriptor() = default;
 
   // Analyze the schema
   void Init(std::unique_ptr<schema::Node> schema);
@@ -436,7 +433,7 @@ class PARQUET_EXPORT SchemaDescriptor {
   // Get the index of a column by its node, or negative value if not found.
   int ColumnIndex(const schema::Node& node) const;
 
-  bool Equals(const SchemaDescriptor& other) const;
+  bool Equals(const SchemaDescriptor& other, std::ostream* diff_output = NULLPTR) const;
 
   // The number of physical columns appearing in the file
   int num_columns() const { return static_cast<int>(leaves_.size()); }
@@ -468,6 +465,7 @@ class PARQUET_EXPORT SchemaDescriptor {
   // Root Node
   schema::NodePtr schema_;
   // Root Node
+  // Would never be NULLPTR.
   const schema::GroupNode* group_node_;
 
   void BuildTree(const schema::NodePtr& node, int16_t max_def_level,

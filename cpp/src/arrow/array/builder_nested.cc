@@ -26,9 +26,23 @@
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
+
+// ----------------------------------------------------------------------
+// VarLengthListLikeBuilder / BaseListBuilder / BaseListViewBuilder
+
+template class VarLengthListLikeBuilder<ListType>;
+template class VarLengthListLikeBuilder<LargeListType>;
+template class VarLengthListLikeBuilder<ListViewType>;
+template class VarLengthListLikeBuilder<LargeListViewType>;
+
+template class BaseListBuilder<ListType>;
+template class BaseListBuilder<LargeListType>;
+
+template class BaseListViewBuilder<ListViewType>;
+template class BaseListViewBuilder<LargeListViewType>;
 
 // ----------------------------------------------------------------------
 // MapBuilder
@@ -38,6 +52,10 @@ MapBuilder::MapBuilder(MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& ke
                        const std::shared_ptr<DataType>& type)
     : ArrayBuilder(pool), key_builder_(key_builder), item_builder_(item_builder) {
   auto map_type = internal::checked_cast<const MapType*>(type.get());
+  entries_name_ = map_type->field(0)->name();
+  key_name_ = map_type->key_field()->name();
+  item_name_ = map_type->item_field()->name();
+  item_nullable_ = map_type->item_field()->nullable();
   keys_sorted_ = map_type->keys_sorted();
 
   std::vector<std::shared_ptr<ArrayBuilder>> child_builders{key_builder, item_builder};
@@ -53,6 +71,22 @@ MapBuilder::MapBuilder(MemoryPool* pool, const std::shared_ptr<ArrayBuilder>& ke
                        bool keys_sorted)
     : MapBuilder(pool, key_builder, item_builder,
                  map(key_builder->type(), item_builder->type(), keys_sorted)) {}
+
+MapBuilder::MapBuilder(MemoryPool* pool,
+                       const std::shared_ptr<ArrayBuilder>& struct_builder,
+                       const std::shared_ptr<DataType>& type)
+    : ArrayBuilder(pool) {
+  auto map_type = internal::checked_cast<const MapType*>(type.get());
+  entries_name_ = map_type->field(0)->name();
+  key_name_ = map_type->key_field()->name();
+  item_name_ = map_type->item_field()->name();
+  item_nullable_ = map_type->item_field()->nullable();
+  keys_sorted_ = map_type->keys_sorted();
+  key_builder_ = struct_builder->child_builder(0);
+  item_builder_ = struct_builder->child_builder(1);
+  list_builder_ =
+      std::make_shared<ListBuilder>(pool, struct_builder, struct_builder->type());
+}
 
 Status MapBuilder::Resize(int64_t capacity) {
   RETURN_NOT_OK(list_builder_->Resize(capacity));
@@ -106,6 +140,24 @@ Status MapBuilder::AppendNulls(int64_t length) {
   DCHECK_EQ(item_builder_->length(), key_builder_->length());
   RETURN_NOT_OK(AdjustStructBuilderLength());
   RETURN_NOT_OK(list_builder_->AppendNulls(length));
+  length_ = list_builder_->length();
+  null_count_ = list_builder_->null_count();
+  return Status::OK();
+}
+
+Status MapBuilder::AppendEmptyValue() {
+  DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
+  RETURN_NOT_OK(list_builder_->AppendEmptyValue());
+  length_ = list_builder_->length();
+  null_count_ = list_builder_->null_count();
+  return Status::OK();
+}
+
+Status MapBuilder::AppendEmptyValues(int64_t length) {
+  DCHECK_EQ(item_builder_->length(), key_builder_->length());
+  RETURN_NOT_OK(AdjustStructBuilderLength());
+  RETURN_NOT_OK(list_builder_->AppendEmptyValues(length));
   length_ = list_builder_->length();
   null_count_ = list_builder_->null_count();
   return Status::OK();
@@ -170,6 +222,31 @@ Status FixedSizeListBuilder::AppendNulls(int64_t length) {
   return value_builder_->AppendNulls(list_size_ * length);
 }
 
+Status FixedSizeListBuilder::ValidateOverflow(int64_t new_elements) {
+  auto new_length = value_builder_->length() + new_elements;
+  if (new_elements != list_size_) {
+    return Status::Invalid("Length of item not correct: expected ", list_size_,
+                           " but got array of size ", new_elements);
+  }
+  if (new_length > maximum_elements()) {
+    return Status::CapacityError("array cannot contain more than ", maximum_elements(),
+                                 " elements, have ", new_elements);
+  }
+  return Status::OK();
+}
+
+Status FixedSizeListBuilder::AppendEmptyValue() {
+  RETURN_NOT_OK(Reserve(1));
+  UnsafeAppendToBitmap(true);
+  return value_builder_->AppendEmptyValues(list_size_);
+}
+
+Status FixedSizeListBuilder::AppendEmptyValues(int64_t length) {
+  RETURN_NOT_OK(Reserve(length));
+  UnsafeAppendToBitmap(length, true);
+  return value_builder_->AppendEmptyValues(list_size_ * length);
+}
+
 Status FixedSizeListBuilder::Resize(int64_t capacity) {
   RETURN_NOT_OK(CheckCapacity(capacity));
   return ArrayBuilder::Resize(capacity);
@@ -209,12 +286,6 @@ void StructBuilder::Reset() {
   for (const auto& field_builder : children_) {
     field_builder->Reset();
   }
-}
-
-Status StructBuilder::AppendNulls(int64_t length) {
-  ARROW_RETURN_NOT_OK(Reserve(length));
-  UnsafeAppendToBitmap(length, false);
-  return Status::OK();
 }
 
 Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {

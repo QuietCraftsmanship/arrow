@@ -28,23 +28,23 @@
 #ifdef ARROW_EXTRA_ERROR_CONTEXT
 
 /// \brief Return with given status if condition is met.
-#define ARROW_RETURN_IF_(condition, status, expr)   \
-  do {                                              \
-    if (ARROW_PREDICT_FALSE(condition)) {           \
-      ::arrow::Status _st = (status);               \
-      _st.AddContextLine(__FILE__, __LINE__, expr); \
-      return _st;                                   \
-    }                                               \
-  } while (0)
+#  define ARROW_RETURN_IF_(condition, status, expr)   \
+    do {                                              \
+      if (ARROW_PREDICT_FALSE(condition)) {           \
+        ::arrow::Status _st = (status);               \
+        _st.AddContextLine(__FILE__, __LINE__, expr); \
+        return _st;                                   \
+      }                                               \
+    } while (0)
 
 #else
 
-#define ARROW_RETURN_IF_(condition, status, _) \
-  do {                                         \
-    if (ARROW_PREDICT_FALSE(condition)) {      \
-      return (status);                         \
-    }                                          \
-  } while (0)
+#  define ARROW_RETURN_IF_(condition, status, _) \
+    do {                                         \
+      if (ARROW_PREDICT_FALSE(condition)) {      \
+        return (status);                         \
+      }                                          \
+    } while (0)
 
 #endif  // ARROW_EXTRA_ERROR_CONTEXT
 
@@ -58,6 +58,15 @@
     ARROW_RETURN_IF_(!__s.ok(), __s, ARROW_STRINGIFY(status));        \
   } while (false)
 
+/// \brief Given `expr` and `warn_msg`; log `warn_msg` if `expr` is a non-ok status
+#define ARROW_WARN_NOT_OK(expr, warn_msg) \
+  do {                                    \
+    ::arrow::Status _s = (expr);          \
+    if (ARROW_PREDICT_FALSE(!_s.ok())) {  \
+      _s.Warn(warn_msg);                  \
+    }                                     \
+  } while (false)
+
 #define RETURN_NOT_OK_ELSE(s, else_)                            \
   do {                                                          \
     ::arrow::Status _s = ::arrow::internal::GenericToStatus(s); \
@@ -69,10 +78,13 @@
 
 // This is an internal-use macro and should not be used in public headers.
 #ifndef RETURN_NOT_OK
-#define RETURN_NOT_OK(s) ARROW_RETURN_NOT_OK(s)
+#  define RETURN_NOT_OK(s) ARROW_RETURN_NOT_OK(s)
 #endif
 
 namespace arrow {
+namespace internal {
+class StatusConstant;
+}
 
 enum class StatusCode : char {
   OK = 0,
@@ -83,6 +95,7 @@ enum class StatusCode : char {
   IOError = 5,
   CapacityError = 6,
   IndexError = 7,
+  Cancelled = 8,
   UnknownError = 9,
   NotImplemented = 10,
   SerializationError = 11,
@@ -119,16 +132,16 @@ class ARROW_EXPORT StatusDetail {
 ///
 /// Additionally, if an error occurred, a specific error message is generally
 /// attached.
-class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<Status>,
-                                                public util::ToStringOstreamable<Status> {
+class ARROW_EXPORT [[nodiscard]] Status : public util::EqualityComparable<Status>,
+                                          public util::ToStringOstreamable<Status> {
  public:
   // Create a success status.
-  Status() noexcept : state_(NULLPTR) {}
+  constexpr Status() noexcept : state_(NULLPTR) {}
   ~Status() noexcept {
-    // ARROW-2400: On certain compilers, splitting off the slow path improves
-    // performance significantly.
     if (ARROW_PREDICT_FALSE(state_ != NULL)) {
-      DeleteState();
+      if (!state_->is_constant) {
+        DeleteState();
+      }
     }
   }
 
@@ -204,6 +217,12 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
     return Status::FromArgs(StatusCode::Invalid, std::forward<Args>(args)...);
   }
 
+  /// Return an error status for cancelled operation
+  template <typename... Args>
+  static Status Cancelled(Args&&... args) {
+    return Status::FromArgs(StatusCode::Cancelled, std::forward<Args>(args)...);
+  }
+
   /// Return an error status when an index is out of bounds
   template <typename... Args>
   static Status IndexError(Args&&... args) {
@@ -255,44 +274,54 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
   }
 
   /// Return true iff the status indicates success.
-  bool ok() const { return (state_ == NULLPTR); }
+  constexpr bool ok() const { return (state_ == NULLPTR); }
 
   /// Return true iff the status indicates an out-of-memory error.
-  bool IsOutOfMemory() const { return code() == StatusCode::OutOfMemory; }
+  constexpr bool IsOutOfMemory() const { return code() == StatusCode::OutOfMemory; }
   /// Return true iff the status indicates a key lookup error.
-  bool IsKeyError() const { return code() == StatusCode::KeyError; }
+  constexpr bool IsKeyError() const { return code() == StatusCode::KeyError; }
   /// Return true iff the status indicates invalid data.
-  bool IsInvalid() const { return code() == StatusCode::Invalid; }
+  constexpr bool IsInvalid() const { return code() == StatusCode::Invalid; }
+  /// Return true iff the status indicates a cancelled operation.
+  constexpr bool IsCancelled() const { return code() == StatusCode::Cancelled; }
   /// Return true iff the status indicates an IO-related failure.
-  bool IsIOError() const { return code() == StatusCode::IOError; }
+  constexpr bool IsIOError() const { return code() == StatusCode::IOError; }
   /// Return true iff the status indicates a container reaching capacity limits.
-  bool IsCapacityError() const { return code() == StatusCode::CapacityError; }
+  constexpr bool IsCapacityError() const { return code() == StatusCode::CapacityError; }
   /// Return true iff the status indicates an out of bounds index.
-  bool IsIndexError() const { return code() == StatusCode::IndexError; }
+  constexpr bool IsIndexError() const { return code() == StatusCode::IndexError; }
   /// Return true iff the status indicates a type error.
-  bool IsTypeError() const { return code() == StatusCode::TypeError; }
+  constexpr bool IsTypeError() const { return code() == StatusCode::TypeError; }
   /// Return true iff the status indicates an unknown error.
-  bool IsUnknownError() const { return code() == StatusCode::UnknownError; }
+  constexpr bool IsUnknownError() const { return code() == StatusCode::UnknownError; }
   /// Return true iff the status indicates an unimplemented operation.
-  bool IsNotImplemented() const { return code() == StatusCode::NotImplemented; }
+  constexpr bool IsNotImplemented() const { return code() == StatusCode::NotImplemented; }
   /// Return true iff the status indicates a (de)serialization failure
-  bool IsSerializationError() const { return code() == StatusCode::SerializationError; }
+  constexpr bool IsSerializationError() const {
+    return code() == StatusCode::SerializationError;
+  }
   /// Return true iff the status indicates a R-originated error.
-  bool IsRError() const { return code() == StatusCode::RError; }
+  constexpr bool IsRError() const { return code() == StatusCode::RError; }
 
-  bool IsCodeGenError() const { return code() == StatusCode::CodeGenError; }
+  constexpr bool IsCodeGenError() const { return code() == StatusCode::CodeGenError; }
 
-  bool IsExpressionValidationError() const {
+  constexpr bool IsExpressionValidationError() const {
     return code() == StatusCode::ExpressionValidationError;
   }
 
-  bool IsExecutionError() const { return code() == StatusCode::ExecutionError; }
-  bool IsAlreadyExists() const { return code() == StatusCode::AlreadyExists; }
+  constexpr bool IsExecutionError() const { return code() == StatusCode::ExecutionError; }
+  constexpr bool IsAlreadyExists() const { return code() == StatusCode::AlreadyExists; }
 
   /// \brief Return a string representation of this status suitable for printing.
   ///
   /// The string "OK" is returned for success.
   std::string ToString() const;
+
+  /// \brief Return a string representation of this status without
+  /// context lines suitable for printing.
+  ///
+  /// The string "OK" is returned for success.
+  std::string ToStringWithoutContextLines() const;
 
   /// \brief Return a string representation of the status code, without the message
   /// text or POSIX code information.
@@ -300,15 +329,13 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
   static std::string CodeAsString(StatusCode);
 
   /// \brief Return the StatusCode value attached to this status.
-  StatusCode code() const { return ok() ? StatusCode::OK : state_->code; }
+  constexpr StatusCode code() const { return ok() ? StatusCode::OK : state_->code; }
 
   /// \brief Return the specific error message attached to this status.
-  std::string message() const { return ok() ? "" : state_->msg; }
+  const std::string& message() const;
 
   /// \brief Return the status detail attached to this message.
-  std::shared_ptr<StatusDetail> detail() const {
-    return state_ == NULLPTR ? NULLPTR : state_->detail;
-  }
+  const std::shared_ptr<StatusDetail>& detail() const;
 
   /// \brief Return a new Status copying the existing status, but
   /// updating with the existing detail.
@@ -323,6 +350,9 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
     return FromArgs(code(), std::forward<Args>(args)...).WithDetail(detail());
   }
 
+  void Warn() const;
+  void Warn(const std::string& message) const;
+
   [[noreturn]] void Abort() const;
   [[noreturn]] void Abort(const std::string& message) const;
 
@@ -333,6 +363,7 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
  private:
   struct State {
     StatusCode code;
+    bool is_constant;
     std::string msg;
     std::shared_ptr<StatusDetail> detail;
   };
@@ -340,22 +371,28 @@ class ARROW_MUST_USE_TYPE ARROW_EXPORT Status : public util::EqualityComparable<
   // a `State` structure containing the error code and message(s)
   State* state_;
 
-  void DeleteState() {
+  void DeleteState() noexcept {
+    // ARROW-2400: On certain compilers, splitting off the slow path improves
+    // performance significantly.
     delete state_;
-    state_ = NULLPTR;
   }
   void CopyFrom(const Status& s);
   inline void MoveFrom(Status& s);
+
+  friend class internal::StatusConstant;
 };
 
 void Status::MoveFrom(Status& s) {
-  delete state_;
+  if (ARROW_PREDICT_FALSE(state_ != NULL)) {
+    if (!state_->is_constant) {
+      DeleteState();
+    }
+  }
   state_ = s.state_;
   s.state_ = NULLPTR;
 }
 
-Status::Status(const Status& s)
-    : state_((s.state_ == NULLPTR) ? NULLPTR : new State(*s.state_)) {}
+Status::Status(const Status& s) : state_{NULLPTR} { CopyFrom(s); }
 
 Status& Status::operator=(const Status& s) {
   // The following condition catches both aliasing (when this == &s),
@@ -430,7 +467,7 @@ namespace internal {
 
 // Extract Status from Status or Result<T>
 // Useful for the status check macros such as RETURN_NOT_OK.
-inline Status GenericToStatus(const Status& st) { return st; }
+inline const Status& GenericToStatus(const Status& st) { return st; }
 inline Status GenericToStatus(Status&& st) { return std::move(st); }
 
 }  // namespace internal

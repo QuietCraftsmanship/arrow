@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { DataType } from '../../type';
-import { Duplex, DuplexOptions } from 'stream';
-import { AsyncByteStream } from '../../io/stream';
-import { RecordBatchWriter } from '../../ipc/writer';
+import { Duplex } from 'node:stream';
+import type { DuplexOptions } from 'node:stream';
+import { AsyncByteStream } from '../../io/stream.js';
+import { RecordBatchWriter } from '../../ipc/writer.js';
+import { TypeMap } from '../../type.js';
 
 /** @ignore */
-export function recordBatchWriterThroughNodeStream<T extends { [key: string]: DataType } = any>(this: typeof RecordBatchWriter, options?: DuplexOptions & { autoDestroy: boolean }) {
+export function recordBatchWriterThroughNodeStream<T extends TypeMap = any>(this: typeof RecordBatchWriter, options?: DuplexOptions & { autoDestroy: boolean }) {
     return new RecordBatchWriterDuplex(new this<T>(options));
 }
 
@@ -29,8 +30,8 @@ export function recordBatchWriterThroughNodeStream<T extends { [key: string]: Da
 type CB = (error?: Error | null | undefined) => void;
 
 /** @ignore */
-class RecordBatchWriterDuplex<T extends { [key: string]: DataType } = any> extends Duplex {
-    private _pulling: boolean = false;
+class RecordBatchWriterDuplex<T extends TypeMap = any> extends Duplex {
+    private _pulling = false;
     private _reader: AsyncByteStream | null;
     private _writer: RecordBatchWriter | null;
     constructor(writer: RecordBatchWriter<T>, options?: DuplexOptions) {
@@ -40,12 +41,12 @@ class RecordBatchWriterDuplex<T extends { [key: string]: DataType } = any> exten
     }
     _final(cb?: CB) {
         const writer = this._writer;
-        writer && writer.close();
+        writer?.close();
         cb && cb();
     }
     _write(x: any, _: string, cb: CB) {
         const writer = this._writer;
-        writer && writer.write(x);
+        writer?.write(x);
         cb && cb();
         return true;
     }
@@ -68,7 +69,7 @@ class RecordBatchWriterDuplex<T extends { [key: string]: DataType } = any> exten
             }
             if (!this.push(r.value) || size <= 0) { break; }
         }
-        if ((r && r.done || !this.readable)) {
+        if ((r?.done || !this.readable)) {
             this.push(null);
             await reader.cancel();
         }

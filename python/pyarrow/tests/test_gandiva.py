@@ -37,14 +37,19 @@ def test_tree_exp_builder():
     node_a = builder.make_field(field_a)
     node_b = builder.make_field(field_b)
 
+    assert node_a.return_type() == field_a.type
+
     condition = builder.make_function("greater_than", [node_a, node_b],
                                       pa.bool_())
     if_node = builder.make_if(condition, node_a, node_b, pa.int32())
 
     expr = builder.make_expression(if_node, field_result)
 
+    assert expr.result().type == pa.int32()
+
+    config = gandiva.Configuration(dump_ir=True)
     projector = gandiva.make_projector(
-        schema, [expr], pa.default_memory_pool())
+        schema, [expr], pa.default_memory_pool(), "NONE", config)
 
     # Gandiva generates compute kernel function named `@expr_X`
     assert projector.llvm_ir.find("@expr_") != -1
@@ -98,7 +103,10 @@ def test_filter():
     cond = builder.make_function("less_than", [node_a, thousand], pa.bool_())
     condition = builder.make_condition(cond)
 
-    filter = gandiva.make_filter(table.schema, condition)
+    assert condition.result().type == pa.bool_()
+
+    config = gandiva.Configuration(dump_ir=True)
+    filter = gandiva.make_filter(table.schema, condition, config)
     # Gandiva generates compute kernel function named `@expr_X`
     assert filter.llvm_ir.find("@expr_") != -1
 
@@ -120,7 +128,7 @@ def test_in_expr():
     condition = builder.make_condition(cond)
     filter = gandiva.make_filter(table.schema, condition)
     result = filter.evaluate(table.to_batches()[0], pa.default_memory_pool())
-    assert list(result.to_array()) == [1, 2]
+    assert result.to_array().equals(pa.array([1, 2], type=pa.uint32()))
 
     # int32
     arr = pa.array([3, 1, 4, 1, 5, 9, 2, 6, 5, 4])
@@ -130,7 +138,7 @@ def test_in_expr():
     condition = builder.make_condition(cond)
     filter = gandiva.make_filter(table.schema, condition)
     result = filter.evaluate(table.to_batches()[0], pa.default_memory_pool())
-    assert list(result.to_array()) == [1, 3, 4, 8]
+    assert result.to_array().equals(pa.array([1, 3, 4, 8], type=pa.uint32()))
 
     # int64
     arr = pa.array([3, 1, 4, 1, 5, 9, 2, 6, 5, 4])
@@ -140,7 +148,7 @@ def test_in_expr():
     condition = builder.make_condition(cond)
     filter = gandiva.make_filter(table.schema, condition)
     result = filter.evaluate(table.to_batches()[0], pa.default_memory_pool())
-    assert list(result.to_array()) == [1, 3, 4, 8]
+    assert result.to_array().equals(pa.array([1, 3, 4, 8], type=pa.uint32()))
 
 
 @pytest.mark.skip(reason="Gandiva C++ did not have *real* binary, "
@@ -163,7 +171,7 @@ def test_in_expr_todo():
 
     filter = gandiva.make_filter(table.schema, condition)
     result = filter.evaluate(table.to_batches()[0], pa.default_memory_pool())
-    assert list(result.to_array()) == [1, 2]
+    assert result.to_array().equals(pa.array([1, 2], type=pa.uint32()))
 
     # timestamp
     datetime_1 = datetime.datetime.utcfromtimestamp(1542238951.621877)
@@ -221,10 +229,10 @@ def test_in_expr_todo():
 def test_boolean():
     import pyarrow.gandiva as gandiva
 
-    table = pa.Table.from_arrays([pa.array([1., 31., 46., 3., 57., 44., 22.]),
-                                  pa.array([5., 45., 36., 73.,
-                                            83., 23., 76.])],
-                                 ['a', 'b'])
+    table = pa.Table.from_arrays([
+        pa.array([1., 31., 46., 3., 57., 44., 22.]),
+        pa.array([5., 45., 36., 73., 83., 23., 76.])],
+        ['a', 'b'])
 
     builder = gandiva.TreeExprBuilder()
     node_a = builder.make_field(table.schema.field("a"))
@@ -241,7 +249,7 @@ def test_boolean():
 
     filter = gandiva.make_filter(table.schema, condition)
     result = filter.evaluate(table.to_batches()[0], pa.default_memory_pool())
-    assert list(result.to_array()) == [0, 2, 5]
+    assert result.to_array().equals(pa.array([0, 2, 5], type=pa.uint32()))
 
 
 @pytest.mark.gandiva
@@ -316,3 +324,111 @@ def test_get_registered_function_signatures():
     assert type(signatures[0].return_type()) is pa.DataType
     assert type(signatures[0].param_types()) is list
     assert hasattr(signatures[0], "name")
+
+
+@pytest.mark.gandiva
+def test_filter_project():
+    import pyarrow.gandiva as gandiva
+    mpool = pa.default_memory_pool()
+    # Create a table with some sample data
+    array0 = pa.array([10, 12, -20, 5, 21, 29], pa.int32())
+    array1 = pa.array([5, 15, 15, 17, 12, 3], pa.int32())
+    array2 = pa.array([1, 25, 11, 30, -21, None], pa.int32())
+
+    table = pa.Table.from_arrays([array0, array1, array2], ['a', 'b', 'c'])
+
+    field_result = pa.field("res", pa.int32())
+
+    builder = gandiva.TreeExprBuilder()
+    node_a = builder.make_field(table.schema.field("a"))
+    node_b = builder.make_field(table.schema.field("b"))
+    node_c = builder.make_field(table.schema.field("c"))
+
+    greater_than_function = builder.make_function("greater_than",
+                                                  [node_a, node_b], pa.bool_())
+    filter_condition = builder.make_condition(
+        greater_than_function)
+
+    project_condition = builder.make_function("less_than",
+                                              [node_b, node_c], pa.bool_())
+    if_node = builder.make_if(project_condition,
+                              node_b, node_c, pa.int32())
+    expr = builder.make_expression(if_node, field_result)
+
+    # Build a filter for the expressions.
+    filter = gandiva.make_filter(table.schema, filter_condition)
+
+    # Build a projector for the expressions.
+    projector = gandiva.make_projector(
+        table.schema, [expr], mpool, "UINT32")
+
+    # Evaluate filter
+    selection_vector = filter.evaluate(table.to_batches()[0], mpool)
+
+    # Evaluate project
+    r, = projector.evaluate(
+        table.to_batches()[0], selection_vector)
+
+    exp = pa.array([1, -21, None], pa.int32())
+    assert r.equals(exp)
+
+
+@pytest.mark.gandiva
+def test_to_string():
+    import pyarrow.gandiva as gandiva
+    builder = gandiva.TreeExprBuilder()
+
+    assert str(builder.make_literal(2.0, pa.float64())
+               ).startswith('(const double) 2 raw(')
+    assert str(builder.make_literal(2, pa.int64())) == '(const int64) 2'
+    assert str(builder.make_field(pa.field('x', pa.float64()))) == '(double) x'
+    assert str(builder.make_field(pa.field('y', pa.string()))) == '(string) y'
+
+    field_z = builder.make_field(pa.field('z', pa.bool_()))
+    func_node = builder.make_function('not', [field_z], pa.bool_())
+    assert str(func_node) == 'bool not((bool) z)'
+
+    field_y = builder.make_field(pa.field('y', pa.bool_()))
+    and_node = builder.make_and([func_node, field_y])
+    assert str(and_node) == 'bool not((bool) z) && (bool) y'
+
+
+@pytest.mark.gandiva
+def test_rejects_none():
+    import pyarrow.gandiva as gandiva
+
+    builder = gandiva.TreeExprBuilder()
+
+    field_x = pa.field('x', pa.int32())
+    schema = pa.schema([field_x])
+    literal_true = builder.make_literal(True, pa.bool_())
+
+    with pytest.raises(TypeError):
+        builder.make_field(None)
+
+    with pytest.raises(TypeError):
+        builder.make_if(literal_true, None, None, None)
+
+    with pytest.raises(TypeError):
+        builder.make_and([literal_true, None])
+
+    with pytest.raises(TypeError):
+        builder.make_or([None, literal_true])
+
+    with pytest.raises(TypeError):
+        builder.make_in_expression(None, [1, 2, 3], pa.int32())
+
+    with pytest.raises(TypeError):
+        builder.make_expression(None, field_x)
+
+    with pytest.raises(TypeError):
+        builder.make_condition(None)
+
+    with pytest.raises(TypeError):
+        builder.make_function('less_than', [literal_true, None], pa.bool_())
+
+    with pytest.raises(TypeError):
+        gandiva.make_projector(schema, [None])
+
+    with pytest.raises(TypeError):
+        gandiva.make_filter(schema, None)

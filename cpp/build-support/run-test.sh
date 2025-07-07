@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2014 Cloudera, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,7 +39,7 @@ TEST_DIRNAME=$(cd $(dirname $1); pwd)
 TEST_FILENAME=$(basename $1)
 shift
 TEST_EXECUTABLE="$TEST_DIRNAME/$TEST_FILENAME"
-TEST_NAME=$(echo $TEST_FILENAME | perl -pe 's/\..+?$//') # Remove path and extension (if any).
+TEST_NAME=$(echo $TEST_FILENAME | sed -E -e 's/\..+$//') # Remove path and extension (if any).
 
 # We run each test in its own subdir to avoid core file related races.
 TEST_WORKDIR=$OUTPUT_ROOT/build/test-work/$TEST_NAME
@@ -65,14 +65,10 @@ function setup_sanitizers() {
 
   # Configure TSAN (ignored if this isn't a TSAN build).
   #
-  # Deadlock detection (new in clang 3.5) is disabled because:
-  # 1. The clang 3.5 deadlock detector crashes in some unit tests. It
-  #    needs compiler-rt commits c4c3dfd, 9a8efe3, and possibly others.
-  # 2. Many unit tests report lock-order-inversion warnings; they should be
-  #    fixed before reenabling the detector.
-  TSAN_OPTIONS="$TSAN_OPTIONS detect_deadlocks=0"
   TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$ROOT/build-support/tsan-suppressions.txt"
   TSAN_OPTIONS="$TSAN_OPTIONS history_size=7"
+  # Some tests deliberately fail allocating memory
+  TSAN_OPTIONS="$TSAN_OPTIONS allocator_may_return_null=1"
   export TSAN_OPTIONS
 
   UBSAN_OPTIONS="$UBSAN_OPTIONS print_stacktrace=1"
@@ -96,12 +92,13 @@ function run_test() {
   # even when retries are successful.
   rm -f $XMLFILE
 
-  $TEST_EXECUTABLE "$@" 2>&1 \
+  $TEST_EXECUTABLE "$@" > $LOGFILE.raw 2>&1
+  STATUS=$?
+  cat $LOGFILE.raw \
     | ${PYTHON:-python} $ROOT/build-support/asan_symbolize.py \
     | ${CXXFILT:-c++filt} \
-    | $ROOT/build-support/stacktrace_addr2line.pl $TEST_EXECUTABLE \
     | $pipe_cmd 2>&1 | tee $LOGFILE
-  STATUS=$?
+  rm -f $LOGFILE.raw
 
   # TSAN doesn't always exit with a non-zero exit code due to a bug:
   # mutex errors don't get reported through the normal error reporting infrastructure.
@@ -111,8 +108,7 @@ function run_test() {
   # XML output from gtest. We assume that gtest knows better than us and our
   # regexes in most cases, but for certain errors we delete the resulting xml
   # file and let our own post-processing step regenerate it.
-  export GREP=$(which egrep)
-  if zgrep --silent "ThreadSanitizer|Leak check.*detected leaks" $LOGFILE ; then
+  if grep -E -q "ThreadSanitizer|Leak check.*detected leaks" $LOGFILE ; then
     echo ThreadSanitizer or leak check failures in $LOGFILE
     STATUS=1
     rm -f $XMLFILE
@@ -125,12 +121,15 @@ function print_coredumps() {
   # patterns must be set with prefix `core.{test-executable}*`:
   #
   # In case of macOS:
-  #   sudo sysctl -w kern.corefile=core.%N.%P
+  #   sudo sysctl -w kern.corefile=/tmp/core.%N.%P
   # On Linux:
-  #   sudo sysctl -w kernel.core_pattern=core.%e.%p
+  #   sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
   #
   # and the ulimit must be increased:
   #   ulimit -c unlimited
+  #
+  # If the tests are run in a Docker container, the instructions are slightly
+  # different: see the 'Coredumps' comment section in `docker-compose.yml`.
 
   # filename is truncated to the first 15 characters in case of linux, so limit
   # the pattern for the first 15 characters
@@ -138,19 +137,21 @@ function print_coredumps() {
   FILENAME=$(echo ${FILENAME} | cut -c-15)
   PATTERN="^core\.${FILENAME}"
 
-  COREFILES=$(ls | grep $PATTERN)
+  COREFILES=$(ls /tmp | grep $PATTERN)
   if [ -n "$COREFILES" ]; then
-    echo "Found core dump, printing backtrace:"
-
     for COREFILE in $COREFILES; do
+      COREPATH="/tmp/${COREFILE}"
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "Running '${TEST_EXECUTABLE}' produced core dump at '${COREPATH}', printing backtrace:"
       # Print backtrace
       if [ "$(uname)" == "Darwin" ]; then
-        lldb -c "${COREFILE}" --batch --one-line "thread backtrace all -e true"
+        lldb -c "${COREPATH}" --batch --one-line "thread backtrace all -e true"
       else
-        gdb -c "${COREFILE}" $TEST_EXECUTABLE -ex "thread apply all bt" -ex "set pagination 0" -batch
+        gdb -c "${COREPATH}" $TEST_EXECUTABLE -ex "thread apply all bt" -ex "set pagination 0" -batch
       fi
-      # Remove the coredump, regenerate it via running the test case directly
-      rm "${COREFILE}"
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      # Remove the coredump, it can be regenerated via running the test case directly
+      rm "${COREPATH}"
     done
   fi
 }
@@ -159,16 +160,16 @@ function post_process_tests() {
   # If we have a LeakSanitizer report, and XML reporting is configured, add a new test
   # case result to the XML file for the leak report. Otherwise Jenkins won't show
   # us which tests had LSAN errors.
-  if zgrep --silent "ERROR: LeakSanitizer: detected memory leaks" $LOGFILE ; then
-      echo Test had memory leaks. Editing XML
-      perl -p -i -e '
-      if (m#</testsuite>#) {
-        print "<testcase name=\"LeakSanitizer\" status=\"run\" classname=\"LSAN\">\n";
-        print "  <failure message=\"LeakSanitizer failed\" type=\"\">\n";
-        print "    See txt log file for details\n";
-        print "  </failure>\n";
-        print "</testcase>\n";
-      }' $XMLFILE
+  if grep -E -q "ERROR: LeakSanitizer: detected memory leaks" $LOGFILE ; then
+    echo Test had memory leaks. Editing XML
+    sed -i.bak -e '/<\/testsuite>/ i\
+  <testcase name="LeakSanitizer" status="run" classname="LSAN">\
+    <failure message="LeakSanitizer failed" type="">\
+      See txt log file for details\
+    </failure>\
+  </testcase>' \
+      $XMLFILE
+    mv $XMLFILE.bak $XMLFILE
   fi
 }
 

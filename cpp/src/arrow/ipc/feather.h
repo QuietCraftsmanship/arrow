@@ -25,7 +25,8 @@
 #include <string>
 #include <vector>
 
-#include "arrow/result.h"
+#include "arrow/ipc/options.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/compression.h"
 #include "arrow/util/visibility.h"
 
@@ -63,6 +64,15 @@ class ARROW_EXPORT Reader {
   /// \return the table reader
   static Result<std::shared_ptr<Reader>> Open(
       const std::shared_ptr<io::RandomAccessFile>& source);
+
+  /// \brief Open a Feather file from a RandomAccessFile interface
+  /// with IPC Read options
+  ///
+  /// \param[in] source a RandomAccessFile instance
+  /// \param[in] options IPC Read options
+  /// \return the table reader
+  static Result<std::shared_ptr<Reader>> Open(
+      const std::shared_ptr<io::RandomAccessFile>& source, const IpcReadOptions& options);
 
   /// \brief Return the version number of the Feather file
   virtual int version() const = 0;
@@ -128,7 +138,7 @@ struct ARROW_EXPORT WriteProperties {
   Compression::type compression = Compression::UNCOMPRESSED;
 
   /// Compressor-specific compression level
-  int compression_level = Compression::kUseDefaultCompressionLevel;
+  int compression_level = ::arrow::util::kUseDefaultCompressionLevel;
 };
 
 ARROW_EXPORT

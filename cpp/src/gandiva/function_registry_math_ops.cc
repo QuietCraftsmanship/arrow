@@ -36,11 +36,28 @@ namespace gandiva {
       BINARY_UNSAFE_NULL_IF_NULL(name, ALIASES, float32, float64), \
       BINARY_UNSAFE_NULL_IF_NULL(name, ALIASES, float64, float64)
 
+#define MATH_BINARY_SAFE(name, ALIASES)                                           \
+  BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, int32, int32, float64),         \
+      BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, int64, int64, float64),     \
+      BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, uint32, uint32, float64),   \
+      BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, uint64, uint64, float64),   \
+      BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, float32, float32, float64), \
+      BINARY_GENERIC_SAFE_NULL_IF_NULL(name, ALIASES, float64, float64, float64)
+
 #define UNARY_SAFE_NULL_NEVER_BOOL_FN(name, ALIASES) \
   NUMERIC_BOOL_DATE_TYPES(UNARY_SAFE_NULL_NEVER_BOOL, name, ALIASES)
 
 #define BINARY_SAFE_NULL_NEVER_BOOL_FN(name, ALIASES) \
   NUMERIC_BOOL_DATE_TYPES(BINARY_SAFE_NULL_NEVER_BOOL, name, ALIASES)
+
+#define BINARY_SYMMETRIC_SAFE_NULL_NEVER_FN(name, ALIASES) \
+  BINARY_SAFE_NULL_NEVER(name, ALIASES, int32),            \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, int64),        \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, uint32),       \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, uint64),       \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, float32),      \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, float64),      \
+      BINARY_SAFE_NULL_NEVER(name, ALIASES, boolean)
 
 std::vector<NativeFunction> GetMathOpsFunctionRegistry() {
   static std::vector<NativeFunction> math_fn_registry_ = {
@@ -59,6 +76,16 @@ std::vector<NativeFunction> GetMathOpsFunctionRegistry() {
       BINARY_SAFE_NULL_NEVER_BOOL_FN(is_distinct_from, {}),
       BINARY_SAFE_NULL_NEVER_BOOL_FN(is_not_distinct_from, {}),
 
+      UNARY_UNSAFE_NULL_IF_NULL(factorial, {}, int32, int64),
+      UNARY_UNSAFE_NULL_IF_NULL(factorial, {}, int64, int64),
+
+      // trigonometry functions
+      MATH_UNARY_OPS(sin, {}), MATH_UNARY_OPS(cos, {}), MATH_UNARY_OPS(asin, {}),
+      MATH_UNARY_OPS(acos, {}), MATH_UNARY_OPS(tan, {}), MATH_UNARY_OPS(atan, {}),
+      MATH_UNARY_OPS(sinh, {}), MATH_UNARY_OPS(cosh, {}), MATH_UNARY_OPS(tanh, {}),
+      MATH_UNARY_OPS(cot, {}), MATH_UNARY_OPS(radians, {}),
+      MATH_UNARY_OPS(degrees, {"udfdegrees"}), MATH_BINARY_SAFE(atan2, {}),
+
       // decimal functions
       UNARY_SAFE_NULL_IF_NULL(abs, {}, decimal128, decimal128),
       UNARY_SAFE_NULL_IF_NULL(ceil, {}, decimal128, decimal128),
@@ -68,6 +95,7 @@ std::vector<NativeFunction> GetMathOpsFunctionRegistry() {
       BINARY_GENERIC_SAFE_NULL_IF_NULL(round, {}, decimal128, int32, decimal128),
       BINARY_GENERIC_SAFE_NULL_IF_NULL(truncate, {"trunc"}, decimal128, int32,
                                        decimal128),
+      BINARY_SYMMETRIC_SAFE_NULL_NEVER_FN(nvl, {}),
 
       NativeFunction("truncate", {"trunc"}, DataTypeVector{int64(), int32()}, int64(),
                      kResultNullIfNull, "truncate_int64_int32"),

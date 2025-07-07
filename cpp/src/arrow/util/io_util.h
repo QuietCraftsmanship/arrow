@@ -18,85 +18,27 @@
 #pragma once
 
 #ifndef _WIN32
-#define ARROW_HAVE_SIGACTION 1
+#  define ARROW_HAVE_SIGACTION 1
 #endif
 
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #if ARROW_HAVE_SIGACTION
-#include <signal.h>  // Needed for struct sigaction
+#  include <csignal>  // Needed for struct sigaction
 #endif
 
-#include "arrow/io/interfaces.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/windows_fixup.h"
 
-namespace arrow {
-
-class Buffer;
-
-namespace io {
-
-// Output stream that just writes to stdout.
-class ARROW_EXPORT StdoutStream : public OutputStream {
- public:
-  StdoutStream();
-  ~StdoutStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Status Write(const void* data, int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-// Output stream that just writes to stderr.
-class ARROW_EXPORT StderrStream : public OutputStream {
- public:
-  StderrStream();
-  ~StderrStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Status Write(const void* data, int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-// Input stream that just reads from stdin.
-class ARROW_EXPORT StdinStream : public InputStream {
- public:
-  StdinStream();
-  ~StdinStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Result<int64_t> Read(int64_t nbytes, void* out) override;
-
-  Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-}  // namespace io
-
-namespace internal {
+namespace arrow::internal {
 
 // NOTE: 8-bit path strings on Windows are encoded using UTF-8.
 // Using MBCS would fail encoding some paths.
@@ -117,17 +59,18 @@ class ARROW_EXPORT PlatformFilename {
   PlatformFilename(PlatformFilename&&);
   PlatformFilename& operator=(const PlatformFilename&);
   PlatformFilename& operator=(PlatformFilename&&);
-  explicit PlatformFilename(const NativePathString& path);
+  explicit PlatformFilename(NativePathString path);
   explicit PlatformFilename(const NativePathString::value_type* path);
 
   const NativePathString& ToNative() const;
   std::string ToString() const;
 
   PlatformFilename Parent() const;
+  Result<PlatformFilename> Real() const;
 
   // These functions can fail for character encoding reasons.
-  static Result<PlatformFilename> FromString(const std::string& file_name);
-  Result<PlatformFilename> Join(const std::string& child_name) const;
+  static Result<PlatformFilename> FromString(std::string_view file_name);
+  Result<PlatformFilename> Join(std::string_view child_name) const;
 
   PlatformFilename Join(const PlatformFilename& child_name) const;
 
@@ -183,14 +126,46 @@ Result<bool> DeleteFile(const PlatformFilename& file_path, bool allow_not_found 
 ARROW_EXPORT
 Result<bool> FileExists(const PlatformFilename& path);
 
+// TODO expose this more publicly to make it available from io/file.h?
+/// A RAII wrapper for a file descriptor.
+///
+/// The underlying file descriptor is automatically closed on destruction.
+/// Moving is supported with well-defined semantics.
+/// Furthermore, closing is idempotent.
+class ARROW_EXPORT FileDescriptor {
+ public:
+  FileDescriptor() = default;
+  explicit FileDescriptor(int fd) : fd_(fd) {}
+  FileDescriptor(FileDescriptor&&);
+  FileDescriptor& operator=(FileDescriptor&&);
+
+  ~FileDescriptor();
+
+  Status Close();
+
+  /// May return -1 if closed or default-initialized
+  int fd() const { return fd_.load(); }
+
+  /// Detach and return the underlying file descriptor
+  int Detach();
+
+  bool closed() const { return fd_.load() == -1; }
+
+ protected:
+  static void CloseFromDestructor(int fd);
+
+  std::atomic<int> fd_{-1};
+};
+
 /// Open a file for reading and return a file descriptor.
 ARROW_EXPORT
-Result<int> FileOpenReadable(const PlatformFilename& file_name);
+Result<FileDescriptor> FileOpenReadable(const PlatformFilename& file_name);
 
 /// Open a file for writing and return a file descriptor.
 ARROW_EXPORT
-Result<int> FileOpenWritable(const PlatformFilename& file_name, bool write_only = true,
-                             bool truncate = true, bool append = false);
+Result<FileDescriptor> FileOpenWritable(const PlatformFilename& file_name,
+                                        bool write_only = true, bool truncate = true,
+                                        bool append = false);
 
 /// Read from current file position.  Return number of bytes read.
 ARROW_EXPORT
@@ -217,12 +192,37 @@ ARROW_EXPORT
 Status FileClose(int fd);
 
 struct Pipe {
-  int rfd;
-  int wfd;
+  FileDescriptor rfd;
+  FileDescriptor wfd;
+
+  Status Close() { return rfd.Close() & wfd.Close(); }
 };
 
 ARROW_EXPORT
 Result<Pipe> CreatePipe();
+
+ARROW_EXPORT
+Status SetPipeFileDescriptorNonBlocking(int fd);
+
+class ARROW_EXPORT SelfPipe {
+ public:
+  static Result<std::shared_ptr<SelfPipe>> Make(bool signal_safe);
+  virtual ~SelfPipe();
+
+  /// \brief Wait for a wakeup.
+  ///
+  /// Status::Invalid is returned if the pipe has been shutdown.
+  /// Otherwise the next sent payload is returned.
+  virtual Result<uint64_t> Wait() = 0;
+
+  /// \brief Wake up the pipe by sending a payload.
+  ///
+  /// This method is async-signal-safe if `signal_safe` was set to true.
+  virtual void Send(uint64_t payload) = 0;
+
+  /// \brief Wake up the pipe and shut it down.
+  virtual Status Shutdown() = 0;
+};
 
 ARROW_EXPORT
 int64_t GetPageSize();
@@ -265,10 +265,14 @@ std::string WinErrorMessage(int errnum);
 
 ARROW_EXPORT
 std::shared_ptr<StatusDetail> StatusDetailFromErrno(int errnum);
+ARROW_EXPORT
+std::optional<int> ErrnoFromStatusDetail(const StatusDetail& detail);
 #if _WIN32
 ARROW_EXPORT
 std::shared_ptr<StatusDetail> StatusDetailFromWinError(int errnum);
 #endif
+ARROW_EXPORT
+std::shared_ptr<StatusDetail> StatusDetailFromSignal(int signum);
 
 template <typename... Args>
 Status StatusFromErrno(int errnum, StatusCode code, Args&&... args) {
@@ -294,12 +298,26 @@ Status IOErrorFromWinError(int errnum, Args&&... args) {
 }
 #endif
 
+template <typename... Args>
+Status StatusFromSignal(int signum, StatusCode code, Args&&... args) {
+  return Status::FromDetailAndArgs(code, StatusDetailFromSignal(signum),
+                                   std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+Status CancelledFromSignal(int signum, Args&&... args) {
+  return StatusFromSignal(signum, StatusCode::Cancelled, std::forward<Args>(args)...);
+}
+
 ARROW_EXPORT
 int ErrnoFromStatus(const Status&);
 
 // Always returns 0 on non-Windows platforms (for Python).
 ARROW_EXPORT
 int WinErrorFromStatus(const Status&);
+
+ARROW_EXPORT
+int SignalFromStatus(const Status&);
 
 class ARROW_EXPORT TemporaryDir {
  public:
@@ -320,7 +338,7 @@ class ARROW_EXPORT TemporaryDir {
 
 class ARROW_EXPORT SignalHandler {
  public:
-  typedef void (*Callback)(int);
+  using Callback = void (*)(int);
 
   SignalHandler();
   explicit SignalHandler(Callback cb);
@@ -346,11 +364,89 @@ class ARROW_EXPORT SignalHandler {
 /// \brief Return the current handler for the given signal number.
 ARROW_EXPORT
 Result<SignalHandler> GetSignalHandler(int signum);
+
 /// \brief Set a new handler for the given signal number.
 ///
 /// The old signal handler is returned.
 ARROW_EXPORT
 Result<SignalHandler> SetSignalHandler(int signum, const SignalHandler& handler);
 
-}  // namespace internal
-}  // namespace arrow
+/// \brief Reinstate the signal handler
+///
+/// For use in signal handlers.  This is needed on platforms without sigaction()
+/// such as Windows, as the default signal handler is restored there as
+/// soon as a signal is raised.
+ARROW_EXPORT
+void ReinstateSignalHandler(int signum, SignalHandler::Callback handler);
+
+/// \brief Send a signal to the current process
+///
+/// The thread which will receive the signal is unspecified.
+ARROW_EXPORT
+Status SendSignal(int signum);
+
+/// \brief Send a signal to the given thread
+///
+/// This function isn't supported on Windows.
+ARROW_EXPORT
+Status SendSignalToThread(int signum, uint64_t thread_id);
+
+/// \brief Get an unpredictable random seed
+///
+/// This function may be slightly costly, so should only be used to initialize
+/// a PRNG, not to generate a large amount of random numbers.
+/// It is better to use this function rather than std::random_device, unless
+/// absolutely necessary (e.g. to generate a cryptographic secret).
+ARROW_EXPORT
+int64_t GetRandomSeed();
+
+/// \brief Get the current thread id
+///
+/// In addition to having the same properties as std::thread, the returned value
+/// is a regular integer value, which is more convenient than an opaque type.
+ARROW_EXPORT
+uint64_t GetThreadId();
+
+/// \brief Get the current memory used by the current process in bytes
+///
+/// This function supports Windows, Linux, and Mac and will return 0 otherwise
+ARROW_EXPORT
+int64_t GetCurrentRSS();
+
+/// \brief Get the total memory available to the system in bytes
+///
+/// This function supports Windows, Linux, and Mac and will return 0 otherwise
+ARROW_EXPORT
+int64_t GetTotalMemoryBytes();
+
+/// \brief Load a dynamic library
+///
+/// This wraps dlopen() except on Windows, where LoadLibrary() is called.
+/// These two platforms handle absolute paths consistently; relative paths
+/// or the library's bare name may be handled but inconsistently.
+///
+/// \return An opaque handle for the dynamic library, which can be used for
+///         subsequent symbol lookup. Nullptr will never be returned; instead
+///         an error will be raised.
+ARROW_EXPORT Result<void*> LoadDynamicLibrary(const PlatformFilename& path);
+
+/// \brief Load a dynamic library
+///
+/// An overload taking null terminated string.
+ARROW_EXPORT Result<void*> LoadDynamicLibrary(const char* path);
+
+/// \brief Retrieve a symbol by name from a library handle.
+///
+/// This wraps dlsym() except on Windows, where GetProcAddress() is called.
+///
+/// \return The address associated with the named symbol. Nullptr will never be
+///         returned; instead an error will be raised.
+ARROW_EXPORT Result<void*> GetSymbol(void* handle, const char* name);
+
+template <typename T>
+Result<T*> GetSymbolAs(void* handle, const char* name) {
+  ARROW_ASSIGN_OR_RAISE(void* sym, GetSymbol(handle, name));
+  return reinterpret_cast<T*>(sym);
+}
+
+}  // namespace arrow::internal

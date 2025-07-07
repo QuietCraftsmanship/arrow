@@ -22,6 +22,20 @@ class RecordBatchTest < Test::Unit::TestCase
                                   count: :uint32)
     end
 
+    test("[raw_table]") do
+      raw_table = {
+        visible: [true, nil, false],
+        count: [1, nil, 3],
+      }
+      record_batch = Arrow::RecordBatch.new(raw_table)
+      assert_equal([
+                     {"visible" => true,  "count" => 1},
+                     {"visible" => nil,   "count" => nil},
+                     {"visible" => false, "count" => 3},
+                   ],
+                   record_batch.each_record.collect(&:to_h))
+    end
+
     test("[Schema, records]") do
       records = [
         {visible: true, count: 1},
@@ -120,6 +134,54 @@ class RecordBatchTest < Test::Unit::TestCase
         assert do
           not (@record_batch == 29)
         end
+      end
+    end
+
+    sub_test_case("#[]") do
+      def setup
+        @record_batch = Arrow::RecordBatch.new(a: [true],
+                                               b: [true],
+                                               c: [true],
+                                               d: [true],
+                                               e: [true],
+                                               f: [true],
+                                               g: [true])
+      end
+
+      test("[String]") do
+        assert_equal(Arrow::Column.new(@record_batch, 0),
+                     @record_batch["a"])
+      end
+
+      test("[Symbol]") do
+        assert_equal(Arrow::Column.new(@record_batch, 1),
+                     @record_batch[:b])
+      end
+
+      test("[Integer]") do
+        assert_equal(Arrow::Column.new(@record_batch, 6),
+                     @record_batch[-1])
+      end
+
+      test("[Range]") do
+        assert_equal(Arrow::RecordBatch.new(d: [true],
+                                            e: [true]),
+                     @record_batch[3..4])
+      end
+
+      test("[[Symbol, String, Integer, Range]]") do
+        assert_equal(Arrow::RecordBatch.new(c: [true],
+                                            a: [true],
+                                            g: [true],
+                                            d: [true],
+                                            e: [true]),
+                     @record_batch[[:c, "a", -1, 3..4]])
+      end
+    end
+
+    sub_test_case("#column") do
+      test("#size") do
+        assert_equal(@counts.size, @record_batch[:count].size)
       end
     end
   end
