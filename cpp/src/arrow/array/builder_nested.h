@@ -536,6 +536,13 @@ class ARROW_EXPORT MapBuilder : public ArrayBuilder {
 
   Status Resize(int64_t capacity) override;
   void Reset() override;
+
+  /// \brief Return the finished list offsets. For internal use only as this
+  /// resets the offset builder, so Finish can no longer be called
+  /// \param[out] offsets The completed offsets buffer
+  /// \return Status
+  Status FinishOffsets(std::shared_ptr<Buffer>* offsets);
+
   Status FinishInternal(std::shared_ptr<ArrayData>* out) override;
 
   /// \cond FALSE

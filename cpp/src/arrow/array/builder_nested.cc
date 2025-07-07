@@ -193,7 +193,71 @@ FixedSizeListBuilder::FixedSizeListBuilder(
     : FixedSizeListBuilder(pool, value_builder,
                            fixed_size_list(value_builder->type(), list_size)) {}
 
+<<<<<<< HEAD
+Status ListBuilder::AppendNextOffset() {
+  const int64_t num_values = value_builder_->length();
+  ARROW_RETURN_IF(
+      num_values > kListMaximumElements,
+      Status::CapacityError("ListArray cannot contain more then 2^31 - 1 child elements,",
+                            " have ", num_values));
+  return offsets_builder_.Append(static_cast<int32_t>(num_values));
+}
+
+Status ListBuilder::Append(bool is_valid) {
+  RETURN_NOT_OK(Reserve(1));
+  UnsafeAppendToBitmap(is_valid);
+  return AppendNextOffset();
+}
+
+Status ListBuilder::Resize(int64_t capacity) {
+  DCHECK_LE(capacity, kListMaximumElements);
+  RETURN_NOT_OK(CheckCapacity(capacity, capacity_));
+
+  // one more then requested for offsets
+  RETURN_NOT_OK(offsets_builder_.Resize(capacity + 1));
+  return ArrayBuilder::Resize(capacity);
+}
+
+Status ListBuilder::FinishOffsets(std::shared_ptr<Buffer>* offsets) {
+  RETURN_NOT_OK(AppendNextOffset());
+
+  // Offset padding zeroed by BufferBuilder
+  return offsets_builder_.Finish(&offsets);
+}
+
+Status ListBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
+  std::shared_ptr<Buffer> offsets;
+  RETURN_NOT_OK(FinishOffsets(&offsets));
+
+  std::shared_ptr<ArrayData> items;
+  if (values_) {
+    items = values_->data();
+  } else {
+    if (value_builder_->length() == 0) {
+      // Try to make sure we get a non-null values buffer (ARROW-2744)
+      RETURN_NOT_OK(value_builder_->Resize(0));
+    }
+    RETURN_NOT_OK(value_builder_->FinishInternal(&items));
+  }
+
+  // If the type has not been specified in the constructor, infer it
+  // This is the case if the value_builder contains a DenseUnionBuilder
+  if (!arrow::internal::checked_cast<ListType&>(*type_).value_type()) {
+    type_ = std::static_pointer_cast<DataType>(
+        std::make_shared<ListType>(value_builder_->type()));
+  }
+  std::shared_ptr<Buffer> null_bitmap;
+  RETURN_NOT_OK(null_bitmap_builder_.Finish(&null_bitmap));
+  *out = ArrayData::Make(type_, length_, {null_bitmap, offsets}, null_count_);
+  (*out)->child_data.emplace_back(std::move(items));
+  Reset();
+  return Status::OK();
+}
+
+void ListBuilder::Reset() {
+=======
 void FixedSizeListBuilder::Reset() {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   ArrayBuilder::Reset();
   value_builder_->Reset();
 }
