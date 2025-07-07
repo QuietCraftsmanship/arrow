@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -60,7 +59,7 @@ public class UnionReader extends AbstractFieldReader {
   }
 
   public boolean isSet(){
-    return !data.getAccessor().isNull(idx());
+    return !data.isNull(idx());
   }
 
   public void read(UnionHolder holder) {
@@ -81,8 +80,8 @@ public class UnionReader extends AbstractFieldReader {
     switch (MinorType.values()[typeValue]) {
     case NULL:
       return NullReader.INSTANCE;
-    case MAP:
-      return (FieldReader) getMap();
+    case STRUCT:
+      return (FieldReader) getStruct();
     case LIST:
       return (FieldReader) getList();
     <#list vv.types as type>
@@ -100,15 +99,15 @@ public class UnionReader extends AbstractFieldReader {
     }
   }
 
-  private SingleMapReaderImpl mapReader;
+  private SingleStructReaderImpl structReader;
 
-  private MapReader getMap() {
-    if (mapReader == null) {
-      mapReader = (SingleMapReaderImpl) data.getMap().getReader();
-      mapReader.setPosition(idx());
-      readers[MinorType.MAP.ordinal()] = mapReader;
+  private StructReader getStruct() {
+    if (structReader == null) {
+      structReader = (SingleStructReaderImpl) data.getStruct().getReader();
+      structReader.setPosition(idx());
+      readers[MinorType.STRUCT.ordinal()] = structReader;
     }
-    return mapReader;
+    return structReader;
   }
 
   private UnionListReader listReader;
@@ -124,7 +123,7 @@ public class UnionReader extends AbstractFieldReader {
 
   @Override
   public java.util.Iterator<String> iterator() {
-    return getMap().iterator();
+    return getStruct().iterator();
   }
 
   @Override
@@ -132,9 +131,9 @@ public class UnionReader extends AbstractFieldReader {
     writer.data.copyFrom(idx(), writer.idx(), data);
   }
 
-  <#list ["Object", "Integer", "Long", "Boolean",
-          "Character", "LocalDateTime", "Double", "Float",
-          "Text", "Byte", "Short", "byte[]"] as friendlyType>
+  <#list ["Object", "BigDecimal", "Short", "Integer", "Long", "Boolean",
+          "LocalDateTime", "Duration", "Period", "Double", "Float",
+          "Character", "Text", "Byte", "byte[]"] as friendlyType>
   <#assign safeType=friendlyType />
   <#if safeType=="byte[]"><#assign safeType="ByteArray" /></#if>
 
@@ -198,7 +197,7 @@ public class UnionReader extends AbstractFieldReader {
   }
 
   public FieldReader reader(String name){
-    return getMap().reader(name);
+    return getStruct().reader(name);
   }
 
   public FieldReader reader() {

@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,9 +49,9 @@ abstract class AbstractFieldReader extends AbstractBaseReader implements FieldRe
     return null;
   }
 
-  <#list ["Object", "BigDecimal", "Integer", "Long", "Boolean",
-          "Character", "LocalDateTime", "Period", "Double", "Float",
-          "Text", "String", "Byte", "Short", "byte[]"] as friendlyType>
+  <#list ["Object", "BigDecimal", "Short", "Integer", "Long", "Boolean",
+          "LocalDateTime", "Duration", "Period", "Double", "Float",
+          "Character", "Text", "String", "Byte", "byte[]"] as friendlyType>
   <#assign safeType=friendlyType />
   <#if safeType=="byte[]"><#assign safeType="ByteArray" /></#if>
   public ${friendlyType} read${safeType}(int arrayIndex) {
@@ -66,12 +65,12 @@ abstract class AbstractFieldReader extends AbstractBaseReader implements FieldRe
   }
 
   </#list>
-  public void copyAsValue(MapWriter writer) {
-    fail("CopyAsValue MapWriter");
+  public void copyAsValue(StructWriter writer) {
+    fail("CopyAsValue StructWriter");
   }
 
-  public void copyAsField(String name, MapWriter writer) {
-    fail("CopyAsField MapWriter");
+  public void copyAsField(String name, StructWriter writer) {
+    fail("CopyAsField StructWriter");
   }
 
   public void copyAsField(String name, ListWriter writer) {

@@ -20,12 +20,41 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
+#include "arrow/status.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
 
-class Status;
+namespace internal {
+
+///////////////////////////////////////////////////////////////////////
+// Helper tracking memory statistics
+
+class MemoryPoolStats {
+ public:
+  MemoryPoolStats() : bytes_allocated_(0), max_memory_(0) {}
+
+  int64_t max_memory() const { return max_memory_.load(); }
+
+  int64_t bytes_allocated() const { return bytes_allocated_.load(); }
+
+  inline void UpdateAllocatedBytes(int64_t diff) {
+    auto allocated = bytes_allocated_.fetch_add(diff) + diff;
+    // "maximum" allocated memory is ill-defined in multi-threaded code,
+    // so don't try to be too rigorous here
+    if (diff > 0 && allocated > max_memory_) {
+      max_memory_ = allocated;
+    }
+  }
+
+ protected:
+  std::atomic<int64_t> bytes_allocated_;
+  std::atomic<int64_t> max_memory_;
+};
+
+}  // namespace internal
 
 /// Base class for memory allocation.
 ///
@@ -34,6 +63,9 @@ class Status;
 class ARROW_EXPORT MemoryPool {
  public:
   virtual ~MemoryPool();
+
+  /// \brief EXPERIMENTAL. Create a new instance of the default MemoryPool
+  static std::unique_ptr<MemoryPool> CreateDefault();
 
   /// Allocate a new memory region of at least size bytes.
   ///
@@ -71,7 +103,7 @@ class ARROW_EXPORT MemoryPool {
 class ARROW_EXPORT LoggingMemoryPool : public MemoryPool {
  public:
   explicit LoggingMemoryPool(MemoryPool* pool);
-  virtual ~LoggingMemoryPool() = default;
+  ~LoggingMemoryPool() override = default;
 
   Status Allocate(int64_t size, uint8_t** out) override;
   Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override;
@@ -86,6 +118,30 @@ class ARROW_EXPORT LoggingMemoryPool : public MemoryPool {
   MemoryPool* pool_;
 };
 
+/// Derived class for memory allocation.
+///
+/// Tracks the number of bytes and maximum memory allocated through its direct
+/// calls. Actual allocation is delegated to MemoryPool class.
+class ARROW_EXPORT ProxyMemoryPool : public MemoryPool {
+ public:
+  explicit ProxyMemoryPool(MemoryPool* pool);
+  ~ProxyMemoryPool() override;
+
+  Status Allocate(int64_t size, uint8_t** out) override;
+  Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override;
+
+  void Free(uint8_t* buffer, int64_t size) override;
+
+  int64_t bytes_allocated() const override;
+
+  int64_t max_memory() const override;
+
+ private:
+  class ProxyMemoryPoolImpl;
+  std::unique_ptr<ProxyMemoryPoolImpl> impl_;
+};
+
+/// Return the process-wide default memory pool.
 ARROW_EXPORT MemoryPool* default_memory_pool();
 
 #ifdef ARROW_NO_DEFAULT_MEMORY_POOL

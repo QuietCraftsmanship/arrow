@@ -16,15 +16,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-export LZ4_VERSION="1.7.5"
+NCORES=$(($(grep -c ^processor /proc/cpuinfo) + 1))
+export LZ4_VERSION="1.8.3"
 export PREFIX="/usr"
 export CFLAGS="${CFLAGS} -O3 -fPIC"
 export LDFLAGS="${LDFLAGS} -Wl,-rpath,${PREFIX}/lib -L${PREFIX}/lib"
-wget "https://github.com/lz4/lz4/archive/v${LZ4_VERSION}.tar.gz" -O lz4-${LZ4_VERSION}.tar.gz
+curl -sL "https://github.com/lz4/lz4/archive/v${LZ4_VERSION}.tar.gz" -o lz4-${LZ4_VERSION}.tar.gz
 tar xf lz4-${LZ4_VERSION}.tar.gz
 pushd lz4-${LZ4_VERSION}
 
-make -j5 PREFIX=${PREFIX}
-make install PREFIX=$PREFIX
+make -j$NCORES PREFIX=${PREFIX}
+make install PREFIX=${PREFIX}
 popd
 rm -rf lz4-${LZ4_VERSION}.tar.gz lz4-${LZ4_VERSION}
+# We don't want to link against shared libs
+rm -rf /usr/lib/liblz4.so*

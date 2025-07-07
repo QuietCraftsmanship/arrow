@@ -19,81 +19,71 @@
 set -ex
 
 # Set up environment and output directory for C++ libraries
-cd /apache-arrow
-rm -rf dist
-mkdir dist
-export ARROW_BUILD_TYPE=release
-export ARROW_HOME=$(pwd)/dist
-export PARQUET_HOME=$(pwd)/dist
-CONDA_BASE=/home/ubuntu/miniconda
-export LD_LIBRARY_PATH=$(pwd)/dist/lib:${CONDA_BASE}/lib:${LD_LIBRARY_PATH}
-export PATH=${CONDA_BASE}/bin:${PATH}
 
-# Prepare the asf-site before copying api docs
-pushd arrow/site
-rm -rf asf-site
-export GIT_COMMITTER_NAME="Nobody"
-export GIT_COMMITTER_EMAIL="nobody@nowhere.com"
-git clone --branch=asf-site \
-    https://git-wip-us.apache.org/repos/asf/arrow-site.git asf-site
+mkdir -p apidocs-dist
+export ARROW_BUILD_TYPE=release
+export ARROW_HOME=/apidocs-dist
+export PARQUET_HOME=/apidocs-dist
+export PKG_CONFIG_PATH=/apidocs-dist/lib/pkgconfig:${PKG_CONFIG_PATH}
+# For newer GCC per https://arrow.apache.org/docs/python/development.html#known-issues
+export CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=0"
+
+# Make Java documentation
+# Override user.home to cache dependencies outside the Docker container
+pushd arrow/java
+mvn -Duser.home=`pwd`/.apidocs-m2 -Drat.skip=true -Dcheckstyle.skip=true install site
+mkdir -p ../site/asf-site/docs/java/
+rsync -r target/site/apidocs/ ../site/asf-site/docs/java/
+popd
+
+# Make Javascript documentation
+pushd arrow/js
+npm install
+npm run doc
+rsync -r doc/ ../site/asf-site/docs/js
 popd
 
 # Make Python documentation (Depends on C++ )
 # Build Arrow C++
-source activate pyarrow-dev
+export LD_LIBRARY_PATH=/apidocs-dist/lib:${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}
+export PKG_CONFIG_PATH=${CONDA_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}
+export PKG_CONFIG_PATH=/apidocs-dist/lib/pkgconfig:${PKG_CONFIG_PATH}
 
-export ARROW_BUILD_TOOLCHAIN=$CONDA_PREFIX
-export PARQUET_BUILD_TOOLCHAIN=$CONDA_PREFIX
+CPP_BUILD_DIR=arrow/cpp/build_apidocs
 
-rm -rf arrow/cpp/build
-mkdir arrow/cpp/build
-pushd arrow/cpp/build
+mkdir -p $CPP_BUILD_DIR
+pushd $CPP_BUILD_DIR
 cmake -DCMAKE_BUILD_TYPE=$ARROW_BUILD_TYPE \
       -DCMAKE_INSTALL_PREFIX=$ARROW_HOME \
-      -DARROW_PYTHON=on \
-      -DARROW_PLASMA=on \
+      -DARROW_PYTHON=ON \
+      -DARROW_PLASMA=ON \
+      -DARROW_PARQUET=ON \
+      -DARROW_ORC=ON \
       -DARROW_BUILD_TESTS=OFF \
+      -GNinja \
       ..
-make -j4
-make install
-popd
-
-# Build Parquet C++
-rm -rf parquet-cpp/build
-mkdir parquet-cpp/build
-pushd parquet-cpp/build
-cmake -DCMAKE_BUILD_TYPE=$ARROW_BUILD_TYPE \
-      -DCMAKE_INSTALL_PREFIX=$PARQUET_HOME \
-      -DPARQUET_BUILD_BENCHMARKS=off \
-      -DPARQUET_BUILD_EXECUTABLES=off \
-      -DPARQUET_BUILD_TESTS=off \
-      ..
-make -j4
-make install
-popd
-
-# Now Python documentation can be built
-pushd arrow/python
-rm -rf build/*
-rm -rf doc/_build
-python setup.py build_ext --build-type=$ARROW_BUILD_TYPE \
-    --with-plasma --with-parquet --inplace
-python setup.py build_sphinx -s doc/source
-mkdir -p ../site/asf-site/docs/python
-rsync -r doc/_build/html/ ../site/asf-site/docs/python
+ninja
+ninja install
 popd
 
 # Build c_glib documentation
 pushd arrow/c_glib
-rm -rf doc/reference/html/*
+if [ -f Makefile ]; then
+    # Ensure updating to prevent auto re-configure
+    touch configure **/Makefile
+    make distclean
+fi
 ./autogen.sh
-./configure \
-    --with-arrow-cpp-build-dir=$(pwd)/../cpp/build \
-    --with-arrow-cpp-build-type=$ARROW_BUILD_TYPE \
+mkdir -p build_apidocs
+pushd build_apidocs
+../configure \
+    --prefix=${ARROW_HOME} \
     --enable-gtk-doc
-LD_LIBRARY_PATH=$(pwd)/../cpp/build/$ARROW_BUILD_TYPE make GTK_DOC_V_XREF=": "
-mkdir -p ../site/asf-site/docs/c_glib
-rsync -r doc/reference/html/ ../site/asf-site/docs/c_glib
+make -j4 GTK_DOC_V_XREF=": "
+mkdir -p ../../site/asf-site/docs/c_glib
+rsync -r doc/arrow-glib/html/ ../../site/asf-site/docs/c_glib/arrow-glib
+rsync -r doc/parquet-glib/html/ ../../site/asf-site/docs/c_glib/parquet-glib
+popd
 popd
 
 # Make C++ documentation
@@ -102,13 +92,4 @@ rm -rf html/*
 doxygen Doxyfile
 mkdir -p ../../site/asf-site/docs/cpp
 rsync -r html/ ../../site/asf-site/docs/cpp
-popd
-
-# Make Java documentation
-pushd arrow/java
-rm -rf target/site/apidocs/*
-mvn -Drat.skip=true install
-mvn -Drat.skip=true site
-mkdir -p ../site/asf-site/docs/java/
-rsync -r target/site/apidocs/ ../site/asf-site/docs/java/
 popd

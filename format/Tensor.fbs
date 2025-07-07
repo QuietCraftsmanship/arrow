@@ -23,6 +23,9 @@ include "Schema.fbs";
 
 namespace org.apache.arrow.flatbuf;
 
+/// ----------------------------------------------------------------------
+/// Data structures for dense tensors
+
 /// Shape data for a single axis in a tensor
 table TensorDim {
   /// Length of dimension

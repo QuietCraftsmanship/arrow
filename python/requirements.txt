@@ -1,4 +1,4 @@
-pytest
-cloudpickle>=0.4.0
-numpy>=1.10.0
-six
+six>=1.0.0
+numpy>=1.14
+futures; python_version < "3.2"
+enum34 >= 1.1.6; python_version < "3.4"

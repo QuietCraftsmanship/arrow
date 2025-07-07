@@ -29,27 +29,53 @@ class TestBooleanArray < Test::Unit::TestCase
 
   def test_buffer
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
-    builder.append(false)
-    builder.append(true)
+    builder.append_value(true)
+    builder.append_value(false)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([0b101].pack("C*"), array.buffer.data.to_s)
   end
 
   def test_value
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal(true, array.get_value(0))
   end
 
   def test_values
-    require_gi_bindings(3, 1, 9)
+    require_gi_bindings(3, 3, 1)
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
-    builder.append(false)
-    builder.append(true)
+    builder.append_value(true)
+    builder.append_value(false)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([true, false, true], array.values)
+  end
+
+  def test_invert
+    assert_equal(build_boolean_array([true, nil, false]),
+                 build_boolean_array([false, nil, true]).invert)
+  end
+
+  def test_and
+    left = build_boolean_array([true, false, nil, true])
+    right = build_boolean_array([true, nil, true, false])
+    assert_equal(build_boolean_array([true, nil, nil, false]),
+                 left.and(right))
+  end
+
+  def test_or
+    left = build_boolean_array([true, false, nil, false])
+    right = build_boolean_array([false, nil, true, false])
+    assert_equal(build_boolean_array([true, nil, nil, false]),
+                 left.or(right))
+  end
+
+  def test_xor
+    left = build_boolean_array([true, false, nil, true])
+    right = build_boolean_array([false, nil, true, true])
+    assert_equal(build_boolean_array([true, nil, nil, false]),
+                 left.xor(right))
   end
 end

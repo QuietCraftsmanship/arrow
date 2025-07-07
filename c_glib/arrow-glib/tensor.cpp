@@ -40,17 +40,34 @@ G_BEGIN_DECLS
 
 typedef struct GArrowTensorPrivate_ {
   std::shared_ptr<arrow::Tensor> tensor;
+  GArrowBuffer *buffer;
 } GArrowTensorPrivate;
 
 enum {
   PROP_0,
-  PROP_TENSOR
+  PROP_TENSOR,
+  PROP_BUFFER
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE(GArrowTensor, garrow_tensor, G_TYPE_OBJECT)
 
-#define GARROW_TENSOR_GET_PRIVATE(obj)                                   \
-  (G_TYPE_INSTANCE_GET_PRIVATE((obj), GARROW_TYPE_TENSOR, GArrowTensorPrivate))
+#define GARROW_TENSOR_GET_PRIVATE(obj)         \
+  static_cast<GArrowTensorPrivate *>(          \
+     garrow_tensor_get_instance_private(       \
+       GARROW_TENSOR(obj)))
+
+static void
+garrow_tensor_dispose(GObject *object)
+{
+  auto priv = GARROW_TENSOR_GET_PRIVATE(object);
+
+  if (priv->buffer) {
+    g_object_unref(priv->buffer);
+    priv->buffer = nullptr;
+  }
+
+  G_OBJECT_CLASS(garrow_tensor_parent_class)->dispose(object);
+}
 
 static void
 garrow_tensor_finalize(GObject *object)
@@ -64,9 +81,9 @@ garrow_tensor_finalize(GObject *object)
 
 static void
 garrow_tensor_set_property(GObject *object,
-                          guint prop_id,
-                          const GValue *value,
-                          GParamSpec *pspec)
+                           guint prop_id,
+                           const GValue *value,
+                           GParamSpec *pspec)
 {
   auto priv = GARROW_TENSOR_GET_PRIVATE(object);
 
@@ -74,6 +91,9 @@ garrow_tensor_set_property(GObject *object,
   case PROP_TENSOR:
     priv->tensor =
       *static_cast<std::shared_ptr<arrow::Tensor> *>(g_value_get_pointer(value));
+    break;
+  case PROP_BUFFER:
+    priv->buffer = GARROW_BUFFER(g_value_dup_object(value));
     break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -83,11 +103,16 @@ garrow_tensor_set_property(GObject *object,
 
 static void
 garrow_tensor_get_property(GObject *object,
-                          guint prop_id,
-                          GValue *value,
-                          GParamSpec *pspec)
+                           guint prop_id,
+                           GValue *value,
+                           GParamSpec *pspec)
 {
+  auto priv = GARROW_TENSOR_GET_PRIVATE(object);
+
   switch (prop_id) {
+  case PROP_BUFFER:
+    g_value_set_object(value, priv->buffer);
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     break;
@@ -106,6 +131,7 @@ garrow_tensor_class_init(GArrowTensorClass *klass)
 
   auto gobject_class = G_OBJECT_CLASS(klass);
 
+  gobject_class->dispose      = garrow_tensor_dispose;
   gobject_class->finalize     = garrow_tensor_finalize;
   gobject_class->set_property = garrow_tensor_set_property;
   gobject_class->get_property = garrow_tensor_get_property;
@@ -116,6 +142,14 @@ garrow_tensor_class_init(GArrowTensorClass *klass)
                               static_cast<GParamFlags>(G_PARAM_WRITABLE |
                                                        G_PARAM_CONSTRUCT_ONLY));
   g_object_class_install_property(gobject_class, PROP_TENSOR, spec);
+
+  spec = g_param_spec_object("buffer",
+                             "Buffer",
+                             "The data",
+                             GARROW_TYPE_BUFFER,
+                             static_cast<GParamFlags>(G_PARAM_READWRITE |
+                                                      G_PARAM_CONSTRUCT_ONLY));
+  g_object_class_install_property(gobject_class, PROP_BUFFER, spec);
 }
 
 /**
@@ -166,7 +200,7 @@ garrow_tensor_new(GArrowDataType *data_type,
                                     arrow_shape,
                                     arrow_strides,
                                     arrow_dimension_names);
-  auto tensor = garrow_tensor_new_raw(&arrow_tensor);
+  auto tensor = garrow_tensor_new_raw_buffer(&arrow_tensor, data);
   return tensor;
 }
 
@@ -231,6 +265,12 @@ garrow_tensor_get_value_type(GArrowTensor *tensor)
 GArrowBuffer *
 garrow_tensor_get_buffer(GArrowTensor *tensor)
 {
+  auto priv = GARROW_TENSOR_GET_PRIVATE(tensor);
+  if (priv->buffer) {
+    g_object_ref(priv->buffer);
+    return priv->buffer;
+  }
+
   auto arrow_tensor = garrow_tensor_get_raw(tensor);
   auto arrow_buffer = arrow_tensor->data();
   return garrow_buffer_new_raw(&arrow_buffer);
@@ -241,7 +281,9 @@ garrow_tensor_get_buffer(GArrowTensor *tensor)
  * @tensor: A #GArrowTensor.
  * @n_dimensions: (out): The number of dimensions.
  *
- * Returns: (array length=n_dimensions): The shape of the tensor.
+ * Returns: (array length=n_dimensions) (transfer full):
+ *   The shape of the tensor.
+ *
  *   It should be freed with g_free() when no longer needed.
  *
  * Since: 0.3.0
@@ -266,7 +308,9 @@ garrow_tensor_get_shape(GArrowTensor *tensor, gint *n_dimensions)
  * @tensor: A #GArrowTensor.
  * @n_strides: (out): The number of strides.
  *
- * Returns: (array length=n_strides): The strides of the tensor.
+ * Returns: (array length=n_strides) (transfer full):
+ *   The strides of the tensor.
+ *
  *   It should be freed with g_free() when no longer needed.
  *
  * Since: 0.3.0
@@ -400,8 +444,16 @@ G_END_DECLS
 GArrowTensor *
 garrow_tensor_new_raw(std::shared_ptr<arrow::Tensor> *arrow_tensor)
 {
+  return garrow_tensor_new_raw_buffer(arrow_tensor, nullptr);
+}
+
+GArrowTensor *
+garrow_tensor_new_raw_buffer(std::shared_ptr<arrow::Tensor> *arrow_tensor,
+                             GArrowBuffer *buffer)
+{
   auto tensor = GARROW_TENSOR(g_object_new(GARROW_TYPE_TENSOR,
                                            "tensor", arrow_tensor,
+                                           "buffer", buffer,
                                            NULL));
   return tensor;
 }

@@ -30,6 +30,7 @@
 #include "arrow/util/macros.h"
 
 namespace arrow {
+namespace BitUtil {
 
 /// Utility class to write bit/byte streams.  This class can write data to either be
 /// bit packed or byte aligned (and a single stream that has a mix of both).
@@ -51,7 +52,7 @@ class BitWriter {
   /// The number of current bytes written, including the current byte (i.e. may include a
   /// fraction of a byte). Includes buffered values.
   int bytes_written() const {
-    return byte_offset_ + static_cast<int>(BitUtil::Ceil(bit_offset_, 8));
+    return byte_offset_ + static_cast<int>(BitUtil::BytesForBits(bit_offset_));
   }
   uint8_t* buffer() const { return buffer_; }
   int buffer_len() const { return max_bytes_; }
@@ -109,7 +110,12 @@ class BitReader {
     memcpy(&buffered_values_, buffer_ + byte_offset_, num_bytes);
   }
 
-  BitReader() : buffer_(NULL), max_bytes_(0) {}
+  BitReader()
+      : buffer_(NULL),
+        max_bytes_(0),
+        buffered_values_(0),
+        byte_offset_(0),
+        bit_offset_(0) {}
 
   void Reset(const uint8_t* buffer, int buffer_len) {
     buffer_ = buffer;
@@ -148,7 +154,8 @@ class BitReader {
   /// Returns the number of bytes left in the stream, not including the current
   /// byte (i.e., there may be an additional fraction of a byte).
   int bytes_left() {
-    return max_bytes_ - (byte_offset_ + static_cast<int>(BitUtil::Ceil(bit_offset_, 8)));
+    return max_bytes_ -
+           (byte_offset_ + static_cast<int>(BitUtil::BytesForBits(bit_offset_)));
   }
 
   /// Maximum byte length of a vlq encoded int
@@ -190,7 +197,7 @@ inline bool BitWriter::PutValue(uint64_t v, int num_bits) {
 }
 
 inline void BitWriter::Flush(bool align) {
-  int num_bytes = static_cast<int>(BitUtil::Ceil(bit_offset_, 8));
+  int num_bytes = static_cast<int>(BitUtil::BytesForBits(bit_offset_));
   DCHECK_LE(byte_offset_ + num_bytes, max_bytes_);
   memcpy(buffer_ + byte_offset_, &buffered_values_, num_bytes);
 
@@ -355,7 +362,7 @@ inline int BitReader::GetBatch(int num_bits, T* v, int batch_size) {
 template <typename T>
 inline bool BitReader::GetAligned(int num_bytes, T* v) {
   DCHECK_LE(num_bytes, static_cast<int>(sizeof(T)));
-  int bytes_read = static_cast<int>(BitUtil::Ceil(bit_offset_, 8));
+  int bytes_read = static_cast<int>(BitUtil::BytesForBits(bit_offset_));
   if (ARROW_PREDICT_FALSE(byte_offset_ + bytes_read + num_bytes > max_bytes_))
     return false;
 
@@ -390,7 +397,8 @@ inline bool BitReader::GetVlqInt(int32_t* v) {
 }
 
 inline bool BitWriter::PutZigZagVlqInt(int32_t v) {
-  uint32_t u = (v << 1) ^ (v >> 31);
+  // Note negative left shift is undefined
+  uint32_t u = (static_cast<uint32_t>(v) << 1) ^ (v >> 31);
   return PutVlqInt(u);
 }
 
@@ -402,6 +410,7 @@ inline bool BitReader::GetZigZagVlqInt(int32_t* v) {
   return true;
 }
 
+}  // namespace BitUtil
 }  // namespace arrow
 
 #endif  // ARROW_UTIL_BIT_STREAM_UTILS_H

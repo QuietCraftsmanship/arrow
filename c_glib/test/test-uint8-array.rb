@@ -28,26 +28,31 @@ class TestUInt8Array < Test::Unit::TestCase
 
   def test_buffer
     builder = Arrow::UInt8ArrayBuilder.new
-    builder.append(1)
-    builder.append(2)
-    builder.append(4)
+    builder.append_value(1)
+    builder.append_value(2)
+    builder.append_value(4)
     array = builder.finish
     assert_equal([1, 2, 4].pack("C*"), array.buffer.data.to_s)
   end
 
   def test_value
     builder = Arrow::UInt8ArrayBuilder.new
-    builder.append(1)
+    builder.append_value(1)
     array = builder.finish
     assert_equal(1, array.get_value(0))
   end
 
   def test_values
     builder = Arrow::UInt8ArrayBuilder.new
-    builder.append(1)
-    builder.append(2)
-    builder.append(4)
+    builder.append_value(1)
+    builder.append_value(2)
+    builder.append_value(4)
     array = builder.finish
     assert_equal([1, 2, 4], array.values)
+  end
+
+  def test_sum
+    array = build_uint8_array([2, 4, nil])
+    assert_equal(6, array.sum)
   end
 end

@@ -21,10 +21,14 @@
 #  include <config.h>
 #endif
 
+#include <arrow-glib/array.hpp>
 #include <arrow-glib/column.hpp>
 #include <arrow-glib/error.hpp>
+#include <arrow-glib/record-batch.hpp>
 #include <arrow-glib/schema.hpp>
 #include <arrow-glib/table.hpp>
+
+#include <sstream>
 
 G_BEGIN_DECLS
 
@@ -49,10 +53,10 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowTable,
                            garrow_table,
                            G_TYPE_OBJECT)
 
-#define GARROW_TABLE_GET_PRIVATE(obj)               \
-  (G_TYPE_INSTANCE_GET_PRIVATE((obj),               \
-                               GARROW_TYPE_TABLE,   \
-                               GArrowTablePrivate))
+#define GARROW_TABLE_GET_PRIVATE(obj)         \
+  static_cast<GArrowTablePrivate *>(          \
+     garrow_table_get_instance_private(       \
+       GARROW_TABLE(obj)))
 
 static void
 garrow_table_dispose(GObject *object)
@@ -131,21 +135,216 @@ garrow_table_class_init(GArrowTableClass *klass)
  * @columns: (element-type GArrowColumn): The columns of the table.
  *
  * Returns: A newly created #GArrowTable.
+ *
+ * Deprecated: 0.12.0: Use garrow_table_new_values() instead.
  */
 GArrowTable *
 garrow_table_new(GArrowSchema *schema,
                  GList *columns)
 {
+  auto arrow_schema = garrow_schema_get_raw(schema);
   std::vector<std::shared_ptr<arrow::Column>> arrow_columns;
   for (GList *node = columns; node; node = node->next) {
-    GArrowColumn *column = GARROW_COLUMN(node->data);
+    auto column = GARROW_COLUMN(node->data);
     arrow_columns.push_back(garrow_column_get_raw(column));
   }
 
-  auto arrow_table =
-    std::make_shared<arrow::Table>(garrow_schema_get_raw(schema),
-                                   arrow_columns);
+  auto arrow_table = arrow::Table::Make(arrow_schema, arrow_columns);
   return garrow_table_new_raw(&arrow_table);
+}
+
+/**
+ * garrow_table_new_values: (skip)
+ * @schema: The schema of the table.
+ * @values: The values of the table. All values must be instance of the
+ *   same class. Available classes are #GArrowColumn, #GArrowArray and
+ *   #GArrowRecordBatch.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowTable or %NULL on error.
+ *
+ * Since: 0.12.0
+ */
+GArrowTable *
+garrow_table_new_values(GArrowSchema *schema,
+                        GList *values,
+                        GError **error)
+{
+  const auto context = "[table][new][values]";
+  auto arrow_schema = garrow_schema_get_raw(schema);
+  std::vector<std::shared_ptr<arrow::Column>> arrow_columns;
+  std::vector<std::shared_ptr<arrow::Array>> arrow_arrays;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> arrow_record_batches;
+  for (GList *node = values; node; node = node->next) {
+    if (GARROW_IS_COLUMN(node->data)) {
+      auto column = GARROW_COLUMN(node->data);
+      arrow_columns.push_back(garrow_column_get_raw(column));
+    } else if (GARROW_IS_ARRAY(node->data)) {
+      auto array = GARROW_ARRAY(node->data);
+      arrow_arrays.push_back(garrow_array_get_raw(array));
+    } else if (GARROW_IS_RECORD_BATCH(node->data)) {
+      auto record_batch = GARROW_RECORD_BATCH(node->data);
+      arrow_record_batches.push_back(garrow_record_batch_get_raw(record_batch));
+    } else {
+      g_set_error(error,
+                  GARROW_ERROR,
+                  GARROW_ERROR_INVALID,
+                  "%s: %s",
+                  context,
+                  "value must be one of "
+                  "GArrowColumn, GArrowArray and GArrowRecordBatch");
+      return NULL;
+    }
+  }
+
+  size_t n_types = 0;
+  if (!arrow_columns.empty()) {
+    ++n_types;
+  }
+  if (!arrow_arrays.empty()) {
+    ++n_types;
+  }
+  if (!arrow_record_batches.empty()) {
+    ++n_types;
+  }
+  if (n_types > 1) {
+    g_set_error(error,
+                GARROW_ERROR,
+                GARROW_ERROR_INVALID,
+                "%s: %s",
+                context,
+                "all values must be the same objects of "
+                "GArrowColumn, GArrowArray or GArrowRecordBatch");
+    return NULL;
+  }
+
+  if (!arrow_columns.empty()) {
+    auto arrow_table = arrow::Table::Make(arrow_schema, arrow_columns);
+    auto status = arrow_table->Validate();
+    if (garrow_error_check(error, status, context)) {
+      return garrow_table_new_raw(&arrow_table);
+    } else {
+      return NULL;
+    }
+  } else if (!arrow_arrays.empty()) {
+    auto arrow_table = arrow::Table::Make(arrow_schema, arrow_arrays);
+    auto status = arrow_table->Validate();
+    if (garrow_error_check(error, status, context)) {
+      return garrow_table_new_raw(&arrow_table);
+    } else {
+      return NULL;
+    }
+  } else {
+    std::shared_ptr<arrow::Table> arrow_table;
+    auto status = arrow::Table::FromRecordBatches(arrow_schema,
+                                                  arrow_record_batches,
+                                                  &arrow_table);
+    if (garrow_error_check(error, status, context)) {
+      return garrow_table_new_raw(&arrow_table);
+    } else {
+      return NULL;
+    }
+  }
+}
+
+/**
+ * garrow_table_new_columns:
+ * @schema: The schema of the table.
+ * @columns: (array length=n_columns): The columns of the table.
+ * @n_columns: The number of columns.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowTable or %NULL on error.
+ *
+ * Since: 0.12.0
+ */
+GArrowTable *
+garrow_table_new_columns(GArrowSchema *schema,
+                         GArrowColumn **columns,
+                         gsize n_columns,
+                         GError **error)
+{
+  auto arrow_schema = garrow_schema_get_raw(schema);
+  std::vector<std::shared_ptr<arrow::Column>> arrow_columns;
+  for (gsize i = 0; i < n_columns; ++i) {
+    arrow_columns.push_back(garrow_column_get_raw(columns[i]));
+  }
+
+  auto arrow_table = arrow::Table::Make(arrow_schema, arrow_columns);
+  auto status = arrow_table->Validate();
+  if (garrow_error_check(error, status, "[table][new][columns]")) {
+    return garrow_table_new_raw(&arrow_table);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_table_new_arrays:
+ * @schema: The schema of the table.
+ * @arrays: (array length=n_arrays): The arrays of the table.
+ * @n_arrays: The number of arrays.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowTable or %NULL on error.
+ *
+ * Since: 0.12.0
+ */
+GArrowTable *
+garrow_table_new_arrays(GArrowSchema *schema,
+                        GArrowArray **arrays,
+                        gsize n_arrays,
+                        GError **error)
+{
+  auto arrow_schema = garrow_schema_get_raw(schema);
+  std::vector<std::shared_ptr<arrow::Array>> arrow_arrays;
+  for (gsize i = 0; i < n_arrays; ++i) {
+    arrow_arrays.push_back(garrow_array_get_raw(arrays[i]));
+  }
+
+  auto arrow_table = arrow::Table::Make(arrow_schema, arrow_arrays);
+  auto status = arrow_table->Validate();
+  if (garrow_error_check(error, status, "[table][new][arrays]")) {
+    return garrow_table_new_raw(&arrow_table);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_table_new_record_batches:
+ * @schema: The schema of the table.
+ * @record_batches: (array length=n_record_batches): The record batches
+ *   that have data for the table.
+ * @n_record_batches: The number of record batches.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowTable or %NULL on error.
+ *
+ * Since: 0.12.0
+ */
+GArrowTable *
+garrow_table_new_record_batches(GArrowSchema *schema,
+                                GArrowRecordBatch **record_batches,
+                                gsize n_record_batches,
+                                GError **error)
+{
+  auto arrow_schema = garrow_schema_get_raw(schema);
+  std::vector<std::shared_ptr<arrow::RecordBatch>> arrow_record_batches;
+  for (gsize i = 0; i < n_record_batches; ++i) {
+    auto arrow_record_batch = garrow_record_batch_get_raw(record_batches[i]);
+    arrow_record_batches.push_back(arrow_record_batch);
+  }
+
+  std::shared_ptr<arrow::Table> arrow_table;
+  auto status = arrow::Table::FromRecordBatches(arrow_schema,
+                                                arrow_record_batches,
+                                                &arrow_table);
+  if (garrow_error_check(error, status, "[table][new][record-batches]")) {
+    return garrow_table_new_raw(&arrow_table);
+  } else {
+    return NULL;
+  }
 }
 
 /**
@@ -275,6 +474,119 @@ garrow_table_remove_column(GArrowTable *table,
   } else {
     return NULL;
   }
+}
+
+/**
+ * garrow_table_replace_column:
+ * @table: A #GArrowTable.
+ * @i: The index of the column to be replaced.
+ * @column: The newly added #GArrowColumn.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The newly allocated
+ * #GArrowTable that has @column as the @i-th column or %NULL on
+ * error.
+ *
+ * Since: 0.10.0
+ */
+GArrowTable *
+garrow_table_replace_column(GArrowTable *table,
+                            guint i,
+                            GArrowColumn *column,
+                            GError **error)
+{
+  const auto arrow_table = garrow_table_get_raw(table);
+  const auto arrow_column = garrow_column_get_raw(column);
+  std::shared_ptr<arrow::Table> arrow_new_table;
+  auto status = arrow_table->SetColumn(i, arrow_column, &arrow_new_table);
+  if (garrow_error_check(error, status, "[table][replace-column]")) {
+    return garrow_table_new_raw(&arrow_new_table);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_table_to_string:
+ * @table: A #GArrowTable.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full):
+ *   The formatted table content or %NULL on error.
+ *
+ *   The returned string should be freed when with g_free() when no
+ *   longer needed.
+ *
+ * Since: 0.12.0
+ */
+gchar *
+garrow_table_to_string(GArrowTable *table, GError **error)
+{
+  const auto arrow_table = garrow_table_get_raw(table);
+  std::stringstream sink;
+  auto status = arrow::PrettyPrint(*arrow_table, 0, &sink);
+  if (garrow_error_check(error, status, "[table][to-string]")) {
+    return g_strdup(sink.str().c_str());
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_table_concatenate:
+ * @table: A #GArrowTable.
+ * @other_tables: (element-type GArrowTable): The tables to be concatenated.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable) (transfer full): The table concatenated vertically.
+ *
+ * Since: 0.14.0
+ */
+GArrowTable *
+garrow_table_concatenate(GArrowTable *table,
+                         GList *other_tables,
+                         GError **error)
+{
+  auto arrow_table = garrow_table_get_raw(table);
+  std::vector<std::shared_ptr<arrow::Table>> arrow_tables = { arrow_table };
+  for (auto node = other_tables; node; node = g_list_next(node)) {
+    auto arrow_other_table = garrow_table_get_raw(GARROW_TABLE(node->data));
+    arrow_tables.push_back(arrow_other_table);
+  }
+  std::shared_ptr<arrow::Table> arrow_concatenated_table;
+  auto status = arrow::ConcatenateTables(arrow_tables, &arrow_concatenated_table);
+  if (garrow_error_check(error, status, "[table][concatenate]")) {
+    return garrow_table_new_raw(&arrow_concatenated_table);
+  } else {
+    return NULL;
+  }
+}
+
+/**
+ * garrow_table_slice:
+ * @table: A #GArrowTable.
+ * @offset: The offset of sub #GArrowTable. If the offset is negative,
+ *   the offset is counted from the last.
+ * @length: The length of sub #GArrowTable.
+ *
+ * Returns: (transfer full): The sub #GArrowTable. It covers
+ *   only from `offset` to `offset + length` range. The sub
+ *   #GArrowTable shares values with the base
+ *   #GArrowTable.
+ *
+ * Since: 0.14.0
+ */
+GArrowTable *
+garrow_table_slice(GArrowTable *table,
+                   gint64 offset,
+                   gint64 length)
+{
+  const auto arrow_table = garrow_table_get_raw(table);
+  if (offset < 0) {
+    offset += arrow_table->num_rows();
+  }
+  auto arrow_sub_table = arrow_table->Slice(offset, length);
+  return garrow_table_new_raw(&arrow_sub_table);
 }
 
 G_END_DECLS

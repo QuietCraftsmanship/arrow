@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,9 +17,8 @@
 
 package org.apache.arrow.vector.complex;
 
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.UInt4Vector;
-
-import com.google.common.base.Preconditions;
 
 /**
  * A helper class that is used to track and populate empty values in repeated value vectors.
@@ -42,14 +40,12 @@ public class EmptyValuePopulator {
     if (lastIndex < 0) {
       throw new IndexOutOfBoundsException("index cannot be negative");
     }
-    final UInt4Vector.Accessor accessor = offsets.getAccessor();
-    final UInt4Vector.Mutator mutator = offsets.getMutator();
-    final int lastSet = Math.max(accessor.getValueCount() - 1, 0);
-    final int previousEnd = accessor.get(lastSet);//0 ? 0 : accessor.get(lastSet);
+    final int lastSet = Math.max(offsets.getValueCount() - 1, 0);
+    final int previousEnd = offsets.get(lastSet);//0 ? 0 : accessor.get(lastSet);
     for (int i = lastSet; i < lastIndex; i++) {
-      mutator.setSafe(i + 1, previousEnd);
+      offsets.setSafe(i + 1, previousEnd);
     }
-    mutator.setValueCount(lastIndex + 1);
+    offsets.setValueCount(lastIndex + 1);
   }
 
 }

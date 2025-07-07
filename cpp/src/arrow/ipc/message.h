@@ -34,6 +34,7 @@ class Buffer;
 
 namespace io {
 
+class FileInterface;
 class InputStream;
 class OutputStream;
 class RandomAccessFile;
@@ -69,7 +70,7 @@ constexpr int kMaxNestingDepth = 64;
 /// \brief An IPC message including metadata and body
 class ARROW_EXPORT Message {
  public:
-  enum Type { NONE, SCHEMA, DICTIONARY_BATCH, RECORD_BATCH, TENSOR };
+  enum Type { NONE, SCHEMA, DICTIONARY_BATCH, RECORD_BATCH, TENSOR, SPARSE_TENSOR };
 
   /// \brief Construct message, but do not validate
   ///
@@ -97,6 +98,18 @@ class ARROW_EXPORT Message {
   static Status ReadFrom(const std::shared_ptr<Buffer>& metadata, io::InputStream* stream,
                          std::unique_ptr<Message>* out);
 
+  /// \brief Read message body from position in file, and create Message given
+  /// the Flatbuffer metadata
+  /// \param[in] offset the position in the file where the message body starts.
+  /// \param[in] metadata containing a serialized Message flatbuffer
+  /// \param[in] file the seekable file interface to read from
+  /// \param[out] out the created Message
+  /// \return Status
+  ///
+  /// \note If file supports zero-copy, this is zero-copy
+  static Status ReadFrom(const int64_t offset, const std::shared_ptr<Buffer>& metadata,
+                         io::RandomAccessFile* file, std::unique_ptr<Message>* out);
+
   /// \brief Return true if message type and contents are equal
   ///
   /// \param other another message
@@ -113,6 +126,10 @@ class ARROW_EXPORT Message {
   /// \return buffer is null if no body
   std::shared_ptr<Buffer> body() const;
 
+  /// \brief The expected body length according to the metadata, for
+  /// verification purposes
+  int64_t body_length() const;
+
   /// \brief The Message type
   Type type() const;
 
@@ -124,9 +141,20 @@ class ARROW_EXPORT Message {
   /// \brief Write length-prefixed metadata and body to output stream
   ///
   /// \param[in] file output stream to write to
+  /// \param[in] alignment byte alignment for metadata, usually 8 or
+  /// 64. Whether the body is padded depends on the metadata; if the body
+  /// buffer is smaller than the size indicated in the metadata, then extra
+  /// padding bytes will be written
   /// \param[out] output_length the number of bytes written
   /// \return Status
-  Status SerializeTo(io::OutputStream* file, int64_t* output_length) const;
+  Status SerializeTo(io::OutputStream* file, int32_t alignment,
+                     int64_t* output_length) const;
+
+  /// \brief Return true if the Message metadata passes Flatbuffer validation
+  bool Verify() const;
+
+  /// \brief Whether a given message type needs a body.
+  static bool HasBody(Type type) { return type != NONE && type != SCHEMA; }
 
  private:
   // Hide serialization details from user API
@@ -144,6 +172,13 @@ class ARROW_EXPORT MessageReader {
  public:
   virtual ~MessageReader() = default;
 
+  /// \brief Create MessageReader that reads from InputStream
+  static std::unique_ptr<MessageReader> Open(io::InputStream* stream);
+
+  /// \brief Create MessageReader that reads from owned InputStream
+  static std::unique_ptr<MessageReader> Open(
+      const std::shared_ptr<io::InputStream>& owned_stream);
+
   /// \brief Read next Message from the interface
   ///
   /// \param[out] message an arrow::ipc::Message instance
@@ -151,27 +186,7 @@ class ARROW_EXPORT MessageReader {
   virtual Status ReadNextMessage(std::unique_ptr<Message>* message) = 0;
 };
 
-/// \brief Implementation of MessageReader that reads from InputStream
-/// \since 0.5.0
-class ARROW_EXPORT InputStreamMessageReader : public MessageReader {
- public:
-  explicit InputStreamMessageReader(io::InputStream* stream) : stream_(stream) {}
-
-  explicit InputStreamMessageReader(const std::shared_ptr<io::InputStream>& owned_stream)
-      : InputStreamMessageReader(owned_stream.get()) {
-    owned_stream_ = owned_stream;
-  }
-
-  ~InputStreamMessageReader();
-
-  Status ReadNextMessage(std::unique_ptr<Message>* message) override;
-
- private:
-  io::InputStream* stream_;
-  std::shared_ptr<io::InputStream> owned_stream_;
-};
-
-/// \brief Read encapulated RPC message from position in file
+/// \brief Read encapsulated RPC message from position in file
 ///
 /// Read a length-prefixed message flatbuffer starting at the indicated file
 /// offset. If the message has a body with non-zero length, it will also be
@@ -189,7 +204,30 @@ ARROW_EXPORT
 Status ReadMessage(const int64_t offset, const int32_t metadata_length,
                    io::RandomAccessFile* file, std::unique_ptr<Message>* message);
 
-/// \brief Read encapulated RPC message (metadata and body) from InputStream
+/// \brief Advance stream to an 8-byte offset if its position is not a multiple
+/// of 8 already
+/// \param[in] stream an input stream
+/// \param[in] alignment the byte multiple for the metadata prefix, usually 8
+/// or 64, to ensure the body starts on a multiple of that alignment
+/// \return Status
+ARROW_EXPORT
+Status AlignStream(io::InputStream* stream, int32_t alignment = 8);
+
+/// \brief Advance stream to an 8-byte offset if its position is not a multiple
+/// of 8 already
+/// \param[in] stream an output stream
+/// \param[in] alignment the byte multiple for the metadata prefix, usually 8
+/// or 64, to ensure the body starts on a multiple of that alignment
+/// \return Status
+ARROW_EXPORT
+Status AlignStream(io::OutputStream* stream, int32_t alignment = 8);
+
+/// \brief Return error Status if file position is not a multiple of the
+/// indicated alignment
+ARROW_EXPORT
+Status CheckAligned(io::FileInterface* stream, int32_t alignment = 8);
+
+/// \brief Read encapsulated RPC message (metadata and body) from InputStream
 ///
 /// Read length-prefixed message with as-yet unknown length. Returns null if
 /// there are not enough bytes available or the message length is 0 (e.g. EOS

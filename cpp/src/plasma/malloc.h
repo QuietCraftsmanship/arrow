@@ -21,8 +21,34 @@
 #include <inttypes.h>
 #include <stddef.h>
 
-void get_malloc_mapinfo(void* addr, int* fd, int64_t* map_length, ptrdiff_t* offset);
+#include <unordered_map>
 
-void set_malloc_granularity(int value);
+namespace plasma {
 
-#endif  // MALLOC_H
+/// Gap between two consecutive mmap regions allocated by fake_mmap.
+/// This ensures that the segments of memory returned by
+/// fake_mmap are never contiguous and dlmalloc does not coalesce it
+/// (in the client we cannot guarantee that these mmaps are contiguous).
+constexpr int64_t kMmapRegionsGap = sizeof(size_t);
+
+void GetMallocMapinfo(void* addr, int* fd, int64_t* map_length, ptrdiff_t* offset);
+
+/// Get the mmap size corresponding to a specific file descriptor.
+///
+/// @param fd The file descriptor to look up.
+/// @return The size of the corresponding memory-mapped file.
+int64_t GetMmapSize(int fd);
+
+struct MmapRecord {
+  int fd;
+  int64_t size;
+};
+
+/// Hashtable that contains one entry per segment that we got from the OS
+/// via mmap. Associates the address of that segment with its file descriptor
+/// and size.
+extern std::unordered_map<void*, MmapRecord> mmap_records;
+
+}  // namespace plasma
+
+#endif  // PLASMA_MALLOC_H

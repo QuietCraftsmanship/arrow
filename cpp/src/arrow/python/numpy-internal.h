@@ -22,9 +22,12 @@
 
 #include "arrow/python/numpy_interop.h"
 
+#include "arrow/status.h"
+
 #include "arrow/python/platform.h"
 
 #include <cstdint>
+#include <sstream>
 #include <string>
 
 namespace arrow {
@@ -36,16 +39,14 @@ class Ndarray1DIndexer {
  public:
   typedef int64_t size_type;
 
-  Ndarray1DIndexer() : arr_(nullptr), data_(nullptr) {}
+  Ndarray1DIndexer() : arr_(NULLPTR), data_(NULLPTR) {}
 
-  explicit Ndarray1DIndexer(PyArrayObject* arr) : Ndarray1DIndexer() { Init(arr); }
-
-  void Init(PyArrayObject* arr) {
+  explicit Ndarray1DIndexer(PyArrayObject* arr) : Ndarray1DIndexer() {
     arr_ = arr;
     DCHECK_EQ(1, PyArray_NDIM(arr)) << "Only works with 1-dimensional arrays";
     Py_INCREF(arr);
-    data_ = reinterpret_cast<T*>(PyArray_DATA(arr));
-    stride_ = PyArray_STRIDES(arr)[0] / sizeof(T);
+    data_ = reinterpret_cast<uint8_t*>(PyArray_DATA(arr));
+    stride_ = PyArray_STRIDES(arr)[0];
   }
 
   ~Ndarray1DIndexer() { Py_XDECREF(arr_); }
@@ -54,16 +55,23 @@ class Ndarray1DIndexer {
 
   T* data() const { return data_; }
 
-  bool is_strided() const { return stride_ == 1; }
+  bool is_strided() const { return stride_ != sizeof(T); }
 
-  T& operator[](size_type index) { return *(data_ + index * stride_); }
-  T& operator[](size_type index) const { return *(data_ + index * stride_); }
+  T& operator[](size_type index) {
+    return *reinterpret_cast<T*>(data_ + index * stride_);
+  }
+  const T& operator[](size_type index) const {
+    return *reinterpret_cast<const T*>(data_ + index * stride_);
+  }
 
  private:
   PyArrayObject* arr_;
-  T* data_;
+  uint8_t* data_;
   int64_t stride_;
 };
+
+// Handling of Numpy Types by their static numbers
+// (the NPY_TYPES enum and related defines)
 
 static inline std::string GetNumPyTypeName(int npy_type) {
 #define TYPE_CASE(TYPE, NAME) \
@@ -76,14 +84,20 @@ static inline std::string GetNumPyTypeName(int npy_type) {
     TYPE_CASE(INT16, "int16")
     TYPE_CASE(INT32, "int32")
     TYPE_CASE(INT64, "int64")
-#if (NPY_INT64 != NPY_LONGLONG)
+#if !NPY_INT32_IS_INT
+    TYPE_CASE(INT, "intc")
+#endif
+#if !NPY_INT64_IS_LONG_LONG
     TYPE_CASE(LONGLONG, "longlong")
 #endif
     TYPE_CASE(UINT8, "uint8")
     TYPE_CASE(UINT16, "uint16")
     TYPE_CASE(UINT32, "uint32")
     TYPE_CASE(UINT64, "uint64")
-#if (NPY_UINT64 != NPY_ULONGLONG)
+#if !NPY_INT32_IS_INT
+    TYPE_CASE(UINT, "uintc")
+#endif
+#if !NPY_INT64_IS_LONG_LONG
     TYPE_CASE(ULONGLONG, "ulonglong")
 #endif
     TYPE_CASE(FLOAT16, "float16")
@@ -97,8 +111,76 @@ static inline std::string GetNumPyTypeName(int npy_type) {
   }
 
 #undef TYPE_CASE
-  return "unrecognized type in GetNumPyTypeName";
+  std::stringstream ss;
+  ss << "unrecognized type (" << npy_type << ") in GetNumPyTypeName";
+  return ss.str();
 }
+
+#define TYPE_VISIT_INLINE(TYPE) \
+  case NPY_##TYPE:              \
+    return visitor->template Visit<NPY_##TYPE>(arr);
+
+template <typename VISITOR>
+inline Status VisitNumpyArrayInline(PyArrayObject* arr, VISITOR* visitor) {
+  switch (PyArray_TYPE(arr)) {
+    TYPE_VISIT_INLINE(BOOL);
+    TYPE_VISIT_INLINE(INT8);
+    TYPE_VISIT_INLINE(UINT8);
+    TYPE_VISIT_INLINE(INT16);
+    TYPE_VISIT_INLINE(UINT16);
+    TYPE_VISIT_INLINE(INT32);
+    TYPE_VISIT_INLINE(UINT32);
+    TYPE_VISIT_INLINE(INT64);
+    TYPE_VISIT_INLINE(UINT64);
+#if !NPY_INT32_IS_INT
+    TYPE_VISIT_INLINE(INT);
+    TYPE_VISIT_INLINE(UINT);
+#endif
+#if !NPY_INT64_IS_LONG_LONG
+    TYPE_VISIT_INLINE(LONGLONG);
+    TYPE_VISIT_INLINE(ULONGLONG);
+#endif
+    TYPE_VISIT_INLINE(FLOAT16);
+    TYPE_VISIT_INLINE(FLOAT32);
+    TYPE_VISIT_INLINE(FLOAT64);
+    TYPE_VISIT_INLINE(DATETIME);
+    TYPE_VISIT_INLINE(OBJECT);
+  }
+  return Status::NotImplemented("NumPy type not implemented: ",
+                                GetNumPyTypeName(PyArray_TYPE(arr)));
+}
+
+#undef TYPE_VISIT_INLINE
+
+namespace internal {
+
+inline bool PyFloatScalar_Check(PyObject* obj) {
+  return PyFloat_Check(obj) || PyArray_IsScalar(obj, Floating);
+}
+
+inline bool PyIntScalar_Check(PyObject* obj) {
+#if PY_MAJOR_VERSION < 3
+  if (PyInt_Check(obj)) {
+    return true;
+  }
+#endif
+  return PyLong_Check(obj) || PyArray_IsScalar(obj, Integer);
+}
+
+inline bool PyBoolScalar_Check(PyObject* obj) {
+  return PyBool_Check(obj) || PyArray_IsScalar(obj, Bool);
+}
+
+static inline PyArray_Descr* GetSafeNumPyDtype(int type) {
+  if (type == NPY_DATETIME) {
+    // It is not safe to mutate the result of DescrFromType
+    return PyArray_DescrNewFromType(type);
+  } else {
+    return PyArray_DescrFromType(type);
+  }
+}
+
+}  // namespace internal
 
 }  // namespace py
 }  // namespace arrow

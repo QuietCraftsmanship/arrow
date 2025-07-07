@@ -17,17 +17,34 @@
 
 # flake8: noqa
 
-from pkg_resources import get_distribution, DistributionNotFound
+from __future__ import absolute_import
+
+import os as _os
+import sys as _sys
+
 try:
-    __version__ = get_distribution(__name__).version
-except DistributionNotFound:
-   # package is not installed
+    from ._generated_version import version as __version__
+except ImportError:
+    # Package is not installed, parse git tag at runtime
     try:
         import setuptools_scm
-        __version__ = setuptools_scm.get_version('../')
-    except (ImportError, LookupError):
+        # Code duplicated from setup.py to avoid a dependency on each other
+        def parse_git(root, **kwargs):
+            """
+            Parse function for setuptools_scm that ignores tags for non-C++
+            subprojects, e.g. apache-arrow-js-XXX tags.
+            """
+            from setuptools_scm.git import parse
+            kwargs['describe_command'] = \
+                "git describe --dirty --tags --long --match 'apache-arrow-[0-9].*'"
+            return parse(root, **kwargs)
+        __version__ = setuptools_scm.get_version('../',
+                                                 parse=parse_git)
+    except ImportError:
         __version__ = None
 
+
+import pyarrow.compat as compat
 
 from pyarrow.lib import cpu_count, set_cpu_count
 from pyarrow.lib import (null, bool_,
@@ -35,16 +52,21 @@ from pyarrow.lib import (null, bool_,
                          uint8, uint16, uint32, uint64,
                          time32, time64, timestamp, date32, date64,
                          float16, float32, float64,
-                         binary, string, decimal,
+                         binary, string, utf8, decimal128,
                          list_, struct, union, dictionary, field,
                          type_for_alias,
-                         DataType, NAType,
+                         DataType, DictionaryType, ListType, StructType,
+                         UnionType, TimestampType, Time32Type, Time64Type,
+                         FixedSizeBinaryType, Decimal128Type,
+                         BaseExtensionType, ExtensionType,
+                         UnknownExtensionType,
+                         DictionaryMemo,
                          Field,
                          Schema,
                          schema,
                          Array, Tensor,
-                         array,
-                         from_numpy_dtype,
+                         array, chunked_array, column, table,
+                         infer_type, from_numpy_dtype,
                          NullArray,
                          NumericArray, IntegerArray, FloatingPointArray,
                          BooleanArray,
@@ -58,34 +80,40 @@ from pyarrow.lib import (null, bool_,
                          DictionaryArray,
                          Date32Array, Date64Array,
                          TimestampArray, Time32Array, Time64Array,
-                         DecimalArray, StructArray,
-                         ArrayValue, Scalar, NA,
+                         Decimal128Array, StructArray, ExtensionArray,
+                         ArrayValue, Scalar, NA, _NULL as NULL,
                          BooleanValue,
                          Int8Value, Int16Value, Int32Value, Int64Value,
                          UInt8Value, UInt16Value, UInt32Value, UInt64Value,
-                         FloatValue, DoubleValue, ListValue,
+                         HalfFloatValue, FloatValue, DoubleValue, ListValue,
                          BinaryValue, StringValue, FixedSizeBinaryValue,
-                         DecimalValue,
-                         Date32Value, Date64Value, TimestampValue)
+                         DecimalValue, UnionValue, StructValue, DictionaryValue,
+                         Date32Value, Date64Value,
+                         Time32Value, Time64Value,
+                         TimestampValue)
 
-# ARROW-1683: Remove after 0.8.0?
-from pyarrow.lib import TimestampType
+# Buffers, allocation
+from pyarrow.lib import (Buffer, ResizableBuffer, foreign_buffer, py_buffer,
+                         compress, decompress, allocate_buffer)
 
+from pyarrow.lib import (MemoryPool, LoggingMemoryPool, ProxyMemoryPool,
+                         total_allocated_bytes, set_memory_pool,
+                         default_memory_pool, logging_memory_pool,
+                         proxy_memory_pool, log_memory_allocations)
+
+# I/O
 from pyarrow.lib import (HdfsFile, NativeFile, PythonFile,
+                         CompressedInputStream, CompressedOutputStream,
                          FixedSizeBufferWriter,
-                         Buffer, BufferReader, BufferOutputStream,
+                         BufferReader, BufferOutputStream,
                          OSFile, MemoryMappedFile, memory_map,
-                         allocate_buffer, frombuffer,
-                         memory_map, create_memory_map,
-                         have_libhdfs, have_libhdfs3, MockOutputStream)
-
-from pyarrow.lib import (MemoryPool, total_allocated_bytes,
-                         set_memory_pool, default_memory_pool,
-                         log_memory_allocations)
+                         create_memory_map, have_libhdfs, have_libhdfs3,
+                         MockOutputStream, input_stream, output_stream)
 
 from pyarrow.lib import (ChunkedArray, Column, RecordBatch, Table,
-                         concat_tables)
+                         concat_arrays, concat_tables)
 
+# Exceptions
 from pyarrow.lib import (ArrowException,
                          ArrowKeyError,
                          ArrowInvalid,
@@ -98,6 +126,7 @@ from pyarrow.lib import (ArrowException,
 
 # Serialization
 from pyarrow.lib import (deserialize_from, deserialize,
+                         deserialize_components,
                          serialize, serialize_to, read_serialized,
                          SerializedPyObject, SerializationContext,
                          SerializationCallbackError,
@@ -117,11 +146,34 @@ from pyarrow.ipc import (Message, MessageReader,
                          open_stream,
                          open_file,
                          serialize_pandas, deserialize_pandas)
+import pyarrow.ipc as ipc
+
+
+def open_stream(source):
+    """
+    pyarrow.open_stream deprecated since 0.12, use pyarrow.ipc.open_stream
+    """
+    import warnings
+    warnings.warn("pyarrow.open_stream is deprecated, please use "
+                  "pyarrow.ipc.open_stream")
+    return ipc.open_stream(source)
+
+
+def open_file(source):
+    """
+    pyarrow.open_file deprecated since 0.12, use pyarrow.ipc.open_file
+    """
+    import warnings
+    warnings.warn("pyarrow.open_file is deprecated, please use "
+                  "pyarrow.ipc.open_file")
+    return ipc.open_file(source)
+
 
 localfs = LocalFileSystem.get_instance()
 
-from pyarrow.serialization import (_default_serialization_context,
-                                   register_default_serialization_handlers)
+from pyarrow.serialization import (default_serialization_context,
+                                   register_default_serialization_handlers,
+                                   register_torch_serialization_handlers)
 
 import pyarrow.types as types
 
@@ -135,18 +187,15 @@ def _plasma_store_entry_point():
     from the command line and will start the plasma_store executable with the
     given arguments.
     """
-    import os
     import pyarrow
-    import subprocess
-    import sys
-    plasma_store_executable = os.path.join(pyarrow.__path__[0], "plasma_store")
-    process = subprocess.Popen([plasma_store_executable] + sys.argv[1:])
-    process.wait()
+    plasma_store_executable = _os.path.join(pyarrow.__path__[0],
+                                            "plasma_store_server")
+    _os.execv(plasma_store_executable, _sys.argv)
 
 # ----------------------------------------------------------------------
 # Deprecations
 
-from pyarrow.util import _deprecate_class  # noqa
+from pyarrow.util import _deprecate_api  # noqa
 
 # ----------------------------------------------------------------------
 # Returning absolute path to the pyarrow include directory (if bundled, e.g. in
@@ -157,5 +206,55 @@ def get_include():
     Return absolute path to directory containing Arrow C++ include
     headers. Similar to numpy.get_include
     """
-    import os
-    return os.path.join(os.path.dirname(__file__), 'include')
+    return _os.path.join(_os.path.dirname(__file__), 'include')
+
+
+def get_libraries():
+    """
+    Return list of library names to include in the `libraries` argument for C
+    or Cython extensions using pyarrow
+    """
+    return ['arrow', 'arrow_python']
+
+
+def get_library_dirs():
+    """
+    Return lists of directories likely to contain Arrow C++ libraries for
+    linking C or Cython extensions using pyarrow
+    """
+    package_cwd = _os.path.dirname(__file__)
+
+    library_dirs = [package_cwd]
+
+    # Search library paths via pkg-config. This is necessary if the user
+    # installed libarrow and the other shared libraries manually and they
+    # are not shipped inside the pyarrow package (see also ARROW-2976).
+    from subprocess import call, PIPE, Popen
+    pkg_config_executable = _os.environ.get('PKG_CONFIG', None) or 'pkg-config'
+    for package in ["arrow", "plasma", "arrow_python"]:
+        cmd = '{0} --exists {1}'.format(pkg_config_executable, package).split()
+        try:
+            if call(cmd) == 0:
+                cmd = [pkg_config_executable, "--libs-only-L", package]
+                proc = Popen(cmd, stdout=PIPE, stderr=PIPE)
+                out, err = proc.communicate()
+                library_dir = out.rstrip().decode('utf-8')[2:] # strip "-L"
+                if library_dir not in library_dirs:
+                    library_dirs.append(library_dir)
+        except FileNotFoundError:
+            pass
+
+    if _sys.platform == 'win32':
+        # TODO(wesm): Is this necessary, or does setuptools within a conda
+        # installation add Library\lib to the linker path for MSVC?
+        python_base_install = _os.path.dirname(_sys.executable)
+        library_lib = _os.path.join(python_base_install, 'Library', 'lib')
+
+        if _os.path.exists(_os.path.join(library_lib, 'arrow.lib')):
+            library_dirs.append(library_lib)
+
+    # ARROW-4074: Allow for ARROW_HOME to be set to some other directory
+    if 'ARROW_HOME' in _os.environ:
+        library_dirs.append(_os.path.join(_os.environ['ARROW_HOME'], 'lib'))
+
+    return library_dirs

@@ -18,69 +18,38 @@
 #ifndef ARROW_IO_TEST_COMMON_H
 #define ARROW_IO_TEST_COMMON_H
 
-#include <algorithm>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#if defined(__MINGW32__)  // MinGW
-// nothing
-#elif defined(_MSC_VER)  // Visual Studio
-#include <io.h>
-#else  // POSIX / Linux
-// nothing
-#endif
-
-#include "arrow/buffer.h"
-#include "arrow/io/file.h"
-#include "arrow/io/memory.h"
-#include "arrow/memory_pool.h"
-#include "arrow/test-util.h"
+#include "arrow/status.h"
+#include "arrow/util/visibility.h"
 
 namespace arrow {
 namespace io {
 
-static inline Status ZeroMemoryMap(MemoryMappedFile* file) {
-  constexpr int64_t kBufferSize = 512;
-  static constexpr uint8_t kZeroBytes[kBufferSize] = {0};
+class MemoryMappedFile;
 
-  RETURN_NOT_OK(file->Seek(0));
-  int64_t position = 0;
-  int64_t file_size;
-  RETURN_NOT_OK(file->GetSize(&file_size));
+ARROW_EXPORT
+void AssertFileContents(const std::string& path, const std::string& contents);
 
-  int64_t chunksize;
-  while (position < file_size) {
-    chunksize = std::min(kBufferSize, file_size - position);
-    RETURN_NOT_OK(file->Write(kZeroBytes, chunksize));
-    position += chunksize;
-  }
-  return Status::OK();
-}
+ARROW_EXPORT bool FileExists(const std::string& path);
 
-class MemoryMapFixture {
+ARROW_EXPORT bool FileIsClosed(int fd);
+
+ARROW_EXPORT
+Status ZeroMemoryMap(MemoryMappedFile* file);
+
+class ARROW_EXPORT MemoryMapFixture {
  public:
-  void TearDown() {
-    for (auto path : tmp_files_) {
-      std::remove(path.c_str());
-    }
-  }
+  void TearDown();
 
-  void CreateFile(const std::string& path, int64_t size) {
-    std::shared_ptr<MemoryMappedFile> file;
-    ASSERT_OK(MemoryMappedFile::Create(path, size, &file));
-    tmp_files_.push_back(path);
-  }
+  void CreateFile(const std::string& path, int64_t size);
 
   Status InitMemoryMap(int64_t size, const std::string& path,
-                       std::shared_ptr<MemoryMappedFile>* mmap) {
-    RETURN_NOT_OK(MemoryMappedFile::Create(path, size, mmap));
-    tmp_files_.push_back(path);
-    return Status::OK();
-  }
+                       std::shared_ptr<MemoryMappedFile>* mmap);
 
-  void AppendFile(const std::string& path) { tmp_files_.push_back(path); }
+  void AppendFile(const std::string& path);
 
  private:
   std::vector<std::string> tmp_files_;

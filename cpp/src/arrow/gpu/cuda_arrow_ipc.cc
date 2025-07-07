@@ -24,11 +24,12 @@
 
 #include "arrow/buffer.h"
 #include "arrow/ipc/Message_generated.h"
+#include "arrow/ipc/dictionary.h"
 #include "arrow/ipc/message.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
+#include "arrow/record_batch.h"
 #include "arrow/status.h"
-#include "arrow/table.h"
 #include "arrow/util/visibility.h"
 
 #include "arrow/gpu/cuda_context.h"
@@ -38,7 +39,7 @@ namespace arrow {
 
 namespace flatbuf = org::apache::arrow::flatbuf;
 
-namespace gpu {
+namespace cuda {
 
 Status SerializeRecordBatch(const RecordBatch& batch, CudaContext* ctx,
                             std::shared_ptr<CudaBuffer>* out) {
@@ -82,9 +83,8 @@ Status ReadMessage(CudaBufferReader* reader, MemoryPool* pool,
   RETURN_NOT_OK(AllocateBuffer(pool, message_length, &metadata));
   RETURN_NOT_OK(reader->Read(message_length, &bytes_read, metadata->mutable_data()));
   if (bytes_read != message_length) {
-    std::stringstream ss;
-    ss << "Expected " << message_length << " metadata bytes, but only got " << bytes_read;
-    return Status::IOError(ss.str());
+    return Status::IOError("Expected ", message_length, " metadata bytes, but only got ",
+                           bytes_read);
   }
 
   return ipc::Message::ReadFrom(metadata, reader, out);
@@ -103,8 +103,9 @@ Status ReadRecordBatch(const std::shared_ptr<Schema>& schema,
   }
 
   // Zero-copy read on device memory
-  return ipc::ReadRecordBatch(*message, schema, out);
+  ipc::DictionaryMemo unused_memo;
+  return ipc::ReadRecordBatch(*message, schema, &unused_memo, out);
 }
 
-}  // namespace gpu
+}  // namespace cuda
 }  // namespace arrow

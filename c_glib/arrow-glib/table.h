@@ -20,54 +20,52 @@
 #pragma once
 
 #include <arrow-glib/column.h>
+#include <arrow-glib/record-batch.h>
 #include <arrow-glib/schema.h>
+#include <arrow-glib/version.h>
 
 G_BEGIN_DECLS
 
-#define GARROW_TYPE_TABLE                       \
-  (garrow_table_get_type())
-#define GARROW_TABLE(obj)                               \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),                    \
-                              GARROW_TYPE_TABLE,        \
-                              GArrowTable))
-#define GARROW_TABLE_CLASS(klass)               \
-  (G_TYPE_CHECK_CLASS_CAST((klass),             \
-                           GARROW_TYPE_TABLE,   \
-                           GArrowTableClass))
-#define GARROW_IS_TABLE(obj)                            \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                    \
-                              GARROW_TYPE_TABLE))
-#define GARROW_IS_TABLE_CLASS(klass)            \
-  (G_TYPE_CHECK_CLASS_TYPE((klass),             \
-                           GARROW_TYPE_TABLE))
-#define GARROW_TABLE_GET_CLASS(obj)             \
-  (G_TYPE_INSTANCE_GET_CLASS((obj),             \
-                             GARROW_TYPE_TABLE, \
-                             GArrowTableClass))
-
-typedef struct _GArrowTable         GArrowTable;
-typedef struct _GArrowTableClass    GArrowTableClass;
-
-/**
- * GArrowTable:
- *
- * It wraps `arrow::Table`.
- */
-struct _GArrowTable
-{
-  /*< private >*/
-  GObject parent_instance;
-};
-
+#define GARROW_TYPE_TABLE (garrow_table_get_type())
+G_DECLARE_DERIVABLE_TYPE(GArrowTable,
+                         garrow_table,
+                         GARROW,
+                         TABLE,
+                         GObject)
 struct _GArrowTableClass
 {
   GObjectClass parent_class;
 };
 
-GType           garrow_table_get_type      (void) G_GNUC_CONST;
-
-GArrowTable    *garrow_table_new           (GArrowSchema *schema,
-                                            GList *columns);
+#ifndef GARROW_DISABLE_DEPRECATED
+GARROW_DEPRECATED_IN_0_12_FOR(garrow_table_new_values)
+GArrowTable *
+garrow_table_new(GArrowSchema *schema,
+                 GList *columns);
+#endif
+GARROW_AVAILABLE_IN_0_12
+GArrowTable *
+garrow_table_new_values(GArrowSchema *schema,
+                        GList *values,
+                        GError **error);
+GARROW_AVAILABLE_IN_0_12
+GArrowTable *
+garrow_table_new_columns(GArrowSchema *schema,
+                         GArrowColumn **columns,
+                         gsize n_columns,
+                         GError **error);
+GARROW_AVAILABLE_IN_0_12
+GArrowTable *
+garrow_table_new_arrays(GArrowSchema *schema,
+                        GArrowArray **arrays,
+                        gsize n_arrays,
+                        GError **error);
+GARROW_AVAILABLE_IN_0_12
+GArrowTable *
+garrow_table_new_record_batches(GArrowSchema *schema,
+                                GArrowRecordBatch **record_batches,
+                                gsize n_record_batches,
+                                GError **error);
 
 gboolean        garrow_table_equal         (GArrowTable *table,
                                             GArrowTable *other_table);
@@ -85,5 +83,21 @@ GArrowTable    *garrow_table_add_column    (GArrowTable *table,
 GArrowTable    *garrow_table_remove_column (GArrowTable *table,
                                             guint i,
                                             GError **error);
+GArrowTable    *garrow_table_replace_column(GArrowTable *table,
+                                            guint i,
+                                            GArrowColumn *column,
+                                            GError **error);
+gchar          *garrow_table_to_string     (GArrowTable *table,
+                                            GError **error);
+GARROW_AVAILABLE_IN_0_14
+GArrowTable *
+garrow_table_concatenate(GArrowTable *table,
+                         GList *other_tables,
+                         GError **error);
+GARROW_AVAILABLE_IN_0_14
+GArrowTable*
+garrow_table_slice(GArrowTable *table,
+                   gint64 offset,
+                   gint64 length);
 
 G_END_DECLS

@@ -18,6 +18,11 @@
 #ifndef ARROW_UTIL_MACROS_H
 #define ARROW_UTIL_MACROS_H
 
+#include <cstdint>
+
+#define ARROW_STRINGIFY(x) #x
+#define ARROW_CONCAT(x, y) x##y
+
 // From Google gutil
 #ifndef ARROW_DISALLOW_COPY_AND_ASSIGN
 #define ARROW_DISALLOW_COPY_AND_ASSIGN(TypeName) \
@@ -73,6 +78,25 @@
 
 // ----------------------------------------------------------------------
 
+// clang-format off
+// [[deprecated]] is only available in C++14, use this for the time being
+// This macro takes an optional deprecation message
+#ifdef __COVERITY__
+#  define ARROW_DEPRECATED(...)
+#elif __cplusplus > 201103L
+#  define ARROW_DEPRECATED(...) [[deprecated(__VA_ARGS__)]]
+#else
+# ifdef __GNUC__
+#  define ARROW_DEPRECATED(...) __attribute__((deprecated(__VA_ARGS__)))
+# elif defined(_MSC_VER)
+#  define ARROW_DEPRECATED(...) __declspec(deprecated(__VA_ARGS__))
+# else
+#  define ARROW_DEPRECATED(...)
+# endif
+#endif
+
+// ----------------------------------------------------------------------
+
 // macros to disable padding
 // these macros are portable across different compilers and platforms
 //[https://github.com/google/flatbuffers/blob/master/include/flatbuffers/flatbuffers.h#L1355]
@@ -93,5 +117,50 @@
 #error Unknown compiler, please define structure alignment macros
 #endif
 #endif  // !defined(MANUALLY_ALIGNED_STRUCT)
+
+// ----------------------------------------------------------------------
+// Convenience macro disabling a particular UBSan check in a function
+
+#if defined(__clang__)
+#define ARROW_DISABLE_UBSAN(feature) __attribute__((no_sanitize(feature)))
+#else
+#define ARROW_DISABLE_UBSAN(feature)
+#endif
+
+// ----------------------------------------------------------------------
+// Machine information
+
+#if INTPTR_MAX == INT64_MAX
+#define ARROW_BITNESS 64
+#elif INTPTR_MAX == INT32_MAX
+#define ARROW_BITNESS 32
+#else
+#error Unexpected INTPTR_MAX
+#endif
+
+// ----------------------------------------------------------------------
+// From googletest
+// (also in parquet-cpp)
+
+// When you need to test the private or protected members of a class,
+// use the FRIEND_TEST macro to declare your tests as friends of the
+// class.  For example:
+//
+// class MyClass {
+//  private:
+//   void MyMethod();
+//   FRIEND_TEST(MyClassTest, MyMethod);
+// };
+//
+// class MyClassTest : public testing::Test {
+//   // ...
+// };
+//
+// TEST_F(MyClassTest, MyMethod) {
+//   // Can call MyClass::MyMethod() here.
+// }
+
+#define FRIEND_TEST(test_case_name, test_name) \
+  friend class test_case_name##_##test_name##_Test
 
 #endif  // ARROW_UTIL_MACROS_H

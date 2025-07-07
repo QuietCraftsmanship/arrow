@@ -17,32 +17,46 @@
   under the License.
 -->
 
-## Apache Arrow Website
+# Apache Arrow Website
 
-### Development instructions
+## Overview
 
-If you are planning to publish the website, you must first clone the arrow-site
-git repository:
+Site content is maintained in the main Arrow repository, mostly in markdown
+format. [Jekyll](https://jekyllrb.com/) is used to generate HTML files that can
+then be committed to the [arrow-site](https://github.com/apache/arrow-site)
+repository.
 
-```shell
-git clone --branch=asf-site https://git-wip-us.apache.org/repos/asf/arrow-site.git asf-site
-```
+## Prerequisites
 
-Now, with Ruby >= 2.1 installed, run:
+With Ruby >= 2.1 installed, run the following commands to install
+[Jekyll](https://jekyllrb.com/).
 
 ```shell
 gem install jekyll bundler
 bundle install
+```
 
-# This imports the format Markdown documents so they will be rendered
-scripts/sync_format_docs.sh
+If you are planning to publish the website, you must clone the arrow-site git
+repository. Run this command from the `site` directory so that `asf-site` is a
+subdirectory of `site`.
 
+```shell
+git clone --branch=asf-site https://github.com/apache/arrow-site.git asf-site
+```
+
+## Previewing the site
+
+From the `site` directory, run the following to generate HTML files and run the
+web site locally.
+
+```
 bundle exec jekyll serve
 ```
 
-### Publishing
+## Publishing
 
-After following the above instructions the base `site/` directory, run:
+After following the above instructions, run the following commands from the
+`site` directory:
 
 ```shell
 JEKYLL_ENV=production bundle exec jekyll build
@@ -59,33 +73,8 @@ git push
 
 ### Updating Code Documentation
 
-#### Java
-
-```
-cd ../java
-mvn install
-mvn site
-rsync -r target/site/apidocs/ ../site/asf-site/docs/java/
-```
-
-#### C++
-
-```
-cd ../cpp/apidoc
-doxygen Doxyfile
-rsync -r html/ ../../site/asf-site/docs/cpp
-```
-
-#### Python
-
-First, build PyArrow with all optional extensions (Apache Parquet).
-
-```
-cd ../python
-python setup.py build_ext --inplace --with-parquet --with-plasma
-python setup.py build_sphinx -s doc/source
-rsync -r doc/_build/html/ ../site/asf-site/docs/python/
-```
+To update the documentation, run the script `./dev/gen_apidocs.sh`. This script
+will run the code documentation tools in a fixed environment.
 
 #### C (GLib)
 
@@ -104,6 +93,14 @@ cd ../../c_glib
   --enable-gtk-doc
 LD_LIBRARY_PATH=$PWD/../cpp/build/debug make GTK_DOC_V_XREF=": "
 rsync -r doc/reference/html/ ../site/asf-site/docs/c_glib/
+```
+
+#### Javascript
+
+```
+cd ../js
+npm run doc
+rsync -r doc/ ../site/asf-site/docs/js
 ```
 
 Then add/commit/push from the site/asf-site git checkout.

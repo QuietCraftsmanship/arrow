@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,123 +17,20 @@
 
 package org.apache.arrow.vector.util;
 
-import io.netty.buffer.ArrowBuf;
-import org.apache.arrow.vector.DecimalVector;
-import org.apache.arrow.vector.types.pojo.ArrowType;
-
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 
+import io.netty.buffer.ArrowBuf;
+import io.netty.util.internal.PlatformDependent;
 
+/**
+ * Utility methods for configurable precision Decimal values (e.g. {@link BigDecimal}).
+ */
 public class DecimalUtility {
-
-  public final static int MAX_DIGITS = 9;
-  public final static int DIGITS_BASE = 1000000000;
-  public final static int DIGITS_MAX = 999999999;
-  public final static int INTEGER_SIZE = (Integer.SIZE / 8);
-
-  public final static String[] decimalToString = {"",
-      "0",
-      "00",
-      "000",
-      "0000",
-      "00000",
-      "000000",
-      "0000000",
-      "00000000",
-      "000000000"};
-
-  public final static long[] scale_long_constants = {
-      1,
-      10,
-      100,
-      1000,
-      10000,
-      100000,
-      1000000,
-      10000000,
-      100000000,
-      1000000000,
-      10000000000l,
-      100000000000l,
-      1000000000000l,
-      10000000000000l,
-      100000000000000l,
-      1000000000000000l,
-      10000000000000000l,
-      100000000000000000l,
-      1000000000000000000l};
+  private DecimalUtility() {}
 
   public static final int DECIMAL_BYTE_LENGTH = 16;
-
-  /**
-   * Simple function that returns the static precomputed
-   * power of ten, instead of using Math.pow
-   */
-  public static long getPowerOfTen(int power) {
-    assert power >= 0 && power < scale_long_constants.length;
-    return scale_long_constants[(power)];
-  }
-
-  /**
-   * Math.pow returns a double and while multiplying with large digits
-   * in the decimal data type we encounter noise. So instead of multiplying
-   * with Math.pow we use the static constants to perform the multiplication
-   */
-  public static long adjustScaleMultiply(long input, int factor) {
-    int index = Math.abs(factor);
-    assert index >= 0 && index < scale_long_constants.length;
-    if (factor >= 0) {
-      return input * scale_long_constants[index];
-    } else {
-      return input / scale_long_constants[index];
-    }
-  }
-
-  public static long adjustScaleDivide(long input, int factor) {
-    int index = Math.abs(factor);
-    assert index >= 0 && index < scale_long_constants.length;
-    if (factor >= 0) {
-      return input / scale_long_constants[index];
-    } else {
-      return input * scale_long_constants[index];
-    }
-  }
-
-  /**
-   * Returns a string representation of the given integer
-   * If the length of the given integer is less than the
-   * passed length, this function will prepend zeroes to the string
-   */
-  public static StringBuilder toStringWithZeroes(int number, int desiredLength) {
-    String value = ((Integer) number).toString();
-    int length = value.length();
-
-    StringBuilder str = new StringBuilder();
-    str.append(decimalToString[desiredLength - length]);
-    str.append(value);
-
-    return str;
-  }
-
-  public static StringBuilder toStringWithZeroes(long number, int desiredLength) {
-    String value = ((Long) number).toString();
-    int length = value.length();
-
-    StringBuilder str = new StringBuilder();
-
-    // Desired length can be > MAX_DIGITS
-    int zeroesLength = desiredLength - length;
-    while (zeroesLength > MAX_DIGITS) {
-      str.append(decimalToString[MAX_DIGITS]);
-      zeroesLength -= MAX_DIGITS;
-    }
-    str.append(decimalToString[zeroesLength]);
-    str.append(value);
-
-    return str;
-  }
 
   /**
    * Read an ArrowType.Decimal at the given value index in the ArrowBuf and convert to a BigDecimal
@@ -191,8 +87,8 @@ public class DecimalUtility {
           value.scale() + " != " + vectorScale);
     }
     if (value.precision() > vectorPrecision) {
-      throw new UnsupportedOperationException("BigDecimal precision can not be greater than that in the Arrow vector: " +
-          value.precision() + " > " + vectorPrecision);
+      throw new UnsupportedOperationException("BigDecimal precision can not be greater than that in the Arrow " +
+        "vector: " + value.precision() + " > " + vectorPrecision);
     }
     return true;
   }
@@ -206,6 +102,16 @@ public class DecimalUtility {
     final byte[] bytes = value.unscaledValue().toByteArray();
     final int padValue = value.signum() == -1 ? 0xFF : 0;
     writeByteArrayToArrowBuf(bytes, bytebuf, index, padValue);
+  }
+
+  /**
+   * Write the given long to the ArrowBuf at the given value index.
+   */
+  public static void writeLongToArrowBuf(long value, ArrowBuf bytebuf, int index) {
+    final long addressOfValue = bytebuf.memoryAddress() + index * DECIMAL_BYTE_LENGTH;
+    PlatformDependent.putLong(addressOfValue, value);
+    final long padValue = Long.signum(value) == -1 ? -1L : 0L;
+    PlatformDependent.putLong(addressOfValue + Long.BYTES, padValue);
   }
 
   /**

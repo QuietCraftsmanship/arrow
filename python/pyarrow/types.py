@@ -17,6 +17,12 @@
 
 # Tools for dealing with Arrow type metadata in Python
 
+from __future__ import absolute_import
+
+from pyarrow.lib import (is_boolean_value,  # noqa
+                         is_integer_value,
+                         is_float_value)
+
 import pyarrow.lib as lib
 
 
@@ -32,6 +38,13 @@ _TEMPORAL_TYPES = {lib.Type_TIMESTAMP} | _TIME_TYPES | _DATE_TYPES
 _NESTED_TYPES = {lib.Type_LIST, lib.Type_STRUCT, lib.Type_UNION, lib.Type_MAP}
 
 
+def is_null(t):
+    """
+    Return True if value is an instance of a null type
+    """
+    return t.id == lib.Type_NA
+
+
 def is_boolean(t):
     """
     Return True if value is an instance of a boolean type
@@ -41,23 +54,79 @@ def is_boolean(t):
 
 def is_integer(t):
     """
-    Return True if value is an instance of an integer type
+    Return True if value is an instance of any integer type
     """
     return t.id in _INTEGER_TYPES
 
 
 def is_signed_integer(t):
     """
-    Return True if value is an instance of a signed integer type
+    Return True if value is an instance of any signed integer type
     """
     return t.id in _SIGNED_INTEGER_TYPES
 
 
 def is_unsigned_integer(t):
     """
-    Return True if value is an instance of an unsigned integer type
+    Return True if value is an instance of any unsigned integer type
     """
     return t.id in _UNSIGNED_INTEGER_TYPES
+
+
+def is_int8(t):
+    """
+    Return True if value is an instance of an int8 type
+    """
+    return t.id == lib.Type_INT8
+
+
+def is_int16(t):
+    """
+    Return True if value is an instance of an int16 type
+    """
+    return t.id == lib.Type_INT16
+
+
+def is_int32(t):
+    """
+    Return True if value is an instance of an int32 type
+    """
+    return t.id == lib.Type_INT32
+
+
+def is_int64(t):
+    """
+    Return True if value is an instance of an int64 type
+    """
+    return t.id == lib.Type_INT64
+
+
+def is_uint8(t):
+    """
+    Return True if value is an instance of an uint8 type
+    """
+    return t.id == lib.Type_UINT8
+
+
+def is_uint16(t):
+    """
+    Return True if value is an instance of an uint16 type
+    """
+    return t.id == lib.Type_UINT16
+
+
+def is_uint32(t):
+    """
+    Return True if value is an instance of an uint32 type
+    """
+    return t.id == lib.Type_UINT32
+
+
+def is_uint64(t):
+    """
+    Return True if value is an instance of an uint64 type
+    """
+    return t.id == lib.Type_UINT64
 
 
 def is_floating(t):
@@ -65,6 +134,27 @@ def is_floating(t):
     Return True if value is an instance of a floating point numeric type
     """
     return t.id in _FLOATING_TYPES
+
+
+def is_float16(t):
+    """
+    Return True if value is an instance of an float16 (half-precision) type
+    """
+    return t.id == lib.Type_HALF_FLOAT
+
+
+def is_float32(t):
+    """
+    Return True if value is an instance of an float32 (single precision) type
+    """
+    return t.id == lib.Type_FLOAT
+
+
+def is_float64(t):
+    """
+    Return True if value is an instance of an float64 (double precision) type
+    """
+    return t.id == lib.Type_DOUBLE
 
 
 def is_list(t):
@@ -117,11 +207,18 @@ def is_time(t):
     return t.id in _TIME_TYPES
 
 
-def is_null(t):
+def is_time32(t):
     """
-    Return True if value is an instance of a null type
+    Return True if value is an instance of a time32 type
     """
-    return t.id == lib.Type_NA
+    return t.id == lib.Type_TIME32
+
+
+def is_time64(t):
+    """
+    Return True if value is an instance of a time64 type
+    """
+    return t.id == lib.Type_TIME64
 
 
 def is_binary(t):
@@ -159,6 +256,20 @@ def is_date(t):
     return t.id in _DATE_TYPES
 
 
+def is_date32(t):
+    """
+    Return True if value is an instance of a date32 (days) type
+    """
+    return t.id == lib.Type_DATE32
+
+
+def is_date64(t):
+    """
+    Return True if value is an instance of a date64 (milliseconds) type
+    """
+    return t.id == lib.Type_DATE64
+
+
 def is_map(t):
     """
     Return True if value is an instance of a map logical type
@@ -178,3 +289,10 @@ def is_dictionary(t):
     Return True if value is an instance of a dictionary-encoded type
     """
     return t.id == lib.Type_DICTIONARY
+
+
+def is_primitive(t):
+    """
+    Return True if the value is an instance of a primitive type
+    """
+    return lib._is_primitive(t.id)

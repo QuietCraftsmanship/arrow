@@ -23,40 +23,47 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "arrow/status.h"
 #include "plasma/compat.h"
 
+namespace plasma {
+
+namespace flatbuf {
+
+// Forward declaration outside the namespace, which is defined in plasma_generated.h.
+enum class MessageType : int64_t;
+
+}  // namespace flatbuf
+
 // TODO(pcm): Replace our own custom message header (message type,
 // message length, plasma protocol verion) with one that is serialized
 // using flatbuffers.
-#define PLASMA_PROTOCOL_VERSION 0x0000000000000000
-#define DISCONNECT_CLIENT 0
-
-namespace plasma {
+constexpr int64_t kPlasmaProtocolVersion = 0x0000000000000000;
 
 using arrow::Status;
 
 Status WriteBytes(int fd, uint8_t* cursor, size_t length);
 
-Status WriteMessage(int fd, int64_t type, int64_t length, uint8_t* bytes);
+Status WriteMessage(int fd, flatbuf::MessageType type, int64_t length, uint8_t* bytes);
 
 Status ReadBytes(int fd, uint8_t* cursor, size_t length);
 
-Status ReadMessage(int fd, int64_t* type, std::vector<uint8_t>* buffer);
+Status ReadMessage(int fd, flatbuf::MessageType* type, std::vector<uint8_t>* buffer);
 
-int bind_ipc_sock(const std::string& pathname, bool shall_listen);
+int BindIpcSock(const std::string& pathname, bool shall_listen);
 
-int connect_ipc_sock(const std::string& pathname);
+int ConnectIpcSock(const std::string& pathname);
 
 Status ConnectIpcSocketRetry(const std::string& pathname, int num_retries,
                              int64_t timeout, int* fd);
 
 int AcceptClient(int socket_fd);
 
-uint8_t* read_message_async(int sock);
+std::unique_ptr<uint8_t[]> ReadMessageAsync(int sock);
 
 }  // namespace plasma
 

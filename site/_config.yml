@@ -18,6 +18,7 @@ permalink: /blog/:year/:month/:day/:title/
 repository: https://github.com/apache/arrow
 destination: build
 excerpt_separator: ""
+timezone: America/New_York
 
 kramdown:
   input: GFM
@@ -29,10 +30,11 @@ include:
 exclude:
   - Gemfile
   - Gemfile.lock
-  - _docs/format/*
+  - ruby
   - asf-site
   - scripts
   - README.md
+  - vendor
 
 collections:
   docs:
@@ -46,10 +48,7 @@ sass:
 # The base path where the website is deployed
 baseurl:
 
-gems:
+plugins:
+  - jekyll-assets
   - jekyll-feed
-  - jekyll-bootstrap-sass
   - jekyll-jupyter-notebook
-
-bootstrap:
-  assets: true

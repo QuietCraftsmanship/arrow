@@ -1,14 +1,13 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,18 +17,22 @@
 
 package org.apache.arrow.vector.types.pojo;
 
-import static com.google.common.base.Preconditions.checkNotNull;
-
+import java.util.HashMap;
 import java.util.Map;
 
-import com.google.common.collect.ImmutableMap;
-
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Collections2;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.Types.MinorType;
+import org.apache.arrow.vector.types.pojo.ArrowType.ExtensionType;
 import org.apache.arrow.vector.util.CallBack;
 
+/**
+ * POJO representation of an Arrow field type.  It consists of a logical type, nullability and whether the field
+ * (column) is dictionary encoded.
+ */
 public class FieldType {
 
   public static FieldType nullable(ArrowType type) {
@@ -45,12 +48,33 @@ public class FieldType {
     this(nullable, type, dictionary, null);
   }
 
+  /**
+   * Constructs a new instance.
+   *
+   * @param nullable Whether the Vector is nullable
+   * @param type The logical arrow type of the field.
+   * @param dictionary The dictionary encoding of the field.
+   * @param metadata Custom metadata for the field.
+   */
   public FieldType(boolean nullable, ArrowType type, DictionaryEncoding dictionary, Map<String, String> metadata) {
     super();
     this.nullable = nullable;
-    this.type = checkNotNull(type);
+    this.type = Preconditions.checkNotNull(type);
     this.dictionary = dictionary;
-    this.metadata = metadata == null ? ImmutableMap.<String, String>of() : ImmutableMap.copyOf(metadata);
+    if (type instanceof ExtensionType) {
+      // Save the extension type name/metadata
+      final Map<String, String> extensionMetadata = new HashMap<>();
+      extensionMetadata.put(ExtensionType.EXTENSION_METADATA_KEY_NAME, ((ExtensionType) type).extensionName());
+      extensionMetadata.put(ExtensionType.EXTENSION_METADATA_KEY_METADATA, ((ExtensionType) type).serialize());
+      if (metadata != null) {
+        for (Map.Entry<String, String> entry : metadata.entrySet()) {
+          extensionMetadata.put(entry.getKey(), entry.getValue());
+        }
+      }
+      this.metadata = Collections2.immutableMapCopy(extensionMetadata);
+    } else {
+      this.metadata = metadata == null ? java.util.Collections.emptyMap() : Collections2.immutableMapCopy(metadata);
+    }
   }
 
   public boolean isNullable() {

@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,12 +32,12 @@ import io.netty.buffer.ArrowBuf;
 /**
  * An abstraction that is used to store a sequence of values in an individual column.
  *
- * A {@link ValueVector value vector} stores underlying data in-memory in a columnar fashion that is compact and
+ * <p>A {@link ValueVector value vector} stores underlying data in-memory in a columnar fashion that is compact and
  * efficient. The column whose data is stored, is referred by {@link #getField()}.
  *
- * It is important that vector is allocated before attempting to read or write.
+ * <p>It is important that vector is allocated before attempting to read or write.
  *
- * There are a few "rules" around vectors:
+ * <p>There are a few "rules" around vectors:
  *
  * <ul>
  * <li>values need to be written in order (e.g. index 0, 1, 2, 5)</li>
@@ -48,10 +47,10 @@ import io.netty.buffer.ArrowBuf;
  * <li>you should never write to a vector once it has been read.</li>
  * </ul>
  *
- * Please note that the current implementation doesn't enforce those rules, hence we may find few places that
+ * <p>Please note that the current implementation doesn't enforce those rules, hence we may find few places that
  * deviate from these rules (e.g. offset vectors in Variable Length and Repeated vector)
  *
- * This interface "should" strive to guarantee this order of operation:
+ * <p>This interface "should" strive to guarantee this order of operation:
  * <blockquote>
  * allocate &gt; mutate &gt; setvaluecount &gt; access &gt; clear (or allocate to start the process over).
  * </blockquote>
@@ -80,7 +79,7 @@ public interface ValueVector extends Closeable, Iterable<ValueVector> {
   BufferAllocator getAllocator();
 
   /**
-   * Set the initial record capacity
+   * Set the initial record capacity.
    *
    * @param numRecords the initial record capacity.
    */
@@ -100,9 +99,18 @@ public interface ValueVector extends Closeable, Iterable<ValueVector> {
   void close();
 
   /**
-   * Release the underlying ArrowBuf and reset the ValueVector to empty.
+   * Release any owned ArrowBuf and reset the ValueVector to the initial state. If the
+   * vector has any child vectors, they will also be cleared.
    */
   void clear();
+
+  /**
+   * Reset the ValueVector to the initial state without releasing any owned ArrowBuf.
+   * Buffer capacities will remain unchanged and any previous data will be zeroed out.
+   * This includes buffers for data, validity, offset, etc. If the vector has any
+   * child vectors, they will also be reset.
+   */
+  void reset();
 
   /**
    * Get information about how this field is materialized.
@@ -114,11 +122,11 @@ public interface ValueVector extends Closeable, Iterable<ValueVector> {
   MinorType getMinorType();
 
   /**
-   * to transfer quota responsibility
+   * To transfer quota responsibility.
    *
    * @param allocator the target allocator
    * @return a {@link org.apache.arrow.vector.util.TransferPair transfer pair}, creating a new target vector of
-   * the same type.
+   *         the same type.
    */
   TransferPair getTransferPair(BufferAllocator allocator);
 
@@ -127,40 +135,32 @@ public interface ValueVector extends Closeable, Iterable<ValueVector> {
   TransferPair getTransferPair(String ref, BufferAllocator allocator, CallBack callBack);
 
   /**
-   * makes a new transfer pair used to transfer underlying buffers
+   * Makes a new transfer pair used to transfer underlying buffers.
    *
    * @param target the target for the transfer
    * @return a new {@link org.apache.arrow.vector.util.TransferPair transfer pair} that is used to transfer underlying
-   * buffers into the target vector.
+   *         buffers into the target vector.
    */
   TransferPair makeTransferPair(ValueVector target);
 
   /**
-   * @return an {@link org.apache.arrow.vector.ValueVector.Accessor accessor} that is used to read from this vector
-   * instance.
-   */
-  Accessor getAccessor();
-
-  /**
-   * @return an {@link org.apache.arrow.vector.ValueVector.Mutator mutator} that is used to write to this vector
-   * instance.
-   */
-  Mutator getMutator();
-
-  /**
+   * Get a reader for this vector.
+   *
    * @return a {@link org.apache.arrow.vector.complex.reader.FieldReader field reader} that supports reading values
-   * from this vector.
+   *         from this vector.
    */
   FieldReader getReader();
 
   /**
+   * Get the number of bytes used by this vector.
+   *
    * @return the number of bytes that is used by this vector instance.
    */
   int getBufferSize();
 
   /**
    * Returns the number of bytes that is used by this vector if it holds the given number
-   * of values. The result will be the same as if Mutator.setValueCount() were called, followed
+   * of values. The result will be the same as if setValueCount() were called, followed
    * by calling getBufferSize(), but without any of the closing side-effects that setValueCount()
    * implies wrt finishing off the population of a vector. Some operations might wish to use
    * this to determine how much memory has been used by a vector so far, even though it is
@@ -183,76 +183,58 @@ public interface ValueVector extends Closeable, Iterable<ValueVector> {
   ArrowBuf[] getBuffers(boolean clear);
 
   /**
-   * An abstraction that is used to read from this vector instance.
-   */
-  interface Accessor {
-    /**
-     * Get the Java Object representation of the element at the specified position. Useful for testing.
-     *
-     * @param index Index of the value to get
-     * @return the friendly java type
-     */
-    Object getObject(int index);
-
-    /**
-     * @return the number of values that is stored in this vector.
-     */
-    int getValueCount();
-
-    /**
-     * @param index the index to check for nullity
-     * @return true if the value at the given index is null, false otherwise.
-     */
-    boolean isNull(int index);
-
-    /**
-     * @return the number of null values
-     */
-    int getNullCount();
-  }
-
-  /**
-   * An abstraction that is used to write into this vector instance.
-   */
-  interface Mutator {
-    /**
-     * Sets the number of values that is stored in this vector to the given value count.
-     *
-     * @param valueCount value count to set.
-     */
-    void setValueCount(int valueCount);
-
-    /**
-     * Resets the mutator to pristine state.
-     */
-    void reset();
-
-    /**
-     * @param values the number of values to generate
-     * @deprecated this has nothing to do with value vector abstraction and should be removed.
-     */
-    @Deprecated
-    void generateTestData(int values);
-  }
-
-  /**
-   * Gets the underlying buffer associated with validity vector
+   * Gets the underlying buffer associated with validity vector.
    *
    * @return buffer
    */
-  public ArrowBuf getValidityBuffer();
+  ArrowBuf getValidityBuffer();
 
   /**
-   * Gets the underlying buffer associated with data vector
+   * Gets the underlying buffer associated with data vector.
    *
    * @return buffer
    */
-  public ArrowBuf getDataBuffer();
+  ArrowBuf getDataBuffer();
 
   /**
-   * Gets the underlying buffer associated with offset vector
+   * Gets the underlying buffer associated with offset vector.
    *
    * @return buffer
    */
-  public ArrowBuf getOffsetBuffer();
+  ArrowBuf getOffsetBuffer();
+
+  /**
+   * Gets the number of values.
+   *
+   * @return number of values in the vector
+   */
+  int getValueCount();
+
+  /**
+   * Set number of values in the vector.
+   */
+  void setValueCount(int valueCount);
+
+  /**
+   * Get friendly type object from the vector.
+   *
+   * @param index index of object to get
+   * @return friendly type object
+   */
+  Object getObject(int index);
+
+  /**
+   * Returns number of null elements in the vector.
+   *
+   * @return number of null elements
+   */
+  int getNullCount();
+
+  /**
+   * Check whether an element in the vector is null.
+   *
+   * @param index index to check for null
+   * @return true if element is null
+   */
+  boolean isNull(int index);
 }

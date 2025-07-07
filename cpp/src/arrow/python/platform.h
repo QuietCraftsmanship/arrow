@@ -21,13 +21,14 @@
 #ifndef ARROW_PYTHON_PLATFORM_H
 #define ARROW_PYTHON_PLATFORM_H
 
-#include <iostream>
-#include <Python.h>
+#include <Python.h> // IWYU pragma: export
 #include <datetime.h>
 
 // Work around C2528 error
+#ifdef _MSC_VER
 #if _MSC_VER >= 1900
 #undef timezone
+#endif
 #endif
 
 #endif  // ARROW_PYTHON_PLATFORM_H

@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,19 +20,16 @@ package org.apache.arrow.vector.util;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
+import org.apache.arrow.util.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.base.Function;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
@@ -41,12 +37,12 @@ import io.netty.util.collection.IntObjectMap;
 /**
  * An implementation of map that supports constant time look-up by a generic key or an ordinal.
  *
- * This class extends the functionality a regular {@link Map} with ordinal lookup support.
+ * <p>This class extends the functionality a regular {@link Map} with ordinal lookup support.
  * Upon insertion an unused ordinal is assigned to the inserted (key, value) tuple.
  * Upon update the same ordinal id is re-used while value is replaced.
  * Upon deletion of an existing item, its corresponding ordinal is recycled and could be used by another item.
  *
- * For any instance with N items, this implementation guarantees that ordinals are in the range of [0, N). However,
+ * <p>For any instance with N items, this implementation guarantees that ordinals are in the range of [0, N). However,
  * the ordinal assignment is dynamic and may change after an insertion or deletion. Consumers of this class are
  * responsible for explicitly checking the ordinal corresponding to a key via
  * {@link org.apache.arrow.vector.util.MapWithOrdinal#getOrdinal(Object)} before attempting to execute a lookup
@@ -55,11 +51,10 @@ import io.netty.util.collection.IntObjectMap;
  * @param <K> key type
  * @param <V> value type
  */
-
 public class MapWithOrdinal<K, V> implements Map<K, V> {
-  private final static Logger logger = LoggerFactory.getLogger(MapWithOrdinal.class);
+  private static final Logger logger = LoggerFactory.getLogger(MapWithOrdinal.class);
 
-  private final Map<K, Entry<Integer, V>> primary = Maps.newLinkedHashMap();
+  private final Map<K, Entry<Integer, V>> primary = new HashMap<>();
   private final IntObjectHashMap<V> secondary = new IntObjectHashMap<>();
 
   private final Map<K, V> delegate = new Map<K, V>() {
@@ -134,27 +129,21 @@ public class MapWithOrdinal<K, V> implements Map<K, V> {
 
     @Override
     public Collection<V> values() {
-      return Lists.newArrayList(Iterables.transform(secondary.entries(), new Function<IntObjectMap.Entry<V>, V>() {
-        @Override
-        public V apply(IntObjectMap.Entry<V> entry) {
-          return Preconditions.checkNotNull(entry).value();
-        }
-      }));
+      return StreamSupport.stream(secondary.entries().spliterator(), false)
+          .map((IntObjectMap.PrimitiveEntry<V> t) -> Preconditions.checkNotNull(t).value())
+          .collect(Collectors.toList());
     }
 
     @Override
     public Set<Entry<K, V>> entrySet() {
-      return Sets.newHashSet(Iterables.transform(primary.entrySet(), new Function<Entry<K, Entry<Integer, V>>, Entry<K, V>>() {
-        @Override
-        public Entry<K, V> apply(Entry<K, Entry<Integer, V>> entry) {
-          return new AbstractMap.SimpleImmutableEntry<>(entry.getKey(), entry.getValue().getValue());
-        }
-      }));
+      return primary.entrySet().stream()
+          .map(entry -> new AbstractMap.SimpleImmutableEntry<>(entry.getKey(), entry.getValue().getValue()))
+          .collect(Collectors.toSet());
     }
   };
 
   /**
-   * Returns the value corresponding to the given ordinal
+   * Returns the value corresponding to the given ordinal.
    *
    * @param id ordinal value for lookup
    * @return an instance of V
@@ -220,9 +209,10 @@ public class MapWithOrdinal<K, V> implements Map<K, V> {
   }
 
   /**
-   * Removes the element corresponding to the key if exists extending the semantics of {@link java.util.Map#remove} with ordinal
-   * re-cycling. The ordinal corresponding to the given key may be re-assigned to another tuple. It is important that
-   * consumer checks the ordinal value via {@link org.apache.arrow.vector.util.MapWithOrdinal#getOrdinal(Object)} before attempting to look-up by ordinal.
+   * Removes the element corresponding to the key if exists extending the semantics of {@link java.util.Map#remove}
+   * with ordinal re-cycling. The ordinal corresponding to the given key may be re-assigned to another tuple. It is
+   * important that consumer checks the ordinal value via
+   * {@link org.apache.arrow.vector.util.MapWithOrdinal#getOrdinal(Object)} before attempting to look-up by ordinal.
    *
    * @see java.util.Map#remove
    */
@@ -246,6 +236,9 @@ public class MapWithOrdinal<K, V> implements Map<K, V> {
     return delegate.keySet();
   }
 
+  /**
+   * Returns a list of keys in ordinal order.
+   */
   public List<K> keyList() {
     int size = size();
     Set<K> keys = keySet();

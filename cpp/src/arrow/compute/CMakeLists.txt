@@ -15,25 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Headers: top level
-install(FILES
-  api.h
-  context.h
-  kernel.h
-  kernels/cast.h
-  kernels/hash.h
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/compute")
+arrow_install_all_headers("arrow/compute")
 
 # pkg-config support
-configure_file(arrow-compute.pc.in
-  "${CMAKE_CURRENT_BINARY_DIR}/arrow-compute.pc"
-  @ONLY)
-install(
-  FILES "${CMAKE_CURRENT_BINARY_DIR}/arrow-compute.pc"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig/")
+arrow_add_pkg_config("arrow-compute")
 
-#######################################
+#
 # Unit tests
-#######################################
+#
 
-ADD_ARROW_TEST(compute-test)
+add_arrow_test(compute-test)
+add_arrow_test(expression-test PREFIX "arrow-compute")
+add_arrow_test(operations/operations-test PREFIX "arrow-compute")
+add_arrow_benchmark(compute-benchmark)
+
+add_subdirectory(kernels)

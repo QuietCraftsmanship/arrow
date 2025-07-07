@@ -25,6 +25,10 @@
   apacheId: uwe
   githubId: xhochy
   role: PMC
+- name: Jacques Nadeau
+  apacheId: jacques
+  githubId: jacques-n
+  role: PMC
 - name: Julien Le Dem
   apacheId: julienledem
   githubId: julienledem
@@ -32,4 +36,14 @@
 - name: Michael König
   apacheId: MathMagique
   githubId: MathMagique
+- name: Siddharth Teotia
+  apacheId: siddharthteotia
+  githubId: siddharthteotia
+- name: The Apache Arrow PMC
+  apacheId: pmc
+  githubId: pmc
+- name: Andy Grove
+  apacheId: agrove
+  githubId: andygrove
+  role: PMC
 # End contributors.yml

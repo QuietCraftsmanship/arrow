@@ -23,9 +23,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-.vscode
-yarn.lock
-package-lock.json
+.vscode/**
+!.vscode/launch.json
 
 # Runtime data
 pids
@@ -63,7 +62,6 @@ jspm_packages/
 
 # JS package manager files
 yarn.lock
-package-lock.json
 
 # Optional eslint cache
 .eslintcache
@@ -81,5 +79,13 @@ package-lock.json
 .env
 
 # compilation targets
+doc
 dist
 targets
+
+# test data files
+test/data/**/*.json
+test/data/**/*.arrow
+
+# jest snapshots (too big)
+test/__snapshots__/

@@ -17,89 +17,85 @@
 
 const del = require('del');
 const gulp = require('gulp');
-const path = require('path');
 const { Observable } = require('rxjs');
-const testsTask = require('./gulp/test-task');
-const buildTask = require('./gulp/build-task');
 const cleanTask = require('./gulp/clean-task');
+const compileTask = require('./gulp/compile-task');
 const packageTask = require('./gulp/package-task');
 const { targets, modules } = require('./gulp/argv');
+const { testTask, createTestData, cleanTestData } = require('./gulp/test-task');
 const {
-    targetDir,
     taskName, combinations,
-    knownTargets, knownModules,
+    targetDir, knownTargets,
     npmPkgName, UMDSourceTargets,
-    moduleFormatsToSkipCombosOf
+    tasksToSkipPerTargetOrFormat
 } = require('./gulp/util');
 
 for (const [target, format] of combinations([`all`], [`all`])) {
     const task = taskName(target, format);
     gulp.task(`clean:${task}`, cleanTask(target, format));
-    gulp.task( `test:${task}`, testsTask(target, format));
-    gulp.task(`debug:${task}`, testsTask(target, format, true));
-    gulp.task(`build:${task}`, gulp.series(`clean:${task}`,
-                                            buildTask(target, format),
-                                            packageTask(target, format)));
+    gulp.task( `test:${task}`,  testTask(target, format));
+    gulp.task(`compile:${task}`, compileTask(target, format));
+    gulp.task(`package:${task}`, packageTask(target, format));
+    gulp.task(`build:${task}`, gulp.series(
+        `clean:${task}`, `compile:${task}`, `package:${task}`
+    ));
 }
 
 // The UMD bundles build temporary es5/6/next targets via TS,
 // then run the TS source through either closure-compiler or
-// uglify, so we special case that here.
-knownTargets.forEach((target) =>
-    gulp.task(`build:${target}:umd`,
-        gulp.series(
-            gulp.parallel(
-                cleanTask(target, `umd`),
-                cleanTask(UMDSourceTargets[target], `cls`),
-            ),
-            buildTask(UMDSourceTargets[target], `cls`),
-            buildTask(target, `umd`), packageTask(target, `umd`)
-        )
-    )
-);
+// a minifier, so we special case that here.
+knownTargets.forEach((target) => {
+    const umd = taskName(target, `umd`);
+    const cls = taskName(UMDSourceTargets[target], `cls`);
+    gulp.task(`build:${umd}`, gulp.series(
+        `build:${cls}`,
+        `clean:${umd}`, `compile:${umd}`, `package:${umd}`,
+        function remove_closure_tmp_files() {
+            return del(targetDir(target, `cls`))
+        }
+    ));
+});
 
-// The main "apache-arrow" module builds the es5/cjs, es5/umd,
-// es2015/esm, es2015/umd, and ts targets, then copies and
-// renames the compiled output into the apache-arrow folder
+// The main "apache-arrow" module builds the es5/umd, es2015/cjs,
+// es2015/esm, and es2015/umd targets, then copies and renames the
+// compiled output into the apache-arrow folder
 gulp.task(`build:${npmPkgName}`,
     gulp.series(
-        cleanTask(npmPkgName),
         gulp.parallel(
-            `build:${taskName(`es5`, `cjs`)}`,
             `build:${taskName(`es5`, `umd`)}`,
-            `build:${taskName(`es2015`, `esm`)}`,
-            `build:${taskName(`es2015`, `umd`)}`
+            `build:${taskName(`esnext`, `cjs`)}`,
+            `build:${taskName(`esnext`, `esm`)}`,
+            `build:${taskName(`esnext`, `umd`)}`
         ),
-        buildTask(npmPkgName), packageTask(npmPkgName)
+        `clean:${npmPkgName}`,
+        `compile:${npmPkgName}`,
+        `package:${npmPkgName}`
     )
 );
 
+// And finally the global composite tasks
+gulp.task(`clean:testdata`, cleanTestData);
+gulp.task(`create:testdata`, createTestData);
+gulp.task(`test`, gulpConcurrent(getTasks(`test`)));
+gulp.task(`clean`, gulp.parallel(getTasks(`clean`)));
+gulp.task(`build`, gulpConcurrent(getTasks(`build`)));
+gulp.task(`compile`, gulpConcurrent(getTasks(`compile`)));
+gulp.task(`package`, gulpConcurrent(getTasks(`package`)));
+gulp.task(`default`,  gulp.series(`clean`, `build`, `test`));
 
 function gulpConcurrent(tasks) {
-    return () => Observable.bindCallback((tasks, cb) => gulp.parallel(tasks)(cb))(tasks);
+    const numCPUs = Math.max(1, require('os').cpus().length * 0.75) | 0;
+    return () => Observable.from(tasks.map((task) => gulp.series(task)))
+        .flatMap((task) => Observable.bindNodeCallback(task)(), numCPUs);
 }
-  
-const buildConcurrent = (tasks) => () =>
-    gulpConcurrent(tasks)()
-        .concat(Observable
-            .defer(() => Observable
-            .merge(...knownTargets.map((target) =>
-                del(`${targetDir(target, `cls`)}/**`)))));
-  
-gulp.task( `test`, gulp.series(getTasks(`test`)));
-gulp.task(`debug`, gulp.series(getTasks(`debug`)));
-gulp.task(`clean`, gulp.parallel(getTasks(`clean`)));
-gulp.task(`build`, buildConcurrent(getTasks(`build`)));
-gulp.task(`default`,  gulp.series(`build`, `test`));
-  
+
 function getTasks(name) {
     const tasks = [];
     if (targets.indexOf(`ts`) !== -1) tasks.push(`${name}:ts`);
     if (targets.indexOf(npmPkgName) !== -1) tasks.push(`${name}:${npmPkgName}`);
     for (const [target, format] of combinations(targets, modules)) {
-        if (moduleFormatsToSkipCombosOf[format] && name === `test`) {
-            continue;
-        }
+        if (tasksToSkipPerTargetOrFormat[target] && tasksToSkipPerTargetOrFormat[target][name]) continue;
+        if (tasksToSkipPerTargetOrFormat[format] && tasksToSkipPerTargetOrFormat[format][name]) continue;
         tasks.push(`${name}:${taskName(target, format)}`);
     }
     return tasks.length && tasks || [(done) => done()];

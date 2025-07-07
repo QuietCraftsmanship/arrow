@@ -43,7 +43,7 @@ asf_jira = jira.client.JIRA({'server': JIRA_API_BASE},
                             basic_auth=(JIRA_USERNAME, JIRA_PASSWORD))
 
 
-locale.setlocale(locale.LC_ALL, 'en_US.utf8')
+locale.setlocale(locale.LC_ALL, 'en_US.utf-8')
 
 
 def get_issues_for_version(version):
@@ -67,11 +67,20 @@ def format_changelog_markdown(issues, out):
     for issue_type, issue_group in sorted(issues_by_type.items()):
         issue_group.sort(key=lambda x: x.key)
 
-        out.write('## {0}\n\n'.format(issue_type))
+        out.write('## {0}\n\n'.format(_escape_for_markdown(issue_type)))
         for issue in issue_group:
+            markdown_summary = _escape_for_markdown(issue.fields.summary)
             out.write('* {0} - {1}\n'.format(issue.key,
-                                             issue.fields.summary))
+                                             markdown_summary))
         out.write('\n')
+
+
+def _escape_for_markdown(x):
+    return (
+        x.replace('_', r'\_')  # underscores
+        .replace('`', r'\`')   # backticks
+        .replace('*', r'\*')   # asterisks
+    )
 
 
 def format_changelog_website(issues, out):
@@ -84,7 +93,8 @@ def format_changelog_website(issues, out):
         'Wish': NEW_FEATURE,
         'Task': NEW_FEATURE,
         'Test': BUGFIX,
-        'Bug': BUGFIX
+        'Bug': BUGFIX,
+        'Sub-task': NEW_FEATURE
     }
 
     issues_by_category = defaultdict(list)
@@ -102,7 +112,9 @@ def format_changelog_website(issues, out):
         out.write('## {0}\n\n'.format(issue_category))
         for issue in issue_group:
             name = LINK_TEMPLATE.format(issue.key)
-            out.write('* {0} - {1}\n'.format(name, issue.fields.summary))
+            markdown_summary = _escape_for_markdown(issue.fields.summary)
+            out.write('* {0} - {1}\n'
+                      .format(name, markdown_summary))
         out.write('\n')
 
 
@@ -134,14 +146,13 @@ def append_changelog(version, changelog_path):
     print('# Apache Arrow {0} ({1})'.format(version, today),
           end='', file=result)
     print('\n', file=result)
-    print(new_changelog.replace('_', '\_'),
-          end='', file=result)
+    print(new_changelog, end='', file=result)
 
     # Prior versions
     print(''.join(old_changelog[19:]), file=result)
 
     with open(changelog_path, 'w') as f:
-        f.write(result.getvalue())
+        f.write(result.getvalue().rstrip() + '\n')
 
 
 if __name__ == '__main__':

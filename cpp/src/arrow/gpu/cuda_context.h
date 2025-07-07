@@ -27,7 +27,7 @@
 #include "arrow/gpu/cuda_memory.h"
 
 namespace arrow {
-namespace gpu {
+namespace cuda {
 
 // Forward declaration
 class CudaContext;
@@ -36,17 +36,26 @@ class ARROW_EXPORT CudaDeviceManager {
  public:
   static Status GetInstance(CudaDeviceManager** manager);
 
+  /// \brief Get the CUDA driver context for a particular device
+  /// \param[in] device_number the CUDA device
+  /// \param[out] out cached context
+  Status GetContext(int device_number, std::shared_ptr<CudaContext>* out);
+
   /// \brief Get the shared CUDA driver context for a particular device
-  Status GetContext(int gpu_number, std::shared_ptr<CudaContext>* ctx);
+  /// \param[in] device_number the CUDA device
+  /// \param[in] handle CUDA context handler created by another library
+  /// \param[out] out shared context
+  Status GetSharedContext(int device_number, void* handle,
+                          std::shared_ptr<CudaContext>* out);
 
-  /// \brief Create a new context for a given device number
-  ///
-  /// In general code will use GetContext
-  Status CreateNewContext(int gpu_number, std::shared_ptr<CudaContext>* ctx);
+  /// \brief Allocate host memory with fast access to given GPU device
+  /// \param[in] device_number the CUDA device
+  /// \param[in] nbytes number of bytes
+  /// \param[out] out the allocated buffer
+  Status AllocateHost(int device_number, int64_t nbytes,
+                      std::shared_ptr<CudaHostBuffer>* out);
 
-  Status AllocateHost(int64_t nbytes, std::shared_ptr<CudaHostBuffer>* buffer);
-
-  Status FreeHost(uint8_t* data, int64_t nbytes);
+  Status FreeHost(void* data, int64_t nbytes);
 
   int num_devices() const;
 
@@ -76,22 +85,70 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
   /// \return Status
   Status Allocate(int64_t nbytes, std::shared_ptr<CudaBuffer>* out);
 
+  /// \brief Create a view of CUDA memory on GPU device of this context
+  /// \param[in] data the starting device address
+  /// \param[in] nbytes number of bytes
+  /// \param[out] out the view buffer
+  /// \return Status
+  ///
+  /// \note The caller is responsible for allocating and freeing the
+  /// memory as well as ensuring that the memory belongs to the CUDA
+  /// context that this CudaContext instance holds.
+  Status View(uint8_t* data, int64_t nbytes, std::shared_ptr<CudaBuffer>* out);
+
   /// \brief Open existing CUDA IPC memory handle
   /// \param[in] ipc_handle opaque pointer to CUipcMemHandle (driver API)
-  /// \param[out] buffer a CudaBuffer referencing
+  /// \param[out] out a CudaBuffer referencing the IPC segment
   /// \return Status
   Status OpenIpcBuffer(const CudaIpcMemHandle& ipc_handle,
-                       std::shared_ptr<CudaBuffer>* buffer);
+                       std::shared_ptr<CudaBuffer>* out);
+
+  /// \brief Close memory mapped with IPC buffer
+  /// \param[in] buffer a CudaBuffer referencing
+  /// \return Status
+  Status CloseIpcBuffer(CudaBuffer* buffer);
+
+  /// \brief Block until the all device tasks are completed.
+  Status Synchronize(void);
 
   int64_t bytes_allocated() const;
+
+  /// \brief Expose CUDA context handle to other libraries
+  void* handle() const;
+
+  /// \brief Return device number
+  int device_number() const;
+
+  /// \brief Return the device address that is reachable from kernels
+  /// running in the context
+  /// \param[in] addr device or host memory address
+  /// \param[out] devaddr the device address
+  /// \return Status
+  ///
+  /// The device address is defined as a memory address accessible by
+  /// device. While it is often a device memory address, it can be
+  /// also a host memory address, for instance, when the memory is
+  /// allocated as host memory (using cudaMallocHost or cudaHostAlloc)
+  /// or as managed memory (using cudaMallocManaged) or the host
+  /// memory is page-locked (using cudaHostRegister).
+  Status GetDeviceAddress(uint8_t* addr, uint8_t** devaddr);
+
+  /// \brief Release CUDA memory on GPU device for this context
+  /// \param[in] device_ptr the buffer address
+  /// \param[in] nbytes number of bytes
+  /// \return Status
+  Status Free(void* device_ptr, int64_t nbytes);
 
  private:
   CudaContext();
 
-  Status ExportIpcBuffer(uint8_t* data, std::unique_ptr<CudaIpcMemHandle>* handle);
-  Status CopyHostToDevice(uint8_t* dst, const uint8_t* src, int64_t nbytes);
-  Status CopyDeviceToHost(uint8_t* dst, const uint8_t* src, int64_t nbytes);
-  Status Free(uint8_t* device_ptr, int64_t nbytes);
+  Status ExportIpcBuffer(void* data, int64_t size,
+                         std::shared_ptr<CudaIpcMemHandle>* handle);
+  Status CopyHostToDevice(void* dst, const void* src, int64_t nbytes);
+  Status CopyDeviceToHost(void* dst, const void* src, int64_t nbytes);
+  Status CopyDeviceToDevice(void* dst, const void* src, int64_t nbytes);
+  Status CopyDeviceToAnotherDevice(const std::shared_ptr<CudaContext>& dst_ctx, void* dst,
+                                   const void* src, int64_t nbytes);
 
   class CudaContextImpl;
   std::unique_ptr<CudaContextImpl> impl_;
@@ -99,10 +156,13 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
   friend CudaBuffer;
   friend CudaBufferReader;
   friend CudaBufferWriter;
+  /// \cond FALSE
+  // (note: emits warning on Doxygen < 1.8.15)
   friend CudaDeviceManager::CudaDeviceManagerImpl;
+  /// \endcond
 };
 
-}  // namespace gpu
+}  // namespace cuda
 }  // namespace arrow
 
 #endif  // ARROW_GPU_CUDA_CONTEXT_H

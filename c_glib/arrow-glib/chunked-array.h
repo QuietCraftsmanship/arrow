@@ -23,52 +23,26 @@
 
 G_BEGIN_DECLS
 
-#define GARROW_TYPE_CHUNKED_ARRAY               \
-  (garrow_chunked_array_get_type())
-#define GARROW_CHUNKED_ARRAY(obj)                               \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),                            \
-                              GARROW_TYPE_CHUNKED_ARRAY,        \
-                              GArrowChunkedArray))
-#define GARROW_CHUNKED_ARRAY_CLASS(klass)               \
-  (G_TYPE_CHECK_CLASS_CAST((klass),                     \
-                           GARROW_TYPE_CHUNKED_ARRAY,   \
-                           GArrowChunkedArrayClass))
-#define GARROW_IS_CHUNKED_ARRAY(obj)                            \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                            \
-                              GARROW_TYPE_CHUNKED_ARRAY))
-#define GARROW_IS_CHUNKED_ARRAY_CLASS(klass)            \
-  (G_TYPE_CHECK_CLASS_TYPE((klass),                     \
-                           GARROW_TYPE_CHUNKED_ARRAY))
-#define GARROW_CHUNKED_ARRAY_GET_CLASS(obj)             \
-  (G_TYPE_INSTANCE_GET_CLASS((obj),                     \
-                             GARROW_TYPE_CHUNKED_ARRAY, \
-                             GArrowChunkedArrayClass))
-
-typedef struct _GArrowChunkedArray         GArrowChunkedArray;
-typedef struct _GArrowChunkedArrayClass    GArrowChunkedArrayClass;
-
-/**
- * GArrowChunkedArray:
- *
- * It wraps `arrow::ChunkedArray`.
- */
-struct _GArrowChunkedArray
-{
-  /*< private >*/
-  GObject parent_instance;
-};
-
+#define GARROW_TYPE_CHUNKED_ARRAY (garrow_chunked_array_get_type())
+G_DECLARE_DERIVABLE_TYPE(GArrowChunkedArray,
+                         garrow_chunked_array,
+                         GARROW,
+                         CHUNKED_ARRAY,
+                         GObject)
 struct _GArrowChunkedArrayClass
 {
   GObjectClass parent_class;
 };
 
-GType garrow_chunked_array_get_type(void) G_GNUC_CONST;
-
 GArrowChunkedArray *garrow_chunked_array_new(GList *chunks);
 
 gboolean garrow_chunked_array_equal(GArrowChunkedArray *chunked_array,
                                     GArrowChunkedArray *other_chunked_array);
+
+GArrowDataType *
+garrow_chunked_array_get_value_data_type(GArrowChunkedArray *chunked_array);
+GArrowType
+garrow_chunked_array_get_value_type(GArrowChunkedArray *chunked_array);
 
 guint64 garrow_chunked_array_get_length (GArrowChunkedArray *chunked_array);
 guint64 garrow_chunked_array_get_n_nulls(GArrowChunkedArray *chunked_array);
@@ -77,5 +51,10 @@ guint   garrow_chunked_array_get_n_chunks (GArrowChunkedArray *chunked_array);
 GArrowArray *garrow_chunked_array_get_chunk(GArrowChunkedArray *chunked_array,
                                             guint i);
 GList *garrow_chunked_array_get_chunks(GArrowChunkedArray *chunked_array);
+GArrowChunkedArray *garrow_chunked_array_slice(GArrowChunkedArray *chunked_array,
+                                               guint64 offset,
+                                               guint64 length);
+gchar *garrow_chunked_array_to_string(GArrowChunkedArray *chunked_array,
+                                      GError **error);
 
 G_END_DECLS

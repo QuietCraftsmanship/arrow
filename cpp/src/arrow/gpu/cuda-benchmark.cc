@@ -23,12 +23,13 @@
 
 #include "arrow/array.h"
 #include "arrow/memory_pool.h"
-#include "arrow/test-util.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/testing/util.h"
 
 #include "arrow/gpu/cuda_api.h"
 
 namespace arrow {
-namespace gpu {
+namespace cuda {
 
 constexpr int64_t kGpuNumber = 0;
 
@@ -48,8 +49,8 @@ static void CudaBufferWriterBenchmark(benchmark::State& state, const int64_t tot
     ABORT_NOT_OK(writer.SetBufferSize(buffer_size));
   }
 
-  std::shared_ptr<PoolBuffer> buffer;
-  ASSERT_OK(test::MakeRandomBytePoolBuffer(total_bytes, default_memory_pool(), &buffer));
+  std::shared_ptr<ResizableBuffer> buffer;
+  ASSERT_OK(MakeRandomByteBuffer(total_bytes, default_memory_pool(), &buffer));
 
   const uint8_t* host_data = buffer->data();
   while (state.KeepRunning()) {
@@ -64,7 +65,7 @@ static void CudaBufferWriterBenchmark(benchmark::State& state, const int64_t tot
   state.SetBytesProcessed(int64_t(state.iterations()) * total_bytes);
 }
 
-static void BM_Writer_Buffered(benchmark::State& state) {
+static void Writer_Buffered(benchmark::State& state) {
   // 128MB
   const int64_t kTotalBytes = 1 << 27;
 
@@ -74,25 +75,20 @@ static void BM_Writer_Buffered(benchmark::State& state) {
   CudaBufferWriterBenchmark(state, kTotalBytes, state.range(0), kBufferSize);
 }
 
-static void BM_Writer_Unbuffered(benchmark::State& state) {
+static void Writer_Unbuffered(benchmark::State& state) {
   // 128MB
   const int64_t kTotalBytes = 1 << 27;
   CudaBufferWriterBenchmark(state, kTotalBytes, state.range(0), 0);
 }
 
 // Vary chunk write size from 256 bytes to 64K
-BENCHMARK(BM_Writer_Buffered)
-    ->RangeMultiplier(16)
-    ->Range(1 << 8, 1 << 16)
-    ->MinTime(1.0)
-    ->UseRealTime();
+BENCHMARK(Writer_Buffered)->RangeMultiplier(16)->Range(1 << 8, 1 << 16)->UseRealTime();
 
-BENCHMARK(BM_Writer_Unbuffered)
+BENCHMARK(Writer_Unbuffered)
     ->RangeMultiplier(4)
     ->RangeMultiplier(16)
     ->Range(1 << 8, 1 << 16)
-    ->MinTime(1.0)
     ->UseRealTime();
 
-}  // namespace gpu
+}  // namespace cuda
 }  // namespace arrow

@@ -147,7 +147,7 @@ static std::vector<fs::path> get_potential_libjvm_paths() {
   file_name = "jvm.dll";
 #elif __APPLE__
   search_prefixes = {""};
-  search_suffixes = {"", "/jre/lib/server"};
+  search_suffixes = {"", "/jre/lib/server", "/lib/server"};
   file_name = "libjvm.dylib";
 
 // SFrame uses /usr/libexec/java_home to find JAVA_HOME; for now we are
@@ -175,7 +175,7 @@ static std::vector<fs::path> get_potential_libjvm_paths() {
       "/usr/lib/jvm/default",                     // alt centos
       "/usr/java/latest",                         // alt centos
   };
-  search_suffixes = {"/jre/lib/amd64/server"};
+  search_suffixes = {"", "/jre/lib/amd64/server", "/lib/amd64/server"};
   file_name = "libjvm.so";
 #endif
   // From direct environment variable
@@ -218,9 +218,7 @@ static arrow::Status try_dlopen(std::vector<fs::path> potential_paths, const cha
   }
 
   if (out_handle == NULL) {
-    std::stringstream ss;
-    ss << "Unable to load " << name;
-    return arrow::Status::IOError(ss.str());
+    return arrow::Status::IOError("Unable to load ", name);
   }
 
   return arrow::Status::OK();
@@ -243,9 +241,7 @@ static arrow::Status try_dlopen(std::vector<fs::path> potential_paths, const cha
   }
 
   if (out_handle == NULL) {
-    std::stringstream ss;
-    ss << "Unable to load " << name;
-    return arrow::Status::IOError(ss.str());
+    return arrow::Status::IOError("Unable to load ", name);
   }
 
   return arrow::Status::OK();
@@ -310,8 +306,16 @@ void LibHdfsShim::BuilderSetKerbTicketCachePath(hdfsBuilder* bld,
   this->hdfsBuilderSetKerbTicketCachePath(bld, kerbTicketCachePath);
 }
 
+void LibHdfsShim::BuilderSetForceNewInstance(hdfsBuilder* bld) {
+  this->hdfsBuilderSetForceNewInstance(bld);
+}
+
 hdfsFS LibHdfsShim::BuilderConnect(hdfsBuilder* bld) {
   return this->hdfsBuilderConnect(bld);
+}
+
+int LibHdfsShim::BuilderConfSetStr(hdfsBuilder* bld, const char* key, const char* val) {
+  return this->hdfsBuilderConfSetStr(bld, key, val);
 }
 
 int LibHdfsShim::Disconnect(hdfsFS fs) { return this->hdfsDisconnect(fs); }
@@ -490,6 +494,8 @@ Status LibHdfsShim::GetRequiredSymbols() {
   GET_SYMBOL_REQUIRED(this, hdfsBuilderSetNameNodePort);
   GET_SYMBOL_REQUIRED(this, hdfsBuilderSetUserName);
   GET_SYMBOL_REQUIRED(this, hdfsBuilderSetKerbTicketCachePath);
+  GET_SYMBOL_REQUIRED(this, hdfsBuilderSetForceNewInstance);
+  GET_SYMBOL_REQUIRED(this, hdfsBuilderConfSetStr);
   GET_SYMBOL_REQUIRED(this, hdfsBuilderConnect);
   GET_SYMBOL_REQUIRED(this, hdfsCreateDirectory);
   GET_SYMBOL_REQUIRED(this, hdfsDelete);

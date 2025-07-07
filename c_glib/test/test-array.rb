@@ -42,7 +42,7 @@ class TestArray < Test::Unit::TestCase
   def test_is_null
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([true, false],
                  array.length.times.collect {|i| array.null?(i)})
@@ -51,7 +51,7 @@ class TestArray < Test::Unit::TestCase
   def test_is_valid
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal([false, true],
                  array.length.times.collect {|i| array.valid?(i)})
@@ -59,7 +59,7 @@ class TestArray < Test::Unit::TestCase
 
   def test_length
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
+    builder.append_value(true)
     array = builder.finish
     assert_equal(1, array.length)
   end
@@ -75,10 +75,10 @@ class TestArray < Test::Unit::TestCase
   def test_null_bitmap
     builder = Arrow::BooleanArrayBuilder.new
     builder.append_null
-    builder.append(true)
-    builder.append(false)
+    builder.append_value(true)
+    builder.append_value(false)
     builder.append_null
-    builder.append(false)
+    builder.append_value(false)
     array = builder.finish
     assert_equal(0b10110, array.null_bitmap.data.to_s.unpack("c*")[0])
   end
@@ -92,14 +92,14 @@ class TestArray < Test::Unit::TestCase
   def test_value_type
     builder = Arrow::BooleanArrayBuilder.new
     array = builder.finish
-    assert_equal(Arrow::Type::BOOL, array.value_type)
+    assert_equal(Arrow::Type::BOOLEAN, array.value_type)
   end
 
   def test_slice
     builder = Arrow::BooleanArrayBuilder.new
-    builder.append(true)
-    builder.append(false)
-    builder.append(true)
+    builder.append_value(true)
+    builder.append_value(false)
+    builder.append_value(true)
     array = builder.finish
     sub_array = array.slice(1, 2)
     assert_equal([false, true],
@@ -107,7 +107,12 @@ class TestArray < Test::Unit::TestCase
   end
 
   def test_to_s
-    assert_equal("[true, false, true]",
-                 build_boolean_array([true, false, true]).to_s)
+    assert_equal(<<-CONTENT.chomp, build_boolean_array([true, false, true]).to_s)
+[
+  true,
+  false,
+  true
+]
+    CONTENT
   end
 end

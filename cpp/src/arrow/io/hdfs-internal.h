@@ -23,8 +23,8 @@
 
 #include <hdfs.h>
 
-#include "arrow/io/windows_compatibility.h"  // IWYU pragma: keep
 #include "arrow/util/visibility.h"
+#include "arrow/util/windows_compatibility.h"  // IWYU pragma: keep
 
 using std::size_t;
 
@@ -51,7 +51,9 @@ struct LibHdfsShim {
   void (*hdfsBuilderSetUserName)(hdfsBuilder* bld, const char* userName);
   void (*hdfsBuilderSetKerbTicketCachePath)(hdfsBuilder* bld,
                                             const char* kerbTicketCachePath);
+  void (*hdfsBuilderSetForceNewInstance)(hdfsBuilder* bld);
   hdfsFS (*hdfsBuilderConnect)(hdfsBuilder* bld);
+  int (*hdfsBuilderConfSetStr)(hdfsBuilder* bld, const char* key, const char* val);
 
   int (*hdfsDisconnect)(hdfsFS fs);
 
@@ -95,6 +97,8 @@ struct LibHdfsShim {
     this->hdfsBuilderSetNameNodePort = nullptr;
     this->hdfsBuilderSetUserName = nullptr;
     this->hdfsBuilderSetKerbTicketCachePath = nullptr;
+    this->hdfsBuilderSetForceNewInstance = nullptr;
+    this->hdfsBuilderConfSetStr = nullptr;
     this->hdfsBuilderConnect = nullptr;
     this->hdfsDisconnect = nullptr;
     this->hdfsOpenFile = nullptr;
@@ -137,6 +141,10 @@ struct LibHdfsShim {
   void BuilderSetUserName(hdfsBuilder* bld, const char* userName);
 
   void BuilderSetKerbTicketCachePath(hdfsBuilder* bld, const char* kerbTicketCachePath);
+
+  void BuilderSetForceNewInstance(hdfsBuilder* bld);
+
+  int BuilderConfSetStr(hdfsBuilder* bld, const char* key, const char* val);
 
   hdfsFS BuilderConnect(hdfsBuilder* bld);
 

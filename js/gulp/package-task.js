@@ -27,6 +27,7 @@ const { Observable, ReplaySubject } = require('rxjs');
 const gulpJsonTransform = require('gulp-json-transform');
 
 const packageTask = ((cache) => memoizeTask(cache, function bundle(target, format) {
+    if (target === `src`) return Observable.empty();
     const out = targetDir(target, format);
     const jsonTransform = gulpJsonTransform(target === npmPkgName ? createMainPackageJson(target, format) :
                                             target === `ts`       ? createTypeScriptPackageJson(target, format)
@@ -43,33 +44,52 @@ module.exports.packageTask = packageTask;
 
 const createMainPackageJson = (target, format) => (orig) => ({
     ...createTypeScriptPackageJson(target, format)(orig),
+    bin: orig.bin,
     name: npmPkgName,
-    main: mainExport,
-    module: `${mainExport}.mjs`,
-    browser: `${mainExport}.es5.min.js`,
-    [`browser:es2015`]: `${mainExport}.es2015.min.js`,
-    [`@std/esm`]: { esm: `mjs` },
+    main: `${mainExport}.node`,
+    browser: `${mainExport}.dom`,
+    module: `${mainExport}.dom.mjs`,
+    types: `${mainExport}.node.d.ts`,
+    unpkg: `${mainExport}.es5.min.js`,
+    jsdelivr: `${mainExport}.es5.min.js`,
+    esm: { mode: `all`, sourceMap: true }
 });
   
 const createTypeScriptPackageJson = (target, format) => (orig) => ({
     ...createScopedPackageJSON(target, format)(orig),
-    main: `${mainExport}.ts`, types: `${mainExport}.ts`
+    bin: undefined,
+    module: undefined,
+    main: `${mainExport}.node.ts`,
+    types: `${mainExport}.node.ts`,
+    browser: `${mainExport}.dom.ts`,
+    dependencies: {
+        '@types/flatbuffers': '*',
+        '@types/node': '*',
+        ...orig.dependencies
+    }
 });
   
 const createScopedPackageJSON = (target, format) => (({ name, ...orig }) =>
-    conditionallyAddStandardESMEntry(target, format)(
-      packageJSONFields.reduce(
+    packageJSONFields.reduce(
         (xs, key) => ({ ...xs, [key]: xs[key] || orig[key] }),
-        { name: `${npmOrgName}/${packageName(target, format)}`,
-          version: undefined, main: `${mainExport}.js`, types: `${mainExport}.d.ts`,
-          browser: undefined, [`browser:es2015`]: undefined, module: undefined, [`@std/esm`]: undefined }
-      )
+        {
+            // un-set version, since it's automatically applied during the release process
+            version: undefined,
+            // set the scoped package name (e.g. "@apache-arrow/esnext-esm")
+            name: `${npmOrgName}/${packageName(target, format)}`,
+            // set "unpkg"/"jsdeliver" if building scoped UMD target
+            unpkg:    format === 'umd' ? `${mainExport}.js` : undefined,
+            jsdelivr: format === 'umd' ? `${mainExport}.js` : undefined,
+            // set "browser" if building scoped UMD target, otherwise "Arrow.dom"
+            browser:  format === 'umd' ? `${mainExport}.js` : `${mainExport}.dom.js`,
+            // set "main" to "Arrow" if building scoped UMD target, otherwise "Arrow.node"
+            main:     format === 'umd' ? `${mainExport}.js` : `${mainExport}.node`,
+            // set "module" (for https://www.npmjs.com/package/@pika/pack) if building scoped ESM target
+            module:   format === 'esm' ? `${mainExport}.dom.js` : undefined,
+            // include "esm" settings for https://www.npmjs.com/package/esm if building scoped ESM target
+            esm:      format === `esm` ? { mode: `auto`, sourceMap: true } : undefined,
+            // set "types" (for TypeScript/VSCode)
+            types:    format === 'umd' ? undefined : `${mainExport}.node.d.ts`,
+        }
     )
 );
-  
-const conditionallyAddStandardESMEntry = (target, format) => (packageJSON) => (
-    format !== `esm`
-      ? packageJSON
-      : { ...packageJSON, [`@std/esm`]: { esm: `js` } }
-);
-  

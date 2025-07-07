@@ -15,61 +15,69 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_PYTHON_PYTHON_TO_ARROW_H
-#define ARROW_PYTHON_PYTHON_TO_ARROW_H
+// Functions for converting between CPython built-in data structures and Arrow
+// data structures
+
+#ifndef ARROW_PYTHON_ADAPTERS_BUILTIN_H
+#define ARROW_PYTHON_ADAPTERS_BUILTIN_H
 
 #include "arrow/python/platform.h"
 
+#include <cstdint>
 #include <memory>
-#include <vector>
+
+#include "arrow/python/visibility.h"
+#include "arrow/type.h"
+#include "arrow/util/macros.h"
 
 #include "arrow/python/common.h"
-#include "arrow/python/pyarrow.h"
-#include "arrow/status.h"
-#include "arrow/util/visibility.h"
 
 namespace arrow {
 
-class RecordBatch;
-class Tensor;
-
-namespace io {
-
-class OutputStream;
-
-}  // namespace io
+class Array;
+class Status;
 
 namespace py {
 
-struct ARROW_EXPORT SerializedPyObject {
-  std::shared_ptr<RecordBatch> batch;
-  std::vector<std::shared_ptr<Tensor>> tensors;
-  std::vector<std::shared_ptr<Buffer>> buffers;
+struct PyConversionOptions {
+  PyConversionOptions() : type(NULLPTR), size(-1), pool(NULLPTR), from_pandas(false) {}
+
+  PyConversionOptions(const std::shared_ptr<DataType>& type, int64_t size,
+                      MemoryPool* pool, bool from_pandas)
+      : type(type), size(size), pool(default_memory_pool()), from_pandas(from_pandas) {}
+
+  // Set to null if to be inferred
+  std::shared_ptr<DataType> type;
+
+  // Default is -1: infer from data
+  int64_t size;
+
+  // Memory pool to use for allocations
+  MemoryPool* pool;
+
+  // Default false
+  bool from_pandas;
 };
 
-/// \brief Serialize Python sequence as a RecordBatch plus
-/// \param[in] context Serialization context which contains custom serialization
-/// and deserialization callbacks. Can be any Python object with a
-/// _serialize_callback method for serialization and a _deserialize_callback
-/// method for deserialization. If context is None, no custom serialization
-/// will be attempted.
-/// \param[in] sequence a Python sequence object to serialize to Arrow data
-/// structures
-/// \param[out] out the serialized representation
+/// \brief Convert sequence (list, generator, NumPy array with dtype object) of
+/// Python objects.
+/// \param[in] obj the sequence to convert
+/// \param[in] mask a NumPy array of true/false values to indicate whether
+/// values in the sequence are null (true) or not null (false). This parameter
+/// may be null
+/// \param[in] options various conversion options
+/// \param[out] out a ChunkedArray containing one or more chunks
 /// \return Status
-///
-/// Release GIL before calling
-ARROW_EXPORT
-Status SerializeObject(PyObject* context, PyObject* sequence, SerializedPyObject* out);
+ARROW_PYTHON_EXPORT
+Status ConvertPySequence(PyObject* obj, PyObject* mask,
+                         const PyConversionOptions& options,
+                         std::shared_ptr<ChunkedArray>* out);
 
-/// \brief Write serialized Python object to OutputStream
-/// \param[in] object a serialized Python object to write out
-/// \param[out] dst an OutputStream
-/// \return Status
-ARROW_EXPORT
-Status WriteSerializedObject(const SerializedPyObject& object, io::OutputStream* dst);
+ARROW_PYTHON_EXPORT
+Status ConvertPySequence(PyObject* obj, const PyConversionOptions& options,
+                         std::shared_ptr<ChunkedArray>* out);
 
 }  // namespace py
 }  // namespace arrow
 
-#endif  // ARROW_PYTHON_PYTHON_TO_ARROW_H
+#endif  // ARROW_PYTHON_ADAPTERS_BUILTIN_H

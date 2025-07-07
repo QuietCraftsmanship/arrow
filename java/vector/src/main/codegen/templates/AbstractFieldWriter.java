@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -31,6 +30,20 @@ package org.apache.arrow.vector.complex.impl;
  */
 @SuppressWarnings("unused")
 abstract class AbstractFieldWriter extends AbstractBaseWriter implements FieldWriter {
+
+  protected boolean addVectorAsNullable = true;
+
+  /**
+   * Set flag to control the FieldType.nullable property when a writer creates a new vector.
+   * If true then vectors created will be nullable, this is the default behavior. If false then
+   * vectors created will be non-nullable.
+   *
+   * @param nullable Whether or not to create nullable vectors (default behavior is true)
+   */
+  public void setAddVectorAsNullable(boolean nullable) {
+    addVectorAsNullable = nullable;
+  }
+
   @Override
   public void start() {
     throw new IllegalStateException(String.format("You tried to start when you are using a ValueWriter of type %s.", this.getClass().getSimpleName()));
@@ -67,6 +80,10 @@ abstract class AbstractFieldWriter extends AbstractBaseWriter implements FieldWr
   public void write${minor.class}(${friendlyType} value) {
     fail("${name}");
   }
+
+  public void writeBigEndianBytesToDecimal(byte[] value) {
+    fail("${name}");
+  }
   </#if>
 
   </#list></#list>
@@ -78,17 +95,17 @@ abstract class AbstractFieldWriter extends AbstractBaseWriter implements FieldWr
   /**
    * This implementation returns {@code false}.
    * <p>  
-   *   Must be overridden by map writers.
+   *   Must be overridden by struct writers.
    * </p>  
    */
   @Override
-  public boolean isEmptyMap() {
+  public boolean isEmptyStruct() {
     return false;
   }
 
   @Override
-  public MapWriter map() {
-    fail("Map");
+  public StructWriter struct() {
+    fail("Struct");
     return null;
   }
 
@@ -99,8 +116,8 @@ abstract class AbstractFieldWriter extends AbstractBaseWriter implements FieldWr
   }
 
   @Override
-  public MapWriter map(String name) {
-    fail("Map");
+  public StructWriter struct(String name) {
+    fail("Struct");
     return null;
   }
 

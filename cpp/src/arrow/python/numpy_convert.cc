@@ -21,7 +21,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +29,7 @@
 #include "arrow/type.h"
 
 #include "arrow/python/common.h"
+#include "arrow/python/pyarrow.h"
 #include "arrow/python/type_traits.h"
 
 namespace arrow {
@@ -44,23 +44,8 @@ bool is_contiguous(PyObject* array) {
   }
 }
 
-int cast_npy_type_compat(int type_num) {
-// Both LONGLONG and INT64 can be observed in the wild, which is buggy. We set
-// U/LONGLONG to U/INT64 so things work properly.
-
-#if (NPY_INT64 == NPY_LONGLONG) && (NPY_SIZEOF_LONGLONG == 8)
-  if (type_num == NPY_LONGLONG) {
-    type_num = NPY_INT64;
-  }
-  if (type_num == NPY_ULONGLONG) {
-    type_num = NPY_UINT64;
-  }
-#endif
-
-  return type_num;
-}
-
 NumPyBuffer::NumPyBuffer(PyObject* ao) : Buffer(nullptr, 0) {
+  PyAcquireGIL lock;
   arr_ = ao;
   Py_INCREF(ao);
 
@@ -76,7 +61,10 @@ NumPyBuffer::NumPyBuffer(PyObject* ao) : Buffer(nullptr, 0) {
   }
 }
 
-NumPyBuffer::~NumPyBuffer() { Py_XDECREF(arr_); }
+NumPyBuffer::~NumPyBuffer() {
+  PyAcquireGIL lock;
+  Py_XDECREF(arr_);
+}
 
 #define TO_ARROW_TYPE_CASE(NPY_NAME, FACTORY) \
   case NPY_##NPY_NAME:                        \
@@ -84,8 +72,11 @@ NumPyBuffer::~NumPyBuffer() { Py_XDECREF(arr_); }
     break;
 
 Status GetTensorType(PyObject* dtype, std::shared_ptr<DataType>* out) {
+  if (!PyArray_DescrCheck(dtype)) {
+    return Status::TypeError("Did not pass numpy.dtype object");
+  }
   PyArray_Descr* descr = reinterpret_cast<PyArray_Descr*>(dtype);
-  int type_num = cast_npy_type_compat(descr->type_num);
+  int type_num = fix_numpy_type_num(descr->type_num);
 
   switch (type_num) {
     TO_ARROW_TYPE_CASE(BOOL, uint8);
@@ -93,23 +84,15 @@ Status GetTensorType(PyObject* dtype, std::shared_ptr<DataType>* out) {
     TO_ARROW_TYPE_CASE(INT16, int16);
     TO_ARROW_TYPE_CASE(INT32, int32);
     TO_ARROW_TYPE_CASE(INT64, int64);
-#if (NPY_INT64 != NPY_LONGLONG)
-    TO_ARROW_TYPE_CASE(LONGLONG, int64);
-#endif
     TO_ARROW_TYPE_CASE(UINT8, uint8);
     TO_ARROW_TYPE_CASE(UINT16, uint16);
     TO_ARROW_TYPE_CASE(UINT32, uint32);
     TO_ARROW_TYPE_CASE(UINT64, uint64);
-#if (NPY_UINT64 != NPY_ULONGLONG)
-    TO_ARROW_CASE(ULONGLONG);
-#endif
     TO_ARROW_TYPE_CASE(FLOAT16, float16);
     TO_ARROW_TYPE_CASE(FLOAT32, float32);
     TO_ARROW_TYPE_CASE(FLOAT64, float64);
     default: {
-      std::stringstream ss;
-      ss << "Unsupported numpy type " << descr->type_num << std::endl;
-      return Status::NotImplemented(ss.str());
+      return Status::NotImplemented("Unsupported numpy type ", descr->type_num);
     }
   }
   return Status::OK();
@@ -134,9 +117,7 @@ Status GetNumPyType(const DataType& type, int* type_num) {
     NUMPY_TYPE_CASE(FLOAT, FLOAT32);
     NUMPY_TYPE_CASE(DOUBLE, FLOAT64);
     default: {
-      std::stringstream ss;
-      ss << "Unsupported tensor type: " << type.ToString() << std::endl;
-      return Status::NotImplemented(ss.str());
+      return Status::NotImplemented("Unsupported tensor type: ", type.ToString());
     }
   }
 #undef NUMPY_TYPE_CASE
@@ -145,9 +126,15 @@ Status GetNumPyType(const DataType& type, int* type_num) {
 }
 
 Status NumPyDtypeToArrow(PyObject* dtype, std::shared_ptr<DataType>* out) {
+  if (!PyArray_DescrCheck(dtype)) {
+    return Status::TypeError("Did not pass numpy.dtype object");
+  }
   PyArray_Descr* descr = reinterpret_cast<PyArray_Descr*>(dtype);
+  return NumPyDtypeToArrow(descr, out);
+}
 
-  int type_num = cast_npy_type_compat(descr->type_num);
+Status NumPyDtypeToArrow(PyArray_Descr* descr, std::shared_ptr<DataType>* out) {
+  int type_num = fix_numpy_type_num(descr->type_num);
 
   switch (type_num) {
     TO_ARROW_TYPE_CASE(BOOL, boolean);
@@ -155,16 +142,10 @@ Status NumPyDtypeToArrow(PyObject* dtype, std::shared_ptr<DataType>* out) {
     TO_ARROW_TYPE_CASE(INT16, int16);
     TO_ARROW_TYPE_CASE(INT32, int32);
     TO_ARROW_TYPE_CASE(INT64, int64);
-#if (NPY_INT64 != NPY_LONGLONG)
-    TO_ARROW_TYPE_CASE(LONGLONG, int64);
-#endif
     TO_ARROW_TYPE_CASE(UINT8, uint8);
     TO_ARROW_TYPE_CASE(UINT16, uint16);
     TO_ARROW_TYPE_CASE(UINT32, uint32);
     TO_ARROW_TYPE_CASE(UINT64, uint64);
-#if (NPY_UINT64 != NPY_ULONGLONG)
-    TO_ARROW_CASE(ULONGLONG);
-#endif
     TO_ARROW_TYPE_CASE(FLOAT16, float16);
     TO_ARROW_TYPE_CASE(FLOAT32, float32);
     TO_ARROW_TYPE_CASE(FLOAT64, float64);
@@ -189,14 +170,14 @@ Status NumPyDtypeToArrow(PyObject* dtype, std::shared_ptr<DataType>* out) {
         case NPY_FR_D:
           *out = date32();
           break;
+        case NPY_FR_GENERIC:
+          return Status::NotImplemented("Unbound or generic datetime64 time unit");
         default:
           return Status::NotImplemented("Unsupported datetime64 time unit");
       }
     } break;
     default: {
-      std::stringstream ss;
-      ss << "Unsupported numpy type " << descr->type_num << std::endl;
-      return Status::NotImplemented(ss.str());
+      return Status::NotImplemented("Unsupported numpy type ", descr->type_num);
     }
   }
 
@@ -206,8 +187,6 @@ Status NumPyDtypeToArrow(PyObject* dtype, std::shared_ptr<DataType>* out) {
 #undef TO_ARROW_TYPE_CASE
 
 Status NdarrayToTensor(MemoryPool* pool, PyObject* ao, std::shared_ptr<Tensor>* out) {
-  PyAcquireGIL lock;
-
   if (!PyArray_Check(ao)) {
     return Status::TypeError("Did not pass ndarray object");
   }
@@ -218,71 +197,79 @@ Status NdarrayToTensor(MemoryPool* pool, PyObject* ao, std::shared_ptr<Tensor>* 
 
   int ndim = PyArray_NDIM(ndarray);
 
+  // This is also holding the GIL, so don't already draw it.
   std::shared_ptr<Buffer> data = std::make_shared<NumPyBuffer>(ao);
   std::vector<int64_t> shape(ndim);
   std::vector<int64_t> strides(ndim);
 
-  npy_intp* array_strides = PyArray_STRIDES(ndarray);
-  npy_intp* array_shape = PyArray_SHAPE(ndarray);
-  for (int i = 0; i < ndim; ++i) {
-    if (array_strides[i] < 0) {
-      return Status::Invalid("Negative ndarray strides not supported");
+  {
+    PyAcquireGIL lock;
+    npy_intp* array_strides = PyArray_STRIDES(ndarray);
+    npy_intp* array_shape = PyArray_SHAPE(ndarray);
+    for (int i = 0; i < ndim; ++i) {
+      if (array_strides[i] < 0) {
+        return Status::Invalid("Negative ndarray strides not supported");
+      }
+      shape[i] = array_shape[i];
+      strides[i] = array_strides[i];
     }
-    shape[i] = array_shape[i];
-    strides[i] = array_strides[i];
-  }
 
-  std::shared_ptr<DataType> type;
-  RETURN_NOT_OK(
-      GetTensorType(reinterpret_cast<PyObject*>(PyArray_DESCR(ndarray)), &type));
-  *out = std::make_shared<Tensor>(type, data, shape, strides);
-  return Status::OK();
+    std::shared_ptr<DataType> type;
+    RETURN_NOT_OK(
+        GetTensorType(reinterpret_cast<PyObject*>(PyArray_DESCR(ndarray)), &type));
+    *out = std::make_shared<Tensor>(type, data, shape, strides);
+    return Status::OK();
+  }
 }
 
-Status TensorToNdarray(const Tensor& tensor, PyObject* base, PyObject** out) {
+Status TensorToNdarray(const std::shared_ptr<Tensor>& tensor, PyObject* base,
+                       PyObject** out) {
   PyAcquireGIL lock;
 
   int type_num;
-  RETURN_NOT_OK(GetNumPyType(*tensor.type(), &type_num));
+  RETURN_NOT_OK(GetNumPyType(*tensor->type(), &type_num));
   PyArray_Descr* dtype = PyArray_DescrNewFromType(type_num);
   RETURN_IF_PYERROR();
 
-  std::vector<npy_intp> npy_shape(tensor.ndim());
-  std::vector<npy_intp> npy_strides(tensor.ndim());
+  const int ndim = tensor->ndim();
+  std::vector<npy_intp> npy_shape(ndim);
+  std::vector<npy_intp> npy_strides(ndim);
 
-  for (int i = 0; i < tensor.ndim(); ++i) {
-    npy_shape[i] = tensor.shape()[i];
-    npy_strides[i] = tensor.strides()[i];
+  for (int i = 0; i < ndim; ++i) {
+    npy_shape[i] = tensor->shape()[i];
+    npy_strides[i] = tensor->strides()[i];
   }
 
   const void* immutable_data = nullptr;
-  if (tensor.data()) {
-    immutable_data = tensor.data()->data();
+  if (tensor->data()) {
+    immutable_data = tensor->data()->data();
   }
 
   // Remove const =(
   void* mutable_data = const_cast<void*>(immutable_data);
 
   int array_flags = 0;
-  if (tensor.is_row_major()) {
+  if (tensor->is_row_major()) {
     array_flags |= NPY_ARRAY_C_CONTIGUOUS;
   }
-  if (tensor.is_column_major()) {
+  if (tensor->is_column_major()) {
     array_flags |= NPY_ARRAY_F_CONTIGUOUS;
   }
-  if (tensor.is_mutable()) {
+  if (tensor->is_mutable()) {
     array_flags |= NPY_ARRAY_WRITEABLE;
   }
 
   PyObject* result =
-      PyArray_NewFromDescr(&PyArray_Type, dtype, tensor.ndim(), npy_shape.data(),
+      PyArray_NewFromDescr(&PyArray_Type, dtype, ndim, npy_shape.data(),
                            npy_strides.data(), mutable_data, array_flags, nullptr);
   RETURN_IF_PYERROR()
 
-  if (base != Py_None) {
-    PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(result), base);
+  if (base == Py_None || base == nullptr) {
+    base = py::wrap_tensor(tensor);
+  } else {
     Py_XINCREF(base);
   }
+  PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(result), base);
   *out = result;
   return Status::OK();
 }

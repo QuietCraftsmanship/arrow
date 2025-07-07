@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>  // pid_t
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,10 +36,18 @@
 
 #include "arrow/status.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/macros.h"
 #include "plasma/common.h"
-#include "plasma/common_generated.h"
+
+#ifdef PLASMA_CUDA
+using arrow::cuda::CudaIpcMemHandle;
+#endif
 
 namespace plasma {
+
+namespace flatbuf {
+struct ObjectInfoT;
+}  // namespace flatbuf
 
 #define HANDLE_SIGPIPE(s, fd_)                                              \
   do {                                                                      \
@@ -48,8 +57,9 @@ namespace plasma {
         ARROW_LOG(WARNING)                                                  \
             << "Received SIGPIPE, BAD FILE DESCRIPTOR, or ECONNRESET when " \
                "sending a message to client on fd "                         \
-            << fd_ << ". "                                                  \
-                      "The client on the other end may have hung up.";      \
+            << fd_                                                          \
+            << ". "                                                         \
+               "The client on the other end may have hung up.";             \
       } else {                                                              \
         return _s;                                                          \
       }                                                                     \
@@ -57,27 +67,20 @@ namespace plasma {
   } while (0);
 
 /// Allocation granularity used in plasma for object allocation.
-#define BLOCK_SIZE 64
+constexpr int64_t kBlockSize = 64;
 
 struct Client;
 
-/// Mapping from object IDs to type and status of the request.
-typedef std::unordered_map<ObjectID, ObjectRequest, UniqueIDHasher> ObjectRequestMap;
-
-/// Handle to access memory mapped file and map it into client address space.
-struct object_handle {
+// TODO(pcm): Replace this by the flatbuffers message PlasmaObjectSpec.
+struct PlasmaObject {
+#ifdef PLASMA_CUDA
+  // IPC handle for Cuda.
+  std::shared_ptr<CudaIpcMemHandle> ipc_handle;
+#endif
   /// The file descriptor of the memory mapped file in the store. It is used as
   /// a unique identifier of the file in the client to look up the corresponding
   /// file descriptor on the client's side.
   int store_fd;
-  /// The size in bytes of the memory mapped file.
-  int64_t mmap_size;
-};
-
-// TODO(pcm): Replace this by the flatbuffers message PlasmaObjectSpec.
-struct PlasmaObject {
-  /// Handle for memory mapped file the object is stored in.
-  object_handle handle;
   /// The offset in bytes in the memory mapped file of the data.
   ptrdiff_t data_offset;
   /// The offset in bytes in the memory mapped file of the metadata.
@@ -86,52 +89,31 @@ struct PlasmaObject {
   int64_t data_size;
   /// The size in bytes of the metadata.
   int64_t metadata_size;
+  /// Device number object is on.
+  int device_num;
+
+  bool operator==(const PlasmaObject& other) const {
+    return (
+#ifdef PLASMA_CUDA
+        (ipc_handle == other.ipc_handle) &&
+#endif
+        (store_fd == other.store_fd) && (data_offset == other.data_offset) &&
+        (metadata_offset == other.metadata_offset) && (data_size == other.data_size) &&
+        (metadata_size == other.metadata_size) && (device_num == other.device_num));
+  }
 };
 
-enum object_state {
-  /// Object was created but not sealed in the local Plasma Store.
-  PLASMA_CREATED = 1,
-  /// Object is sealed and stored in the local Plasma Store.
-  PLASMA_SEALED
-};
-
-enum object_status {
+enum class ObjectStatus : int {
   /// The object was not found.
   OBJECT_NOT_FOUND = 0,
   /// The object was found.
   OBJECT_FOUND = 1
 };
 
-/// This type is used by the Plasma store. It is here because it is exposed to
-/// the eviction policy.
-struct ObjectTableEntry {
-  /// Object id of this object.
-  ObjectID object_id;
-  /// Object info like size, creation time and owner.
-  ObjectInfoT info;
-  /// Memory mapped file containing the object.
-  int fd;
-  /// Size of the underlying map.
-  int64_t map_size;
-  /// Offset from the base of the mmap.
-  ptrdiff_t offset;
-  /// Pointer to the object data. Needed to free the object.
-  uint8_t* pointer;
-  /// Set of clients currently using this object.
-  std::unordered_set<Client*> clients;
-  /// The state of the object, e.g., whether it is open or sealed.
-  object_state state;
-  /// The digest of the object. Used to see if two objects are the same.
-  unsigned char digest[kDigestSize];
-};
-
 /// The plasma store information that is exposed to the eviction policy.
 struct PlasmaStoreInfo {
   /// Objects that are in the Plasma store.
-  std::unordered_map<ObjectID, std::unique_ptr<ObjectTableEntry>, UniqueIDHasher> objects;
-  /// The amount of memory (in bytes) that we allow to be allocated in the
-  /// store.
-  int64_t memory_capacity;
+  ObjectTable objects;
   /// Boolean flag indicating whether to start the object store with hugepages
   /// support enabled. Huge pages are substantially larger than normal memory
   /// pages (e.g. 2MB or 1GB instead of 4KB) and using them can reduce
@@ -148,8 +130,8 @@ struct PlasmaStoreInfo {
 /// @param object_id The object_id of the entry we are looking for.
 /// @return The entry associated with the object_id or NULL if the object_id
 ///         is not present.
-ObjectTableEntry* get_object_table_entry(PlasmaStoreInfo* store_info,
-                                         const ObjectID& object_id);
+ObjectTableEntry* GetObjectTableEntry(PlasmaStoreInfo* store_info,
+                                      const ObjectID& object_id);
 
 /// Print a warning if the status is less than zero. This should be used to check
 /// the success of messages sent to plasma clients. We print a warning instead of
@@ -165,9 +147,9 @@ ObjectTableEntry* get_object_table_entry(PlasmaStoreInfo* store_info,
 /// @param client_sock The client socket. This is just used to print some extra
 ///        information.
 /// @return The errno set.
-int warn_if_sigpipe(int status, int client_sock);
+int WarnIfSigpipe(int status, int client_sock);
 
-uint8_t* create_object_info_buffer(ObjectInfoT* object_info);
+std::unique_ptr<uint8_t[]> CreateObjectInfoBuffer(flatbuf::ObjectInfoT* object_info);
 
 }  // namespace plasma
 

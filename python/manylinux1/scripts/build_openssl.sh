@@ -16,11 +16,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-wget --no-check-certificate https://www.openssl.org/source/openssl-1.0.2k.tar.gz -O openssl-1.0.2k.tar.gz
-tar xf openssl-1.0.2k.tar.gz
-pushd openssl-1.0.2k
-./config -fpic shared --prefix=/usr
-make -j5
+# XXX OpenSSL 1.1.1 needs Perl 5.10 to compile.
+OPENSSL_VERSION="1.0.2s"
+NCORES=$(($(grep -c ^processor /proc/cpuinfo) + 1))
+
+wget --no-check-certificate https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz -O openssl-${OPENSSL_VERSION}.tar.gz
+tar xf openssl-${OPENSSL_VERSION}.tar.gz
+pushd openssl-${OPENSSL_VERSION}
+./config -fpic shared --prefix=/usr/local
+make -j${NCORES}
 make install
 popd
-rm -rf openssl-1.0.2k.tar.gz openssl-1.0.2k
+rm -rf openssl-${OPENSSL_VERSION}.tar.gz openssl-${OPENSSL_VERSION}

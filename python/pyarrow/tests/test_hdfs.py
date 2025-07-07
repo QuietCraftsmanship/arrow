@@ -15,30 +15,32 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from io import BytesIO
-from os.path import join as pjoin
 import os
+import pickle
+import pytest
 import random
 import unittest
 
+from io import BytesIO
+from os.path import join as pjoin
+
 import numpy as np
-import pandas.util.testing as pdt
-import pytest
+import pyarrow as pa
+import pyarrow.tests.test_parquet as test_parquet
 
 from pyarrow.compat import guid
-import pyarrow as pa
+from pyarrow.pandas_compat import _pandas_api
 
-import pyarrow.tests.test_parquet as test_parquet
 
 # ----------------------------------------------------------------------
 # HDFS tests
 
 
 def hdfs_test_client(driver='libhdfs'):
-    host = os.environ.get('ARROW_HDFS_TEST_HOST', 'localhost')
-    user = os.environ['ARROW_HDFS_TEST_USER']
+    host = os.environ.get('ARROW_HDFS_TEST_HOST', 'default')
+    user = os.environ.get('ARROW_HDFS_TEST_USER', None)
     try:
-        port = int(os.environ.get('ARROW_HDFS_TEST_PORT', 20500))
+        port = int(os.environ.get('ARROW_HDFS_TEST_PORT', 0))
     except ValueError:
         raise ValueError('Env variable ARROW_HDFS_TEST_PORT was not '
                          'an integer')
@@ -71,6 +73,22 @@ class HdfsTestCases(object):
     def tearDownClass(cls):
         cls.hdfs.delete(cls.tmp_path, recursive=True)
         cls.hdfs.close()
+
+    def test_unknown_driver(self):
+        with pytest.raises(ValueError):
+            hdfs_test_client(driver="not_a_driver_name")
+
+    def test_pickle(self):
+        s = pickle.dumps(self.hdfs)
+        h2 = pickle.loads(s)
+        assert h2.is_open
+        assert h2.host == self.hdfs.host
+        assert h2.port == self.hdfs.port
+        assert h2.user == self.hdfs.user
+        assert h2.kerb_ticket == self.hdfs.kerb_ticket
+        assert h2.driver == self.hdfs.driver
+        # smoketest unpickled client works
+        h2.ls(self.tmp_path)
 
     def test_cat(self):
         path = pjoin(self.tmp_path, 'cat-test')
@@ -145,6 +163,27 @@ class HdfsTestCases(object):
         assert file_path_info['kind'] == 'file'
         assert file_path_info['size'] == len(data)
 
+    def test_exists_isdir_isfile(self):
+        dir_path = pjoin(self.tmp_path, 'info-base')
+        file_path = pjoin(dir_path, 'ex')
+        missing_path = pjoin(dir_path, 'this-path-is-missing')
+
+        self.hdfs.mkdir(dir_path)
+        with self.hdfs.open(file_path, 'wb') as f:
+            f.write(b'foobarbaz')
+
+        assert self.hdfs.exists(dir_path)
+        assert self.hdfs.exists(file_path)
+        assert not self.hdfs.exists(missing_path)
+
+        assert self.hdfs.isdir(dir_path)
+        assert not self.hdfs.isdir(file_path)
+        assert not self.hdfs.isdir(missing_path)
+
+        assert not self.hdfs.isfile(dir_path)
+        assert self.hdfs.isfile(file_path)
+        assert not self.hdfs.isfile(missing_path)
+
     def test_disk_usage(self):
         path = pjoin(self.tmp_path, 'disk-usage-base')
         p1 = pjoin(path, 'p1')
@@ -177,7 +216,7 @@ class HdfsTestCases(object):
         self.hdfs.mkdir(dir_path)
 
         f = self.hdfs.open(f1_path, 'wb')
-        f.write('a' * 10)
+        f.write(b'a' * 10)
 
         contents = sorted(self.hdfs.ls(base_path, False))
         assert contents == [dir_path, f1_path]
@@ -234,19 +273,11 @@ class HdfsTestCases(object):
 
         assert result == data
 
-    @test_parquet.parquet
-    def test_read_multiple_parquet_files(self):
+    def _write_multiple_hdfs_pq_files(self, tmpdir):
         import pyarrow.parquet as pq
-
         nfiles = 10
         size = 5
-
-        tmpdir = pjoin(self.tmp_path, 'multi-parquet-' + guid())
-
-        self.hdfs.mkdir(tmpdir)
-
         test_data = []
-        paths = []
         for i in range(nfiles):
             df = test_parquet._test_dataframe(size, seed=i)
 
@@ -262,29 +293,79 @@ class HdfsTestCases(object):
                 pq.write_table(table, f)
 
             test_data.append(table)
-            paths.append(path)
 
-        result = self.hdfs.read_parquet(tmpdir)
         expected = pa.concat_tables(test_data)
+        return expected
 
-        pdt.assert_frame_equal(result.to_pandas()
-                               .sort_values(by='index').reset_index(drop=True),
-                               expected.to_pandas())
+    @pytest.mark.pandas
+    @pytest.mark.parquet
+    def test_read_multiple_parquet_files(self):
 
-    @test_parquet.parquet
+        tmpdir = pjoin(self.tmp_path, 'multi-parquet-' + guid())
+
+        self.hdfs.mkdir(tmpdir)
+
+        expected = self._write_multiple_hdfs_pq_files(tmpdir)
+        result = self.hdfs.read_parquet(tmpdir)
+
+        _pandas_api.assert_frame_equal(result.to_pandas()
+                                       .sort_values(by='index')
+                                       .reset_index(drop=True),
+                                       expected.to_pandas())
+
+    @pytest.mark.pandas
+    @pytest.mark.parquet
+    def test_read_multiple_parquet_files_with_uri(self):
+        import pyarrow.parquet as pq
+
+        tmpdir = pjoin(self.tmp_path, 'multi-parquet-uri-' + guid())
+
+        self.hdfs.mkdir(tmpdir)
+
+        expected = self._write_multiple_hdfs_pq_files(tmpdir)
+        path = _get_hdfs_uri(tmpdir)
+        result = pq.read_table(path)
+
+        _pandas_api.assert_frame_equal(result.to_pandas()
+                                       .sort_values(by='index')
+                                       .reset_index(drop=True),
+                                       expected.to_pandas())
+
+    @pytest.mark.pandas
+    @pytest.mark.parquet
+    def test_read_write_parquet_files_with_uri(self):
+        import pyarrow.parquet as pq
+
+        tmpdir = pjoin(self.tmp_path, 'uri-parquet-' + guid())
+        self.hdfs.mkdir(tmpdir)
+        path = _get_hdfs_uri(pjoin(tmpdir, 'test.parquet'))
+
+        size = 5
+        df = test_parquet._test_dataframe(size, seed=0)
+        # Hack so that we don't have a dtype cast in v1 files
+        df['uint32'] = df['uint32'].astype(np.int64)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+
+        pq.write_table(table, path, filesystem=self.hdfs)
+
+        result = pq.read_table(path, filesystem=self.hdfs).to_pandas()
+
+        _pandas_api.assert_frame_equal(result, df)
+
+    @pytest.mark.parquet
     def test_read_common_metadata_files(self):
         tmpdir = pjoin(self.tmp_path, 'common-metadata-' + guid())
         self.hdfs.mkdir(tmpdir)
         test_parquet._test_read_common_metadata_files(self.hdfs, tmpdir)
 
-    @test_parquet.parquet
+    @pytest.mark.parquet
     def test_write_to_dataset_with_partitions(self):
         tmpdir = pjoin(self.tmp_path, 'write-partitions-' + guid())
         self.hdfs.mkdir(tmpdir)
         test_parquet._test_write_to_dataset_with_partitions(
             tmpdir, filesystem=self.hdfs)
 
-    @test_parquet.parquet
+    @pytest.mark.parquet
     def test_write_to_dataset_no_partitions(self):
         tmpdir = pjoin(self.tmp_path, 'write-no_partitions-' + guid())
         self.hdfs.mkdir(tmpdir)
@@ -299,12 +380,12 @@ class TestLibHdfs(HdfsTestCases, unittest.TestCase):
     @classmethod
     def check_driver(cls):
         if not pa.have_libhdfs():
-            pytest.fail('No libhdfs available on system')
+            pytest.skip('No libhdfs available on system')
 
     def test_orphaned_file(self):
         hdfs = hdfs_test_client()
         file_path = self._make_test_file(hdfs, 'orphaned_file_test', 'fname',
-                                         'foobarbaz')
+                                         b'foobarbaz')
 
         f = hdfs.open(file_path)
         hdfs = None
@@ -318,4 +399,46 @@ class TestLibHdfs3(HdfsTestCases, unittest.TestCase):
     @classmethod
     def check_driver(cls):
         if not pa.have_libhdfs3():
-            pytest.fail('No libhdfs3 available on system')
+            pytest.skip('No libhdfs3 available on system')
+
+
+def _get_hdfs_uri(path):
+    host = os.environ.get('ARROW_HDFS_TEST_HOST', 'localhost')
+    try:
+        port = int(os.environ.get('ARROW_HDFS_TEST_PORT', 0))
+    except ValueError:
+        raise ValueError('Env variable ARROW_HDFS_TEST_PORT was not '
+                         'an integer')
+    uri = "hdfs://{}:{}{}".format(host, port, path)
+
+    return uri
+
+
+@pytest.mark.pandas
+@pytest.mark.parquet
+@pytest.mark.fastparquet
+@pytest.mark.parametrize('client', ['libhdfs', 'libhdfs3'])
+def test_fastparquet_read_with_hdfs(client):
+    from pandas.util.testing import assert_frame_equal, makeDataFrame
+
+    try:
+        import snappy  # noqa
+    except ImportError:
+        pytest.skip('fastparquet test requires snappy')
+
+    import pyarrow.parquet as pq
+    fastparquet = pytest.importorskip('fastparquet')
+
+    fs = hdfs_test_client(client)
+
+    df = makeDataFrame()
+    table = pa.Table.from_pandas(df)
+
+    path = '/tmp/testing.parquet'
+    with fs.open(path, 'wb') as f:
+        pq.write_table(table, f)
+
+    parquet_file = fastparquet.ParquetFile(path, open_with=fs.open)
+
+    result = parquet_file.to_pandas()
+    assert_frame_equal(result, df)

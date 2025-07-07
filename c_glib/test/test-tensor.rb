@@ -66,12 +66,12 @@ class TestTensor < Test::Unit::TestCase
   end
 
   def test_shape
-    require_gi_bindings(3, 1, 2)
+    require_gi_bindings(3, 3, 1)
     assert_equal(@shape, @tensor.shape)
   end
 
   def test_strides
-    require_gi_bindings(3, 1, 2)
+    require_gi_bindings(3, 3, 1)
     assert_equal([4, 2, 1], @tensor.strides)
   end
 
@@ -116,11 +116,10 @@ class TestTensor < Test::Unit::TestCase
   end
 
   def test_io
-    buffer = Arrow::PoolBuffer.new
+    buffer = Arrow::ResizableBuffer.new(0)
     output = Arrow::BufferOutputStream.new(buffer)
     output.write_tensor(@tensor)
     input = Arrow::BufferInputStream.new(buffer)
-    assert_equal(@tensor,
-                 input.read_tensor(0))
+    assert_equal(@tensor, input.read_tensor)
   end
 end

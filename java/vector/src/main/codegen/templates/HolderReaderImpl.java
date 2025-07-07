@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,11 +36,6 @@
 package org.apache.arrow.vector.complex.impl;
 
 <#include "/@includes/vv_imports.ftl" />
-
-import java.math.BigDecimal;
-import java.math.BigInteger;
-
-import org.joda.time.Period;
 
 // Source code generated using FreeMarker template ${.template_name}
 
@@ -119,8 +113,11 @@ public class ${holderMode}${name}HolderReaderImpl extends AbstractFieldReader {
     return text;
     </#if>
   <#elseif minor.class == "IntervalDay">
-    Period p = new Period();
-    return p.plusDays(holder.days).plusMillis(holder.milliseconds);
+    return Duration.ofDays(holder.days).plusMillis(holder.milliseconds);
+  <#elseif minor.class == "IntervalYear">
+    return Period.ofMonths(holder.value);
+  <#elseif minor.class == "Duration">
+    return DurationVector.toDuration(holder.value, holder.unit);
   <#elseif minor.class == "Bit" >
     return new Boolean(holder.value != 0);
   <#elseif minor.class == "Decimal">
@@ -128,6 +125,19 @@ public class ${holderMode}${name}HolderReaderImpl extends AbstractFieldReader {
     holder.buffer.getBytes(holder.start, bytes, 0, ${type.width});
     ${friendlyType} value = new BigDecimal(new BigInteger(bytes), holder.scale);
     return value;
+  <#elseif minor.class == "FixedSizeBinary">
+    byte[] value = new byte [holder.byteWidth];
+    holder.buffer.getBytes(0, value, 0, holder.byteWidth);
+    return value;
+  <#elseif minor.class == "TimeStampSec">
+    final long millis = java.util.concurrent.TimeUnit.SECONDS.toMillis(holder.value);
+    return DateUtility.getLocalDateTimeFromEpochMilli(millis);
+  <#elseif minor.class == "TimeStampMilli" || minor.class == "DateMilli" || minor.class == "TimeMilli">
+    return DateUtility.getLocalDateTimeFromEpochMilli(holder.value);
+  <#elseif minor.class == "TimeStampMicro">
+    return DateUtility.getLocalDateTimeFromEpochMicro(holder.value);
+  <#elseif minor.class == "TimeStampNano">
+    return DateUtility.getLocalDateTimeFromEpochNano(holder.value);
   <#else>
     ${friendlyType} value = new ${friendlyType}(this.holder.value);
     return value;

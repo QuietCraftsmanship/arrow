@@ -1,14 +1,13 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,12 +17,6 @@
 
 package org.apache.arrow.tools;
 
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.file.ArrowFileWriter;
-import org.apache.arrow.vector.stream.ArrowStreamReader;
-
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -32,21 +25,29 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.channels.Channels;
 
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowFileWriter;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+
 /**
  * Converts an Arrow stream to an Arrow file.
  */
 public class StreamToFile {
+  /**
+   *  Reads an Arrow stream from <code>in</code> and writes it to <code>out</code>.
+   */
   public static void convert(InputStream in, OutputStream out) throws IOException {
     BufferAllocator allocator = new RootAllocator(Integer.MAX_VALUE);
     try (ArrowStreamReader reader = new ArrowStreamReader(in, allocator)) {
       VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      // load the first batch before instantiating the writer so that we have any dictionaries
-      if (!reader.loadNextBatch()) {
-        throw new IOException("Unable to read first record batch");
-      }
+      // load the first batch before instantiating the writer so that we have any dictionaries.
+      // Only writeBatches if we load the first one.
+      boolean writeBatches = reader.loadNextBatch();
       try (ArrowFileWriter writer = new ArrowFileWriter(root, reader, Channels.newChannel(out))) {
         writer.start();
-        while (true) {
+        while (writeBatches) {
           writer.writeBatch();
           if (!reader.loadNextBatch()) {
             break;
@@ -57,6 +58,11 @@ public class StreamToFile {
     }
   }
 
+  /**
+   * Main method.  Defaults to reading from standard in and standard out.
+   * If there are two arguments the first is interpreted as the input file path,
+   * the second is the output file path.
+   */
   public static void main(String[] args) throws IOException {
     InputStream in = System.in;
     OutputStream out = System.out;

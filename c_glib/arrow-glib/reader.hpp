@@ -20,8 +20,10 @@
 #pragma once
 
 #include <arrow/api.h>
+#include <arrow/csv/api.h>
 #include <arrow/ipc/api.h>
 #include <arrow/ipc/feather.h>
+#include <arrow/json/api.h>
 
 #include <arrow-glib/reader.h>
 
@@ -37,3 +39,13 @@ std::shared_ptr<arrow::ipc::RecordBatchFileReader> garrow_record_batch_file_read
 
 GArrowFeatherFileReader *garrow_feather_file_reader_new_raw(arrow::ipc::feather::TableReader *arrow_reader);
 arrow::ipc::feather::TableReader *garrow_feather_file_reader_get_raw(GArrowFeatherFileReader *reader);
+
+GArrowCSVReader *
+garrow_csv_reader_new_raw(std::shared_ptr<arrow::csv::TableReader> *arrow_reader);
+std::shared_ptr<arrow::csv::TableReader>
+garrow_csv_reader_get_raw(GArrowCSVReader *reader);
+
+GArrowJSONReader *
+garrow_json_reader_new_raw(std::shared_ptr<arrow::json::TableReader> *arrow_reader);
+std::shared_ptr<arrow::json::TableReader>
+garrow_json_reader_get_raw(GArrowJSONReader *reader);

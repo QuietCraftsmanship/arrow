@@ -15,8 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import
+
 import os
 import posixpath
+import sys
 
 from pyarrow.util import implements
 from pyarrow.filesystem import FileSystem
@@ -30,11 +33,23 @@ class HadoopFileSystem(lib.HadoopFileSystem, FileSystem):
     """
 
     def __init__(self, host="default", port=0, user=None, kerb_ticket=None,
-                 driver='libhdfs'):
+                 driver='libhdfs', extra_conf=None):
         if driver == 'libhdfs':
             _maybe_set_hadoop_classpath()
 
-        self._connect(host, port, user, kerb_ticket, driver)
+        self._connect(host, port, user, kerb_ticket, driver, extra_conf)
+
+    def __reduce__(self):
+        return (HadoopFileSystem, (self.host, self.port, self.user,
+                                   self.kerb_ticket, self.driver,
+                                   self.extra_conf))
+
+    def _isfilestore(self):
+        """
+        Returns True if this FileSystem is a unix-style file store with
+        directories.
+        """
+        return True
 
     @implements(FileSystem.isdir)
     def isdir(self, path):
@@ -110,18 +125,44 @@ class HadoopFileSystem(lib.HadoopFileSystem, FileSystem):
 
 
 def _maybe_set_hadoop_classpath():
-    import subprocess
+    import re
 
-    if 'hadoop' in os.environ.get('CLASSPATH', ''):
+    if re.search(r'hadoop-common[^/]+.jar', os.environ.get('CLASSPATH', '')):
         return
 
     if 'HADOOP_HOME' in os.environ:
-        hadoop_bin = '{0}/bin/hadoop'.format(os.environ['HADOOP_HOME'])
+        if sys.platform != 'win32':
+            classpath = _derive_hadoop_classpath()
+        else:
+            hadoop_bin = '{0}/bin/hadoop'.format(os.environ['HADOOP_HOME'])
+            classpath = _hadoop_classpath_glob(hadoop_bin)
     else:
-        hadoop_bin = 'hadoop'
+        classpath = _hadoop_classpath_glob('hadoop')
 
-    classpath = subprocess.check_output([hadoop_bin, 'classpath', '--glob'])
     os.environ['CLASSPATH'] = classpath.decode('utf-8')
+
+
+def _derive_hadoop_classpath():
+    import subprocess
+
+    find_args = ('find', '-L', os.environ['HADOOP_HOME'], '-name', '*.jar')
+    find = subprocess.Popen(find_args, stdout=subprocess.PIPE)
+    xargs_echo = subprocess.Popen(('xargs', 'echo'),
+                                  stdin=find.stdout,
+                                  stdout=subprocess.PIPE)
+    jars = subprocess.check_output(('tr', "' '", "':'"),
+                                   stdin=xargs_echo.stdout)
+    hadoop_conf = os.environ["HADOOP_CONF_DIR"] \
+        if "HADOOP_CONF_DIR" in os.environ \
+        else os.environ["HADOOP_HOME"] + "/etc/hadoop"
+    return (hadoop_conf + ":").encode("utf-8") + jars
+
+
+def _hadoop_classpath_glob(hadoop_bin):
+    import subprocess
+
+    hadoop_classpath_args = (hadoop_bin, 'classpath', '--glob')
+    return subprocess.check_output(hadoop_classpath_args)
 
 
 def _libhdfs_walk_files_dirs(top_path, contents):
@@ -138,7 +179,7 @@ def _libhdfs_walk_files_dirs(top_path, contents):
 
 
 def connect(host="default", port=0, user=None, kerb_ticket=None,
-            driver='libhdfs'):
+            driver='libhdfs', extra_conf=None):
     """
     Connect to an HDFS cluster. All parameters are optional and should
     only be set if the defaults need to be overridden.
@@ -156,6 +197,9 @@ def connect(host="default", port=0, user=None, kerb_ticket=None,
     driver : {'libhdfs', 'libhdfs3'}, default 'libhdfs'
       Connect using libhdfs (JNI-based) or libhdfs3 (3rd-party C++
       library from Apache HAWQ (incubating) )
+    extra_conf : dict, default None
+      extra Key/Value pairs for config; Will override any
+      hdfs-site.xml properties
 
     Notes
     -----
@@ -167,5 +211,6 @@ def connect(host="default", port=0, user=None, kerb_ticket=None,
     filesystem : HadoopFileSystem
     """
     fs = HadoopFileSystem(host=host, port=port, user=user,
-                          kerb_ticket=kerb_ticket, driver=driver)
+                          kerb_ticket=kerb_ticket, driver=driver,
+                          extra_conf=extra_conf)
     return fs

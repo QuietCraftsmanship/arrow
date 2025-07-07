@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,7 +36,7 @@ public class NullReader extends AbstractBaseReader implements FieldReader{
   
   public static final NullReader INSTANCE = new NullReader();
   public static final NullReader EMPTY_LIST_INSTANCE = new NullReader(MinorType.NULL);
-  public static final NullReader EMPTY_MAP_INSTANCE = new NullReader(MinorType.MAP);
+  public static final NullReader EMPTY_STRUCT_INSTANCE = new NullReader(MinorType.STRUCT);
   private MinorType type;
   
   private NullReader(){
@@ -60,7 +59,7 @@ public class NullReader extends AbstractBaseReader implements FieldReader{
     return new Field("", FieldType.nullable(new Null()), null);
   }
 
-  public void copyAsValue(MapWriter writer) {}
+  public void copyAsValue(StructWriter writer) {}
 
   public void copyAsValue(ListWriter writer) {}
 
@@ -99,7 +98,7 @@ public class NullReader extends AbstractBaseReader implements FieldReader{
     return false;
   }
   
-  public RepeatedMapReader map(){
+  public RepeatedStructReader struct(){
     return this;
   }
   
@@ -107,7 +106,7 @@ public class NullReader extends AbstractBaseReader implements FieldReader{
     return this;
   }
   
-  public MapReader map(String name){
+  public StructReader struct(String name){
     return this;
   }
   
@@ -127,9 +126,9 @@ public class NullReader extends AbstractBaseReader implements FieldReader{
     throw new IllegalArgumentException(String.format("You tried to read a %s type when you are using a ValueReader of type %s.", name, this.getClass().getSimpleName()));
   }
   
-  <#list ["Object", "BigDecimal", "Integer", "Long", "Boolean", 
-          "Character", "LocalDateTime", "Period", "Double", "Float",
-          "Text", "String", "Byte", "Short", "byte[]"] as friendlyType>
+  <#list ["Object", "BigDecimal", "Short", "Integer", "Long", "Boolean",
+          "LocalDateTime", "Duration", "Period", "Double", "Float",
+          "Character", "Text", "String", "Byte", "byte[]"] as friendlyType>
   <#assign safeType=friendlyType />
   <#if safeType=="byte[]"><#assign safeType="ByteArray" /></#if>
   

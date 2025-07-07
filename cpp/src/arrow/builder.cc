@@ -17,25 +17,15 @@
 
 #include "arrow/builder.h"
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <sstream>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "arrow/array.h"
-#include "arrow/buffer.h"
-#include "arrow/compare.h"
 #include "arrow/status.h"
-#include "arrow/table.h"
 #include "arrow/type.h"
-#include "arrow/type_traits.h"
-#include "arrow/util/bit-util.h"
-#include "arrow/util/cpu-info.h"
-#include "arrow/util/decimal.h"
-#include "arrow/util/hash-util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/hashing.h"
+#include "arrow/visitor_inline.h"
 
 namespace arrow {
 
@@ -215,54 +205,43 @@ void ArrayBuilder::UnsafeSetNotNull(int64_t length) {
 
   length_ = new_length;
 }
+class MemoryPool;
 
 // ----------------------------------------------------------------------
-// Null builder
+// Helper functions
 
-Status NullBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
-  BufferVector buffers = {nullptr};
-  *out = std::make_shared<ArrayData>(null(), length_, std::move(buffers), length_);
-  length_ = null_count_ = 0;
-  return Status::OK();
-}
-
-// ----------------------------------------------------------------------
-
-template <typename T>
-Status PrimitiveBuilder<T>::Init(int64_t capacity) {
-  RETURN_NOT_OK(ArrayBuilder::Init(capacity));
-  data_ = std::make_shared<PoolBuffer>(pool_);
-
-  int64_t nbytes = TypeTraits<T>::bytes_required(capacity);
-  RETURN_NOT_OK(data_->Resize(nbytes));
-  // TODO(emkornfield) valgrind complains without this
-  memset(data_->mutable_data(), 0, static_cast<size_t>(nbytes));
-
-  raw_data_ = reinterpret_cast<value_type*>(data_->mutable_data());
-  return Status::OK();
-}
-
-template <typename T>
-Status PrimitiveBuilder<T>::Resize(int64_t capacity) {
-  // XXX: Set floor size for now
-  if (capacity < kMinBuilderCapacity) {
-    capacity = kMinBuilderCapacity;
+struct DictionaryBuilderCase {
+  template <typename ValueType>
+  Status Visit(const ValueType&, typename ValueType::c_type* = nullptr) {
+    return CreateFor<ValueType>();
   }
 
-  if (capacity_ == 0) {
-    RETURN_NOT_OK(Init(capacity));
-  } else {
-    RETURN_NOT_OK(ArrayBuilder::Resize(capacity));
-    const int64_t old_bytes = data_->size();
-    const int64_t new_bytes = TypeTraits<T>::bytes_required(capacity);
-    RETURN_NOT_OK(data_->Resize(new_bytes));
-    raw_data_ = reinterpret_cast<value_type*>(data_->mutable_data());
-    // TODO(emkornfield) valgrind complains without this
-    memset(data_->mutable_data() + old_bytes, 0,
-           static_cast<size_t>(new_bytes - old_bytes));
+  Status Visit(const BinaryType&) { return Create<BinaryDictionaryBuilder>(); }
+  Status Visit(const StringType&) { return Create<StringDictionaryBuilder>(); }
+  Status Visit(const FixedSizeBinaryType&) { return CreateFor<FixedSizeBinaryType>(); }
+
+  Status Visit(const DataType& value_type) { return NotImplemented(value_type); }
+  Status Visit(const HalfFloatType& value_type) { return NotImplemented(value_type); }
+  Status NotImplemented(const DataType& value_type) {
+    return Status::NotImplemented(
+        "MakeBuilder: cannot construct builder for dictionaries with value type ",
+        value_type);
   }
-  return Status::OK();
-}
+
+  template <typename ValueType>
+  Status CreateFor() {
+    return Create<DictionaryBuilder<ValueType>>();
+  }
+
+  template <typename BuilderType>
+  Status Create() {
+    if (dictionary != nullptr) {
+      out->reset(new BuilderType(dictionary, pool));
+    } else {
+      out->reset(new BuilderType(value_type, pool));
+    }
+    return Status::OK();
+  }
 
 template <typename T>
 Status PrimitiveBuilder<T>::Append(const value_type* values, int64_t length,
@@ -1075,16 +1054,19 @@ Status StructBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
 
 // ----------------------------------------------------------------------
 // Helper functions
+  Status Make() { return VisitTypeInline(*value_type, this); }
+
+  MemoryPool* pool;
+  const std::shared_ptr<DataType>& value_type;
+  const std::shared_ptr<Array>& dictionary;
+  std::unique_ptr<ArrayBuilder>* out;
+};
 
 #define BUILDER_CASE(ENUM, BuilderType)      \
   case Type::ENUM:                           \
     out->reset(new BuilderType(type, pool)); \
     return Status::OK();
 
-// Initially looked at doing this with vtables, but shared pointers makes it
-// difficult
-//
-// TODO(wesm): come up with a less monolithic strategy
 Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
                    std::unique_ptr<ArrayBuilder>* out) {
   switch (type->id()) {
@@ -1102,6 +1084,7 @@ Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
       BUILDER_CASE(INT64, Int64Builder);
       BUILDER_CASE(DATE32, Date32Builder);
       BUILDER_CASE(DATE64, Date64Builder);
+      BUILDER_CASE(DURATION, DurationBuilder);
       BUILDER_CASE(TIME32, Time32Builder);
       BUILDER_CASE(TIME64, Time64Builder);
       BUILDER_CASE(TIMESTAMP, TimestampBuilder);
@@ -1112,26 +1095,61 @@ Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
       BUILDER_CASE(STRING, StringBuilder);
       BUILDER_CASE(BINARY, BinaryBuilder);
       BUILDER_CASE(FIXED_SIZE_BINARY, FixedSizeBinaryBuilder);
-      BUILDER_CASE(DECIMAL, DecimalBuilder);
+      BUILDER_CASE(DECIMAL, Decimal128Builder);
+    case Type::DICTIONARY: {
+      const auto& dict_type = static_cast<const DictionaryType&>(*type);
+      DictionaryBuilderCase visitor = {pool, dict_type.value_type(), nullptr, out};
+      return visitor.Make();
+    }
+    case Type::INTERVAL: {
+      const auto& interval_type = internal::checked_cast<const IntervalType&>(*type);
+      if (interval_type.interval_type() == IntervalType::MONTHS) {
+        out->reset(new MonthIntervalBuilder(type, pool));
+        return Status::OK();
+      }
+      if (interval_type.interval_type() == IntervalType::DAY_TIME) {
+        out->reset(new DayTimeIntervalBuilder(pool));
+        return Status::OK();
+      }
+      break;
+    }
     case Type::LIST: {
       std::unique_ptr<ArrayBuilder> value_builder;
       std::shared_ptr<DataType> value_type =
-          static_cast<ListType*>(type.get())->value_type();
+          internal::checked_cast<const ListType&>(*type).value_type();
       RETURN_NOT_OK(MakeBuilder(pool, value_type, &value_builder));
-      out->reset(new ListBuilder(pool, std::move(value_builder)));
+      out->reset(new ListBuilder(pool, std::move(value_builder), type));
+      return Status::OK();
+    }
+    case Type::MAP: {
+      const auto& map_type = internal::checked_cast<const MapType&>(*type);
+      std::unique_ptr<ArrayBuilder> key_builder, item_builder;
+      RETURN_NOT_OK(MakeBuilder(pool, map_type.key_type(), &key_builder));
+      RETURN_NOT_OK(MakeBuilder(pool, map_type.item_type(), &item_builder));
+      out->reset(
+          new MapBuilder(pool, std::move(key_builder), std::move(item_builder), type));
+      return Status::OK();
+    }
+
+    case Type::FIXED_SIZE_LIST: {
+      std::unique_ptr<ArrayBuilder> value_builder;
+      std::shared_ptr<DataType> value_type =
+          internal::checked_cast<const FixedSizeListType&>(*type).value_type();
+      RETURN_NOT_OK(MakeBuilder(pool, value_type, &value_builder));
+      out->reset(new FixedSizeListBuilder(pool, std::move(value_builder), type));
       return Status::OK();
     }
 
     case Type::STRUCT: {
       const std::vector<std::shared_ptr<Field>>& fields = type->children();
-      std::vector<std::unique_ptr<ArrayBuilder>> values_builder;
+      std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
 
       for (auto it : fields) {
         std::unique_ptr<ArrayBuilder> builder;
         RETURN_NOT_OK(MakeBuilder(pool, it->type(), &builder));
-        values_builder.emplace_back(std::move(builder));
+        field_builders.emplace_back(std::move(builder));
       }
-      out->reset(new StructBuilder(type, pool, std::move(values_builder)));
+      out->reset(new StructBuilder(type, pool, std::move(field_builders)));
       return Status::OK();
     }
 
@@ -1141,6 +1159,40 @@ Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
       return Status::NotImplemented(ss.str());
     }
   }
+}
+    case Type::UNION: {
+      const auto& union_type = internal::checked_cast<const UnionType&>(*type);
+      const std::vector<std::shared_ptr<Field>>& fields = type->children();
+      std::vector<std::shared_ptr<ArrayBuilder>> field_builders;
+
+      for (auto it : fields) {
+        std::unique_ptr<ArrayBuilder> builder;
+        RETURN_NOT_OK(MakeBuilder(pool, it->type(), &builder));
+        field_builders.emplace_back(std::move(builder));
+      }
+      if (union_type.mode() == UnionMode::DENSE) {
+        out->reset(new DenseUnionBuilder(pool, std::move(field_builders), type));
+      } else {
+        out->reset(new SparseUnionBuilder(pool, std::move(field_builders), type));
+      }
+      return Status::OK();
+    }
+
+    default: {
+      return Status::NotImplemented("MakeBuilder: cannot construct builder for type ",
+                                    type->ToString());
+    }
+  }
+  return Status::NotImplemented("MakeBuilder: cannot construct builder for type ",
+                                type->ToString());
+}
+
+Status MakeDictionaryBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                             const std::shared_ptr<Array>& dictionary,
+                             std::unique_ptr<ArrayBuilder>* out) {
+  const auto& dict_type = static_cast<const DictionaryType&>(*type);
+  DictionaryBuilderCase visitor = {pool, dict_type.value_type(), dictionary, out};
+  return visitor.Make();
 }
 
 }  // namespace arrow

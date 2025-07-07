@@ -15,17 +15,52 @@
 # specific language governing permissions and limitations
 # under the License.
 
+apache-rat-*.jar
+arrow-src.tar
+arrow-src.tar.gz
+
 # Compiled source
 *.a
 *.dll
 *.o
 *.py[ocd]
 *.so
+*.so.*
+*.bundle
 *.dylib
 .build_cache_dir
+dependency-reduced-pom.xml
 MANIFEST
+compile_commands.json
+build.ninja
+
+# Generated Visual Studio files
+*.vcxproj
+*.vcxproj.*
+*.sln
+*.iml
+
+# Linux perf sample data
+perf.data
+perf.data.old
 
 cpp/.idea/
+cpp/apidoc/xml/
+docs/example.gz
+docs/example1.dat
+docs/example3.dat
 python/.eggs/
+python/doc/
+# Egg metadata
+*.egg-info
+
 .vscode
 .idea/
+.pytest_cache/
+pkgs
+.Rproj.user
+arrow.Rcheck/
+docker_cache
+.gdb_history
+.DS_Store
+*.orig

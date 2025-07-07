@@ -65,4 +65,38 @@ class TestCast < Test::Unit::TestCase
                    milli_array.cast(second_timestamp, options))
     end
   end
+
+  sub_test_case("allow-float-truncate") do
+    def test_default
+      require_gi(1, 42, 0)
+      assert_raise(Arrow::Error::Invalid) do
+        build_float_array([1.1]).cast(Arrow::Int8DataType.new)
+      end
+    end
+
+    def test_true
+      options = Arrow::CastOptions.new
+      options.allow_float_truncate = true
+      int8_data_type = Arrow::Int8DataType.new
+      assert_equal(build_int8_array([1]),
+                   build_float_array([1.1]).cast(int8_data_type, options))
+    end
+  end
+
+  sub_test_case("allow-invalid-utf8") do
+    def test_default
+      require_gi(1, 42, 0)
+      assert_raise(Arrow::Error::Invalid) do
+        build_binary_array(["\xff"]).cast(Arrow::StringDataType.new)
+      end
+    end
+
+    def test_true
+      options = Arrow::CastOptions.new
+      options.allow_invalid_utf8 = true
+      string_data_type = Arrow::StringDataType.new
+      assert_equal(build_string_array(["\xff"]),
+                   build_binary_array(["\xff"]).cast(string_data_type, options))
+    end
+  end
 end

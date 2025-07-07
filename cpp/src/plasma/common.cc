@@ -17,23 +17,15 @@
 
 #include "plasma/common.h"
 
-#include <random>
+#include <limits>
 
 #include "plasma/plasma_generated.h"
+
+namespace fb = plasma::flatbuf;
 
 namespace plasma {
 
 using arrow::Status;
-
-UniqueID UniqueID::from_random() {
-  UniqueID id;
-  uint8_t* data = id.mutable_data();
-  std::random_device engine;
-  for (int i = 0; i < kUniqueIDSize; i++) {
-    data[i] = static_cast<uint8_t>(engine());
-  }
-  return id;
-}
 
 UniqueID UniqueID::from_binary(const std::string& binary) {
   UniqueID id;
@@ -60,28 +52,60 @@ std::string UniqueID::hex() const {
   return result;
 }
 
+// This code is from https://sites.google.com/site/murmurhash/
+// and is public domain.
+uint64_t MurmurHash64A(const void* key, int len, unsigned int seed) {
+  const uint64_t m = 0xc6a4a7935bd1e995;
+  const int r = 47;
+
+  uint64_t h = seed ^ (len * m);
+
+  const uint64_t* data = reinterpret_cast<const uint64_t*>(key);
+  const uint64_t* end = data + (len / 8);
+
+  while (data != end) {
+    uint64_t k = *data++;
+
+    k *= m;
+    k ^= k >> r;
+    k *= m;
+
+    h ^= k;
+    h *= m;
+  }
+
+  const unsigned char* data2 = reinterpret_cast<const unsigned char*>(data);
+
+  switch (len & 7) {
+    case 7:
+      h ^= uint64_t(data2[6]) << 48;  // fall through
+    case 6:
+      h ^= uint64_t(data2[5]) << 40;  // fall through
+    case 5:
+      h ^= uint64_t(data2[4]) << 32;  // fall through
+    case 4:
+      h ^= uint64_t(data2[3]) << 24;  // fall through
+    case 3:
+      h ^= uint64_t(data2[2]) << 16;  // fall through
+    case 2:
+      h ^= uint64_t(data2[1]) << 8;  // fall through
+    case 1:
+      h ^= uint64_t(data2[0]);
+      h *= m;
+  }
+
+  h ^= h >> r;
+  h *= m;
+  h ^= h >> r;
+
+  return h;
+}
+
+size_t UniqueID::hash() const { return MurmurHash64A(&id_[0], kUniqueIDSize, 0); }
+
 bool UniqueID::operator==(const UniqueID& rhs) const {
   return std::memcmp(data(), rhs.data(), kUniqueIDSize) == 0;
 }
-
-Status plasma_error_status(int plasma_error) {
-  switch (plasma_error) {
-    case PlasmaError_OK:
-      return Status::OK();
-    case PlasmaError_ObjectExists:
-      return Status::PlasmaObjectExists("object already exists in the plasma store");
-    case PlasmaError_ObjectNonexistent:
-      return Status::PlasmaObjectNonexistent("object does not exist in the plasma store");
-    case PlasmaError_OutOfMemory:
-      return Status::PlasmaStoreFull("object does not fit in the plasma store");
-    default:
-      ARROW_LOG(FATAL) << "unknown plasma error code " << plasma_error;
-  }
-  return Status::OK();
-}
-
-ARROW_EXPORT int ObjectStatusLocal = ObjectStatus_Local;
-ARROW_EXPORT int ObjectStatusRemote = ObjectStatus_Remote;
 
 const PlasmaStoreInfo* plasma_config;
 

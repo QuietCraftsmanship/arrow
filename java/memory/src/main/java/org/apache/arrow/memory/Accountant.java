@@ -1,14 +1,13 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,7 +21,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import javax.annotation.concurrent.ThreadSafe;
 
-import com.google.common.base.Preconditions;
+import org.apache.arrow.util.Preconditions;
 
 /**
  * Provides a concurrent way to manage account for memory usage without locking. Used as basis
@@ -31,13 +30,13 @@ import com.google.common.base.Preconditions;
  */
 @ThreadSafe
 class Accountant implements AutoCloseable {
-  // private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(Accountant
-  // .class);
 
   /**
-   * The parent allocator
+   * The parent allocator.
    */
   protected final Accountant parent;
+
+  private final String name;
 
   /**
    * The amount of memory reserved for this allocator. Releases below this amount of memory will
@@ -56,11 +55,12 @@ class Accountant implements AutoCloseable {
   private final AtomicLong allocationLimit = new AtomicLong();
 
   /**
-   * Currently allocated amount of memory;
+   * Currently allocated amount of memory.
    */
   private final AtomicLong locallyHeldMemory = new AtomicLong();
 
-  public Accountant(Accountant parent, long reservation, long maxAllocation) {
+  public Accountant(Accountant parent, String name, long reservation, long maxAllocation) {
+    Preconditions.checkNotNull(name, "name must not be null");
     Preconditions.checkArgument(reservation >= 0, "The initial reservation size must be " +
         "non-negative.");
     Preconditions.checkArgument(maxAllocation >= 0, "The maximum allocation limit must be " +
@@ -71,6 +71,7 @@ class Accountant implements AutoCloseable {
         "reserve memory.");
 
     this.parent = parent;
+    this.name = name;
     this.reservation = reservation;
     this.allocationLimit.set(maxAllocation);
 
@@ -79,29 +80,44 @@ class Accountant implements AutoCloseable {
       final AllocationOutcome outcome = parent.allocateBytes(reservation);
       if (!outcome.isOk()) {
         throw new OutOfMemoryException(String.format(
-            "Failure trying to allocate initial reservation for Allocator. "
-                + "Attempted to allocate %d bytes and received an outcome of %s.", reservation,
-            outcome.name()));
+            "Failure trying to allocate initial reservation for Allocator. " +
+                "Attempted to allocate %d bytes.", reservation,
+            outcome.getStatus().name()), outcome.getDetails());
       }
     }
   }
 
   /**
    * Attempt to allocate the requested amount of memory. Either completely succeeds or completely
-   * fails. Constructs a a
-   * log of delta
-   * <p>
-   * If it fails, no changes are made to accounting.
+   * fails. If it fails, no changes are made to accounting.
    *
    * @param size The amount of memory to reserve in bytes.
-   * @return True if the allocation was successful, false if the allocation failed.
+   * @return the status and details of allocation at each allocator in the chain.
    */
   AllocationOutcome allocateBytes(long size) {
-    final AllocationOutcome outcome = allocate(size, true, false);
-    if (!outcome.isOk()) {
+    AllocationOutcome.Status status = allocateBytesInternal(size);
+    if (status.isOk()) {
+      return AllocationOutcome.SUCCESS_INSTANCE;
+    } else {
+      // Try again, but with details this time.
+      // Populating details only on failures avoids performance overhead in the common case (success case).
+      AllocationOutcomeDetails details = new AllocationOutcomeDetails();
+      status = allocateBytesInternal(size, details);
+      return new AllocationOutcome(status, details);
+    }
+  }
+
+  private AllocationOutcome.Status allocateBytesInternal(long size, AllocationOutcomeDetails details) {
+    final AllocationOutcome.Status status = allocate(size,
+        true /*incomingUpdatePeek*/, false /*forceAllocation*/, details);
+    if (!status.isOk()) {
       releaseBytes(size);
     }
-    return outcome;
+    return status;
+  }
+
+  private AllocationOutcome.Status allocateBytesInternal(long size) {
+    return allocateBytesInternal(size, null /*details*/);
   }
 
   private void updatePeak() {
@@ -129,7 +145,7 @@ class Accountant implements AutoCloseable {
    * @return Whether the allocation fit within limits.
    */
   boolean forceAllocate(long size) {
-    final AllocationOutcome outcome = allocate(size, true, true);
+    final AllocationOutcome.Status outcome = allocate(size, true, true, null);
     return outcome.isOk();
   }
 
@@ -155,22 +171,38 @@ class Accountant implements AutoCloseable {
    * @param forceAllocation    Whether we should force the allocation.
    * @return The outcome of the allocation.
    */
-  private AllocationOutcome allocate(final long size, final boolean incomingUpdatePeak, final
-  boolean forceAllocation) {
+  private AllocationOutcome.Status allocate(final long size, final boolean incomingUpdatePeak,
+      final boolean forceAllocation, AllocationOutcomeDetails details) {
     final long newLocal = locallyHeldMemory.addAndGet(size);
     final long beyondReservation = newLocal - reservation;
     final boolean beyondLimit = newLocal > allocationLimit.get();
     final boolean updatePeak = forceAllocation || (incomingUpdatePeak && !beyondLimit);
 
-    AllocationOutcome parentOutcome = AllocationOutcome.SUCCESS;
+    if (details != null) {
+      // Add details if required (used in exceptions and debugging).
+      boolean allocationFailed = true;
+      long allocatedLocal = 0;
+      if (!beyondLimit) {
+        allocatedLocal = size - Math.min(beyondReservation, size);
+        allocationFailed = false;
+      }
+      details.pushEntry(this, newLocal - size, size, allocatedLocal, allocationFailed);
+    }
+
+    AllocationOutcome.Status parentOutcome = AllocationOutcome.Status.SUCCESS;
     if (beyondReservation > 0 && parent != null) {
       // we need to get memory from our parent.
       final long parentRequest = Math.min(beyondReservation, size);
-      parentOutcome = parent.allocate(parentRequest, updatePeak, forceAllocation);
+      parentOutcome = parent.allocate(parentRequest, updatePeak, forceAllocation, details);
     }
 
-    final AllocationOutcome finalOutcome = beyondLimit ? AllocationOutcome.FAILED_LOCAL :
-        parentOutcome.ok ? AllocationOutcome.SUCCESS : AllocationOutcome.FAILED_PARENT;
+    final AllocationOutcome.Status finalOutcome;
+    if (beyondLimit) {
+      finalOutcome = AllocationOutcome.Status.FAILED_LOCAL;
+    } else {
+      finalOutcome = parentOutcome.isOk() ? AllocationOutcome.Status.SUCCESS
+          : AllocationOutcome.Status.FAILED_PARENT;
+    }
 
     if (updatePeak) {
       updatePeak();
@@ -211,12 +243,30 @@ class Accountant implements AutoCloseable {
   }
 
   /**
+   * Return the name of the accountant.
+   *
+   * @return name of accountant
+   */
+  public String getName() {
+    return name;
+  }
+
+  /**
    * Return the current limit of this Accountant.
    *
    * @return Limit in bytes.
    */
   public long getLimit() {
     return allocationLimit.get();
+  }
+
+  /**
+   * Return the initial reservation.
+   *
+   * @return reservation in bytes.
+   */
+  public long getInitReservation() {
+    return reservation;
   }
 
   /**
@@ -255,42 +305,9 @@ class Accountant implements AutoCloseable {
       return localHeadroom;
     }
 
-    return Math.min(localHeadroom, parent.getHeadroom());
+    // Amount of reserved memory left on top of what parent has
+    long reservedHeadroom = Math.max(0, reservation - locallyHeldMemory.get());
+    return Math.min(localHeadroom, parent.getHeadroom() + reservedHeadroom);
   }
 
-  /**
-   * Describes the type of outcome that occurred when trying to account for allocation of memory.
-   */
-  public static enum AllocationOutcome {
-
-    /**
-     * Allocation succeeded.
-     */
-    SUCCESS(true),
-
-    /**
-     * Allocation succeeded but only because the allocator was forced to move beyond a limit.
-     */
-    FORCED_SUCCESS(true),
-
-    /**
-     * Allocation failed because the local allocator's limits were exceeded.
-     */
-    FAILED_LOCAL(false),
-
-    /**
-     * Allocation failed because a parent allocator's limits were exceeded.
-     */
-    FAILED_PARENT(false);
-
-    private final boolean ok;
-
-    AllocationOutcome(boolean ok) {
-      this.ok = ok;
-    }
-
-    public boolean isOk() {
-      return ok;
-    }
-  }
 }

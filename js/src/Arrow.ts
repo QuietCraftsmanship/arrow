@@ -15,74 +15,103 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { readBuffers } from './reader/arrow';
+export { ArrowType, DateUnit, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type, UnionMode, BufferType } from './enum';
+export { Data } from './data';
+export {
+    DataType,
+    Null,
+    Bool,
+    Int, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64,
+    Float, Float16, Float32, Float64,
+    Utf8,
+    Binary,
+    FixedSizeBinary,
+    Date_, DateDay, DateMillisecond,
+    Timestamp, TimestampSecond, TimestampMillisecond, TimestampMicrosecond, TimestampNanosecond,
+    Time, TimeSecond, TimeMillisecond, TimeMicrosecond, TimeNanosecond,
+    Decimal,
+    List,
+    Struct,
+    Union, DenseUnion, SparseUnion,
+    Dictionary,
+    Interval, IntervalDayTime, IntervalYearMonth,
+    FixedSizeList,
+    Map_,
+} from './type';
 
-import { Vector } from './types/types';
-import { ListVector } from './types/list';
-import { Utf8Vector } from './types/utf8';
-import { BoolVector } from './types/vector/bool';
-import { DateVector } from './types/vector/date';
-import { RowVector } from './types/table/row';
-import { TableVector } from './types/table/table';
-import { StructVector } from './types/table/struct';
-import { DictionaryVector } from './types/dictionary';
-import { FixedSizeListVector } from './types/fixedsizelist';
-import { LongVector, Int64Vector, Uint64Vector, } from './types/vector/long';
-import {
-    TypedVector,
-    Int8Vector,
-    Int16Vector,
-    Int32Vector,
-    Uint8Vector,
-    Uint16Vector,
-    Uint32Vector,
-    Float32Vector,
-    Float64Vector
-} from './types/vector/typed';
-
-import './types/table/from';
+export { Table } from './table';
+export { Column } from './column';
+export { Visitor } from './visitor';
+export { Schema, Field } from './schema';
+export {
+    Row,
+    Vector,
+    BaseVector,
+    BinaryVector,
+    BoolVector,
+    Chunked,
+    DateVector, DateDayVector, DateMillisecondVector,
+    DecimalVector,
+    DictionaryVector,
+    FixedSizeBinaryVector,
+    FixedSizeListVector,
+    FloatVector, Float16Vector, Float32Vector, Float64Vector,
+    IntervalVector, IntervalDayTimeVector, IntervalYearMonthVector,
+    IntVector, Int8Vector, Int16Vector, Int32Vector, Int64Vector, Uint8Vector, Uint16Vector, Uint32Vector, Uint64Vector,
+    ListVector,
+    MapVector,
+    NullVector,
+    StructVector,
+    TimestampVector, TimestampSecondVector, TimestampMillisecondVector, TimestampMicrosecondVector, TimestampNanosecondVector,
+    TimeVector, TimeSecondVector, TimeMillisecondVector, TimeMicrosecondVector, TimeNanosecondVector,
+    UnionVector, DenseUnionVector, SparseUnionVector,
+    Utf8Vector,
+} from './vector/index';
 
 export {
-    Vector,
-    readBuffers,
-    DictionaryVector,
-    RowVector as Row,
-    TableVector as Table,
-    StructVector, Utf8Vector,
-    ListVector, FixedSizeListVector,
-    BoolVector, TypedVector, LongVector,
-    DateVector, Float32Vector, Float64Vector,
-    Int8Vector, Int16Vector, Int32Vector, Int64Vector,
-    Uint8Vector, Uint16Vector, Uint32Vector, Uint64Vector,
-};
+    Builder,
+    BinaryBuilder,
+    BoolBuilder,
+    DateBuilder, DateDayBuilder, DateMillisecondBuilder,
+    DecimalBuilder,
+    DictionaryBuilder,
+    FixedSizeBinaryBuilder,
+    FixedSizeListBuilder,
+    FloatBuilder, Float16Builder, Float32Builder, Float64Builder,
+    IntervalBuilder, IntervalDayTimeBuilder, IntervalYearMonthBuilder,
+    IntBuilder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, Uint8Builder, Uint16Builder, Uint32Builder, Uint64Builder,
+    ListBuilder,
+    MapBuilder,
+    NullBuilder,
+    StructBuilder,
+    TimestampBuilder, TimestampSecondBuilder, TimestampMillisecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
+    TimeBuilder, TimeSecondBuilder, TimeMillisecondBuilder, TimeMicrosecondBuilder, TimeNanosecondBuilder,
+    UnionBuilder, DenseUnionBuilder, SparseUnionBuilder,
+    Utf8Builder,
+} from './builder/index';
 
-/* These exports are needed for the closure umd targets */
-try {
-    const Arrow = eval('exports');
-    if (typeof Arrow === 'object') {
-        // string indexers tell closure compiler not to rename these properties
-        Arrow['Vector'] = Vector;
-        Arrow['Table'] = TableVector;
-        Arrow['readBuffers'] = readBuffers;
-        Arrow['BoolVector'] = BoolVector;
-        Arrow['Utf8Vector'] = Utf8Vector;
-        Arrow['ListVector'] = ListVector;
-        Arrow['StructVector'] = StructVector;
-        Arrow['DictionaryVector'] = DictionaryVector;
-        Arrow['FixedSizeListVector'] = FixedSizeListVector;
-        Arrow['LongVector'] = LongVector;
-        Arrow['TypedVector'] = TypedVector;
-        Arrow['DateVector'] = DateVector;
-        Arrow['Int8Vector'] = Int8Vector;
-        Arrow['Int16Vector'] = Int16Vector;
-        Arrow['Int32Vector'] = Int32Vector;
-        Arrow['Int64Vector'] = Int64Vector;
-        Arrow['Uint8Vector'] = Uint8Vector;
-        Arrow['Uint16Vector'] = Uint16Vector;
-        Arrow['Uint32Vector'] = Uint32Vector;
-        Arrow['Uint64Vector'] = Uint64Vector;
-        Arrow['Float32Vector'] = Float32Vector;
-        Arrow['Float64Vector'] = Float64Vector;
-    }
-} catch (e) { /* not the UMD bundle */ }
-/* end closure exports */
+export { ByteStream, AsyncByteStream, AsyncByteQueue, ReadableSource, WritableSink } from './io/stream';
+export { RecordBatchReader, RecordBatchFileReader, RecordBatchStreamReader, AsyncRecordBatchFileReader, AsyncRecordBatchStreamReader } from './ipc/reader';
+export { RecordBatchWriter, RecordBatchFileWriter, RecordBatchStreamWriter, RecordBatchJSONWriter } from './ipc/writer';
+export { MessageReader, AsyncMessageReader, JSONMessageReader } from './ipc/message';
+export { Message } from './ipc/metadata/message';
+export { RecordBatch } from './recordbatch';
+export { ArrowJSONLike, FileHandle, Readable, Writable, ReadableWritable, ReadableDOMStreamOptions } from './io/interfaces';
+export { DataFrame, FilteredDataFrame, CountByResult, BindFunc, NextFunc } from './compute/dataframe';
+
+import * as util_bn_ from './util/bn';
+import * as util_int_ from './util/int';
+import * as util_bit_ from './util/bit';
+import * as util_buffer_ from './util/buffer';
+import * as util_vector_ from './util/vector';
+import * as predicate from './compute/predicate';
+
+export { predicate };
+/** @ignore */
+export const util = {
+    ...util_bn_,
+    ...util_int_,
+    ...util_bit_,
+    ...util_buffer_,
+    ...util_vector_
+};

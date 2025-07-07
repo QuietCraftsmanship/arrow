@@ -30,13 +30,13 @@
 #include <boost/filesystem.hpp>  // NOLINT
 
 #include "arrow/io/file.h"
-#include "arrow/ipc/json.h"
+#include "arrow/ipc/json-integration.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
 #include "arrow/pretty_print.h"
+#include "arrow/record_batch.h"
 #include "arrow/status.h"
-#include "arrow/table.h"
-#include "arrow/test-util.h"
+#include "arrow/testing/gtest_util.h"
 #include "arrow/type.h"
 
 DEFINE_string(arrow, "", "Arrow file name");
@@ -52,6 +52,8 @@ namespace fs = boost::filesystem;
 namespace arrow {
 
 class Buffer;
+
+namespace ipc {
 
 bool file_exists(const char* path) {
   std::ifstream handle(path);
@@ -73,16 +75,15 @@ static Status ConvertJsonToArrow(const std::string& json_path,
   std::shared_ptr<Buffer> json_buffer;
   RETURN_NOT_OK(in_file->Read(file_size, &json_buffer));
 
-  std::unique_ptr<ipc::JsonReader> reader;
-  RETURN_NOT_OK(ipc::JsonReader::Open(json_buffer, &reader));
+  std::unique_ptr<internal::json::JsonReader> reader;
+  RETURN_NOT_OK(internal::json::JsonReader::Open(json_buffer, &reader));
 
   if (FLAGS_verbose) {
-    std::cout << "Found schema: " << reader->schema()->ToString() << std::endl;
+    std::cout << "Found schema:\n" << reader->schema()->ToString() << std::endl;
   }
 
-  std::shared_ptr<ipc::RecordBatchWriter> writer;
-  RETURN_NOT_OK(
-      ipc::RecordBatchFileWriter::Open(out_file.get(), reader->schema(), &writer));
+  std::shared_ptr<RecordBatchWriter> writer;
+  RETURN_NOT_OK(RecordBatchFileWriter::Open(out_file.get(), reader->schema(), &writer));
 
   for (int i = 0; i < reader->num_record_batches(); ++i) {
     std::shared_ptr<RecordBatch> batch;
@@ -101,15 +102,15 @@ static Status ConvertArrowToJson(const std::string& arrow_path,
   RETURN_NOT_OK(io::ReadableFile::Open(arrow_path, &in_file));
   RETURN_NOT_OK(io::FileOutputStream::Open(json_path, &out_file));
 
-  std::shared_ptr<ipc::RecordBatchFileReader> reader;
-  RETURN_NOT_OK(ipc::RecordBatchFileReader::Open(in_file.get(), &reader));
+  std::shared_ptr<RecordBatchFileReader> reader;
+  RETURN_NOT_OK(RecordBatchFileReader::Open(in_file.get(), &reader));
 
   if (FLAGS_verbose) {
-    std::cout << "Found schema: " << reader->schema()->ToString() << std::endl;
+    std::cout << "Found schema:\n" << reader->schema()->ToString() << std::endl;
   }
 
-  std::unique_ptr<ipc::JsonWriter> writer;
-  RETURN_NOT_OK(ipc::JsonWriter::Open(reader->schema(), &writer));
+  std::unique_ptr<internal::json::JsonWriter> writer;
+  RETURN_NOT_OK(internal::json::JsonWriter::Open(reader->schema(), &writer));
 
   for (int i = 0; i < reader->num_record_batches(); ++i) {
     std::shared_ptr<RecordBatch> batch;
@@ -119,8 +120,7 @@ static Status ConvertArrowToJson(const std::string& arrow_path,
 
   std::string result;
   RETURN_NOT_OK(writer->Finish(&result));
-  return out_file->Write(reinterpret_cast<const uint8_t*>(result.c_str()),
-                         static_cast<int64_t>(result.size()));
+  return out_file->Write(result.c_str(), static_cast<int64_t>(result.size()));
 }
 
 static Status ValidateArrowVsJson(const std::string& arrow_path,
@@ -135,15 +135,15 @@ static Status ValidateArrowVsJson(const std::string& arrow_path,
   std::shared_ptr<Buffer> json_buffer;
   RETURN_NOT_OK(json_file->Read(file_size, &json_buffer));
 
-  std::unique_ptr<ipc::JsonReader> json_reader;
-  RETURN_NOT_OK(ipc::JsonReader::Open(json_buffer, &json_reader));
+  std::unique_ptr<internal::json::JsonReader> json_reader;
+  RETURN_NOT_OK(internal::json::JsonReader::Open(json_buffer, &json_reader));
 
   // Construct Arrow reader
   std::shared_ptr<io::ReadableFile> arrow_file;
   RETURN_NOT_OK(io::ReadableFile::Open(arrow_path, &arrow_file));
 
-  std::shared_ptr<ipc::RecordBatchFileReader> arrow_reader;
-  RETURN_NOT_OK(ipc::RecordBatchFileReader::Open(arrow_file.get(), &arrow_reader));
+  std::shared_ptr<RecordBatchFileReader> arrow_reader;
+  RETURN_NOT_OK(RecordBatchFileReader::Open(arrow_file.get(), &arrow_reader));
 
   auto json_schema = json_reader->schema();
   auto arrow_schema = arrow_reader->schema();
@@ -165,10 +165,8 @@ static Status ValidateArrowVsJson(const std::string& arrow_path,
   const int arrow_nbatches = arrow_reader->num_record_batches();
 
   if (json_nbatches != arrow_nbatches) {
-    std::stringstream ss;
-    ss << "Different number of record batches: " << json_nbatches << " (JSON) vs "
-       << arrow_nbatches << " (Arrow)";
-    return Status::Invalid(ss.str());
+    return Status::Invalid("Different number of record batches: ", json_nbatches,
+                           " (JSON) vs ", arrow_nbatches, " (Arrow)");
   }
 
   std::shared_ptr<RecordBatch> arrow_batch;
@@ -226,9 +224,7 @@ Status RunCommand(const std::string& json_path, const std::string& arrow_path,
 
     return ValidateArrowVsJson(arrow_path, json_path);
   } else {
-    std::stringstream ss;
-    ss << "Unknown command: " << command;
-    return Status::Invalid(ss.str());
+    return Status::Invalid("Unknown command: ", command);
   }
 }
 
@@ -250,15 +246,14 @@ class TestJSONIntegration : public ::testing::Test {
     do {
       std::shared_ptr<io::FileOutputStream> out;
       RETURN_NOT_OK(io::FileOutputStream::Open(path, &out));
-      RETURN_NOT_OK(out->Write(reinterpret_cast<const uint8_t*>(data),
-                               static_cast<int64_t>(strlen(data))));
+      RETURN_NOT_OK(out->Write(data, static_cast<int64_t>(strlen(data))));
     } while (0);
     return Status::OK();
   }
 
   void TearDown() {
     for (const std::string path : tmp_paths_) {
-      std::remove(path.c_str());
+      ARROW_UNUSED(std::remove(path.c_str()));
     }
   }
 
@@ -401,6 +396,7 @@ TEST_F(TestJSONIntegration, ErrorStates) {
   ASSERT_RAISES(Invalid, RunCommand(json_path, "", "VALIDATE"));
 }
 
+}  // namespace ipc
 }  // namespace arrow
 
 int main(int argc, char** argv) {
@@ -409,7 +405,7 @@ int main(int argc, char** argv) {
   int ret = 0;
 
   if (FLAGS_integration) {
-    arrow::Status result = arrow::RunCommand(FLAGS_json, FLAGS_arrow, FLAGS_mode);
+    arrow::Status result = arrow::ipc::RunCommand(FLAGS_json, FLAGS_arrow, FLAGS_mode);
     if (!result.ok()) {
       std::cout << "Error message: " << result.ToString() << std::endl;
       ret = 1;

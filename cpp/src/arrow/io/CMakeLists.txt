@@ -18,21 +18,19 @@
 # ----------------------------------------------------------------------
 # arrow_io : Arrow IO interfaces
 
-ADD_ARROW_TEST(io-file-test)
+add_arrow_test(buffered-test PREFIX "arrow-io")
+add_arrow_test(compressed-test PREFIX "arrow-io")
+add_arrow_test(file-test PREFIX "arrow-io")
 
-if (ARROW_HDFS AND NOT ARROW_BOOST_HEADER_ONLY)
-  ADD_ARROW_TEST(io-hdfs-test NO_VALGRIND)
+if(ARROW_HDFS)
+  add_arrow_test(hdfs-test NO_VALGRIND PREFIX "arrow-io")
 endif()
 
-ADD_ARROW_TEST(io-memory-test)
+add_arrow_test(memory-test PREFIX "arrow-io")
+add_arrow_test(readahead-test PREFIX "arrow-io")
 
-ADD_ARROW_BENCHMARK(io-memory-benchmark)
+add_arrow_benchmark(file-benchmark PREFIX "arrow-io")
+add_arrow_benchmark(memory-benchmark PREFIX "arrow-io")
 
 # Headers: top level
-install(FILES
-  api.h
-  file.h
-  hdfs.h
-  interfaces.h
-  memory.h
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/io")
+arrow_install_all_headers("arrow/io")

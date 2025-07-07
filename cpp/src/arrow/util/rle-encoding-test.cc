@@ -30,9 +30,8 @@
 #include "arrow/util/bit-util.h"
 #include "arrow/util/rle-encoding.h"
 
-using std::vector;
-
 namespace arrow {
+namespace util {
 
 const int MAX_WIDTH = 32;
 
@@ -40,7 +39,7 @@ TEST(BitArray, TestBool) {
   const int len = 8;
   uint8_t buffer[len];
 
-  BitWriter writer(buffer, len);
+  BitUtil::BitWriter writer(buffer, len);
 
   // Write alternating 0's and 1's
   for (int i = 0; i < 8; ++i) {
@@ -73,7 +72,7 @@ TEST(BitArray, TestBool) {
   EXPECT_EQ((int)buffer[1], BOOST_BINARY(1 1 0 0 1 1 0 0));
 
   // Use the reader and validate
-  BitReader reader(buffer, len);
+  BitUtil::BitReader reader(buffer, len);
   for (int i = 0; i < 8; ++i) {
     bool val = false;
     bool result = reader.GetValue(1, &val);
@@ -101,12 +100,12 @@ TEST(BitArray, TestBool) {
 
 // Writes 'num_vals' values with width 'bit_width' and reads them back.
 void TestBitArrayValues(int bit_width, int num_vals) {
-  int len = static_cast<int>(BitUtil::Ceil(bit_width * num_vals, 8));
+  int len = static_cast<int>(BitUtil::BytesForBits(bit_width * num_vals));
   EXPECT_GT(len, 0);
   const uint64_t mod = bit_width == 64 ? 1 : 1LL << bit_width;
 
   std::vector<uint8_t> buffer(len);
-  BitWriter writer(buffer.data(), len);
+  BitUtil::BitWriter writer(buffer.data(), len);
   for (int i = 0; i < num_vals; ++i) {
     bool result = writer.PutValue(i % mod, bit_width);
     EXPECT_TRUE(result);
@@ -114,7 +113,7 @@ void TestBitArrayValues(int bit_width, int num_vals) {
   writer.Flush();
   EXPECT_EQ(writer.bytes_written(), len);
 
-  BitReader reader(buffer.data(), len);
+  BitUtil::BitReader reader(buffer.data(), len);
   for (int i = 0; i < num_vals; ++i) {
     int64_t val = 0;
     bool result = reader.GetValue(bit_width, &val);
@@ -140,7 +139,7 @@ TEST(BitArray, TestMixed) {
   uint8_t buffer[len];
   bool parity = true;
 
-  BitWriter writer(buffer, len);
+  BitUtil::BitWriter writer(buffer, len);
   for (int i = 0; i < len; ++i) {
     bool result;
     if (i % 2 == 0) {
@@ -154,7 +153,7 @@ TEST(BitArray, TestMixed) {
   writer.Flush();
 
   parity = true;
-  BitReader reader(buffer, len);
+  BitUtil::BitReader reader(buffer, len);
   for (int i = 0; i < len; ++i) {
     bool result;
     if (i % 2 == 0) {
@@ -175,8 +174,8 @@ TEST(BitArray, TestMixed) {
 // expected_encoding != NULL, also validates that the encoded buffer is
 // exactly 'expected_encoding'.
 // if expected_len is not -1, it will validate the encoded size is correct.
-void ValidateRle(const vector<int>& values, int bit_width, uint8_t* expected_encoding,
-                 int expected_len) {
+void ValidateRle(const std::vector<int>& values, int bit_width,
+                 uint8_t* expected_encoding, int expected_len) {
   const int len = 64 * 1024;
   uint8_t buffer[len];
   EXPECT_LE(expected_len, len);
@@ -192,7 +191,7 @@ void ValidateRle(const vector<int>& values, int bit_width, uint8_t* expected_enc
     EXPECT_EQ(encoded_len, expected_len);
   }
   if (expected_encoding != NULL) {
-    EXPECT_EQ(memcmp(buffer, expected_encoding, expected_len), 0);
+    EXPECT_EQ(memcmp(buffer, expected_encoding, encoded_len), 0);
   }
 
   // Verify read
@@ -209,7 +208,7 @@ void ValidateRle(const vector<int>& values, int bit_width, uint8_t* expected_enc
   // Verify batch read
   {
     RleDecoder decoder(buffer, len, bit_width);
-    vector<int> values_read(values.size());
+    std::vector<int> values_read(values.size());
     ASSERT_EQ(values.size(),
               decoder.GetBatch(values_read.data(), static_cast<int>(values.size())));
     EXPECT_EQ(values, values_read);
@@ -218,7 +217,7 @@ void ValidateRle(const vector<int>& values, int bit_width, uint8_t* expected_enc
 
 // A version of ValidateRle that round-trips the values and returns false if
 // the returned values are not all the same
-bool CheckRoundTrip(const vector<int>& values, int bit_width) {
+bool CheckRoundTrip(const std::vector<int>& values, int bit_width) {
   const int len = 64 * 1024;
   uint8_t buffer[len];
   RleEncoder encoder(buffer, len, bit_width);
@@ -244,7 +243,7 @@ bool CheckRoundTrip(const vector<int>& values, int bit_width) {
   // Verify batch read
   {
     RleDecoder decoder(buffer, len, bit_width);
-    vector<int> values_read(values.size());
+    std::vector<int> values_read(values.size());
     if (static_cast<int>(values.size()) !=
         decoder.GetBatch(values_read.data(), static_cast<int>(values.size()))) {
       return false;
@@ -260,7 +259,7 @@ bool CheckRoundTrip(const vector<int>& values, int bit_width) {
 TEST(Rle, SpecificSequences) {
   const int len = 1024;
   uint8_t expected_buffer[len];
-  vector<int> values;
+  std::vector<int> values;
 
   // Test 50 0' followed by 50 1's
   values.resize(100);
@@ -281,14 +280,15 @@ TEST(Rle, SpecificSequences) {
   }
 
   for (int width = 9; width <= MAX_WIDTH; ++width) {
-    ValidateRle(values, width, NULL, 2 * (1 + static_cast<int>(BitUtil::Ceil(width, 8))));
+    ValidateRle(values, width, NULL,
+                2 * (1 + static_cast<int>(BitUtil::CeilDiv(width, 8))));
   }
 
   // Test 100 0's and 1's alternating
   for (int i = 0; i < 100; ++i) {
     values[i] = i % 2;
   }
-  int num_groups = static_cast<int>(BitUtil::Ceil(100, 8));
+  int num_groups = static_cast<int>(BitUtil::CeilDiv(100, 8));
   expected_buffer[0] = static_cast<uint8_t>((num_groups << 1) | 1);
   for (int i = 1; i <= 100 / 8; ++i) {
     expected_buffer[i] = BOOST_BINARY(1 0 1 0 1 0 1 0);
@@ -299,9 +299,9 @@ TEST(Rle, SpecificSequences) {
   // num_groups and expected_buffer only valid for bit width = 1
   ValidateRle(values, 1, expected_buffer, 1 + num_groups);
   for (int width = 2; width <= MAX_WIDTH; ++width) {
-    int num_values = static_cast<int>(BitUtil::Ceil(100, 8)) * 8;
+    int num_values = static_cast<int>(BitUtil::CeilDiv(100, 8)) * 8;
     ValidateRle(values, width, NULL,
-                1 + static_cast<int>(BitUtil::Ceil(width * num_values, 8)));
+                1 + static_cast<int>(BitUtil::CeilDiv(width * num_values, 8)));
   }
 }
 
@@ -309,7 +309,7 @@ TEST(Rle, SpecificSequences) {
 // is used, otherwise alternating values are used.
 void TestRleValues(int bit_width, int num_vals, int value = -1) {
   const uint64_t mod = (bit_width == 64) ? 1 : 1LL << bit_width;
-  vector<int> values;
+  std::vector<int> values;
   for (int v = 0; v < num_vals; ++v) {
     values.push_back((value != -1) ? value : static_cast<int>(v % mod));
   }
@@ -357,7 +357,7 @@ TEST(Rle, BitWidthZeroLiteral) {
 // Test that writes out a repeated group and then a literal
 // group but flush before finishing.
 TEST(BitRle, Flush) {
-  vector<int> values;
+  std::vector<int> values;
   for (int i = 0; i < 16; ++i) values.push_back(1);
   values.push_back(0);
   ValidateRle(values, 1, NULL, -1);
@@ -374,7 +374,7 @@ TEST(BitRle, Random) {
   int niters = 50;
   int ngroups = 1000;
   int max_group_size = 16;
-  vector<int> values(ngroups + max_group_size);
+  std::vector<int> values(ngroups + max_group_size);
 
   // prng setup
   std::random_device rd;
@@ -407,7 +407,7 @@ TEST(BitRle, Random) {
 // Test a sequence of 1 0's, 2 1's, 3 0's. etc
 // e.g. 011000111100000
 TEST(BitRle, RepeatedPattern) {
-  vector<int> values;
+  std::vector<int> values;
   const int min_run = 1;
   const int max_run = 32;
 
@@ -464,4 +464,5 @@ TEST(BitRle, Overflow) {
   }
 }
 
+}  // namespace util
 }  // namespace arrow

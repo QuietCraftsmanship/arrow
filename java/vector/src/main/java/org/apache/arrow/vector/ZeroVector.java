@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,7 +27,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.vector.complex.impl.NullReader;
 import org.apache.arrow.vector.complex.reader.FieldReader;
-import org.apache.arrow.vector.schema.ArrowFieldNode;
+import org.apache.arrow.vector.ipc.message.ArrowFieldNode;
 import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.ArrowType.Null;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -38,8 +37,11 @@ import org.apache.arrow.vector.util.TransferPair;
 
 import io.netty.buffer.ArrowBuf;
 
+/**
+ * A zero length vector of any type.
+ */
 public class ZeroVector implements FieldVector {
-  public final static ZeroVector INSTANCE = new ZeroVector();
+  public static final ZeroVector INSTANCE = new ZeroVector();
 
   private final TransferPair defaultPair = new TransferPair() {
     @Override
@@ -60,41 +62,6 @@ public class ZeroVector implements FieldVector {
     }
   };
 
-  private final Accessor defaultAccessor = new Accessor() {
-    @Override
-    public Object getObject(int index) {
-      return null;
-    }
-
-    @Override
-    public int getValueCount() {
-      return 0;
-    }
-
-    @Override
-    public boolean isNull(int index) {
-      return true;
-    }
-
-    @Override
-    public int getNullCount() {
-      return 0;
-    }
-  };
-
-  private final Mutator defaultMutator = new Mutator() {
-    @Override
-    public void setValueCount(int valueCount) {
-    }
-
-    @Override
-    public void reset() {
-    }
-
-    @Override
-    public void generateTestData(int values) {
-    }
-  };
 
   public ZeroVector() {
   }
@@ -105,6 +72,10 @@ public class ZeroVector implements FieldVector {
 
   @Override
   public void clear() {
+  }
+
+  @Override
+  public void reset() {
   }
 
   @Override
@@ -187,16 +158,6 @@ public class ZeroVector implements FieldVector {
   }
 
   @Override
-  public Accessor getAccessor() {
-    return defaultAccessor;
-  }
-
-  @Override
-  public Mutator getMutator() {
-    return defaultMutator;
-  }
-
-  @Override
   public FieldReader getReader() {
     return NullReader.INSTANCE;
   }
@@ -258,5 +219,29 @@ public class ZeroVector implements FieldVector {
   @Override
   public ArrowBuf getOffsetBuffer() {
     throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public int getValueCount() {
+    return 0;
+  }
+
+  @Override
+  public void setValueCount(int valueCount) {
+  }
+
+  @Override
+  public Object getObject(int index) {
+    return null;
+  }
+
+  @Override
+  public int getNullCount() {
+    return 0;
+  }
+
+  @Override
+  public boolean isNull(int index) {
+    return false;
   }
 }

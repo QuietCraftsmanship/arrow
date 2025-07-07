@@ -16,101 +16,112 @@
 # Usage of this module as follows:
 #
 #  find_package(Brotli)
-#
-# Variables used by this module, they can change the default behaviour and need
-# to be set before calling find_package:
-#
-#  Brotli_HOME - When set, this path is inspected instead of standard library
-#                locations as the root of the Brotli installation.
-#                The environment variable BROTLI_HOME overrides this veriable.
-#
-# This module defines
-#  BROTLI_INCLUDE_DIR, directory containing headers
-#  BROTLI_LIBS, directory containing brotli libraries
-#  BROTLI_STATIC_LIB, path to libbrotli.a
-#  BROTLI_SHARED_LIB, path to libbrotli's shared library
-#  BROTLI_FOUND, whether brotli has been found
 
-if( NOT "${BROTLI_HOME}" STREQUAL "")
-    file( TO_CMAKE_PATH "${BROTLI_HOME}" _native_path )
-    list( APPEND _brotli_roots ${_native_path} )
-elseif ( Brotli_HOME )
-    list( APPEND _brotli_roots ${Brotli_HOME} )
+# Favour static libraries over dynamic libraries, and handle various spellings
+set(BROTLI_COMMON_LIB_NAMES
+    brotlicommon-static
+    brotlicommon
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlicommon-static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlicommon_static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_SHARED_LIBRARY_PREFIX}brotlicommon${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlicommon${CMAKE_STATIC_LIBRARY_SUFFIX})
+
+set(BROTLI_ENC_LIB_NAMES
+    brotlienc-static
+    brotlienc
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlienc-static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlienc_static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_SHARED_LIBRARY_PREFIX}brotlienc${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlienc${CMAKE_STATIC_LIBRARY_SUFFIX})
+
+set(BROTLI_DEC_LIB_NAMES
+    brotlidec-static
+    brotlidec
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlidec-static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlidec_static${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${CMAKE_SHARED_LIBRARY_PREFIX}brotlidec${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${CMAKE_STATIC_LIBRARY_PREFIX}brotlidec${CMAKE_STATIC_LIBRARY_SUFFIX})
+
+if(BROTLI_ROOT)
+  find_library(BROTLI_COMMON_LIBRARY
+               NAMES ${BROTLI_COMMON_LIB_NAMES}
+               PATHS ${BROTLI_ROOT}
+               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+               NO_DEFAULT_PATH)
+  find_library(BROTLI_ENC_LIBRARY
+               NAMES ${BROTLI_ENC_LIB_NAMES}
+               PATHS ${BROTLI_ROOT}
+               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+               NO_DEFAULT_PATH)
+  find_library(BROTLI_DEC_LIBRARY
+               NAMES ${BROTLI_DEC_LIB_NAMES}
+               PATHS ${BROTLI_ROOT}
+               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+               NO_DEFAULT_PATH)
+  find_path(BROTLI_INCLUDE_DIR
+            NAMES brotli/decode.h
+            PATHS ${BROTLI_ROOT}
+            PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES}
+            NO_DEFAULT_PATH)
+else()
+  pkg_check_modules(BROTLI_PC libbrotlicommon libbrotlienc libbrotlidec)
+  if(BROTLI_PC_FOUND)
+    set(BROTLI_INCLUDE_DIR "${BROTLI_PC_libbrotlicommon_INCLUDEDIR}")
+
+    # Some systems (e.g. Fedora) don't fill Brotli_LIBRARY_DIRS, so add the other dirs here.
+    list(APPEND BROTLI_PC_LIBRARY_DIRS "${BROTLI_PC_libbrotlicommon_LIBDIR}")
+    list(APPEND BROTLI_PC_LIBRARY_DIRS "${BROTLI_PC_libbrotlienc_LIBDIR}")
+    list(APPEND BROTLI_PC_LIBRARY_DIRS "${BROTLI_PC_libbrotlidec_LIBDIR}")
+
+    find_library(BROTLI_COMMON_LIBRARY
+                 NAMES ${BROTLI_COMMON_LIB_NAMES}
+                 PATHS ${BROTLI_PC_LIBRARY_DIRS}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+                 NO_DEFAULT_PATH)
+    find_library(BROTLI_ENC_LIBRARY
+                 NAMES ${BROTLI_ENC_LIB_NAMES}
+                 PATHS ${BROTLI_PC_LIBRARY_DIRS}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+                 NO_DEFAULT_PATH)
+    find_library(BROTLI_DEC_LIBRARY
+                 NAMES ${BROTLI_DEC_LIB_NAMES}
+                 PATHS ${BROTLI_PC_LIBRARY_DIRS}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
+                 NO_DEFAULT_PATH)
+  else()
+    find_library(BROTLI_COMMON_LIBRARY
+                 NAMES ${BROTLI_COMMON_LIB_NAMES}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
+    find_library(BROTLI_ENC_LIBRARY
+                 NAMES ${BROTLI_ENC_LIB_NAMES}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
+    find_library(BROTLI_DEC_LIBRARY
+                 NAMES ${BROTLI_DEC_LIB_NAMES}
+                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
+    find_path(BROTLI_INCLUDE_DIR
+              NAMES brotli/decode.h
+              PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES})
+  endif()
 endif()
 
-find_path( BROTLI_INCLUDE_DIR NAMES brotli/decode.h
-  PATHS ${_brotli_roots}
-  NO_DEFAULT_PATH
-  PATH_SUFFIXES "include" )
-
-find_library( BROTLI_LIBRARY_ENC NAMES libbrotlienc.a brotlienc
-  PATHS ${_brotli_roots}
-  NO_DEFAULT_PATH
-  PATH_SUFFIXES "lib/${CMAKE_LIBRARY_ARCHITECTURE}" "lib" )
-
-find_library( BROTLI_LIBRARY_DEC NAMES libbrotlidec.a brotlidec
-  PATHS ${_brotli_roots}
-  NO_DEFAULT_PATH
-  PATH_SUFFIXES "lib/${CMAKE_LIBRARY_ARCHITECTURE}" "lib" )
-
-find_library( BROTLI_LIBRARY_COMMON NAMES libbrotlicommon.a brotlicommon
-  PATHS ${_brotli_roots}
-  NO_DEFAULT_PATH
-  PATH_SUFFIXES "lib/${CMAKE_LIBRARY_ARCHITECTURE}" "lib" )
-
-set(BROTLI_LIBRARIES ${BROTLI_LIBRARY_ENC} ${BROTLI_LIBRARY_DEC}
-    ${BROTLI_LIBRARY_COMMON})
-
-if (BROTLI_INCLUDE_DIR AND (PARQUET_MINIMAL_DEPENDENCY OR BROTLI_LIBRARIES))
-  set(BROTLI_FOUND TRUE)
-  get_filename_component( BROTLI_LIBS ${BROTLI_LIBRARY_ENC} PATH )
-  set(BROTLI_LIB_NAME brotli)
-  if (MSVC AND NOT BROTLI_MSVC_STATIC_LIB_SUFFIX)
-    set(BROTLI_MSVC_STATIC_LIB_SUFFIX _static)
-  endif()
-  set(BROTLI_STATIC_LIB
-      ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}enc${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}
-      ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}dec${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}
-      ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}common${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX})
-  set(BROTLI_STATIC_LIBRARY_ENC ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}enc${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX})
-  set(BROTLI_STATIC_LIBRARY_DEC ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}dec${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX})
-  set(BROTLI_STATIC_LIBRARY_COMMON ${BROTLI_LIBS}/${CMAKE_STATIC_LIBRARY_PREFIX}${BROTLI_LIB_NAME}common${BROTLI_MSVC_STATIC_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX})
-  set(BROTLI_SHARED_LIB
-      ${BROTLI_LIBS}/${CMAKE_SHARED_LIBRARY_PREFIX}${BROTLI_LIB_NAME}enc${CMAKE_SHARED_LIBRARY_SUFFIX}
-      ${BROTLI_LIBS}/${CMAKE_SHARED_LIBRARY_PREFIX}${BROTLI_LIB_NAME}dec${CMAKE_SHARED_LIBRARY_SUFFIX}
-      ${BROTLI_LIBS}/${CMAKE_SHARED_LIBRARY_PREFIX}${BROTLI_LIB_NAME}common${CMAKE_SHARED_LIBRARY_SUFFIX})
-else ()
-  set(BROTLI_FOUND FALSE)
-endif ()
-
-if (BROTLI_FOUND)
-  if (NOT Brotli_FIND_QUIETLY)
-    if (PARQUET_MINIMAL_DEPENDENCY)
-      message(STATUS "Found the Brotli headers: ${BROTLI_INCLUDE_DIR}")
-    else ()
-      message(STATUS "Found the Brotli library: ${BROTLI_LIBRARIES}")
-    endif ()
-  endif ()
-else ()
-  if (NOT Brotli_FIND_QUIETLY)
-    set(BROTLI_ERR_MSG "Could not find the Brotli library. Looked in ")
-    if ( _brotli_roots )
-      set(BROTLI_ERR_MSG "${BROTLI_ERR_MSG} in ${_brotli_roots}.")
-    else ()
-      set(BROTLI_ERR_MSG "${BROTLI_ERR_MSG} system search paths.")
-    endif ()
-    if (Brotli_FIND_REQUIRED)
-      message(FATAL_ERROR "${BROTLI_ERR_MSG}")
-    else (Brotli_FIND_REQUIRED)
-      message(STATUS "${BROTLI_ERR_MSG}")
-    endif (Brotli_FIND_REQUIRED)
-  endif ()
-endif ()
-
-mark_as_advanced(
-  BROTLI_INCLUDE_DIR
-  BROTLI_LIBS
-  BROTLI_LIBRARIES
-  BROTLI_STATIC_LIB
-  BROTLI_SHARED_LIB
-)
+find_package_handle_standard_args(Brotli
+                                  REQUIRED_VARS
+                                  BROTLI_COMMON_LIBRARY
+                                  BROTLI_ENC_LIBRARY
+                                  BROTLI_DEC_LIBRARY
+                                  BROTLI_INCLUDE_DIR)
+if(Brotli_FOUND OR BROTLI_FOUND)
+  set(Brotli_FOUND TRUE)
+  add_library(Brotli::brotlicommon UNKNOWN IMPORTED)
+  set_target_properties(Brotli::brotlicommon
+                        PROPERTIES IMPORTED_LOCATION "${BROTLI_COMMON_LIBRARY}"
+                                   INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
+  add_library(Brotli::brotlienc UNKNOWN IMPORTED)
+  set_target_properties(Brotli::brotlienc
+                        PROPERTIES IMPORTED_LOCATION "${BROTLI_ENC_LIBRARY}"
+                                   INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
+  add_library(Brotli::brotlidec UNKNOWN IMPORTED)
+  set_target_properties(Brotli::brotlidec
+                        PROPERTIES IMPORTED_LOCATION "${BROTLI_DEC_LIBRARY}"
+                                   INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
+endif()

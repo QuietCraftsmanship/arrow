@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,7 +17,10 @@
 
 package org.apache.arrow.vector;
 
-public interface VariableWidthVector extends ValueVector {
+/**
+ * Interface vectors that contain variable width members (e.g. Strings, Lists, etc).
+ */
+public interface VariableWidthVector extends ValueVector, DensityAwareVector {
 
   /**
    * Allocate a new memory space for this vector.  Must be called prior to using the ValueVector.
@@ -35,17 +37,9 @@ public interface VariableWidthVector extends ValueVector {
    */
   int getByteCapacity();
 
-  VariableWidthMutator getMutator();
-
-  VariableWidthAccessor getAccessor();
-
-  interface VariableWidthAccessor extends Accessor {
-    int getValueLength(int index);
-  }
-
-  int getCurrentSizeInBytes();
-
-  interface VariableWidthMutator extends Mutator {
-    void setValueLengthSafe(int index, int length);
-  }
+  /**
+   * Provide the number of bytes contained in the valueBuffer.
+   * @return the number of bytes in valueBuffer.
+   */
+  int sizeOfValueBuffer();
 }

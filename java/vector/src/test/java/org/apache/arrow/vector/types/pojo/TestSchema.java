@@ -1,14 +1,13 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -33,6 +32,8 @@ import org.apache.arrow.vector.types.pojo.ArrowType.Binary;
 import org.apache.arrow.vector.types.pojo.ArrowType.Bool;
 import org.apache.arrow.vector.types.pojo.ArrowType.Date;
 import org.apache.arrow.vector.types.pojo.ArrowType.Decimal;
+import org.apache.arrow.vector.types.pojo.ArrowType.Duration;
+import org.apache.arrow.vector.types.pojo.ArrowType.FixedSizeBinary;
 import org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint;
 import org.apache.arrow.vector.types.pojo.ArrowType.Int;
 import org.apache.arrow.vector.types.pojo.ArrowType.Interval;
@@ -66,11 +67,14 @@ public class TestSchema {
         field("f", new FloatingPoint(FloatingPointPrecision.SINGLE)),
         field("g", new Timestamp(TimeUnit.MILLISECOND, "UTC")),
         field("h", new Timestamp(TimeUnit.MICROSECOND, null)),
-        field("i", new Interval(IntervalUnit.DAY_TIME))
+        field("i", new Interval(IntervalUnit.DAY_TIME)),
+        field("j", new ArrowType.Duration(TimeUnit.SECOND))
     ));
     roundTrip(schema);
     assertEquals(
-        "Schema<a: Int(8, true) not null, b: Struct<c: Int(16, true), d: Utf8>, e: List<Date(MILLISECOND)>, f: FloatingPoint(SINGLE), g: Timestamp(MILLISECOND, UTC), h: Timestamp(MICROSECOND, null), i: Interval(DAY_TIME)>",
+        "Schema<a: Int(8, true) not null, b: Struct<c: Int(16, true), d: Utf8>, e: List<Date(MILLISECOND)>, " +
+          "f: FloatingPoint(SINGLE), g: Timestamp(MILLISECOND, UTC), h: Timestamp(MICROSECOND, null), " +
+          "i: Interval(DAY_TIME), j: Duration(SECOND)>",
         schema.toString());
   }
 
@@ -95,7 +99,10 @@ public class TestSchema {
         field("p", new Time(TimeUnit.NANOSECOND, 64)),
         field("q", new Timestamp(TimeUnit.MILLISECOND, "UTC")),
         field("r", new Timestamp(TimeUnit.MICROSECOND, null)),
-        field("s", new Interval(IntervalUnit.DAY_TIME))
+        field("s", new Interval(IntervalUnit.DAY_TIME)),
+        field("t", new FixedSizeBinary(100)),
+        field("u", new Duration(TimeUnit.SECOND)),
+        field("v", new Duration(TimeUnit.MICROSECOND))
     ));
     roundTrip(schema);
   }
@@ -149,7 +156,9 @@ public class TestSchema {
     ));
     roundTrip(schema);
     assertEquals(
-        "Schema<a: Timestamp(SECOND, UTC), b: Timestamp(MILLISECOND, UTC), c: Timestamp(MICROSECOND, UTC), d: Timestamp(NANOSECOND, UTC), e: Timestamp(SECOND, null), f: Timestamp(MILLISECOND, null), g: Timestamp(MICROSECOND, null), h: Timestamp(NANOSECOND, null)>",
+        "Schema<a: Timestamp(SECOND, UTC), b: Timestamp(MILLISECOND, UTC), c: Timestamp(MICROSECOND, UTC), " +
+          "d: Timestamp(NANOSECOND, UTC), e: Timestamp(SECOND, null), f: Timestamp(MILLISECOND, null), " +
+          "g: Timestamp(MICROSECOND, null), h: Timestamp(NANOSECOND, null)>",
         schema.toString());
   }
 
@@ -161,6 +170,18 @@ public class TestSchema {
     ));
     roundTrip(schema);
     contains(schema, "YEAR_MONTH", "DAY_TIME");
+  }
+
+  @Test
+  public void testRoundTripDurationInterval() throws IOException {
+    Schema schema = new Schema(asList(
+        field("a", new Duration(TimeUnit.SECOND)),
+        field("b", new Duration(TimeUnit.MILLISECOND)),
+        field("c", new Duration(TimeUnit.MICROSECOND)),
+        field("d", new Duration(TimeUnit.NANOSECOND))
+    ));
+    roundTrip(schema);
+    contains(schema, "SECOND", "MILLI", "MICRO", "NANO");
   }
 
   @Test
@@ -202,7 +223,7 @@ public class TestSchema {
     assertEquals(o1 + " == " + o2, o1.hashCode(), o2.hashCode());
   }
 
-  private void contains(Schema schema, String... s) throws IOException {
+  private void contains(Schema schema, String... s) {
     String json = schema.toJson();
     for (String string : s) {
       assertTrue(json + " contains " + string, json.contains(string));

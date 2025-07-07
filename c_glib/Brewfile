@@ -16,13 +16,9 @@
 # under the License.
 
 brew "autoconf-archive"
-brew "boost"
-brew "ccache"
-brew "cmake"
-brew "git"
 brew "gobject-introspection"
 brew "gtk-doc"
-brew "jemalloc"
 brew "libtool"
 brew "lua"
-brew "wget"
+brew "luarocks"
+brew "meson"

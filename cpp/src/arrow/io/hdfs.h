@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "arrow/io/interfaces.h"
@@ -63,12 +64,13 @@ struct HdfsConnectionConfig {
   int port;
   std::string user;
   std::string kerb_ticket;
+  std::unordered_map<std::string, std::string> extra_conf;
   HdfsDriver driver;
 };
 
 class ARROW_EXPORT HadoopFileSystem : public FileSystem {
  public:
-  ~HadoopFileSystem();
+  ~HadoopFileSystem() override;
 
   // Connect to an HDFS cluster given a configuration
   //
@@ -154,10 +156,19 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   // @param buffer_size, 0 for default
   // @param replication, 0 for default
   // @param default_block_size, 0 for default
+  Status OpenWritable(const std::string& path, bool append, int32_t buffer_size,
+                      int16_t replication, int64_t default_block_size,
+                      std::shared_ptr<HdfsOutputStream>* file);
+
+  Status OpenWritable(const std::string& path, bool append,
+                      std::shared_ptr<HdfsOutputStream>* file);
+
+  ARROW_DEPRECATED("Use OpenWritable")
   Status OpenWriteable(const std::string& path, bool append, int32_t buffer_size,
                        int16_t replication, int64_t default_block_size,
                        std::shared_ptr<HdfsOutputStream>* file);
 
+  ARROW_DEPRECATED("Use OpenWritable")
   Status OpenWriteable(const std::string& path, bool append,
                        std::shared_ptr<HdfsOutputStream>* file);
 
@@ -174,24 +185,24 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
 
 class ARROW_EXPORT HdfsReadableFile : public RandomAccessFile {
  public:
-  ~HdfsReadableFile();
+  ~HdfsReadableFile() override;
 
   Status Close() override;
+
+  bool closed() const override;
 
   Status GetSize(int64_t* size) override;
 
   // NOTE: If you wish to read a particular range of a file in a multithreaded
   // context, you may prefer to use ReadAt to avoid locking issues
-  Status Read(int64_t nbytes, int64_t* bytes_read, uint8_t* buffer) override;
+  Status Read(int64_t nbytes, int64_t* bytes_read, void* buffer) override;
 
   Status Read(int64_t nbytes, std::shared_ptr<Buffer>* out) override;
 
   Status ReadAt(int64_t position, int64_t nbytes, int64_t* bytes_read,
-                uint8_t* buffer) override;
+                void* buffer) override;
 
   Status ReadAt(int64_t position, int64_t nbytes, std::shared_ptr<Buffer>* out) override;
-
-  bool supports_zero_copy() const override;
 
   Status Seek(int64_t position) override;
   Status Tell(int64_t* position) const override;
@@ -210,16 +221,18 @@ class ARROW_EXPORT HdfsReadableFile : public RandomAccessFile {
 };
 
 // Naming this file OutputStream because it does not support seeking (like the
-// WriteableFile interface)
+// WritableFile interface)
 class ARROW_EXPORT HdfsOutputStream : public OutputStream {
  public:
-  ~HdfsOutputStream();
+  ~HdfsOutputStream() override;
 
   Status Close() override;
 
-  Status Write(const uint8_t* buffer, int64_t nbytes) override;
+  bool closed() const override;
 
-  Status Write(const uint8_t* buffer, int64_t nbytes, int64_t* bytes_written);
+  Status Write(const void* buffer, int64_t nbytes) override;
+
+  Status Write(const void* buffer, int64_t nbytes, int64_t* bytes_written);
 
   Status Flush() override;
 

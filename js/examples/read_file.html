@@ -29,6 +29,7 @@ table {
 }
 table, th, td {
   border: 1px solid black;
+  white-space: nowrap;
 }
     </style>
     <script type="text/javascript">
@@ -40,7 +41,7 @@ function addCell (tr, type, value) {
 }
 reader.onload = function (evt) {
 
-  var arrowTable = Arrow.Table.from(new Uint8Array(evt.target.result));
+  var arrowTable = Arrow.Table.from([new Uint8Array(evt.target.result)]);
   var thead = document.getElementById("thead");
   var tbody = document.getElementById("tbody");
 
@@ -53,13 +54,13 @@ reader.onload = function (evt) {
   }
 
   var header_row = document.createElement("tr");
-  for (let column of arrowTable.cols()) {
-    addCell(header_row, "th", column.name);
+  for (let field of arrowTable.schema.fields) {
+    addCell(header_row, "th", `${field}`);
   }
 
   thead.appendChild(header_row);
 
-  for (let row of arrowTable.rows(true)) {
+  for (let row of arrowTable) {
     var tr = document.createElement("tr");
     for (let cell of row) {
       addCell(tr, "td",
@@ -85,6 +86,6 @@ function handleFiles(files) {
       <tbody id="tbody">
       </tbody>
     </table>
-    <script type="text/javascript" src="../dist/Arrow.js"></script>
+    <script type="text/javascript" src="../targets/es5/umd/Arrow.js"></script>
   </body>
 </html>

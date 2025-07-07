@@ -26,7 +26,7 @@ G_BEGIN_DECLS
 /**
  * GArrowType:
  * @GARROW_TYPE_NA: A degenerate NULL type represented as 0 bytes/bits.
- * @GARROW_TYPE_BOOL: A boolean value represented as 1 bit.
+ * @GARROW_TYPE_BOOLEAN: A boolean value represented as 1 bit.
  * @GARROW_TYPE_UINT8: Little-endian 8bit unsigned integer.
  * @GARROW_TYPE_INT8: Little-endian 8bit signed integer.
  * @GARROW_TYPE_UINT16: Little-endian 16bit unsigned integer.
@@ -40,6 +40,8 @@ G_BEGIN_DECLS
  * @GARROW_TYPE_DOUBLE: 8-byte floating point value.
  * @GARROW_TYPE_STRING: UTF-8 variable-length string.
  * @GARROW_TYPE_BINARY: Variable-length bytes (no guarantee of UTF-8-ness).
+ * @GARROW_TYPE_FIXED_SIZE_BINARY: Fixed-size binary. Each value occupies
+ *   the same number of bytes.
  * @GARROW_TYPE_DATE32: int32 days since the UNIX epoch.
  * @GARROW_TYPE_DATE64: int64 milliseconds since the UNIX epoch.
  * @GARROW_TYPE_TIMESTAMP: Exact timestamp encoded with int64 since UNIX epoch.
@@ -58,7 +60,7 @@ G_BEGIN_DECLS
  */
 typedef enum {
   GARROW_TYPE_NA,
-  GARROW_TYPE_BOOL,
+  GARROW_TYPE_BOOLEAN,
   GARROW_TYPE_UINT8,
   GARROW_TYPE_INT8,
   GARROW_TYPE_UINT16,
@@ -72,6 +74,7 @@ typedef enum {
   GARROW_TYPE_DOUBLE,
   GARROW_TYPE_STRING,
   GARROW_TYPE_BINARY,
+  GARROW_TYPE_FIXED_SIZE_BINARY,
   GARROW_TYPE_DATE32,
   GARROW_TYPE_DATE64,
   GARROW_TYPE_TIMESTAMP,

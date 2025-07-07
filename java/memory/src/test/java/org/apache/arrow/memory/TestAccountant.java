@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,7 +19,6 @@ package org.apache.arrow.memory;
 
 import static org.junit.Assert.assertEquals;
 
-import org.apache.arrow.memory.Accountant.AllocationOutcome;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -33,7 +31,7 @@ public class TestAccountant {
 
   @Test
   public void nested() {
-    final Accountant parent = new Accountant(null, 0, Long.MAX_VALUE);
+    final Accountant parent = new Accountant(null,  "test", 0, Long.MAX_VALUE);
     ensureAccurateReservations(parent);
     assertEquals(0, parent.getAllocatedMemory());
     assertEquals(parent.getLimit() - parent.getAllocatedMemory(), parent.getHeadroom());
@@ -41,7 +39,7 @@ public class TestAccountant {
 
   @Test
   public void multiThread() throws InterruptedException {
-    final Accountant parent = new Accountant(null, 0, Long.MAX_VALUE);
+    final Accountant parent = new Accountant(null,  "test", 0, Long.MAX_VALUE);
 
     final int numberOfThreads = 32;
     final int loops = 100;
@@ -76,15 +74,15 @@ public class TestAccountant {
   }
 
   private void ensureAccurateReservations(Accountant outsideParent) {
-    final Accountant parent = new Accountant(outsideParent, 0, 10);
+    final Accountant parent = new Accountant(outsideParent, "test",  0, 10);
     assertEquals(0, parent.getAllocatedMemory());
 
-    final Accountant child = new Accountant(parent, 2, Long.MAX_VALUE);
+    final Accountant child = new Accountant(parent, "test",  2, Long.MAX_VALUE);
     assertEquals(2, parent.getAllocatedMemory());
-
+    assertEquals(10, child.getHeadroom());
     {
       AllocationOutcome first = child.allocateBytes(1);
-      assertEquals(AllocationOutcome.SUCCESS, first);
+      assertEquals(AllocationOutcome.Status.SUCCESS, first.getStatus());
     }
 
     // child will have new allocation
@@ -95,7 +93,7 @@ public class TestAccountant {
 
     {
       AllocationOutcome first = child.allocateBytes(1);
-      assertEquals(AllocationOutcome.SUCCESS, first);
+      assertEquals(AllocationOutcome.Status.SUCCESS, first.getStatus());
     }
 
     // child will have new allocation
@@ -114,7 +112,7 @@ public class TestAccountant {
 
     {
       AllocationOutcome first = child.allocateBytes(2);
-      assertEquals(AllocationOutcome.SUCCESS, first);
+      assertEquals(AllocationOutcome.Status.SUCCESS, first.getStatus());
     }
 
     // child will have new allocation
@@ -128,7 +126,7 @@ public class TestAccountant {
 
     {
       AllocationOutcome first = child.allocateBytes(7);
-      assertEquals(AllocationOutcome.SUCCESS, first);
+      assertEquals(AllocationOutcome.Status.SUCCESS, first.getStatus());
     }
 
     // child will have new allocation
@@ -140,14 +138,14 @@ public class TestAccountant {
     child.releaseBytes(9);
 
     assertEquals(1, child.getAllocatedMemory());
-    assertEquals(8, child.getHeadroom());
+    assertEquals(9, child.getHeadroom());
 
     // back to reservation size
     assertEquals(2, parent.getAllocatedMemory());
     assertEquals(8, parent.getHeadroom());
 
     AllocationOutcome first = child.allocateBytes(10);
-    assertEquals(AllocationOutcome.FAILED_PARENT, first);
+    assertEquals(AllocationOutcome.Status.FAILED_PARENT, first.getStatus());
 
     // unchanged
     assertEquals(1, child.getAllocatedMemory());
@@ -165,7 +163,7 @@ public class TestAccountant {
     child.releaseBytes(11);
     assertEquals(child.getAllocatedMemory(), 0);
     assertEquals(parent.getAllocatedMemory(), 2);
-    assertEquals(8, child.getHeadroom());
+    assertEquals(10, child.getHeadroom());
     assertEquals(8, parent.getHeadroom());
 
     child.close();

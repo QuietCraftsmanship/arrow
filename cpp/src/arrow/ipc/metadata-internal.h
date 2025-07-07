@@ -21,21 +21,28 @@
 #define ARROW_IPC_METADATA_INTERNAL_H
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <flatbuffers/flatbuffers.h>
+
+#include "arrow/buffer.h"
+#include "arrow/ipc/Message_generated.h"
 #include "arrow/ipc/Schema_generated.h"
-#include "arrow/ipc/dictionary.h"
+#include "arrow/ipc/dictionary.h"  // IYWU pragma: keep
 #include "arrow/ipc/message.h"
+#include "arrow/memory_pool.h"
+#include "arrow/sparse_tensor.h"
+#include "arrow/status.h"
 
 namespace arrow {
 
-class Buffer;
 class DataType;
 class Schema;
-class Status;
 class Tensor;
+class SparseTensor;
 
 namespace flatbuf = org::apache::arrow::flatbuf;
 
@@ -46,6 +53,9 @@ class OutputStream;
 }  // namespace io
 
 namespace ipc {
+
+class DictionaryMemo;
+
 namespace internal {
 
 static constexpr flatbuf::MetadataVersion kCurrentMetadataVersion =
@@ -82,31 +92,53 @@ struct FileBlock {
 // individual fields metadata can be retrieved from very large schema without
 //
 
-// Retrieve a list of all the dictionary ids and types required by the schema for
-// reconstruction. The presumption is that these will be loaded either from
-// the stream or file (or they may already be somewhere else in memory)
-Status GetDictionaryTypes(const void* opaque_schema, DictionaryTypeMap* id_to_field);
-
-// Construct a complete Schema from the message. May be expensive for very
-// large schemas if you are only interested in a few fields
-Status GetSchema(const void* opaque_schema, const DictionaryMemo& dictionary_memo,
+// Construct a complete Schema from the message and add
+// dictinory-encoded fields to a DictionaryMemo instance. May be
+// expensive for very large schemas if you are only interested in a
+// few fields
+Status GetSchema(const void* opaque_schema, DictionaryMemo* dictionary_memo,
                  std::shared_ptr<Schema>* out);
 
 Status GetTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type,
                          std::vector<int64_t>* shape, std::vector<int64_t>* strides,
                          std::vector<std::string>* dim_names);
 
+// EXPERIMENTAL: Extracting metadata of a sparse tensor from the message
+Status GetSparseTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type,
+                               std::vector<int64_t>* shape,
+                               std::vector<std::string>* dim_names, int64_t* length,
+                               SparseTensorFormat::type* sparse_tensor_format_id);
+
+static inline Status VerifyMessage(const uint8_t* data, int64_t size,
+                                   const flatbuf::Message** out) {
+  flatbuffers::Verifier verifier(data, size, /*max_depth=*/128);
+  if (!flatbuf::VerifyMessageBuffer(verifier)) {
+    return Status::IOError("Invalid flatbuffers message.");
+  }
+  *out = flatbuf::GetMessage(data);
+  return Status::OK();
+}
+
 /// Write a serialized message metadata with a length-prefix and padding to an
-/// 8-byte offset
+/// 8-byte offset. Does not make assumptions about whether the stream is
+/// aligned already
 ///
 /// <message_size: int32><message: const void*><padding>
-Status WriteMessage(const Buffer& message, io::OutputStream* file,
+///
+/// \param[in] message a buffer containing the metadata to write
+/// \param[in] alignment the size multiple of the total message size including
+/// length prefix, metadata, and padding. Usually 8 or 64
+/// \param[in,out] file the OutputStream to write to
+/// \param[out] message_length the total size of the payload written including
+/// padding
+/// \return Status
+Status WriteMessage(const Buffer& message, int32_t alignment, io::OutputStream* file,
                     int32_t* message_length);
 
 // Serialize arrow::Schema as a Flatbuffer
 //
 // \param[in] schema a Schema instance
-// \param[inout] dictionary_memo class for tracking dictionaries and assigning
+// \param[in,out] dictionary_memo class for tracking dictionaries and assigning
 // dictionary ids
 // \param[out] out the serialized arrow::Buffer
 // \return Status outcome
@@ -121,15 +153,32 @@ Status WriteRecordBatchMessage(const int64_t length, const int64_t body_length,
 Status WriteTensorMessage(const Tensor& tensor, const int64_t buffer_start_offset,
                           std::shared_ptr<Buffer>* out);
 
+Status WriteSparseTensorMessage(const SparseTensor& sparse_tensor, int64_t body_length,
+                                const std::vector<BufferMetadata>& buffers,
+                                std::shared_ptr<Buffer>* out);
+
 Status WriteFileFooter(const Schema& schema, const std::vector<FileBlock>& dictionaries,
                        const std::vector<FileBlock>& record_batches,
-                       DictionaryMemo* dictionary_memo, io::OutputStream* out);
+                       io::OutputStream* out);
 
 Status WriteDictionaryMessage(const int64_t id, const int64_t length,
                               const int64_t body_length,
                               const std::vector<FieldMetadata>& nodes,
                               const std::vector<BufferMetadata>& buffers,
                               std::shared_ptr<Buffer>* out);
+
+static inline Status WriteFlatbufferBuilder(flatbuffers::FlatBufferBuilder& fbb,
+                                            std::shared_ptr<Buffer>* out) {
+  int32_t size = fbb.GetSize();
+
+  std::shared_ptr<Buffer> result;
+  RETURN_NOT_OK(AllocateBuffer(default_memory_pool(), size, &result));
+
+  uint8_t* dst = result->mutable_data();
+  memcpy(dst, fbb.GetBufferPointer(), size);
+  *out = result;
+  return Status::OK();
+}
 
 }  // namespace internal
 }  // namespace ipc
