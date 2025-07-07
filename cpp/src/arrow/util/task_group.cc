@@ -24,50 +24,51 @@
 #include <utility>
 
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/config.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/thread_pool.h"
 
 namespace arrow {
 namespace internal {
+
+namespace {
 
 ////////////////////////////////////////////////////////////////////////
 // Serial TaskGroup implementation
 
 class SerialTaskGroup : public TaskGroup {
  public:
-  void AppendReal(std::function<Status()> task) override {
+  explicit SerialTaskGroup(StopToken stop_token) : stop_token_(std::move(stop_token)) {}
+
+  void AppendReal(FnOnce<Status()> task) override {
     DCHECK(!finished_);
+    if (stop_token_.IsStopRequested()) {
+      status_ &= stop_token_.Poll();
+      return;
+    }
     if (status_.ok()) {
-      status_ &= task();
+      status_ &= std::move(task)();
     }
   }
 
   Status current_status() override { return status_; }
 
-  bool ok() override { return status_.ok(); }
+  bool ok() const override { return status_.ok(); }
 
   Status Finish() override {
     if (!finished_) {
       finished_ = true;
-      if (parent_) {
-        parent_->status_ &= status_;
-      }
     }
     return status_;
   }
 
+  Future<> FinishAsync() override { return Future<>::MakeFinished(Finish()); }
+
   int parallelism() override { return 1; }
 
-  std::shared_ptr<TaskGroup> MakeSubGroup() override {
-    auto child = new SerialTaskGroup();
-    child->parent_ = this;
-    return std::shared_ptr<TaskGroup>(child);
-  }
-
- protected:
+  StopToken stop_token_;
   Status status_;
   bool finished_ = false;
-  SerialTaskGroup* parent_ = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -75,8 +76,12 @@ class SerialTaskGroup : public TaskGroup {
 
 class ThreadedTaskGroup : public TaskGroup {
  public:
-  explicit ThreadedTaskGroup(Executor* executor)
-      : executor_(executor), nremaining_(0), ok_(true) {}
+  ThreadedTaskGroup(Executor* executor, StopToken stop_token)
+      : executor_(executor),
+        stop_token_(std::move(stop_token)),
+        nremaining_(0),
+        ok_(true),
+        finished_(false) {}
 
   ~ThreadedTaskGroup() override {
     // Make sure all pending tasks are finished, so that dangling references
@@ -84,22 +89,35 @@ class ThreadedTaskGroup : public TaskGroup {
     ARROW_UNUSED(Finish());
   }
 
-  void AppendReal(std::function<Status()> task) override {
+  void AppendReal(FnOnce<Status()> task) override {
+    DCHECK(!finished_);
+    if (stop_token_.IsStopRequested()) {
+      UpdateStatus(stop_token_.Poll());
+      return;
+    }
+
     // The hot path is unlocked thanks to atomics
     // Only if an error occurs is the lock taken
     if (ok_.load(std::memory_order_acquire)) {
       nremaining_.fetch_add(1, std::memory_order_acquire);
 
       auto self = checked_pointer_cast<ThreadedTaskGroup>(shared_from_this());
-      Status st = executor_->Spawn([self, task]() {
+
+      auto callable = [self = std::move(self), task = std::move(task),
+                       stop_token = stop_token_]() mutable {
         if (self->ok_.load(std::memory_order_acquire)) {
-          // XXX what about exceptions?
-          Status st = task();
+          Status st;
+          if (stop_token.IsStopRequested()) {
+            st = stop_token.Poll();
+          } else {
+            // XXX what about exceptions?
+            st = std::move(task)();
+          }
           self->UpdateStatus(std::move(st));
         }
         self->OneTaskDone();
-      });
-      UpdateStatus(std::move(st));
+      };
+      UpdateStatus(executor_->Spawn(std::move(callable)));
     }
   }
 
@@ -108,30 +126,38 @@ class ThreadedTaskGroup : public TaskGroup {
     return status_;
   }
 
-  bool ok() override { return ok_.load(); }
+  bool ok() const override { return ok_.load(); }
 
   Status Finish() override {
+#ifdef ARROW_ENABLE_THREADING
     std::unique_lock<std::mutex> lock(mutex_);
     if (!finished_) {
       cv_.wait(lock, [&]() { return nremaining_.load() == 0; });
       // Current tasks may start other tasks, so only set this when done
       finished_ = true;
-      if (parent_) {
-        parent_->OneTaskDone();
-      }
     }
+#else
+    while (!finished_ && nremaining_.load() != 0) {
+      arrow::internal::SerialExecutor::RunTasksOnAllExecutors();
+    }
+    finished_ = true;
+#endif
     return status_;
   }
 
-  int parallelism() override { return executor_->GetCapacity(); }
-
-  std::shared_ptr<TaskGroup> MakeSubGroup() override {
+  Future<> FinishAsync() override {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto child = new ThreadedTaskGroup(executor_);
-    child->parent_ = this;
-    nremaining_.fetch_add(1, std::memory_order_acquire);
-    return std::shared_ptr<TaskGroup>(child);
+    if (!completion_future_.has_value()) {
+      if (nremaining_.load() == 0) {
+        completion_future_ = Future<>::MakeFinished(status_);
+      } else {
+        completion_future_ = Future<>::Make();
+      }
+    }
+    return *completion_future_;
   }
+
+  int parallelism() override { return executor_->GetCapacity(); }
 
  protected:
   void UpdateStatus(Status&& st) {
@@ -152,28 +178,47 @@ class ThreadedTaskGroup : public TaskGroup {
       // before cv.notify_one() has returned
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.notify_one();
+      if (completion_future_.has_value()) {
+        // MarkFinished could be slow.  We don't want to call it while we are holding
+        // the lock.
+        auto& future = *completion_future_;
+        const auto finished = completion_future_->is_finished();
+        const auto& status = status_;
+        // This will be redundant if the user calls Finish and not FinishAsync
+        if (!finished && !finished_) {
+          finished_ = true;
+          lock.unlock();
+          future.MarkFinished(status);
+        } else {
+          lock.unlock();
+        }
+      }
     }
   }
 
   // These members are usable unlocked
   Executor* executor_;
+  StopToken stop_token_;
   std::atomic<int32_t> nremaining_;
   std::atomic<bool> ok_;
+  std::atomic<bool> finished_;
 
   // These members use locking
   std::mutex mutex_;
   std::condition_variable cv_;
   Status status_;
-  bool finished_ = false;
-  ThreadedTaskGroup* parent_ = nullptr;
+  std::optional<Future<>> completion_future_;
 };
 
-std::shared_ptr<TaskGroup> TaskGroup::MakeSerial() {
-  return std::shared_ptr<TaskGroup>(new SerialTaskGroup);
+}  // namespace
+
+std::shared_ptr<TaskGroup> TaskGroup::MakeSerial(StopToken stop_token) {
+  return std::shared_ptr<TaskGroup>(new SerialTaskGroup{stop_token});
 }
 
-std::shared_ptr<TaskGroup> TaskGroup::MakeThreaded(Executor* thread_pool) {
-  return std::shared_ptr<TaskGroup>(new ThreadedTaskGroup(thread_pool));
+std::shared_ptr<TaskGroup> TaskGroup::MakeThreaded(Executor* thread_pool,
+                                                   StopToken stop_token) {
+  return std::shared_ptr<TaskGroup>(new ThreadedTaskGroup{thread_pool, stop_token});
 }
 
 }  // namespace internal

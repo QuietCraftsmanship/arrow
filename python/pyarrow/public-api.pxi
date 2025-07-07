@@ -87,27 +87,56 @@ cdef api object pyarrow_wrap_data_type(
         out = ListType.__new__(ListType)
     elif type.get().id() == _Type_LARGE_LIST:
         out = LargeListType.__new__(LargeListType)
+    elif type.get().id() == _Type_LIST_VIEW:
+        out = ListViewType.__new__(ListViewType)
+    elif type.get().id() == _Type_LARGE_LIST_VIEW:
+        out = LargeListViewType.__new__(LargeListViewType)
     elif type.get().id() == _Type_MAP:
         out = MapType.__new__(MapType)
     elif type.get().id() == _Type_FIXED_SIZE_LIST:
         out = FixedSizeListType.__new__(FixedSizeListType)
     elif type.get().id() == _Type_STRUCT:
         out = StructType.__new__(StructType)
-    elif type.get().id() == _Type_UNION:
-        out = UnionType.__new__(UnionType)
+    elif type.get().id() == _Type_SPARSE_UNION:
+        out = SparseUnionType.__new__(SparseUnionType)
+    elif type.get().id() == _Type_DENSE_UNION:
+        out = DenseUnionType.__new__(DenseUnionType)
+    elif type.get().id() == _Type_TIME32:
+        out = Time32Type.__new__(Time32Type)
+    elif type.get().id() == _Type_TIME64:
+        out = Time64Type.__new__(Time64Type)
     elif type.get().id() == _Type_TIMESTAMP:
         out = TimestampType.__new__(TimestampType)
     elif type.get().id() == _Type_DURATION:
         out = DurationType.__new__(DurationType)
     elif type.get().id() == _Type_FIXED_SIZE_BINARY:
         out = FixedSizeBinaryType.__new__(FixedSizeBinaryType)
-    elif type.get().id() == _Type_DECIMAL:
+    elif type.get().id() == _Type_DECIMAL32:
+        out = Decimal32Type.__new__(Decimal32Type)
+    elif type.get().id() == _Type_DECIMAL64:
+        out = Decimal64Type.__new__(Decimal64Type)
+    elif type.get().id() == _Type_DECIMAL128:
         out = Decimal128Type.__new__(Decimal128Type)
+    elif type.get().id() == _Type_DECIMAL256:
+        out = Decimal256Type.__new__(Decimal256Type)
+    elif type.get().id() == _Type_RUN_END_ENCODED:
+        out = RunEndEncodedType.__new__(RunEndEncodedType)
     elif type.get().id() == _Type_EXTENSION:
         ext_type = <const CExtensionType*> type.get()
         cpy_ext_type = dynamic_cast[_CPyExtensionTypePtr](ext_type)
+        extension_name = ext_type.extension_name()
         if cpy_ext_type != nullptr:
             return cpy_ext_type.GetInstance()
+        elif extension_name == b"arrow.bool8":
+            out = Bool8Type.__new__(Bool8Type)
+        elif extension_name == b"arrow.fixed_shape_tensor":
+            out = FixedShapeTensorType.__new__(FixedShapeTensorType)
+        elif extension_name == b"arrow.opaque":
+            out = OpaqueType.__new__(OpaqueType)
+        elif extension_name == b"arrow.uuid":
+            out = UuidType.__new__(UuidType)
+        elif extension_name == b"arrow.json":
+            out = JsonType.__new__(JsonType)
         else:
             out = BaseExtensionType.__new__(BaseExtensionType)
     else:
@@ -229,15 +258,12 @@ cdef api object pyarrow_wrap_chunked_array(
 
 
 cdef api bint pyarrow_is_scalar(object value):
-    return isinstance(value, ScalarValue)
+    return isinstance(value, Scalar)
 
 
 cdef api shared_ptr[CScalar] pyarrow_unwrap_scalar(object scalar):
-    cdef ScalarValue value
     if pyarrow_is_scalar(scalar):
-        value = <ScalarValue>(scalar)
-        return value.sp_scalar
-
+        return (<Scalar> scalar).unwrap()
     return shared_ptr[CScalar]()
 
 
@@ -250,9 +276,15 @@ cdef api object pyarrow_wrap_scalar(const shared_ptr[CScalar]& sp_scalar):
     if data_type == NULL:
         raise ValueError('Scalar data type was NULL')
 
-    klass = _scalar_classes[data_type.id()]
+    if data_type.id() == _Type_NA:
+        return _NULL
 
-    cdef ScalarValue scalar = klass.__new__(klass)
+    if data_type.id() not in _scalar_classes:
+        raise ValueError('Scalar type not supported')
+
+    klass = get_scalar_class_from_type(sp_scalar.get().type)
+
+    cdef Scalar scalar = klass.__new__(klass)
     scalar.init(sp_scalar)
     return scalar
 
@@ -386,8 +418,6 @@ cdef api shared_ptr[CTable] pyarrow_unwrap_table(object table):
 
 
 cdef api object pyarrow_wrap_table(const shared_ptr[CTable]& ctable):
-    # Ensure that wrapped table is Valid
-    check_status(ctable.get().Validate())
     cdef Table table = Table.__new__(Table)
     table.init(ctable)
     return table

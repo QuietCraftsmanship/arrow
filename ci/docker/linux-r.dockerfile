@@ -21,16 +21,39 @@
 ARG base
 FROM ${base}
 
+ARG r_bin=R
+ENV R_BIN=${r_bin}
+
+ARG r_dev=FALSE
+ENV ARROW_R_DEV=${r_dev}
+
+ARG r_prune_deps=FALSE
+ENV R_PRUNE_DEPS=${r_prune_deps}
+
+ARG r_custom_ccache=false
+ENV R_CUSTOM_CCACHE=${r_custom_ccache}
+
+ARG tz="UTC"
+ENV TZ=${tz}
+
 # Make sure R is on the path for the R-hub devel versions (where RPREFIX is set in its dockerfile)
 ENV PATH "${RPREFIX}/bin:${PATH}"
-# Ensure parallel R package installation, set CRAN repo mirror,
-# and use pre-built binaries where possible
+
+# Patch up some of the docker images
+COPY ci/scripts/r_docker_configure.sh /arrow/ci/scripts/
 COPY ci/etc/rprofile /arrow/ci/etc/
-RUN cat /arrow/ci/etc/rprofile >> $(R RHOME)/etc/Rprofile.site
-# Also ensure parallel compilation of C/C++ code
-RUN echo "MAKEFLAGS=-j$(R --slave -e 'cat(parallel::detectCores())')" >> $(R RHOME)/etc/Makeconf
-# Workaround for html help install failure; see https://github.com/r-lib/devtools/issues/2084#issuecomment-530912786
-RUN Rscript -e 'x <- file.path(R.home("doc"), "html"); if (!file.exists(x)) {dir.create(x, recursive=TRUE); file.copy(system.file("html/R.css", package="stats"), x)}'
+COPY ci/scripts/r_install_system_dependencies.sh /arrow/ci/scripts/
+COPY ci/scripts/install_minio.sh /arrow/ci/scripts/
+COPY ci/scripts/install_gcs_testbench.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/r_docker_configure.sh
+
+# this has to come after r_docker_configure to ensure curl is installed
+COPY ci/scripts/install_sccache.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_sccache.sh unknown-linux-musl /usr/local/bin
+
+ARG cmake
+COPY ci/scripts/install_cmake.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_cmake.sh ${cmake} /usr/local/
 
 COPY ci/scripts/r_deps.sh /arrow/ci/scripts/
 COPY r/DESCRIPTION /arrow/r/

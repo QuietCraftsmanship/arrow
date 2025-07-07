@@ -22,7 +22,7 @@
 # (this is an inherent limitation of Cython).
 #
 # The sample paths set with the CMake include_directories() command will be used
-# for include directories to search for *.pxd when running the Cython complire.
+# for include directories to search for *.pxd when running the Cython compiler.
 #
 # Cache variables that effect the behavior include:
 #
@@ -107,8 +107,9 @@ function(compile_pyx
   endif()
 
   if(NOT WIN32)
-    if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug"
-       OR "${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
+    string( TOLOWER "${CMAKE_BUILD_TYPE}" build_type )
+    if("${build_type}" STREQUAL "debug"
+       OR "${build_type}" STREQUAL "relwithdebinfo")
       set(cython_debug_arg "--gdb")
     endif()
   endif()
@@ -117,7 +118,7 @@ function(compile_pyx
   get_source_file_property(property_is_public ${pyx_file} CYTHON_PUBLIC)
   get_source_file_property(property_is_api ${pyx_file} CYTHON_API)
   if(${property_is_api})
-    set(_generated_files "${output_file}" "${_name}.h" "${name}_api.h")
+    set(_generated_files "${output_file}" "${_name}.h" "${_name}_api.h")
   elseif(${property_is_public})
     set(_generated_files "${output_file}" "${_name}.h")
   else()
@@ -144,6 +145,8 @@ function(compile_pyx
             ${no_docstrings_arg}
             ${cython_debug_arg}
             ${CYTHON_FLAGS}
+            # Necessary for autodoc of function arguments
+            --directive embedsignature=True
             # Necessary for Cython code coverage
             --working
             ${CMAKE_CURRENT_SOURCE_DIR}
@@ -180,5 +183,10 @@ function(cython_add_module _name pyx_target_name generated_files)
   python_add_module(${_name} ${_generated_files} ${other_module_sources})
   add_dependencies(${_name} ${pyx_target_name})
 endfunction()
+
+execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "from Cython.Compiler.Version import version; print(version)"
+                OUTPUT_VARIABLE CYTHON_VERSION_OUTPUT
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(CYTHON_VERSION "${CYTHON_VERSION_OUTPUT}")
 
 include(CMakeParseArguments)

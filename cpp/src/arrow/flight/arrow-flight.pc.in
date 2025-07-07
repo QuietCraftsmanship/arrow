@@ -15,11 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-libdir=@CMAKE_INSTALL_FULL_LIBDIR@
-includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=@ARROW_PKG_CONFIG_INCLUDEDIR@
+libdir=@ARROW_PKG_CONFIG_LIBDIR@
 
 Name: Apache Arrow Flight
 Description: Apache Arrow's RPC system built on gRPC
 Version: @ARROW_VERSION@
 Requires: arrow
+Requires.private:@ARROW_FLIGHT_PC_REQUIRES_PRIVATE@
 Libs: -L${libdir} -larrow_flight
+Cflags:@ARROW_FLIGHT_PC_CFLAGS@
+Cflags.private:@ARROW_FLIGHT_PC_CFLAGS_PRIVATE@

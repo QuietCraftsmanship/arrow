@@ -15,10 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Avoid name clash with `pa.struct` function
+import struct as _struct
 
-cdef class Tensor:
+
+cdef class Tensor(_Weakrefable):
     """
     A n-dimensional array a.k.a Tensor.
+
+    Examples
+    --------
+    >>> import pyarrow as pa
+    >>> import numpy as np
+    >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+    >>> pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+    <pyarrow.Tensor>
+    type: int32
+    shape: (2, 3)
+    strides: (12, 4)
     """
 
     def __init__(self):
@@ -29,6 +43,14 @@ cdef class Tensor:
         self.sp_tensor = sp_tensor
         self.tp = sp_tensor.get()
         self.type = pyarrow_wrap_data_type(self.tp.type())
+        self._ssize_t_shape = self._make_shape_or_strides_buffer(self.shape)
+        self._ssize_t_strides = self._make_shape_or_strides_buffer(self.strides)
+
+    def _make_shape_or_strides_buffer(self, values):
+        """
+        Make a bytes object holding an array of `values` cast to `Py_ssize_t`.
+        """
+        return _struct.pack(f"{len(values)}n", *values)
 
     def __repr__(self):
         return """<pyarrow.Tensor>
@@ -38,6 +60,27 @@ strides: {0.strides}""".format(self)
 
     @staticmethod
     def from_numpy(obj, dim_names=None):
+        """
+        Create a Tensor from a numpy array.
+
+        Parameters
+        ----------
+        obj : numpy.ndarray
+            The source numpy array
+        dim_names : list, optional
+            Names of each dimension of the Tensor.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        <pyarrow.Tensor>
+        type: int32
+        shape: (2, 3)
+        strides: (12, 4)
+        """
         cdef:
             vector[c_string] c_dim_names
             shared_ptr[CTensor] ctensor
@@ -53,7 +96,20 @@ strides: {0.strides}""".format(self)
     def to_numpy(self):
         """
         Convert arrow::Tensor to numpy.ndarray with zero copy
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.to_numpy()
+        array([[  2,   2,   4],
+               [  4,   5, 100]], dtype=int32)
         """
+        if np is None:
+            raise ImportError(
+                "Cannot return a numpy.ndarray if NumPy is not present")
         cdef PyObject* out
 
         check_status(TensorToNdarray(self.sp_tensor, self, &out))
@@ -61,7 +117,25 @@ strides: {0.strides}""".format(self)
 
     def equals(self, Tensor other):
         """
-        Return true if the tensors contains exactly equal data
+        Return true if the tensors contains exactly equal data.
+
+        Parameters
+        ----------
+        other : Tensor
+            The other tensor to compare for equality.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> y = np.array([[2, 2, 4], [4, 5, 10]], np.int32)
+        >>> tensor2 = pa.Tensor.from_numpy(y, dim_names=["a","b"])
+        >>> tensor.equals(tensor)
+        True
+        >>> tensor.equals(tensor2)
+        False
         """
         return self.tp.Equals(deref(other.tp))
 
@@ -72,35 +146,138 @@ strides: {0.strides}""".format(self)
             return NotImplemented
 
     def dim_name(self, i):
+        """
+        Returns the name of the i-th tensor dimension.
+
+        Parameters
+        ----------
+        i : int
+            The physical index of the tensor dimension.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.dim_name(0)
+        'dim1'
+        >>> tensor.dim_name(1)
+        'dim2'
+        """
         return frombytes(self.tp.dim_name(i))
 
     @property
     def dim_names(self):
+        """
+        Names of this tensor dimensions.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.dim_names
+        ['dim1', 'dim2']
+        """
         return [frombytes(x) for x in tuple(self.tp.dim_names())]
 
     @property
     def is_mutable(self):
+        """
+        Is this tensor mutable or immutable.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.is_mutable
+        True
+        """
         return self.tp.is_mutable()
 
     @property
     def is_contiguous(self):
+        """
+        Is this tensor contiguous in memory.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.is_contiguous
+        True
+        """
         return self.tp.is_contiguous()
 
     @property
     def ndim(self):
+        """
+        The dimension (n) of this tensor.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.ndim
+        2
+        """
         return self.tp.ndim()
 
     @property
     def size(self):
+        """
+        The size of this tensor.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.size
+        6
+        """
         return self.tp.size()
 
     @property
     def shape(self):
+        """
+        The shape of this tensor.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.shape
+        (2, 3)
+        """
         # Cython knows how to convert a vector[T] to a Python list
         return tuple(self.tp.shape())
 
     @property
     def strides(self):
+        """
+        Strides of this tensor.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> import numpy as np
+        >>> x = np.array([[2, 2, 4], [4, 5, 100]], np.int32)
+        >>> tensor = pa.Tensor.from_numpy(x, dim_names=["dim1","dim2"])
+        >>> tensor.strides
+        (12, 4)
+        """
         return tuple(self.tp.strides())
 
     def __getbuffer__(self, cp.Py_buffer* buffer, int flags):
@@ -119,14 +296,15 @@ strides: {0.strides}""".format(self)
             buffer.readonly = 0
         else:
             buffer.readonly = 1
-        # NOTE: This assumes Py_ssize_t == int64_t, and that the shape
-        # and strides arrays lifetime is tied to the tensor's
-        buffer.shape = <Py_ssize_t *> &self.tp.shape()[0]
-        buffer.strides = <Py_ssize_t *> &self.tp.strides()[0]
+        buffer.shape = <Py_ssize_t *> cp.PyBytes_AsString(self._ssize_t_shape)
+        buffer.strides = <Py_ssize_t *> cp.PyBytes_AsString(self._ssize_t_strides)
         buffer.suboffsets = NULL
 
 
-cdef class SparseCOOTensor:
+ctypedef CSparseCOOIndex* _CSparseCOOIndexPtr
+
+
+cdef class SparseCOOTensor(_Weakrefable):
     """
     A sparse COO tensor.
     """
@@ -150,6 +328,17 @@ shape: {0.shape}""".format(self)
     def from_dense_numpy(cls, obj, dim_names=None):
         """
         Convert numpy.ndarray to arrow::SparseCOOTensor
+
+        Parameters
+        ----------
+        obj : numpy.ndarray
+            Data used to populate the rows.
+        dim_names : list[str], optional
+            Names of the dimensions.
+
+        Returns
+        -------
+        pyarrow.SparseCOOTensor
         """
         return cls.from_tensor(Tensor.from_numpy(obj, dim_names=dim_names))
 
@@ -157,6 +346,17 @@ shape: {0.shape}""".format(self)
     def from_numpy(data, coords, shape, dim_names=None):
         """
         Create arrow::SparseCOOTensor from numpy.ndarrays
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Data used to populate the rows.
+        coords : numpy.ndarray
+            Coordinates of the data.
+        shape : tuple
+            Shape of the tensor.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         cdef shared_ptr[CSparseCOOTensor] csparse_tensor
         cdef vector[int64_t] c_shape
@@ -183,6 +383,13 @@ shape: {0.shape}""".format(self)
     def from_scipy(obj, dim_names=None):
         """
         Convert scipy.sparse.coo_matrix to arrow::SparseCOOTensor
+
+        Parameters
+        ----------
+        obj : scipy.sparse.csr_matrix
+            The scipy matrix that should be converted.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         import scipy.sparse
         if not isinstance(obj, scipy.sparse.coo_matrix):
@@ -199,7 +406,18 @@ shape: {0.shape}""".format(self)
             for x in dim_names:
                 c_dim_names.push_back(tobytes(x))
 
-        coords = np.vstack([obj.row, obj.col]).T
+        row = obj.row
+        col = obj.col
+
+        # When SciPy's coo_matrix has canonical format, its indices matrix is
+        # sorted in column-major order.  As Arrow's SparseCOOIndex is sorted
+        # in row-major order if it is canonical, we must sort indices matrix
+        # into row-major order to keep its canonicalness, here.
+        if obj.has_canonical_format:
+            order = np.lexsort((col, row))  # sort in row-major order
+            row = row[order]
+            col = col[order]
+        coords = np.vstack([row, col]).T
         coords = np.require(coords, dtype='i8', requirements='C')
 
         check_status(NdarraysToSparseCOOTensor(c_default_memory_pool(),
@@ -211,6 +429,13 @@ shape: {0.shape}""".format(self)
     def from_pydata_sparse(obj, dim_names=None):
         """
         Convert pydata/sparse.COO to arrow::SparseCOOTensor.
+
+        Parameters
+        ----------
+        obj : pydata.sparse.COO
+            The sparse multidimensional array that should be converted.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         import sparse
         if not isinstance(obj, sparse.COO):
@@ -238,6 +463,11 @@ shape: {0.shape}""".format(self)
     def from_tensor(obj):
         """
         Convert arrow::Tensor to arrow::SparseCOOTensor.
+
+        Parameters
+        ----------
+        obj : Tensor
+            The tensor that should be converted.
         """
         cdef shared_ptr[CSparseCOOTensor] csparse_tensor
         cdef shared_ptr[CTensor] ctensor = pyarrow_unwrap_tensor(obj)
@@ -251,6 +481,9 @@ shape: {0.shape}""".format(self)
         """
         Convert arrow::SparseCOOTensor to numpy.ndarrays with zero copy.
         """
+        if np is None:
+            raise ImportError(
+                "Cannot return a numpy.ndarray if NumPy is not present")
         cdef PyObject* out_data
         cdef PyObject* out_coords
 
@@ -270,8 +503,15 @@ shape: {0.shape}""".format(self)
                                               &out_data, &out_coords))
         data = PyObject_to_object(out_data)
         coords = PyObject_to_object(out_coords)
-        result = coo_matrix((data[:, 0], (coords[:, 0], coords[:, 1])),
-                            shape=self.shape)
+        row, col = coords[:, 0], coords[:, 1]
+        result = coo_matrix((data[:, 0], (row, col)), shape=self.shape)
+
+        # As the description in from_scipy above, we sorted indices matrix
+        # in row-major order if SciPy's coo_matrix has canonical format.
+        # So, we must call sum_duplicates() to make the result coo_matrix
+        # has canonical format.
+        if self.has_canonical_format:
+            result.sum_duplicates()
         return result
 
     def to_pydata_sparse(self):
@@ -295,13 +535,19 @@ shape: {0.shape}""".format(self)
         """
 
         cdef shared_ptr[CTensor] ctensor
-        check_status(self.stp.ToTensor(&ctensor))
+        with nogil:
+            ctensor = GetResultValue(self.stp.ToTensor())
 
         return pyarrow_wrap_tensor(ctensor)
 
     def equals(self, SparseCOOTensor other):
         """
         Return true if sparse tensors contains exactly equal data.
+
+        Parameters
+        ----------
+        other : SparseCOOTensor
+            The other tensor to compare for equality.
         """
         return self.stp.Equals(deref(other.stp))
 
@@ -329,18 +575,40 @@ shape: {0.shape}""".format(self)
         return self.stp.size()
 
     def dim_name(self, i):
+        """
+        Returns the name of the i-th tensor dimension.
+
+        Parameters
+        ----------
+        i : int
+            The physical index of the tensor dimension.
+
+        Returns
+        -------
+        str
+        """
         return frombytes(self.stp.dim_name(i))
 
     @property
     def dim_names(self):
-        return tuple(frombytes(x) for x in tuple(self.stp.dim_names()))
+        names_tuple = tuple(self.stp.dim_names())
+        return tuple(frombytes(x) for x in names_tuple)
 
     @property
     def non_zero_length(self):
         return self.stp.non_zero_length()
 
+    @property
+    def has_canonical_format(self):
+        cdef:
+            _CSparseCOOIndexPtr csi
 
-cdef class SparseCSRMatrix:
+        csi = <_CSparseCOOIndexPtr>(self.stp.sparse_index().get())
+        if csi != nullptr:
+            return csi.is_canonical()
+        return True
+
+cdef class SparseCSRMatrix(_Weakrefable):
     """
     A sparse CSR matrix.
     """
@@ -364,13 +632,38 @@ shape: {0.shape}""".format(self)
     def from_dense_numpy(cls, obj, dim_names=None):
         """
         Convert numpy.ndarray to arrow::SparseCSRMatrix
+
+        Parameters
+        ----------
+        obj : numpy.ndarray
+            The dense numpy array that should be converted.
+        dim_names : list, optional
+            The names of the dimensions.
+
+        Returns
+        -------
+        pyarrow.SparseCSRMatrix
         """
         return cls.from_tensor(Tensor.from_numpy(obj, dim_names=dim_names))
 
     @staticmethod
     def from_numpy(data, indptr, indices, shape, dim_names=None):
         """
-        Create arrow::SparseCSRMatrix from numpy.ndarrays
+        Create arrow::SparseCSRMatrix from numpy.ndarrays.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Data used to populate the sparse matrix.
+        indptr : numpy.ndarray
+            Range of the rows,
+            The i-th row spans from `indptr[i]` to `indptr[i+1]` in the data.
+        indices : numpy.ndarray
+            Column indices of the corresponding non-zero values.
+        shape : tuple
+            Shape of the matrix.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         cdef shared_ptr[CSparseCSRMatrix] csparse_tensor
         cdef vector[int64_t] c_shape
@@ -401,6 +694,13 @@ shape: {0.shape}""".format(self)
     def from_scipy(obj, dim_names=None):
         """
         Convert scipy.sparse.csr_matrix to arrow::SparseCSRMatrix.
+
+        Parameters
+        ----------
+        obj : scipy.sparse.csr_matrix
+            The scipy matrix that should be converted.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         import scipy.sparse
         if not isinstance(obj, scipy.sparse.csr_matrix):
@@ -431,6 +731,11 @@ shape: {0.shape}""".format(self)
     def from_tensor(obj):
         """
         Convert arrow::Tensor to arrow::SparseCSRMatrix.
+
+        Parameters
+        ----------
+        obj : Tensor
+            The dense tensor that should be converted.
         """
         cdef shared_ptr[CSparseCSRMatrix] csparse_tensor
         cdef shared_ptr[CTensor] ctensor = pyarrow_unwrap_tensor(obj)
@@ -444,6 +749,9 @@ shape: {0.shape}""".format(self)
         """
         Convert arrow::SparseCSRMatrix to numpy.ndarrays with zero copy.
         """
+        if np is None:
+            raise ImportError(
+                "Cannot return a numpy.ndarray if NumPy is not present")
         cdef PyObject* out_data
         cdef PyObject* out_indptr
         cdef PyObject* out_indices
@@ -479,13 +787,18 @@ shape: {0.shape}""".format(self)
         """
         cdef shared_ptr[CTensor] ctensor
         with nogil:
-            check_status(self.stp.ToTensor(&ctensor))
+            ctensor = GetResultValue(self.stp.ToTensor())
 
         return pyarrow_wrap_tensor(ctensor)
 
     def equals(self, SparseCSRMatrix other):
         """
         Return true if sparse tensors contains exactly equal data.
+
+        Parameters
+        ----------
+        other : SparseCSRMatrix
+            The other tensor to compare for equality.
         """
         return self.stp.Equals(deref(other.stp))
 
@@ -513,17 +826,30 @@ shape: {0.shape}""".format(self)
         return self.stp.size()
 
     def dim_name(self, i):
+        """
+        Returns the name of the i-th tensor dimension.
+
+        Parameters
+        ----------
+        i : int
+            The physical index of the tensor dimension.
+
+        Returns
+        -------
+        str
+        """
         return frombytes(self.stp.dim_name(i))
 
     @property
     def dim_names(self):
-        return tuple(frombytes(x) for x in tuple(self.stp.dim_names()))
+        names_tuple = tuple(self.stp.dim_names())
+        return tuple(frombytes(x) for x in names_tuple)
 
     @property
     def non_zero_length(self):
         return self.stp.non_zero_length()
 
-cdef class SparseCSCMatrix:
+cdef class SparseCSCMatrix(_Weakrefable):
     """
     A sparse CSC matrix.
     """
@@ -547,6 +873,17 @@ shape: {0.shape}""".format(self)
     def from_dense_numpy(cls, obj, dim_names=None):
         """
         Convert numpy.ndarray to arrow::SparseCSCMatrix
+
+        Parameters
+        ----------
+        obj : numpy.ndarray
+            Data used to populate the rows.
+        dim_names : list[str], optional
+            Names of the dimensions.
+
+        Returns
+        -------
+        pyarrow.SparseCSCMatrix
         """
         return cls.from_tensor(Tensor.from_numpy(obj, dim_names=dim_names))
 
@@ -554,6 +891,20 @@ shape: {0.shape}""".format(self)
     def from_numpy(data, indptr, indices, shape, dim_names=None):
         """
         Create arrow::SparseCSCMatrix from numpy.ndarrays
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Data used to populate the sparse matrix.
+        indptr : numpy.ndarray
+            Range of the rows,
+            The i-th row spans from `indptr[i]` to `indptr[i+1]` in the data.
+        indices : numpy.ndarray
+            Column indices of the corresponding non-zero values.
+        shape : tuple
+            Shape of the matrix.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         cdef shared_ptr[CSparseCSCMatrix] csparse_tensor
         cdef vector[int64_t] c_shape
@@ -584,6 +935,13 @@ shape: {0.shape}""".format(self)
     def from_scipy(obj, dim_names=None):
         """
         Convert scipy.sparse.csc_matrix to arrow::SparseCSCMatrix
+
+        Parameters
+        ----------
+        obj : scipy.sparse.csc_matrix
+            The scipy matrix that should be converted.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         import scipy.sparse
         if not isinstance(obj, scipy.sparse.csc_matrix):
@@ -614,6 +972,11 @@ shape: {0.shape}""".format(self)
     def from_tensor(obj):
         """
         Convert arrow::Tensor to arrow::SparseCSCMatrix
+
+        Parameters
+        ----------
+        obj : Tensor
+            The dense tensor that should be converted.
         """
         cdef shared_ptr[CSparseCSCMatrix] csparse_tensor
         cdef shared_ptr[CTensor] ctensor = pyarrow_unwrap_tensor(obj)
@@ -627,6 +990,9 @@ shape: {0.shape}""".format(self)
         """
         Convert arrow::SparseCSCMatrix to numpy.ndarrays with zero copy
         """
+        if np is None:
+            raise ImportError(
+                "Cannot return a numpy.ndarray if NumPy is not present")
         cdef PyObject* out_data
         cdef PyObject* out_indptr
         cdef PyObject* out_indices
@@ -663,13 +1029,18 @@ shape: {0.shape}""".format(self)
 
         cdef shared_ptr[CTensor] ctensor
         with nogil:
-            check_status(self.stp.ToTensor(&ctensor))
+            ctensor = GetResultValue(self.stp.ToTensor())
 
         return pyarrow_wrap_tensor(ctensor)
 
     def equals(self, SparseCSCMatrix other):
         """
         Return true if sparse tensors contains exactly equal data
+
+        Parameters
+        ----------
+        other : SparseCSCMatrix
+            The other tensor to compare for equality.
         """
         return self.stp.Equals(deref(other.stp))
 
@@ -697,20 +1068,40 @@ shape: {0.shape}""".format(self)
         return self.stp.size()
 
     def dim_name(self, i):
+        """
+        Returns the name of the i-th tensor dimension.
+
+        Parameters
+        ----------
+        i : int
+            The physical index of the tensor dimension.
+
+        Returns
+        -------
+        str
+        """
         return frombytes(self.stp.dim_name(i))
 
     @property
     def dim_names(self):
-        return tuple(frombytes(x) for x in tuple(self.stp.dim_names()))
+        names_tuple = tuple(self.stp.dim_names())
+        return tuple(frombytes(x) for x in names_tuple)
 
     @property
     def non_zero_length(self):
         return self.stp.non_zero_length()
 
 
-cdef class SparseCSFTensor:
+cdef class SparseCSFTensor(_Weakrefable):
     """
     A sparse CSF tensor.
+
+    CSF is a generalization of compressed sparse row (CSR) index.
+
+    CSF index recursively compresses each dimension of a tensor into a set
+    of prefix trees. Each path from a root to leaf forms one tensor
+    non-zero index. CSF is implemented with two arrays of buffers and one
+    arrays of integers.
     """
 
     def __init__(self):
@@ -732,6 +1123,17 @@ shape: {0.shape}""".format(self)
     def from_dense_numpy(cls, obj, dim_names=None):
         """
         Convert numpy.ndarray to arrow::SparseCSFTensor
+
+        Parameters
+        ----------
+        obj : numpy.ndarray
+            Data used to populate the rows.
+        dim_names : list[str], optional
+            Names of the dimensions.
+
+        Returns
+        -------
+        pyarrow.SparseCSFTensor
         """
         return cls.from_tensor(Tensor.from_numpy(obj, dim_names=dim_names))
 
@@ -740,6 +1142,28 @@ shape: {0.shape}""".format(self)
                    dim_names=None):
         """
         Create arrow::SparseCSFTensor from numpy.ndarrays
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Data used to populate the sparse tensor.
+        indptr : numpy.ndarray
+            The sparsity structure.
+            Each two consecutive dimensions in a tensor correspond to
+            a buffer in indices.
+            A pair of consecutive values at `indptr[dim][i]`
+            `indptr[dim][i + 1]` signify a range of nodes in
+            `indices[dim + 1]` who are children of `indices[dim][i]` node.
+        indices : numpy.ndarray
+            Stores values of nodes.
+            Each tensor dimension corresponds to a buffer in indptr.
+        shape : tuple
+            Shape of the matrix.
+        axis_order : list, optional
+            the sequence in which dimensions were traversed to
+            produce the prefix tree.
+        dim_names : list, optional
+            Names of the dimensions.
         """
         cdef shared_ptr[CSparseCSFTensor] csparse_tensor
         cdef vector[int64_t] c_axis_order
@@ -786,6 +1210,11 @@ shape: {0.shape}""".format(self)
     def from_tensor(obj):
         """
         Convert arrow::Tensor to arrow::SparseCSFTensor
+
+        Parameters
+        ----------
+        obj : Tensor
+            The dense tensor that should be converted.
         """
         cdef shared_ptr[CSparseCSFTensor] csparse_tensor
         cdef shared_ptr[CTensor] ctensor = pyarrow_unwrap_tensor(obj)
@@ -799,6 +1228,9 @@ shape: {0.shape}""".format(self)
         """
         Convert arrow::SparseCSFTensor to numpy.ndarrays with zero copy
         """
+        if np is None:
+            raise ImportError(
+                "Cannot return a numpy.ndarray if NumPy is not present")
         cdef PyObject* out_data
         cdef PyObject* out_indptr
         cdef PyObject* out_indices
@@ -816,13 +1248,18 @@ shape: {0.shape}""".format(self)
 
         cdef shared_ptr[CTensor] ctensor
         with nogil:
-            check_status(self.stp.ToTensor(&ctensor))
+            ctensor = GetResultValue(self.stp.ToTensor())
 
         return pyarrow_wrap_tensor(ctensor)
 
     def equals(self, SparseCSFTensor other):
         """
         Return true if sparse tensors contains exactly equal data
+
+        Parameters
+        ----------
+        other : SparseCSFTensor
+            The other tensor to compare for equality.
         """
         return self.stp.Equals(deref(other.stp))
 
@@ -850,11 +1287,24 @@ shape: {0.shape}""".format(self)
         return self.stp.size()
 
     def dim_name(self, i):
+        """
+        Returns the name of the i-th tensor dimension.
+
+        Parameters
+        ----------
+        i : int
+            The physical index of the tensor dimension.
+
+        Returns
+        -------
+        str
+        """
         return frombytes(self.stp.dim_name(i))
 
     @property
     def dim_names(self):
-        return tuple(frombytes(x) for x in tuple(self.stp.dim_names()))
+        names_tuple = tuple(self.stp.dim_names())
+        return tuple(frombytes(x) for x in names_tuple)
 
     @property
     def non_zero_length(self):

@@ -27,6 +27,7 @@ module Arrow
       @index = index
       @field = @container.schema[@index]
       @data = @container.get_column_data(@index)
+      @container.share_input(@data)
     end
 
     def name
@@ -57,11 +58,11 @@ module Arrow
       @data.reverse_each(&block)
     end
 
-    def n_rows
-      @data.n_rows
+    def size
+      @data.size
     end
-    alias_method :size, :n_rows
-    alias_method :length, :n_rows
+    alias_method :length, :size
+    alias_method :n_rows, :size
 
     def n_nulls
       @data.n_nulls
@@ -71,6 +72,34 @@ module Arrow
       other.is_a?(self.class) and
         @field == other.field and
         @data == other.data
+    end
+
+    def count(options: nil)
+      @data.count(options: options)
+    end
+
+    def sum(options: nil)
+      @data.sum(options: options)
+    end
+
+    def min(options: nil)
+      @data.min(options: options)
+    end
+
+    def max(options: nil)
+      @data.max(options: options)
+    end
+
+    def unique
+      @data.unique
+    end
+
+    def uniq
+      @data.uniq
+    end
+
+    def cast(target_data_type, options: nil)
+      @data.cast(target_data_type, options: options)
     end
   end
 end

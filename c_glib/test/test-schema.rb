@@ -18,6 +18,17 @@
 class TestSchema < Test::Unit::TestCase
   include Helper::Omittable
 
+  def test_export
+    require_gi_bindings(3, 4, 8)
+    fields = [
+      Arrow::Field.new("enabled", Arrow::BooleanDataType.new),
+    ]
+    schema = Arrow::Schema.new(fields)
+    c_abi_schema = schema.export
+    assert_equal(schema,
+                 Arrow::Schema.import(c_abi_schema))
+  end
+
   def test_equal
     fields1 = [
       Arrow::Field.new("enabled", Arrow::BooleanDataType.new),
@@ -162,6 +173,21 @@ required: bool
 enabled: bool
 new: bool
     SCHEMA
+  end
+
+  def test_has_metadata
+    fields = [
+      Arrow::Field.new("enabled", Arrow::BooleanDataType.new),
+      Arrow::Field.new("required", Arrow::BooleanDataType.new),
+    ]
+    schema = Arrow::Schema.new(fields)
+    assert do
+      not schema.has_metadata?
+    end
+    schema_with_metadata = schema.with_metadata("key" => "value")
+    assert do
+      schema_with_metadata.has_metadata?
+    end
   end
 
   sub_test_case("#metadata") do

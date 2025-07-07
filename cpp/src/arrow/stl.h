@@ -20,19 +20,22 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "arrow/builder.h"
+#include "arrow/array.h"
+#include "arrow/array/builder_base.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_nested.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/chunked_array.h"
 #include "arrow/compute/api.h"
-#include "arrow/memory_pool.h"
 #include "arrow/status.h"
 #include "arrow/table.h"
-#include "arrow/type.h"
+#include "arrow/type_fwd.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/macros.h"
@@ -181,6 +184,35 @@ struct ConversionTraits<std::vector<ValueCType>>
           ConversionTraits<ValueCType>::GetEntry(value_array, array.value_offset(j) + i);
     }
     return vec;
+  }
+};
+
+template <class ValueCType, std::size_t N>
+struct ConversionTraits<std::array<ValueCType, N>>
+    : public CTypeTraits<std::array<ValueCType, N>> {
+  static arrow::Status AppendRow(FixedSizeListBuilder& builder,
+                                 const std::array<ValueCType, N>& values) {
+    auto vb =
+        ::arrow::internal::checked_cast<typename CTypeTraits<ValueCType>::BuilderType*>(
+            builder.value_builder());
+    ARROW_RETURN_NOT_OK(builder.Append());
+    return vb->AppendValues(values.data(), N);
+  }
+
+  static std::array<ValueCType, N> GetEntry(const ::arrow::FixedSizeListArray& array,
+                                            size_t j) {
+    using ElementArrayType = typename TypeTraits<
+        typename stl::ConversionTraits<ValueCType>::ArrowType>::ArrayType;
+
+    const ElementArrayType& value_array =
+        ::arrow::internal::checked_cast<const ElementArrayType&>(*array.values());
+
+    std::array<ValueCType, N> arr;
+    for (size_t i = 0; i < N; i++) {
+      arr[i] = stl::ConversionTraits<ValueCType>::GetEntry(value_array,
+                                                           array.value_offset(j) + i);
+    }
+    return arr;
   }
 };
 
@@ -420,7 +452,7 @@ Status TableFromTupleRange(MemoryPool* pool, Range&& rows,
     arrays.emplace_back(array);
   }
 
-  *table = Table::Make(schema, arrays);
+  *table = Table::Make(std::move(schema), std::move(arrays));
 
   return Status::OK();
 }
@@ -432,18 +464,15 @@ Status TupleRangeFromTable(const Table& table, const compute::CastOptions& cast_
   constexpr std::size_t n_columns = std::tuple_size<row_type>::value;
 
   if (table.schema()->num_fields() != n_columns) {
-    std::stringstream ss;
-    ss << "Number of columns in the table does not match the width of the target: ";
-    ss << table.schema()->num_fields() << " != " << n_columns;
-    return Status::Invalid(ss.str());
+    return Status::Invalid(
+        "Number of columns in the table does not match the width of the target: ",
+        table.schema()->num_fields(), " != ", n_columns);
   }
 
-  // TODO: Use std::size with C++17
-  if (rows->size() != static_cast<size_t>(table.num_rows())) {
-    std::stringstream ss;
-    ss << "Number of rows in the table does not match the size of the target: ";
-    ss << table.num_rows() << " != " << rows->size();
-    return Status::Invalid(ss.str());
+  if (std::size(*rows) != static_cast<size_t>(table.num_rows())) {
+    return Status::Invalid(
+        "Number of rows in the table does not match the size of the target: ",
+        table.num_rows(), " != ", std::size(*rows));
   }
 
   // Check that all columns have the correct type, otherwise cast them.

@@ -22,12 +22,11 @@
 #include <vector>
 
 #include "arrow/compute/function.h"
-#include "arrow/compute/kernel.h"
-#include "arrow/datum.h"
+#include "arrow/compute/function_options.h"
+#include "arrow/compute/type_fwd.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
@@ -39,30 +38,29 @@ namespace compute {
 
 class ExecContext;
 
-struct ARROW_EXPORT CastOptions : public FunctionOptions {
-  CastOptions()
-      : allow_int_overflow(false),
-        allow_time_truncate(false),
-        allow_time_overflow(false),
-        allow_decimal_truncate(false),
-        allow_float_truncate(false),
-        allow_invalid_utf8(false) {}
+/// \addtogroup compute-concrete-options
+/// @{
 
-  explicit CastOptions(bool safe)
-      : allow_int_overflow(!safe),
-        allow_time_truncate(!safe),
-        allow_time_overflow(!safe),
-        allow_decimal_truncate(!safe),
-        allow_float_truncate(!safe),
-        allow_invalid_utf8(!safe) {}
+class ARROW_EXPORT CastOptions : public FunctionOptions {
+ public:
+  explicit CastOptions(bool safe = true);
 
-  static CastOptions Safe() { return CastOptions(true); }
+  static constexpr char const kTypeName[] = "CastOptions";
+  static CastOptions Safe(TypeHolder to_type = {}) {
+    CastOptions safe(true);
+    safe.to_type = std::move(to_type);
+    return safe;
+  }
 
-  static CastOptions Unsafe() { return CastOptions(false); }
+  static CastOptions Unsafe(TypeHolder to_type = {}) {
+    CastOptions unsafe(false);
+    unsafe.to_type = std::move(to_type);
+    return unsafe;
+  }
 
   // Type being casted to. May be passed separate to eager function
   // compute::Cast
-  std::shared_ptr<DataType> to_type;
+  TypeHolder to_type;
 
   bool allow_int_overflow;
   bool allow_time_truncate;
@@ -72,39 +70,18 @@ struct ARROW_EXPORT CastOptions : public FunctionOptions {
   // Indicate if conversions from Binary/FixedSizeBinary to string must
   // validate the utf8 payload.
   bool allow_invalid_utf8;
+
+  /// true if the safety options all match CastOptions::Safe
+  ///
+  /// Note, if this returns false it does not mean is_unsafe will return true
+  bool is_safe() const;
+  /// true if the safety options all match CastOptions::Unsafe
+  ///
+  /// Note, if this returns false it does not mean is_safe will return true
+  bool is_unsafe() const;
 };
 
-// Cast functions are _not_ registered in the FunctionRegistry, though they use
-// the same execution machinery
-class CastFunction : public ScalarFunction {
- public:
-  CastFunction(std::string name, Type::type out_type);
-  ~CastFunction();
-
-  Type::type out_type_id() const;
-
-  Status AddKernel(Type::type in_type_id, std::vector<InputType> in_types,
-                   OutputType out_type, ArrayKernelExec exec,
-                   NullHandling::type = NullHandling::INTERSECTION,
-                   MemAllocation::type = MemAllocation::PREALLOCATE);
-
-  // Note, this function toggles off memory allocation and sets the init
-  // function to CastInit
-  Status AddKernel(Type::type in_type_id, ScalarKernel kernel);
-
-  bool CanCastTo(const DataType& out_type) const;
-
-  Result<const ScalarKernel*> DispatchExact(
-      const std::vector<ValueDescr>& values) const override;
-
- private:
-  struct CastFunctionImpl;
-  std::unique_ptr<CastFunctionImpl> impl_;
-};
-
-ARROW_EXPORT
-Result<std::shared_ptr<CastFunction>> GetCastFunction(
-    const std::shared_ptr<DataType>& to_type);
+/// @}
 
 /// \brief Return true if a cast function is defined
 ARROW_EXPORT
@@ -123,7 +100,7 @@ bool CanCast(const DataType& from_type, const DataType& to_type);
 /// \since 1.0.0
 /// \note API not yet finalized
 ARROW_EXPORT
-Result<std::shared_ptr<Array>> Cast(const Array& value, std::shared_ptr<DataType> to_type,
+Result<std::shared_ptr<Array>> Cast(const Array& value, const TypeHolder& to_type,
                                     const CastOptions& options = CastOptions::Safe(),
                                     ExecContext* ctx = NULLPTR);
 
@@ -149,7 +126,7 @@ Result<Datum> Cast(const Datum& value, const CastOptions& options,
 /// \since 1.0.0
 /// \note API not yet finalized
 ARROW_EXPORT
-Result<Datum> Cast(const Datum& value, std::shared_ptr<DataType> to_type,
+Result<Datum> Cast(const Datum& value, const TypeHolder& to_type,
                    const CastOptions& options = CastOptions::Safe(),
                    ExecContext* ctx = NULLPTR);
 

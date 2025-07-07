@@ -34,16 +34,35 @@ namespace fs {
 
 /// Options for the LocalFileSystem implementation.
 struct ARROW_EXPORT LocalFileSystemOptions {
+  static constexpr int32_t kDefaultDirectoryReadahead = 16;
+  static constexpr int32_t kDefaultFileInfoBatchSize = 1000;
+
   /// Whether OpenInputStream and OpenInputFile return a mmap'ed file,
   /// or a regular one.
   bool use_mmap = false;
+
+  /// Options related to `GetFileInfoGenerator` interface.
+
+  /// EXPERIMENTAL: The maximum number of directories processed in parallel
+  /// by `GetFileInfoGenerator`.
+  int32_t directory_readahead = kDefaultDirectoryReadahead;
+
+  /// EXPERIMENTAL: The maximum number of entries aggregated into each
+  /// FileInfoVector chunk by `GetFileInfoGenerator`.
+  ///
+  /// Since each FileInfo entry needs a separate `stat` system call, a
+  /// directory with a very large number of files may take a lot of time to
+  /// process entirely. By generating a FileInfoVector after this chunk
+  /// size is reached, we ensure FileInfo entries can start being consumed
+  /// from the FileInfoGenerator with less initial latency.
+  int32_t file_info_batch_size = kDefaultFileInfoBatchSize;
 
   /// \brief Initialize with defaults
   static LocalFileSystemOptions Defaults();
 
   bool Equals(const LocalFileSystemOptions& other) const;
 
-  static Result<LocalFileSystemOptions> FromUri(const ::arrow::internal::Uri& uri,
+  static Result<LocalFileSystemOptions> FromUri(const ::arrow::util::Uri& uri,
                                                 std::string* out_path);
 };
 
@@ -55,28 +74,38 @@ struct ARROW_EXPORT LocalFileSystemOptions {
 /// followed, except when deleting an entry).
 class ARROW_EXPORT LocalFileSystem : public FileSystem {
  public:
-  LocalFileSystem();
-  explicit LocalFileSystem(const LocalFileSystemOptions&);
+  explicit LocalFileSystem(const io::IOContext& = io::default_io_context());
+  explicit LocalFileSystem(const LocalFileSystemOptions&,
+                           const io::IOContext& = io::default_io_context());
   ~LocalFileSystem() override;
 
   std::string type_name() const override { return "local"; }
 
   Result<std::string> NormalizePath(std::string path) override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
+  Result<std::string> MakeUri(std::string path) const override;
 
   bool Equals(const FileSystem& other) const override;
 
   LocalFileSystemOptions options() const { return options_; }
 
   /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
   using FileSystem::GetFileInfo;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
   /// \endcond
+
   Result<FileInfo> GetFileInfo(const std::string& path) override;
   Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
+  FileInfoGenerator GetFileInfoGenerator(const FileSelector& select) override;
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
-  Status DeleteDirContents(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -89,21 +118,15 @@ class ARROW_EXPORT LocalFileSystem : public FileSystem {
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) override;
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
  protected:
   LocalFileSystemOptions options_;
 };
-
-namespace internal {
-
-// Return whether the string is detected as a local absolute path.
-ARROW_EXPORT
-bool DetectAbsolutePath(const std::string& s);
-
-}  // namespace internal
 
 }  // namespace fs
 }  // namespace arrow

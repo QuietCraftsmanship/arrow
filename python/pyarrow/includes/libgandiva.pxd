@@ -24,17 +24,20 @@ from libc.stdint cimport int64_t, int32_t, uint8_t, uintptr_t
 from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow cimport *
 
-cdef extern from "gandiva/gandiva_aliases.h" namespace "gandiva" nogil:
+cdef extern from "gandiva/node.h" namespace "gandiva" nogil:
 
     cdef cppclass CNode" gandiva::Node":
-        pass
+        c_string ToString()
+        shared_ptr[CDataType] return_type()
 
-    cdef cppclass CExpression" gandiva::Expression":
-        pass
+    cdef cppclass CGandivaExpression" gandiva::Expression":
+        c_string ToString()
+        shared_ptr[CNode] root()
+        shared_ptr[CField] result()
 
     ctypedef vector[shared_ptr[CNode]] CNodeVector" gandiva::NodeVector"
 
-    ctypedef vector[shared_ptr[CExpression]] \
+    ctypedef vector[shared_ptr[CGandivaExpression]] \
         CExpressionVector" gandiva::ExpressionVector"
 
 cdef extern from "gandiva/selection_vector.h" namespace "gandiva" nogil:
@@ -42,6 +45,15 @@ cdef extern from "gandiva/selection_vector.h" namespace "gandiva" nogil:
     cdef cppclass CSelectionVector" gandiva::SelectionVector":
 
         shared_ptr[CArray] ToArray()
+
+    enum CSelectionVector_Mode" gandiva::SelectionVector::Mode":
+        CSelectionVector_Mode_NONE" gandiva::SelectionVector::Mode::MODE_NONE"
+        CSelectionVector_Mode_UINT16" \
+                gandiva::SelectionVector::Mode::MODE_UINT16"
+        CSelectionVector_Mode_UINT32" \
+                gandiva::SelectionVector::Mode::MODE_UINT32"
+        CSelectionVector_Mode_UINT64" \
+                gandiva::SelectionVector::Mode::MODE_UINT64"
 
     cdef CStatus SelectionVector_MakeInt16\
         "gandiva::SelectionVector::MakeInt16"(
@@ -58,10 +70,37 @@ cdef extern from "gandiva/selection_vector.h" namespace "gandiva" nogil:
             int64_t max_slots, CMemoryPool* pool,
             shared_ptr[CSelectionVector]* selection_vector)
 
+cdef inline CSelectionVector_Mode _ensure_selection_mode(str name) except *:
+    uppercase = name.upper()
+    if uppercase == 'NONE':
+        return CSelectionVector_Mode_NONE
+    elif uppercase == 'UINT16':
+        return CSelectionVector_Mode_UINT16
+    elif uppercase == 'UINT32':
+        return CSelectionVector_Mode_UINT32
+    elif uppercase == 'UINT64':
+        return CSelectionVector_Mode_UINT64
+    else:
+        raise ValueError('Invalid value for Selection Mode: {!r}'.format(name))
+
+cdef inline str _selection_mode_name(CSelectionVector_Mode ctype):
+    if ctype == CSelectionVector_Mode_NONE:
+        return 'NONE'
+    elif ctype == CSelectionVector_Mode_UINT16:
+        return 'UINT16'
+    elif ctype == CSelectionVector_Mode_UINT32:
+        return 'UINT32'
+    elif ctype == CSelectionVector_Mode_UINT64:
+        return 'UINT64'
+    else:
+        raise RuntimeError('Unexpected CSelectionVector_Mode value')
+
 cdef extern from "gandiva/condition.h" namespace "gandiva" nogil:
 
     cdef cppclass CCondition" gandiva::Condition":
-        pass
+        c_string ToString()
+        shared_ptr[CNode] root()
+        shared_ptr[CField] result()
 
 cdef extern from "gandiva/arrow.h" namespace "gandiva" nogil:
 
@@ -109,7 +148,7 @@ cdef extern from "gandiva/tree_expr_builder.h" namespace "gandiva" nogil:
     cdef shared_ptr[CNode] TreeExprBuilder_MakeBinaryLiteral \
         "gandiva::TreeExprBuilder::MakeBinaryLiteral"(const c_string& value)
 
-    cdef shared_ptr[CExpression] TreeExprBuilder_MakeExpression\
+    cdef shared_ptr[CGandivaExpression] TreeExprBuilder_MakeExpression\
         "gandiva::TreeExprBuilder::MakeExpression"(
             shared_ptr[CNode] root_node, shared_ptr[CField] result_field)
 
@@ -180,11 +219,24 @@ cdef extern from "gandiva/projector.h" namespace "gandiva" nogil:
             const CRecordBatch& batch, CMemoryPool* pool,
             const CArrayVector* output)
 
+        CStatus Evaluate(
+            const CRecordBatch& batch,
+            const CSelectionVector* selection,
+            CMemoryPool* pool,
+            const CArrayVector* output)
+
         c_string DumpIR()
 
     cdef CStatus Projector_Make \
         "gandiva::Projector::Make"(
             shared_ptr[CSchema] schema, const CExpressionVector& children,
+            shared_ptr[CProjector]* projector)
+
+    cdef CStatus Projector_Make \
+        "gandiva::Projector::Make"(
+            shared_ptr[CSchema] schema, const CExpressionVector& children,
+            CSelectionVector_Mode mode,
+            shared_ptr[CConfiguration] configuration,
             shared_ptr[CProjector]* projector)
 
 cdef extern from "gandiva/filter.h" namespace "gandiva" nogil:
@@ -200,6 +252,7 @@ cdef extern from "gandiva/filter.h" namespace "gandiva" nogil:
     cdef CStatus Filter_Make \
         "gandiva::Filter::Make"(
             shared_ptr[CSchema] schema, shared_ptr[CCondition] condition,
+            shared_ptr[CConfiguration] configuration,
             shared_ptr[CFilter]* filter)
 
 cdef extern from "gandiva/function_signature.h" namespace "gandiva" nogil:
@@ -222,3 +275,24 @@ cdef extern from "gandiva/expression_registry.h" namespace "gandiva" nogil:
 
     cdef vector[shared_ptr[CFunctionSignature]] \
         GetRegisteredFunctionSignatures()
+
+cdef extern from "gandiva/configuration.h" namespace "gandiva" nogil:
+
+    cdef cppclass CConfiguration" gandiva::Configuration":
+
+        CConfiguration()
+
+        CConfiguration(bint optimize, bint dump_ir)
+
+        void set_optimize(bint optimize)
+
+        void set_dump_ir(bint dump_ir)
+
+    cdef cppclass CConfigurationBuilder \
+            " gandiva::ConfigurationBuilder":
+        @staticmethod
+        shared_ptr[CConfiguration] DefaultConfiguration()
+
+        CConfigurationBuilder()
+
+        shared_ptr[CConfiguration] build()

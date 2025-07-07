@@ -20,12 +20,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "arrow/io/type_fwd.h"
 #include "arrow/type_fwd.h"
+#include "arrow/util/cancel.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/string_view.h"
 #include "arrow/util/type_fwd.h"
 #include "arrow/util/visibility.h"
 
@@ -48,18 +49,54 @@ struct ReadRange {
   }
 };
 
-// EXPERIMENTAL
-struct ARROW_EXPORT AsyncContext {
-  ::arrow::internal::Executor* executor;
-  // An application-specific ID, forwarded to executor task submissions
-  int64_t external_id = -1;
+/// EXPERIMENTAL: options provider for IO tasks
+///
+/// Includes an Executor (which will be used to execute asynchronous reads),
+/// a MemoryPool (which will be used to allocate buffers when zero copy reads
+/// are not possible), and an external id (in case the executor receives tasks from
+/// multiple sources and must distinguish tasks associated with this IOContext).
+struct ARROW_EXPORT IOContext {
+  // No specified executor: will use a global IO thread pool
+  IOContext() : IOContext(default_memory_pool(), StopToken::Unstoppable()) {}
 
-  // Set `executor` to a global IO-specific thread pool.
-  AsyncContext();
-  explicit AsyncContext(::arrow::internal::Executor* executor);
+  explicit IOContext(StopToken stop_token)
+      : IOContext(default_memory_pool(), std::move(stop_token)) {}
+
+  explicit IOContext(MemoryPool* pool, StopToken stop_token = StopToken::Unstoppable());
+
+  explicit IOContext(MemoryPool* pool, ::arrow::internal::Executor* executor,
+                     StopToken stop_token = StopToken::Unstoppable(),
+                     int64_t external_id = -1)
+      : pool_(pool),
+        executor_(executor),
+        external_id_(external_id),
+        stop_token_(std::move(stop_token)) {}
+
+  explicit IOContext(::arrow::internal::Executor* executor,
+                     StopToken stop_token = StopToken::Unstoppable(),
+                     int64_t external_id = -1)
+      : pool_(default_memory_pool()),
+        executor_(executor),
+        external_id_(external_id),
+        stop_token_(std::move(stop_token)) {}
+
+  MemoryPool* pool() const { return pool_; }
+
+  ::arrow::internal::Executor* executor() const { return executor_; }
+
+  // An application-specific ID, forwarded to executor task submissions
+  int64_t external_id() const { return external_id_; }
+
+  StopToken stop_token() const { return stop_token_; }
+
+ private:
+  MemoryPool* pool_;
+  ::arrow::internal::Executor* executor_;
+  int64_t external_id_;
+  StopToken stop_token_;
 };
 
-class ARROW_EXPORT FileInterface {
+class ARROW_EXPORT FileInterface : public std::enable_shared_from_this<FileInterface> {
  public:
   virtual ~FileInterface() = 0;
 
@@ -71,6 +108,13 @@ class ARROW_EXPORT FileInterface {
   /// After Close() is called, closed() returns true and the stream is not
   /// available for further operations.
   virtual Status Close() = 0;
+
+  /// \brief Close the stream asynchronously
+  ///
+  /// By default, this will just submit the synchronous Close() to the
+  /// default I/O thread pool. Subclasses may implement this in a more
+  /// efficient manner.
+  virtual Future<> CloseAsync();
 
   /// \brief Close the stream abruptly
   ///
@@ -127,7 +171,7 @@ class ARROW_EXPORT Writable {
   /// \brief Flush buffered bytes, if any
   virtual Status Flush();
 
-  Status Write(const std::string& data);
+  Status Write(std::string_view data);
 };
 
 class ARROW_EXPORT Readable {
@@ -148,6 +192,12 @@ class ARROW_EXPORT Readable {
   /// In some cases (e.g. a memory-mapped file), this method may avoid a
   /// memory copy.
   virtual Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) = 0;
+
+  /// EXPERIMENTAL: The IOContext associated with this file.
+  ///
+  /// By default, this is the same as default_io_context(), but it may be
+  /// overridden by subclasses.
+  virtual const IOContext& io_context() const;
 };
 
 class ARROW_EXPORT OutputStream : virtual public FileInterface, public Writable {
@@ -171,21 +221,30 @@ class ARROW_EXPORT InputStream : virtual public FileInterface, virtual public Re
   /// May return NotImplemented on streams that don't support it.
   ///
   /// \param[in] nbytes the maximum number of bytes to see
-  virtual Result<util::string_view> Peek(int64_t nbytes);
+  virtual Result<std::string_view> Peek(int64_t nbytes);
 
   /// \brief Return true if InputStream is capable of zero copy Buffer reads
   ///
   /// Zero copy reads imply the use of Buffer-returning Read() overloads.
   virtual bool supports_zero_copy() const;
 
+  /// \brief Read and return stream metadata
+  ///
+  /// If the stream implementation doesn't support metadata, empty metadata
+  /// is returned.  Note that it is allowed to return a null pointer rather
+  /// than an allocated empty metadata.
+  virtual Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata();
+
+  /// \brief Read stream metadata asynchronously
+  virtual Future<std::shared_ptr<const KeyValueMetadata>> ReadMetadataAsync(
+      const IOContext& io_context);
+  Future<std::shared_ptr<const KeyValueMetadata>> ReadMetadataAsync();
+
  protected:
   InputStream() = default;
 };
 
-class ARROW_EXPORT RandomAccessFile
-    : public std::enable_shared_from_this<RandomAccessFile>,
-      public InputStream,
-      public Seekable {
+class ARROW_EXPORT RandomAccessFile : public InputStream, public Seekable {
  public:
   /// Necessary because we hold a std::unique_ptr
   ~RandomAccessFile() override;
@@ -197,8 +256,8 @@ class ARROW_EXPORT RandomAccessFile
   /// \param[in] file_offset the starting position in the file
   /// \param[in] nbytes the extent of bytes to read. The file should have
   /// sufficient bytes available
-  static std::shared_ptr<InputStream> GetStream(std::shared_ptr<RandomAccessFile> file,
-                                                int64_t file_offset, int64_t nbytes);
+  static Result<std::shared_ptr<InputStream>> GetStream(
+      std::shared_ptr<RandomAccessFile> file, int64_t file_offset, int64_t nbytes);
 
   /// \brief Return the total file size in bytes.
   ///
@@ -234,8 +293,32 @@ class ARROW_EXPORT RandomAccessFile
   virtual Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes);
 
   /// EXPERIMENTAL: Read data asynchronously.
-  virtual Future<std::shared_ptr<Buffer>> ReadAsync(const AsyncContext&, int64_t position,
+  virtual Future<std::shared_ptr<Buffer>> ReadAsync(const IOContext&, int64_t position,
                                                     int64_t nbytes);
+
+  /// EXPERIMENTAL: Read data asynchronously, using the file's IOContext.
+  Future<std::shared_ptr<Buffer>> ReadAsync(int64_t position, int64_t nbytes);
+
+  /// EXPERIMENTAL: Explicit multi-read.
+  /// \brief Request multiple reads at once
+  ///
+  /// The underlying filesystem may optimize these reads by coalescing small reads into
+  /// large reads or by breaking up large reads into multiple parallel smaller reads.  The
+  /// reads should be issued in parallel if it makes sense for the filesystem.
+  ///
+  /// One future will be returned for each input read range.  Multiple returned futures
+  /// may correspond to a single read.  Or, a single returned future may be a combined
+  /// result of several individual reads.
+  ///
+  /// \param[in] ranges The ranges to read
+  /// \return A future that will complete with the data from the requested range is
+  /// available
+  virtual std::vector<Future<std::shared_ptr<Buffer>>> ReadManyAsync(
+      const IOContext&, const std::vector<ReadRange>& ranges);
+
+  /// EXPERIMENTAL: Explicit multi-read, using the file's IOContext.
+  std::vector<Future<std::shared_ptr<Buffer>>> ReadManyAsync(
+      const std::vector<ReadRange>& ranges);
 
   /// EXPERIMENTAL: Inform that the given ranges may be read soon.
   ///
@@ -248,8 +331,8 @@ class ARROW_EXPORT RandomAccessFile
   RandomAccessFile();
 
  private:
-  struct ARROW_NO_EXPORT RandomAccessFileImpl;
-  std::unique_ptr<RandomAccessFileImpl> interface_impl_;
+  struct ARROW_NO_EXPORT Impl;
+  std::unique_ptr<Impl> interface_impl_;
 };
 
 class ARROW_EXPORT WritableFile : public OutputStream, public Seekable {

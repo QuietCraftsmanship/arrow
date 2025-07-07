@@ -26,54 +26,28 @@ git submodule update --init || exit /B
 set ARROW_TEST_DATA=%CD%\testing\data
 set PARQUET_TEST_DATA=%CD%\cpp\submodules\parquet-testing\data
 
-@rem
-@rem In the configurations below we disable building the Arrow static library
-@rem to save some time.  Unfortunately this will still build the Parquet static
-@rem library because of PARQUET-1420 (Thrift-generated symbols not exported in DLL).
-@rem
-if "%JOB%" == "Build_Debug" (
-  mkdir cpp\build-debug
-  pushd cpp\build-debug
-
-  cmake -G "%GENERATOR%" ^
-        -DARROW_BOOST_USE_SHARED=OFF ^
-        -DARROW_BUILD_EXAMPLES=ON ^
-        -DARROW_BUILD_STATIC=OFF ^
-        -DARROW_BUILD_TESTS=ON ^
-        -DARROW_CXXFLAGS="/MP" ^
-        -DARROW_ENABLE_TIMING_TESTS=OFF ^
-        -DARROW_USE_PRECOMPILED_HEADERS=OFF ^
-        -DARROW_VERBOSE_THIRDPARTY_BUILD=OFF ^
-        -DCMAKE_BUILD_TYPE="Debug" ^
-        -DCMAKE_UNITY_BUILD=ON ^
-        .. || exit /B
-
-  cmake --build . --config Debug || exit /B
-  ctest --output-on-failure -j2 || exit /B
-  popd
-
-  @rem Finish Debug build successfully
-  exit /B 0
+@rem Enable memory debug checks if the env is not set already
+IF "%ARROW_DEBUG_MEMORY_POOL%"=="" (
+  set ARROW_DEBUG_MEMORY_POOL=trap
 )
 
-call activate arrow
+set CMAKE_BUILD_PARALLEL_LEVEL=%NUMBER_OF_PROCESSORS%
+set CTEST_PARALLEL_LEVEL=%NUMBER_OF_PROCESSORS%
 
-@rem Use Boost from Anaconda
-set BOOST_ROOT=%CONDA_PREFIX%\Library
-set BOOST_LIBRARYDIR=%CONDA_PREFIX%\Library\lib
+call activate arrow
 
 @rem The "main" C++ build script for Windows CI
 @rem (i.e. for usual configurations)
 
-if "%JOB%" == "Toolchain" (
-  set CMAKE_ARGS=-DARROW_DEPENDENCY_SOURCE=CONDA -DARROW_WITH_BZ2=ON
-) else (
-  @rem We're in a conda environment but don't want to use it for the dependencies
-  set CMAKE_ARGS=-DARROW_DEPENDENCY_SOURCE=AUTO
-)
+set ARROW_CMAKE_ARGS=-DARROW_DEPENDENCY_SOURCE=CONDA -DARROW_WITH_BZ2=ON
 
 @rem Enable warnings-as-errors
 set ARROW_CXXFLAGS=/WX /MP
+
+@rem Install GCS testbench
+set PIPX_BIN_DIR=C:\Windows\
+call %CD%\ci\scripts\install_gcs_testbench.bat
+storage-testbench -h || exit /B
 
 @rem
 @rem Build and test Arrow C++ libraries (including Parquet)
@@ -88,21 +62,29 @@ pushd cpp\build
 @rem In release mode, disable optimizations (/Od) for faster compiling
 @rem and enable runtime assertions.
 
-cmake -G "%GENERATOR%" %CMAKE_ARGS% ^
-      -DARROW_BOOST_USE_SHARED=OFF ^
+cmake -G "%GENERATOR%" %ARROW_CMAKE_ARGS% ^
+      -DARROW_ACERO=ON ^
+      -DARROW_BOOST_USE_SHARED=ON ^
       -DARROW_BUILD_EXAMPLES=ON ^
       -DARROW_BUILD_STATIC=OFF ^
       -DARROW_BUILD_TESTS=ON ^
+      -DARROW_COMPUTE=ON ^
       -DARROW_CSV=ON ^
       -DARROW_CXXFLAGS="%ARROW_CXXFLAGS%" ^
       -DARROW_DATASET=ON ^
       -DARROW_ENABLE_TIMING_TESTS=OFF ^
+      -DARROW_FILESYSTEM=ON ^
       -DARROW_FLIGHT=%ARROW_BUILD_FLIGHT% ^
+      -DARROW_FLIGHT_SQL=%ARROW_BUILD_FLIGHT_SQL% ^
       -DARROW_GANDIVA=%ARROW_BUILD_GANDIVA% ^
+      -DARROW_GCS=%ARROW_GCS% ^
+      -DARROW_HDFS=ON ^
+      -DARROW_JSON=ON ^
       -DARROW_MIMALLOC=ON ^
+      -DARROW_ORC=%ARROW_ORC% ^
       -DARROW_PARQUET=ON ^
-      -DARROW_PYTHON=ON ^
       -DARROW_S3=%ARROW_S3% ^
+      -DARROW_SUBSTRAIT=ON ^
       -DARROW_VERBOSE_THIRDPARTY_BUILD=OFF ^
       -DARROW_WITH_BROTLI=ON ^
       -DARROW_WITH_LZ4=ON ^
@@ -110,53 +92,72 @@ cmake -G "%GENERATOR%" %CMAKE_ARGS% ^
       -DARROW_WITH_ZLIB=ON ^
       -DARROW_WITH_ZSTD=ON ^
       -DCMAKE_BUILD_TYPE="Release" ^
-      -DCMAKE_CXX_COMPILER=clcache ^
       -DCMAKE_CXX_FLAGS_RELEASE="/MD /Od /UNDEBUG" ^
+      -DCMAKE_CXX_STANDARD=17 ^
       -DCMAKE_INSTALL_PREFIX=%CONDA_PREFIX%\Library ^
       -DCMAKE_UNITY_BUILD=ON ^
       -DCMAKE_VERBOSE_MAKEFILE=OFF ^
       -DPARQUET_BUILD_EXECUTABLES=ON ^
       -DPARQUET_REQUIRE_ENCRYPTION=ON ^
       ..  || exit /B
-cmake --build . --target install --config %CONFIGURATION%  || exit /B
+cmake --build . --target install --config Release || exit /B
 
-@rem Needed so arrow-python-test.exe works
-set OLD_PYTHONHOME=%PYTHONHOME%
-set PYTHONHOME=%CONDA_PREFIX%
+@rem For ORC C++
+set TZDIR=%CONDA_PREFIX%\share\zoneinfo
 
-ctest --output-on-failure -j2 || exit /B
+@rem For finding Python executable for GCS tests
+set PYTHON=python
 
-set PYTHONHOME=%OLD_PYTHONHOME%
+ctest --output-on-failure || exit /B
+
 popd
+
+pushd python
 
 @rem
 @rem Build and install pyarrow
 @rem
 
-pushd python
-
-set PYARROW_BUNDLE_BOOST=OFF
 set PYARROW_CMAKE_GENERATOR=%GENERATOR%
 set PYARROW_CXXFLAGS=%ARROW_CXXFLAGS%
 set PYARROW_PARALLEL=2
+set PYARROW_WITH_ACERO=ON
 set PYARROW_WITH_DATASET=ON
 set PYARROW_WITH_FLIGHT=%ARROW_BUILD_FLIGHT%
 set PYARROW_WITH_GANDIVA=%ARROW_BUILD_GANDIVA%
+set PYARROW_WITH_GCS=%ARROW_GCS%
+set PYARROW_WITH_ORC=%ARROW_ORC%
 set PYARROW_WITH_PARQUET=ON
+set PYARROW_WITH_PARQUET_ENCRYPTION=ON
 set PYARROW_WITH_S3=%ARROW_S3%
-set PYARROW_WITH_STATIC_BOOST=ON
+set PYARROW_WITH_SUBSTRAIT=ON
 
 set ARROW_HOME=%CONDA_PREFIX%\Library
 @rem ARROW-3075; pkgconfig is broken for Parquet for now
 set PARQUET_HOME=%CONDA_PREFIX%\Library
 
-python setup.py develop -q || exit /B
+pip install --no-deps --no-build-isolation -vv --editable .
 
+@rem
+@rem Run pyarrow tests
+@rem
+
+@rem Download IANA Timezone Database to a non-standard location to
+@rem test the configurability of the timezone database path
+curl https://data.iana.org/time-zones/releases/tzdata2024b.tar.gz --output tzdata.tar.gz || exit /B
+mkdir %USERPROFILE%\Downloads\test\tzdata
+tar --extract --file tzdata.tar.gz --directory %USERPROFILE%\Downloads\test\tzdata
+curl https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml ^
+  --output %USERPROFILE%\Downloads\test\tzdata\windowsZones.xml || exit /B
+@rem Remove the database from the default location
+rmdir /s /q %USERPROFILE%\Downloads\tzdata
+@rem Set the env var for the non-standard location of the database
+@rem (only needed for testing purposes)
+set PYARROW_TZDATA_PATH=%USERPROFILE%\Downloads\test\tzdata
+
+set AWS_EC2_METADATA_DISABLED=true
 set PYTHONDEVMODE=1
 
-py.test -r sxX --durations=15 --pyargs pyarrow.tests || exit /B
+python -m pytest -r sxX --durations=15 pyarrow/tests || exit /B
 
-@rem
-@rem Wheels are built and tested separately (see ARROW-5142).
-@rem
-
+popd

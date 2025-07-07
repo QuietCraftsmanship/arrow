@@ -28,6 +28,7 @@
 #include "arrow/io/util_internal.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"
 
 namespace arrow {
@@ -64,8 +65,8 @@ void LatencyGenerator::Sleep() {
 }
 
 std::shared_ptr<LatencyGenerator> LatencyGenerator::Make(double average_latency) {
-  auto seed = static_cast<int32_t>(std::random_device()());
-  return std::make_shared<LatencyGeneratorImpl>(average_latency, seed);
+  return std::make_shared<LatencyGeneratorImpl>(
+      average_latency, static_cast<int32_t>(::arrow::internal::GetRandomSeed()));
 }
 
 std::shared_ptr<LatencyGenerator> LatencyGenerator::Make(double average_latency,
@@ -96,7 +97,7 @@ Result<std::shared_ptr<Buffer>> SlowInputStream::Read(int64_t nbytes) {
   return stream_->Read(nbytes);
 }
 
-Result<util::string_view> SlowInputStream::Peek(int64_t nbytes) {
+Result<std::string_view> SlowInputStream::Peek(int64_t nbytes) {
   return stream_->Peek(nbytes);
 }
 
@@ -139,7 +140,7 @@ Result<std::shared_ptr<Buffer>> SlowRandomAccessFile::ReadAt(int64_t position,
   return stream_->ReadAt(position, nbytes);
 }
 
-Result<util::string_view> SlowRandomAccessFile::Peek(int64_t nbytes) {
+Result<std::string_view> SlowRandomAccessFile::Peek(int64_t nbytes) {
   return stream_->Peek(nbytes);
 }
 

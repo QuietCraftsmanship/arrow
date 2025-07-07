@@ -18,9 +18,15 @@
 use super::*;
 use crate::datatypes::*;
 use crate::util::bit_util;
+<<<<<<< HEAD
+<<<<<<< HEAD
 use hex::FromHex;
 use serde_json::value::Value::{Null as JNull, Object, String as JString};
 use serde_json::Value;
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 
 /// Trait for `Array` equality.
 pub trait ArrayEqual {
@@ -113,11 +119,26 @@ impl ArrayEqual for BooleanArray {
 
         // TODO: we can do this more efficiently if all values are not-null
         for i in 0..self.len() {
+<<<<<<< HEAD
+<<<<<<< HEAD
             if self.is_valid(i)
                 && bit_util::get_bit(values, i + self.offset())
                     != bit_util::get_bit(other_values, i + other.offset())
             {
                 return false;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+            if self.is_valid(i) {
+                if bit_util::get_bit(values, i + self.offset())
+                    != bit_util::get_bit(other_values, i + other.offset())
+                {
+                    return false;
+                }
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             }
         }
 
@@ -131,6 +152,8 @@ impl<T: ArrowNumericType> PartialEq for PrimitiveArray<T> {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 impl PartialEq for BooleanArray {
     fn eq(&self, other: &BooleanArray) -> bool {
         self.equals(other)
@@ -155,6 +178,10 @@ impl PartialEq for BinaryArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl ArrayEqual for ListArray {
     fn equals(&self, other: &dyn Array) -> bool {
         if !base_equal(&self.data(), &other.data()) {
@@ -227,6 +254,8 @@ impl ArrayEqual for ListArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 impl<T: ArrowPrimitiveType> ArrayEqual for DictionaryArray<T> {
     fn equals(&self, other: &dyn Array) -> bool {
         self.range_equals(other, 0, self.len(), 0)
@@ -321,6 +350,10 @@ impl ArrayEqual for FixedSizeListArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl ArrayEqual for BinaryArray {
     fn equals(&self, other: &dyn Array) -> bool {
         if !base_equal(&self.data(), &other.data()) {
@@ -425,6 +458,8 @@ impl ArrayEqual for BinaryArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 impl ArrayEqual for StringArray {
     fn equals(&self, other: &dyn Array) -> bool {
         if !base_equal(&self.data(), &other.data()) {
@@ -639,6 +674,10 @@ impl ArrayEqual for FixedSizeBinaryArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 impl ArrayEqual for StructArray {
     fn equals(&self, other: &dyn Array) -> bool {
         if !base_equal(&self.data(), &other.data()) {
@@ -703,6 +742,8 @@ impl ArrayEqual for StructArray {
     }
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 impl ArrayEqual for UnionArray {
     fn equals(&self, _other: &dyn Array) -> bool {
         unimplemented!(
@@ -750,6 +791,10 @@ impl ArrayEqual for NullArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 // Compare if the common basic fields between the two arrays are equal
 fn base_equal(this: &ArrayDataRef, other: &ArrayDataRef) -> bool {
     if this.data_type() != other.data_type() {
@@ -788,7 +833,15 @@ fn value_offset_equal<T: Array + ListArrayOps>(this: &T, other: &T) -> bool {
     }
 
     // The expensive case
+<<<<<<< HEAD
+<<<<<<< HEAD
     for i in 0..=this.len() {
+=======
+    for i in 0..this.len() + 1 {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+    for i in 0..this.len() + 1 {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
         if this.value_offset_at(i) - this.value_offset_at(0)
             != other.value_offset_at(i) - other.value_offset_at(0)
         {
@@ -799,6 +852,8 @@ fn value_offset_equal<T: Array + ListArrayOps>(this: &T, other: &T) -> bool {
     true
 }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 /// Trait for comparing arrow array with json array
 pub trait JsonEqual {
     /// Checks whether arrow array equals to json array.
@@ -1135,6 +1190,10 @@ impl PartialEq<Value> for NullArray {
     }
 }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1355,8 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
+<<<<<<< HEAD
     fn test_fixed_size_list_equal() {
         let mut a_builder = FixedSizeListBuilder::new(Int32Builder::new(10), 3);
         let mut b_builder = FixedSizeListBuilder::new(Int32Builder::new(10), 3);
@@ -1319,11 +1380,27 @@ mod tests {
             &[Some(&[1, 2, 3]), Some(&[4, 5, 7])],
         )
         .unwrap();
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+    fn test_binary_equal() {
+        let a = BinaryArray::from(vec!["hello", "world"]);
+        let b = BinaryArray::from(vec!["hello", "world"]);
+        assert!(a.equals(&b));
+        assert!(b.equals(&a));
+
+        let b = BinaryArray::from(vec!["hello", "arrow"]);
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
         assert!(!a.equals(&b));
         assert!(!b.equals(&a));
 
         // Test the case where null_count > 0
 
+<<<<<<< HEAD
+<<<<<<< HEAD
         let a = create_fixed_size_list_array(
             &mut a_builder,
             &[Some(&[1, 2, 3]), None, None, Some(&[4, 5, 6]), None, None],
@@ -1392,6 +1469,12 @@ mod tests {
         // Test the case where null_count > 0
 
         let a = StringArray::try_from(vec![
+=======
+        let a = BinaryArray::try_from(vec![
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        let a = BinaryArray::try_from(vec![
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             Some("hello"),
             None,
             None,
@@ -1401,7 +1484,15 @@ mod tests {
         ])
         .unwrap();
 
+<<<<<<< HEAD
+<<<<<<< HEAD
         let b = StringArray::try_from(vec![
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             Some("hello"),
             None,
             None,
@@ -1413,7 +1504,15 @@ mod tests {
         assert!(a.equals(&b));
         assert!(b.equals(&a));
 
+<<<<<<< HEAD
+<<<<<<< HEAD
         let b = StringArray::try_from(vec![
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             Some("hello"),
             Some("foo"),
             None,
@@ -1425,7 +1524,15 @@ mod tests {
         assert!(!a.equals(&b));
         assert!(!b.equals(&a));
 
+<<<<<<< HEAD
+<<<<<<< HEAD
         let b = StringArray::try_from(vec![
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        let b = BinaryArray::try_from(vec![
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             Some("hello"),
             None,
             None,
@@ -1457,7 +1564,15 @@ mod tests {
 
     #[test]
     fn test_struct_equal() {
+<<<<<<< HEAD
+<<<<<<< HEAD
         let string_builder = StringBuilder::new(5);
+=======
+        let string_builder = BinaryBuilder::new(5);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+        let string_builder = BinaryBuilder::new(5);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
         let int_builder = Int32Builder::new(5);
 
         let mut fields = Vec::new();
@@ -1488,6 +1603,8 @@ mod tests {
         assert!(b.equals(&a));
     }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
     #[test]
     fn test_null_equal() {
         let a = NullArray::new(12);
@@ -1512,6 +1629,10 @@ mod tests {
         assert!(!b_slice.equals(&*a_slice));
     }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     fn create_list_array<'a, U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(
         builder: &'a mut ListBuilder<Int32Builder>,
         data: T,
@@ -1527,6 +1648,8 @@ mod tests {
         Ok(builder.finish())
     }
 
+<<<<<<< HEAD
+<<<<<<< HEAD
     /// Create a fixed size list of 2 value lengths
     fn create_fixed_size_list_array<'a, U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(
         builder: &'a mut FixedSizeListBuilder<Int32Builder>,
@@ -2126,6 +2249,10 @@ mod tests {
         assert!(json_array.ne(&arrow_array));
     }
 
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
     fn create_struct_array<
         'a,
         T: AsRef<[Option<&'a str>]>,
@@ -2137,10 +2264,23 @@ mod tests {
         second: U,
         is_valid: V,
     ) -> Result<StructArray> {
+<<<<<<< HEAD
+<<<<<<< HEAD
         let string_builder = builder.field_builder::<StringBuilder>(0).unwrap();
         for v in first.as_ref() {
             if let Some(s) = v {
                 string_builder.append_value(s)?;
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+        let string_builder = builder.field_builder::<BinaryBuilder>(0).unwrap();
+        for v in first.as_ref() {
+            if let Some(s) = v {
+                string_builder.append_string(s)?;
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
             } else {
                 string_builder.append_null()?;
             }
@@ -2161,6 +2301,8 @@ mod tests {
 
         Ok(builder.finish())
     }
+<<<<<<< HEAD
+<<<<<<< HEAD
 
     #[test]
     fn test_null_json_equal() {
@@ -2190,4 +2332,8 @@ mod tests {
         assert!(arrow_array.ne(&json_array));
         assert!(json_array.ne(&arrow_array));
     }
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
 }

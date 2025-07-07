@@ -18,10 +18,11 @@
 
 #' @title RecordBatchReader classes
 #' @description Apache Arrow defines two formats for [serializing data for interprocess
-#' communication (IPC)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc):
+#' communication
+#' (IPC)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc):
 #' a "stream" format and a "file" format, known as Feather.
 #' `RecordBatchStreamReader` and `RecordBatchFileReader` are
-#' interfaces for accessing record batches from input sources those formats,
+#' interfaces for accessing record batches from input sources in those formats,
 #' respectively.
 #'
 #' For guidance on how to use these classes, see the examples section.
@@ -55,13 +56,13 @@
 #'
 #' @rdname RecordBatchReader
 #' @name RecordBatchReader
-#' @include arrow-package.R
+#' @export
+#' @include arrow-object.R
 #' @examples
-#' \donttest{
 #' tf <- tempfile()
 #' on.exit(unlink(tf))
 #'
-#' batch <- record_batch(iris)
+#' batch <- record_batch(chickwts)
 #'
 #' # This opens a connection to the file in Arrow
 #' file_obj <- FileOutputStream$create(tf)
@@ -87,32 +88,72 @@
 #' # Call as.data.frame to turn that Table into an R data.frame
 #' df <- as.data.frame(tab)
 #' # This should be the same data we sent
-#' all.equal(df, iris, check.attributes = FALSE)
+#' all.equal(df, chickwts, check.attributes = FALSE)
 #' # Unlike the Writers, we don't have to close RecordBatchReaders,
 #' # but we do still need to close the file connection
 #' read_file_obj$close()
-#' }
-RecordBatchReader <- R6Class("RecordBatchReader", inherit = ArrowObject,
+RecordBatchReader <- R6Class("RecordBatchReader",
+  inherit = ArrowObject,
   public = list(
-    read_next_batch = function() {
-      shared_ptr(RecordBatch, RecordBatchReader__ReadNext(self))
+    read_next_batch = function() RecordBatchReader__ReadNext(self),
+    batches = function() RecordBatchReader__batches(self),
+    read_table = function() Table__from_RecordBatchReader(self),
+    Close = function() RecordBatchReader__Close(self),
+    export_to_c = function(stream_ptr) ExportRecordBatchReader(self, stream_ptr),
+    ToString = function() format_schema(self),
+    .unsafe_delete = function() {
+      RecordBatchReader__UnsafeDelete(self)
+      super$.unsafe_delete()
     }
   ),
   active = list(
-    schema = function() shared_ptr(Schema, RecordBatchReader__schema(self))
+    schema = function() RecordBatchReader__schema(self)
   )
 )
+RecordBatchReader$create <- function(..., batches = list(...), schema = NULL) {
+  are_batches <- map_lgl(batches, ~ inherits(., "RecordBatch"))
+  if (!all(are_batches)) {
+    stop(
+      "All inputs to RecordBatchReader$create must be RecordBatches",
+      call. = FALSE
+    )
+  }
+  RecordBatchReader__from_batches(batches, schema)
+}
+
+#' @export
+names.RecordBatchReader <- function(x) names(x$schema)
+
+#' @export
+dim.RecordBatchReader <- function(x) c(NA_integer_, length(x$schema))
+
+#' @export
+as.data.frame.RecordBatchReader <- function(x, row.names = NULL, optional = FALSE, ...) {
+  as.data.frame(x$read_table(), row.names = row.names, optional = optional, ...)
+}
+
+#' @export
+head.RecordBatchReader <- function(x, n = 6L, ...) {
+  assert_is(n, c("numeric", "integer"))
+  assert_that(length(n) == 1)
+  # Negative n requires knowing nrow(x), which requires consuming the whole RBR
+  assert_that(n >= 0)
+  if (!is.integer(n)) {
+    n <- floor(n)
+  }
+  RecordBatchReader__Head(x, n)
+}
+
+#' @export
+tail.RecordBatchReader <- function(x, n = 6L, ...) {
+  tail_from_batches(x$batches(), n)
+}
 
 #' @rdname RecordBatchReader
 #' @usage NULL
 #' @format NULL
 #' @export
-RecordBatchStreamReader <- R6Class("RecordBatchStreamReader", inherit = RecordBatchReader,
-  public = list(
-    batches = function() map(ipc___RecordBatchStreamReader__batches(self), shared_ptr, class = RecordBatch),
-    read_table = function() shared_ptr(Table, Table__from_RecordBatchStreamReader(self))
-  )
-)
+RecordBatchStreamReader <- R6Class("RecordBatchStreamReader", inherit = RecordBatchReader)
 RecordBatchStreamReader$create <- function(stream) {
   if (inherits(stream, c("raw", "Buffer"))) {
     # TODO: deprecate this because it doesn't close the connection to the Buffer
@@ -120,27 +161,31 @@ RecordBatchStreamReader$create <- function(stream) {
     stream <- BufferReader$create(stream)
   }
   assert_is(stream, "InputStream")
-  shared_ptr(RecordBatchStreamReader, ipc___RecordBatchStreamReader__Open(stream))
+  ipc___RecordBatchStreamReader__Open(stream)
 }
+#' @include arrowExports.R
+RecordBatchReader$import_from_c <- RecordBatchStreamReader$import_from_c <- ImportRecordBatchReader
 
 #' @rdname RecordBatchReader
 #' @usage NULL
 #' @format NULL
 #' @export
-RecordBatchFileReader <- R6Class("RecordBatchFileReader", inherit = ArrowObject,
-  # Why doesn't this inherit from RecordBatchReader?
+RecordBatchFileReader <- R6Class("RecordBatchFileReader",
+  inherit = ArrowObject,
+  # Why doesn't this inherit from RecordBatchReader in C++?
+  # Origin: https://github.com/apache/arrow/pull/679
   public = list(
     get_batch = function(i) {
-      shared_ptr(RecordBatch, ipc___RecordBatchFileReader__ReadRecordBatch(self, i))
+      ipc___RecordBatchFileReader__ReadRecordBatch(self, i)
     },
     batches = function() {
-      map(ipc___RecordBatchFileReader__batches(self), shared_ptr, class = RecordBatch)
+      ipc___RecordBatchFileReader__batches(self)
     },
-    read_table = function() shared_ptr(Table, Table__from_RecordBatchFileReader(self))
+    read_table = function() Table__from_RecordBatchFileReader(self)
   ),
   active = list(
     num_record_batches = function() ipc___RecordBatchFileReader__num_record_batches(self),
-    schema = function() shared_ptr(Schema, ipc___RecordBatchFileReader__schema(self))
+    schema = function() ipc___RecordBatchFileReader__schema(self)
   )
 )
 RecordBatchFileReader$create <- function(file) {
@@ -150,5 +195,78 @@ RecordBatchFileReader$create <- function(file) {
     file <- BufferReader$create(file)
   }
   assert_is(file, "InputStream")
-  shared_ptr(RecordBatchFileReader, ipc___RecordBatchFileReader__Open(file))
+  ipc___RecordBatchFileReader__Open(file)
+}
+
+#' Convert an object to an Arrow RecordBatchReader
+#'
+#' @param x An object to convert to a [RecordBatchReader]
+#' @param schema The [schema()] that must match the schema returned by each
+#'   call to `x` when `x` is a function.
+#' @param ... Passed to S3 methods
+#'
+#' @return A [RecordBatchReader]
+#' @export
+#'
+#' @examplesIf arrow_with_dataset()
+#' reader <- as_record_batch_reader(data.frame(col1 = 1, col2 = "two"))
+#' reader$read_next_batch()
+#'
+as_record_batch_reader <- function(x, ...) {
+  UseMethod("as_record_batch_reader")
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.RecordBatchReader <- function(x, ...) {
+  x
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.Table <- function(x, ...) {
+  RecordBatchReader__from_Table(x)
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.RecordBatch <- function(x, ...) {
+  RecordBatchReader$create(x, schema = x$schema)
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.data.frame <- function(x, ...) {
+  check_named_cols(x)
+  RecordBatchReader$create(as_record_batch(x))
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.Dataset <- function(x, ...) {
+  Scanner$create(x)$ToRecordBatchReader()
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.function <- function(x, ..., schema) {
+  assert_that(inherits(schema, "Schema"))
+  RecordBatchReader__from_function(x, schema)
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.arrow_dplyr_query <- function(x, ...) {
+  # See query-engine.R for ExecPlan/Nodes
+  plan <- ExecPlan$create()
+  final_node <- plan$Build(x)
+  on.exit(plan$.unsafe_delete())
+
+  plan$Run(final_node)
+}
+
+#' @rdname as_record_batch_reader
+#' @export
+as_record_batch_reader.Scanner <- function(x, ...) {
+  x$ToRecordBatchReader()
 }

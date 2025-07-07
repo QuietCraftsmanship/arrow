@@ -15,17 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../../data/tables';
+import { generateRandomTables } from '../../../data/tables.js';
+import { ArrowIOTestHelper } from '../helpers.js';
+import { validateRecordBatchReader } from '../validate.js';
 
-import { ArrowIOTestHelper } from '../helpers';
-import { RecordBatchReader } from '../../../Arrow';
-import { validateRecordBatchReader } from '../validate';
-
-/* tslint:disable */
-const { parse: bignumJSONParse } = require('json-bignum');
+import { RecordBatchReader } from 'apache-arrow';
 
 for (const table of generateRandomTables([10, 20, 30])) {
 
@@ -35,7 +29,7 @@ for (const table of generateRandomTables([10, 20, 30])) {
     describe(`RecordBatchJSONReader (${name})`, () => {
         describe(`should read all RecordBatches`, () => {
             test(`Uint8Array`, io.buffer((buffer) => {
-                const json = bignumJSONParse(Buffer.from(buffer).toString());
+                const json = JSON.parse(Buffer.from(buffer).toString());
                 validateRecordBatchReader('json', 3, RecordBatchReader.from(json));
             }));
         });

@@ -17,14 +17,15 @@
 
 #include "gandiva/expression_registry.h"
 
+#include "arrow/util/logging_internal.h"
 #include "gandiva/function_registry.h"
 #include "gandiva/llvm_types.h"
 
 namespace gandiva {
 
-ExpressionRegistry::ExpressionRegistry() {
-  function_registry_.reset(new FunctionRegistry());
-}
+ExpressionRegistry::ExpressionRegistry(
+    std::shared_ptr<FunctionRegistry> function_registry)
+    : function_registry_{function_registry} {}
 
 ExpressionRegistry::~ExpressionRegistry() {}
 
@@ -60,8 +61,8 @@ FunctionSignature ExpressionRegistry::FunctionSignatureIterator::operator*() {
   return *func_sig_it_;
 }
 
-ExpressionRegistry::func_sig_iterator_type ExpressionRegistry::FunctionSignatureIterator::
-operator++(int increment) {
+ExpressionRegistry::func_sig_iterator_type
+ExpressionRegistry::FunctionSignatureIterator::operator++(int increment) {
   ++func_sig_it_;
   // point func_sig_it_ to first signature of next nativefunction if func_sig_it_ is
   // pointing to end
@@ -158,7 +159,7 @@ static void AddArrowTypesToVector(arrow::Type::type type, DataTypeVector& vector
       vector.push_back(arrow::null());
       break;
     case arrow::Type::type::DECIMAL:
-      vector.push_back(arrow::decimal(38, 0));
+      vector.push_back(arrow::decimal128(38, 0));
       break;
     case arrow::Type::type::INTERVAL_MONTHS:
       vector.push_back(arrow::month_interval());

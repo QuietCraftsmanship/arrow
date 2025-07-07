@@ -1,12 +1,20 @@
 cffi
 cython
-hypothesis==5.0; python_version <= "3.5.2"
-hypothesis; python_version > "3.5.2"
-numpy==1.14.5; python_version < "3.8"
-numpy==1.17.3; python_version >= "3.8"
-pandas==0.24; python_version <= "3.5.2"
-pandas; python_version > "3.5.2"
-pickle5; python_version == "3.6" or python_version == "3.7"
+hypothesis
+packaging
 pytest
-pytest-lazy-fixture
 pytz
+pyuwsgi; sys.platform != 'win32' and python_version < '3.13'
+requests; sys_platform == 'win32'
+tzdata; sys_platform == 'win32'
+
+# We generally test with the oldest numpy version that supports a given Python
+# version. However, there is no need to make this strictly the oldest version,
+# so it can be broadened to have a single version specification across platforms.
+# (`~=x.y.z` specifies a compatible release as `>=x.y.z, == x.y.*`)
+numpy~=1.21.3; python_version < "3.11"
+numpy~=1.23.2; python_version == "3.11"
+numpy~=1.26.0; python_version == "3.12"
+numpy~=2.1.0; python_version >= "3.13"
+
+pandas

@@ -17,11 +17,12 @@
 
 #include "benchmark/benchmark.h"
 
+#include "arrow/array/array_base.h"
+#include "arrow/chunked_array.h"
 #include "arrow/compute/api_vector.h"
-#include "arrow/compute/benchmark_util.h"
-#include "arrow/compute/test_util.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
+#include "arrow/util/benchmark_util.h"
 
 namespace arrow {
 namespace compute {
@@ -50,9 +51,8 @@ static void NthToIndicesInt64(benchmark::State& state) {
 
 BENCHMARK(NthToIndicesInt64)
     ->Apply(RegressionSetArgs)
-    ->Args({1 << 20, 1})
-    ->Args({1 << 23, 1})
-    ->MinTime(1.0)
+    ->Args({1 << 20, 100})
+    ->Args({1 << 23, 100})
     ->Unit(benchmark::TimeUnit::kNanosecond);
 
 }  // namespace compute

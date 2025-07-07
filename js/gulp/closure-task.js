@@ -15,44 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const {
-    targetDir,
-    mainExport,
-    esmRequire,
-    gCCLanguageNames,
-    publicModulePaths,
-    observableFromStreams,
-    shouldRunInChildProcess,
-    spawnGulpCommandInChildProcess,
-} = require('./util');
+import { targetDir, mainExport, gCCLanguageNames, publicModulePaths, observableFromStreams, shouldRunInChildProcess, spawnGulpCommandInChildProcess } from "./util.js";
 
-const fs = require('fs');
-const gulp = require('gulp');
-const path = require('path');
-const sourcemaps = require('gulp-sourcemaps');
-const { memoizeTask } = require('./memoize-task');
-const { compileBinFiles } = require('./typescript-task');
-const mkdirp = require('util').promisify(require('mkdirp'));
-const closureCompiler = require('google-closure-compiler').gulp();
+import fs from 'node:fs';
+import gulp from 'gulp';
+import Path from 'node:path';
+import https from 'node:https';
+import { mkdirp } from 'mkdirp';
+import { PassThrough } from 'node:stream';
+import sourcemaps from 'gulp-sourcemaps';
+import { memoizeTask } from './memoize-task.js';
+import { compileBinFiles } from './typescript-task.js';
 
-const closureTask = ((cache) => memoizeTask(cache, async function closure(target, format) {
+import closureCompiler from 'google-closure-compiler';
+const compiler = closureCompiler.gulp();
+
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const closureCompilerVer = JSON.parse(fs.readFileSync(Path.join(__dirname, '..', 'package.json'))).devDependencies['google-closure-compiler'].split('.')[0];
+
+export const closureTask = ((cache) => memoizeTask(cache, async function closure(target, format) {
 
     if (shouldRunInChildProcess(target, format)) {
         return spawnGulpCommandInChildProcess('compile', target, format);
     }
 
     const src = targetDir(target, `cls`);
-    const srcAbsolute = path.resolve(src);
+    const srcAbsolute = Path.resolve(src);
     const out = targetDir(target, format);
-    const externs = path.join(`${out}/${mainExport}.externs.js`);
-    const entry_point = path.join(`${src}/${mainExport}.dom.cls.js`);
+    const externs = Path.join(`${out}/${mainExport}.externs.js`);
+    const entry_point = Path.join(`${src}/${mainExport}.dom.cls.js`);
 
-    const exportedImports = publicModulePaths(srcAbsolute).reduce((entries, publicModulePath) => [
-        ...entries, {
+    const exportedImports = [];
+    for (const publicModulePath of publicModulePaths(srcAbsolute)) {
+        exportedImports.push({
             publicModulePath,
-            exports_: getPublicExportedNames(esmRequire(publicModulePath, { warnings: false }))
-        }
-    ], []);
+            exports_: getPublicExportedNames(await import(`file://${publicModulePath}`))
+        });
+    }
 
     await mkdirp(out);
 
@@ -61,39 +63,83 @@ const closureTask = ((cache) => memoizeTask(cache, async function closure(target
         fs.promises.writeFile(entry_point, generateUMDExportAssignment(srcAbsolute, exportedImports))
     ]);
 
-    return await Promise.all([
+    const closeCompilerPolyfills = [];
+
+    await Promise.all([
         runClosureCompileAsObservable().toPromise(),
-        compileBinFiles(target, format).toPromise()
+        compileBinFiles(target, format).toPromise().then(() => Promise.all([
+            observableFromStreams(gulp.src(`${src}/**/*.d.ts`), gulp.dest(out)).toPromise(), // copy .d.ts files,
+            observableFromStreams(gulp.src(`${src}/**/*.d.ts.map`), gulp.dest(out)).toPromise(), // copy .d.ts.map files,
+            observableFromStreams(gulp.src(`${src}/src/**/*`), gulp.dest(`${out}/src`)).toPromise(), // copy TS source files,
+        ]))
     ]);
+
+    // Download the closure compiler polyfill sources for sourcemaps
+    await Promise.all(closeCompilerPolyfills.map(async (path) => {
+
+        await fs.promises.mkdir(
+            Path.join(out, Path.parse(path).dir),
+            { recursive: true, mode: 0o755 }
+        );
+
+        const res = new PassThrough();
+        const req = https.request(
+            new URL(`https://raw.githubusercontent.com/google/closure-compiler/v${closureCompilerVer}/${path}`),
+            (res_) => {
+                if (res_.statusCode === 200) {
+                    res_.pipe(res);
+                } else {
+                    res.end();
+                }
+            }
+        );
+
+        req.on('error', (e) => res.emit('error', e)).end();
+
+        return observableFromStreams(res, fs.createWriteStream(Path.join(out, path))).toPromise();
+    }));
 
     function runClosureCompileAsObservable() {
         return observableFromStreams(
             gulp.src([
                 /* external libs first */
                 `node_modules/flatbuffers/package.json`,
-                `node_modules/flatbuffers/js/flatbuffers.mjs`,
-                `node_modules/text-encoding-utf-8/package.json`,
-                `node_modules/text-encoding-utf-8/src/encoding.js`,
+                `node_modules/flatbuffers/**/*.js`,
                 `${src}/**/*.js` /* <-- then source globs */
             ], { base: `./` }),
             sourcemaps.init(),
-            closureCompiler(createClosureArgs(entry_point, externs)),
+            compiler(createClosureArgs(entry_point, externs, target), {
+                platform: ['native', 'java', 'javascript']
+            }),
+            sourcemaps.mapSources((path) => {
+                if (path.indexOf(`${src}/`) === 0) {
+                    return path.slice(`${src}/`.length);
+                }
+                if (path.includes('com/google')) {
+                    closeCompilerPolyfills.push(path);
+                    return path.slice(`src/`.length);
+                }
+                return path;
+            }),
             // rename the sourcemaps from *.js.map files to *.min.js.map
-            sourcemaps.write(`.`, { mapFile: (mapPath) => mapPath.replace(`.js.map`, `.${target}.min.js.map`) }),
+            sourcemaps.write(`./`, {
+                sourceRoot: './src',
+                includeContent: false,
+                mapFile: (mapPath) => mapPath.replace(`.js.map`, `.${target}.min.js.map`),
+            }),
             gulp.dest(out)
         );
     }
 }))({});
 
-module.exports = closureTask;
-module.exports.closureTask = closureTask;
+export default closureTask;
 
-const createClosureArgs = (entry_point, externs) => ({
+const createClosureArgs = (entry_point, externs, target) => ({
     externs,
     entry_point,
     third_party: true,
     warning_level: `QUIET`,
-    dependency_mode: `STRICT`,
+    dependency_mode: `PRUNE`,
     rewrite_polyfills: false,
     module_resolution: `NODE`,
     // formatting: `PRETTY_PRINT`,
@@ -103,8 +149,8 @@ const createClosureArgs = (entry_point, externs) => ({
     assume_function_wrapper: true,
     js_output_file: `${mainExport}.js`,
     language_in: gCCLanguageNames[`esnext`],
-    language_out: gCCLanguageNames[`es5`],
-    output_wrapper:`${apacheHeader()}
+    language_out: gCCLanguageNames[target],
+    output_wrapper: `${apacheHeader()}
 (function (global, factory) {
     typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
     typeof define === 'function' && define.amd ? define(['exports'], factory) :
@@ -148,7 +194,7 @@ function externBody({ exportName, staticNames, instanceNames }) {
 function externsHeader() {
     return (`${apacheHeader()}
 // @ts-nocheck
-/* tslint:disable */
+/* eslint-disable */
 /**
  * @fileoverview Closure Compiler externs for Arrow
  * @externs
@@ -160,11 +206,21 @@ Symbol.iterator;
 Symbol.toPrimitive;
 /** @type {symbol} */
 Symbol.asyncIterator;
+
+var Encoding = function() {};
+/** @type {?} */
+Encoding[1] = function() {};
+/** @type {?} */
+Encoding[2] = function() {};
+/** @type {?} */
+Encoding.UTF8_BYTES = function() {};
+/** @type {?} */
+Encoding.UTF16_STRING = function() {};
 `);
 }
 
 function getPublicExportedNames(entryModule) {
-    const fn = function() {};
+    const fn = function () { };
     const isStaticOrProtoName = (x) => (
         !(x in fn) &&
         (x !== `default`) &&
@@ -209,5 +265,5 @@ function apacheHeader() {
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
-// under the License.`
+// under the License.`;
 }

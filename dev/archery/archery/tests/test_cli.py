@@ -15,111 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from click.testing import CliRunner
 
 from archery.cli import archery
-from archery.docker import DockerCompose
 
 
-@pytest.mark.parametrize(('command', 'args', 'kwargs'), [
-    (
-        ['ubuntu-cpp'],
-        ['ubuntu-cpp'],
-        dict(
-            command=None,
-            env={},
-            force_pull=True,
-            force_build=True,
-            use_cache=True,
-            use_leaf_cache=True,
-            volumes=()
-        )
-    ),
-    (
-        ['ubuntu-cpp', 'bash'],
-        ['ubuntu-cpp'],
-        dict(
-            command='bash',
-            env={},
-            force_pull=True,
-            force_build=True,
-            use_cache=True,
-            use_leaf_cache=True,
-            volumes=()
-        )
-    ),
-    (
-        ['ubuntu-cpp', '--no-pull', '--no-build'],
-        ['ubuntu-cpp'],
-        dict(
-            command=None,
-            env={},
-            force_pull=False,
-            force_build=False,
-            use_cache=True,
-            use_leaf_cache=True,
-            volumes=()
-        )
-    ),
-    (
-        [
-            'ubuntu-cpp', '--no-pull', '--force-build', '--no-cache',
-            '--no-leaf-cache'
-        ],
-        ['ubuntu-cpp'],
-        dict(
-            command=None,
-            env={},
-            force_pull=False,
-            force_build=True,
-            use_cache=False,
-            use_leaf_cache=False,
-            volumes=()
-        )
-    ),
-    (
-        ['-e', 'ARROW_GANDIVA=OFF', '-e', 'ARROW_FLIGHT=ON', 'ubuntu-cpp'],
-        ['ubuntu-cpp'],
-        dict(
-            command=None,
-            env={
-                'ARROW_GANDIVA': 'OFF',
-                'ARROW_FLIGHT': 'ON'
-            },
-            force_pull=True,
-            force_build=True,
-            use_cache=True,
-            use_leaf_cache=True,
-            volumes=()
-        )
-    ),
-    (
-        [
-            '--volume', './build:/build', '-v', './ccache:/ccache:delegated',
-            'ubuntu-cpp'
-        ],
-        ['ubuntu-cpp'],
-        dict(
-            command=None,
-            env={},
-            force_pull=True,
-            force_build=True,
-            use_cache=True,
-            use_leaf_cache=True,
-            volumes=(
-                './build:/build',
-                './ccache:/ccache:delegated',
-            )
-        )
+@patch("archery.linking.check_dynamic_library_dependencies")
+def test_linking_check_dependencies(fn):
+    args = [
+        "linking",
+        "check-dependencies",
+        "-a", "libarrow",
+        "-d", "libcurl",
+        "somelib.so"
+    ]
+    result = CliRunner().invoke(archery, args)
+    assert result.exit_code == 0
+    fn.assert_called_once_with(
+        Path('somelib.so'), allowed={'libarrow'}, disallowed={'libcurl'}
     )
-])
-def test_docker_run(command, args, kwargs):
-    runner = CliRunner()
-
-    with patch.object(DockerCompose, 'run') as run:
-        result = runner.invoke(archery, ['docker', 'run'] + command)
-        assert result.exit_code == 0
-        run.assert_called_once_with(*args, **kwargs)

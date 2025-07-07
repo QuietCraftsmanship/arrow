@@ -17,11 +17,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
+require "English"
+require "json"
+
+require_relative "../../release/binary-task"
+require_relative "helper"
+
 packages = [
   "apache-arrow",
-  "apache-arrow-archive-keyring",
+  "apache-arrow-apt-source",
   "apache-arrow-release",
 ]
+
 
 namespace :apt do
   desc "Build deb packages"
@@ -75,3 +82,20 @@ namespace :docker do
     end
   end
 end
+
+
+class ApacheArrowLocalBinaryTask < LocalBinaryTask
+  include Helper::ApacheArrow
+
+  def initialize(packages)
+    super(packages, File.expand_path(arrow_source_dir))
+  end
+
+  private
+  def version
+    @version ||= detect_version(detect_release_time)
+  end
+end
+
+local_binary_task = ApacheArrowLocalBinaryTask.new(packages)
+local_binary_task.define

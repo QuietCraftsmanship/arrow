@@ -21,8 +21,6 @@ namespace Apache.Arrow
 {
     public class ListArray : Array
     {
-
-
         public class Builder : IArrowArrayBuilder<ListArray, Builder>
         {
             public IArrowArrayBuilder<IArrowArray, IArrowArrayBuilder<IArrowArray>> ValueBuilder { get; }
@@ -31,7 +29,7 @@ namespace Apache.Arrow
 
             private ArrowBuffer.Builder<int> ValueOffsetsBufferBuilder { get; }
 
-            private BooleanArray.Builder ValidityBufferBuilder { get; }
+            private ArrowBuffer.BitmapBuilder ValidityBufferBuilder { get; }
 
             public int NullCount { get; protected set; }
 
@@ -49,7 +47,7 @@ namespace Apache.Arrow
             {
                 ValueBuilder = ArrowArrayBuilderFactory.Build(dataType.ValueDataType);
                 ValueOffsetsBufferBuilder = new ArrowBuffer.Builder<int>();
-                ValidityBufferBuilder = new BooleanArray.Builder();
+                ValidityBufferBuilder = new ArrowBuffer.BitmapBuilder();
                 DataType = dataType;
             }
 
@@ -79,10 +77,10 @@ namespace Apache.Arrow
 
             public ListArray Build(MemoryAllocator allocator = default)
             {
-                Append();
+                ValueOffsetsBufferBuilder.Append(ValueBuilder.Length);
 
                 ArrowBuffer validityBuffer = NullCount > 0
-                                        ? ValidityBufferBuilder.Build(allocator).ValueBuffer
+                                        ? ValidityBufferBuilder.Build(allocator)
                                         : ArrowBuffer.Empty;
 
                 return new ListArray(DataType, Length - 1,
@@ -93,14 +91,14 @@ namespace Apache.Arrow
             public Builder Reserve(int capacity)
             {
                 ValueOffsetsBufferBuilder.Reserve(capacity + 1);
-                ValidityBufferBuilder.Reserve(capacity + 1);
+                ValidityBufferBuilder.Reserve(capacity);
                 return this;
             }
 
             public Builder Resize(int length)
             {
                 ValueOffsetsBufferBuilder.Resize(length + 1);
-                ValidityBufferBuilder.Resize(length + 1);
+                ValidityBufferBuilder.Resize(length);
                 return this;
             }
 
@@ -138,6 +136,14 @@ namespace Apache.Arrow
         {
             data.EnsureBufferCount(2);
             data.EnsureDataType(ArrowTypeId.List);
+            Values = values;
+        }
+
+        // Constructor for child MapArray
+        internal ListArray(ArrayData data, IArrowArray values, ArrowTypeId typeId) : base(data)
+        {
+            data.EnsureBufferCount(2);
+            data.EnsureDataType(typeId);
             Values = values;
         }
 

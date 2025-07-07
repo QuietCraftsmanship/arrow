@@ -29,20 +29,32 @@ if(DEFINED ENV{CUDA_HOME})
   set(CUDA_TOOLKIT_ROOT_DIR "$ENV{CUDA_HOME}")
 endif()
 
-find_package(CUDA REQUIRED)
-include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
-
-message(STATUS "CUDA Libraries: ${CUDA_LIBRARIES}")
+set(ARROW_CUDA_LINK_LIBS arrow::flatbuffers)
+if(CMAKE_VERSION VERSION_LESS 3.17)
+  find_package(CUDA REQUIRED)
+  add_library(ArrowCUDA::cuda_driver SHARED IMPORTED)
+  set_target_properties(ArrowCUDA::cuda_driver
+                        PROPERTIES IMPORTED_LOCATION "${CUDA_CUDA_LIBRARY}"
+                                   INTERFACE_INCLUDE_DIRECTORIES "${CUDA_INCLUDE_DIRS}")
+  set(ARROW_CUDA_SHARED_LINK_LIBS ArrowCUDA::cuda_driver)
+else()
+  # find_package(CUDA) is deprecated, and for newer CUDA, it doesn't
+  # recognize that the CUDA driver library is in the "stubs" dir, but
+  # CUDAToolkit is only available in CMake >= 3.17
+  find_package(CUDAToolkit REQUIRED)
+  set(ARROW_CUDA_SHARED_LINK_LIBS CUDA::cuda_driver)
+endif()
 
 set(ARROW_CUDA_SRCS cuda_arrow_ipc.cc cuda_context.cc cuda_internal.cc cuda_memory.cc)
 
-set(ARROW_CUDA_SHARED_LINK_LIBS ${CUDA_LIBRARIES} ${CUDA_CUDA_LIBRARY})
-
+set(ARROW_CUDA_PKG_CONFIG_NAME_ARGS)
+if(NOT WINDOWS)
+  list(APPEND ARROW_CUDA_PKG_CONFIG_NAME_ARGS PKG_CONFIG_NAME arrow-cuda)
+endif()
 add_arrow_lib(arrow_cuda
               CMAKE_PACKAGE_NAME
               ArrowCUDA
-              PKG_CONFIG_NAME
-              arrow-cuda
+              ${ARROW_CUDA_PKG_CONFIG_NAME_ARGS}
               SOURCES
               ${ARROW_CUDA_SRCS}
               OUTPUTS
@@ -50,10 +62,19 @@ add_arrow_lib(arrow_cuda
               SHARED_LINK_FLAGS
               ${ARROW_VERSION_SCRIPT_FLAGS} # Defined in cpp/arrow/CMakeLists.txt
               SHARED_LINK_LIBS
+              ${ARROW_CUDA_LINK_LIBS}
               arrow_shared
               ${ARROW_CUDA_SHARED_LINK_LIBS}
+              SHARED_INSTALL_INTERFACE_LIBS
+              Arrow::arrow_shared
+              ${ARROW_CUDA_SHARED_LINK_LIBS}
               # Static arrow_cuda must also link against CUDA shared libs
-              STATIC_LINK_LIBS ${ARROW_CUDA_SHARED_LINK_LIBS})
+              STATIC_LINK_LIBS
+              ${ARROW_CUDA_LINK_LIBS}
+              ${ARROW_CUDA_SHARED_LINK_LIBS}
+              STATIC_INSTALL_INTERFACE_LIBS
+              Arrow::arrow_static
+              ${ARROW_CUDA_SHARED_LINK_LIBS})
 
 add_dependencies(arrow_cuda ${ARROW_CUDA_LIBRARIES})
 
@@ -69,15 +90,23 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cuda_version.h"
 
 arrow_install_all_headers("arrow/gpu")
 
-set(ARROW_CUDA_TEST_LINK_LIBS arrow_cuda_shared ${ARROW_TEST_LINK_LIBS})
+if(ARROW_BUILD_SHARED)
+  set(ARROW_CUDA_LIBRARY arrow_cuda_shared)
+else()
+  set(ARROW_CUDA_LIBRARY arrow_cuda_static)
+endif()
+
+set(ARROW_CUDA_TEST_LINK_LIBS ${ARROW_CUDA_LIBRARY} ${ARROW_TEST_LINK_LIBS})
 
 if(ARROW_BUILD_TESTS)
   add_arrow_test(cuda_test STATIC_LINK_LIBS ${ARROW_CUDA_TEST_LINK_LIBS} NO_VALGRIND)
 endif()
 
 if(ARROW_BUILD_BENCHMARKS)
-  cuda_add_executable(arrow-cuda-benchmark cuda_benchmark.cc)
-  target_link_libraries(arrow-cuda-benchmark arrow_cuda_shared GTest::gtest
-                        ${ARROW_BENCHMARK_LINK_LIBS})
-  add_dependencies(arrow_cuda-benchmarks arrow-cuda-benchmark)
+  add_arrow_benchmark(cuda_benchmark
+                      PREFIX
+                      "arrow-gpu"
+                      EXTRA_LINK_LIBS
+                      ${ARROW_CUDA_LIBRARY})
+  add_dependencies(arrow_cuda-benchmarks arrow-gpu-cuda-benchmark)
 endif()

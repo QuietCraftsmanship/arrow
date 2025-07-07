@@ -16,6 +16,7 @@
 // under the License.
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <string>
 #include <utility>
@@ -24,11 +25,17 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "arrow/buffer.h"
+#include "arrow/filesystem/mockfs.h"
 #include "arrow/filesystem/test_util.h"
-#include "arrow/filesystem/util_internal.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/status.h"
+#include "arrow/testing/future_util.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/util/async_generator.h"
+#include "arrow/util/io_util.h"
+#include "arrow/util/key_value_metadata.h"
+#include "arrow/util/vector.h"
 
 using ::testing::ElementsAre;
 
@@ -80,6 +87,16 @@ void AssertAllFiles(FileSystem* fs, const std::vector<std::string>& expected_pat
 
 void ValidateTimePoint(TimePoint tp) { ASSERT_GE(tp.time_since_epoch().count(), 0); }
 
+void AssertRaisesWithErrno(int expected_errno, const Status& st) {
+  ASSERT_RAISES(IOError, st);
+  ASSERT_EQ(::arrow::internal::ErrnoFromStatus(st), expected_errno);
+}
+
+template <typename T>
+void AssertRaisesWithErrno(int expected_errno, const Result<T>& result) {
+  AssertRaisesWithErrno(expected_errno, result.status());
+}
+
 };  // namespace
 
 void AssertFileContents(FileSystem* fs, const std::string& path,
@@ -106,10 +123,19 @@ void CreateFile(FileSystem* fs, const std::string& path, const std::string& data
 }
 
 void SortInfos(std::vector<FileInfo>* infos) {
-  std::sort(infos->begin(), infos->end(),
-            [](const FileInfo& left, const FileInfo& right) -> bool {
-              return left.path() < right.path();
-            });
+  std::sort(infos->begin(), infos->end(), FileInfo::ByPath{});
+}
+
+std::vector<FileInfo> SortedInfos(const std::vector<FileInfo>& infos) {
+  auto sorted = infos;
+  SortInfos(&sorted);
+  return sorted;
+}
+
+void CollectFileInfoGenerator(FileInfoGenerator gen, FileInfoVector* out_infos) {
+  auto fut = CollectAsyncGenerator(gen);
+  ASSERT_FINISHES_OK_AND_ASSIGN(auto nested_infos, fut);
+  *out_infos = ::arrow::internal::FlattenVectors(nested_infos);
 }
 
 void AssertFileInfo(const FileInfo& info, const std::string& path, FileType type) {
@@ -158,6 +184,25 @@ void AssertFileInfo(FileSystem* fs, const std::string& path, FileType type,
   AssertFileInfo(info, path, type, size);
 }
 
+GatedMockFilesystem::GatedMockFilesystem(TimePoint current_time,
+                                         const io::IOContext& io_context)
+    : internal::MockFileSystem(current_time, io_context) {}
+GatedMockFilesystem::~GatedMockFilesystem() = default;
+
+Result<std::shared_ptr<io::OutputStream>> GatedMockFilesystem::OpenOutputStream(
+    const std::string& path, const std::shared_ptr<const KeyValueMetadata>& metadata) {
+  RETURN_NOT_OK(open_output_sem_.Acquire(1));
+  return MockFileSystem::OpenOutputStream(path, metadata);
+}
+
+Status GatedMockFilesystem::WaitForOpenOutputStream(uint32_t num_waiters) {
+  return open_output_sem_.WaitForWaiters(num_waiters);
+}
+
+Status GatedMockFilesystem::UnlockOpenOutputStream(uint32_t num_waiters) {
+  return open_output_sem_.Release(num_waiters);
+}
+
 ////////////////////////////////////////////////////////////////////////////
 // GenericFileSystemTest implementation
 
@@ -199,11 +244,16 @@ void GenericFileSystemTest::TestCreateDir(FileSystem* fs) {
   ASSERT_RAISES(IOError, fs->CreateDir("AB/def/EF/GH", true /* recursive */));
   ASSERT_RAISES(IOError, fs->CreateDir("AB/def/EF", false /* recursive */));
 
+  // Cannot create a directory when there is already a file with the same name
+  ASSERT_RAISES(IOError, fs->CreateDir("AB/def"));
+
   AssertAllDirs(fs, {"AB", "AB/CD", "AB/CD/EF", "AB/GH", "AB/GH/IJ", "XY"});
   AssertAllFiles(fs, {"AB/def"});
 }
 
 void GenericFileSystemTest::TestDeleteDir(FileSystem* fs) {
+  if (have_flaky_directory_tree_deletion()) GTEST_SKIP() << "Flaky directory deletion";
+
   ASSERT_OK(fs->CreateDir("AB/CD/EF"));
   ASSERT_OK(fs->CreateDir("AB/GH/IJ"));
   CreateFile(fs, "AB/abc", "");
@@ -230,6 +280,8 @@ void GenericFileSystemTest::TestDeleteDir(FileSystem* fs) {
 }
 
 void GenericFileSystemTest::TestDeleteDirContents(FileSystem* fs) {
+  if (have_flaky_directory_tree_deletion()) GTEST_SKIP() << "Flaky directory deletion";
+
   ASSERT_OK(fs->CreateDir("AB/CD/EF"));
   ASSERT_OK(fs->CreateDir("AB/GH/IJ"));
   CreateFile(fs, "AB/abc", "");
@@ -241,20 +293,39 @@ void GenericFileSystemTest::TestDeleteDirContents(FileSystem* fs) {
   AssertAllDirs(fs, {"AB", "AB/CD", "AB/GH", "AB/GH/IJ"});
   AssertAllFiles(fs, {"AB/abc"});
 
-  // Also with "" (== wipe filesystem)
-  ASSERT_OK(fs->DeleteDirContents(""));
-  if (!have_flaky_directory_tree_deletion()) {
-    AssertAllDirs(fs, {});
-  }
-  AssertAllFiles(fs, {});
+  // Calling DeleteDirContents on root directory is disallowed
+  ASSERT_RAISES(Invalid, fs->DeleteDirContents(""));
+  ASSERT_RAISES(Invalid, fs->DeleteDirContents("/"));
+  AssertAllDirs(fs, {"AB", "AB/CD", "AB/GH", "AB/GH/IJ"});
+  AssertAllFiles(fs, {"AB/abc"});
 
   // Not a directory
   CreateFile(fs, "abc", "");
   ASSERT_RAISES(IOError, fs->DeleteDirContents("abc"));
-  if (!have_flaky_directory_tree_deletion()) {
+  ASSERT_RAISES(IOError, fs->DeleteDirContents("abc", /*missing_dir_ok=*/true));
+  AssertAllFiles(fs, {"AB/abc", "abc"});
+
+  // Missing directory
+  ASSERT_RAISES(IOError, fs->DeleteDirContents("missing"));
+  ASSERT_OK(fs->DeleteDirContents("missing", /*missing_dir_ok=*/true));
+}
+
+void GenericFileSystemTest::TestDeleteRootDirContents(FileSystem* fs) {
+  if (have_flaky_directory_tree_deletion()) GTEST_SKIP() << "Flaky directory deletion";
+
+  ASSERT_OK(fs->CreateDir("AB/CD"));
+  CreateFile(fs, "AB/abc", "");
+
+  auto st = fs->DeleteRootDirContents();
+  if (!st.ok()) {
+    // Not all filesystems support deleting root directory contents
+    ASSERT_TRUE(st.IsInvalid() || st.IsNotImplemented());
+    AssertAllDirs(fs, {"AB", "AB/CD"});
+    AssertAllFiles(fs, {"AB/abc"});
+  } else {
     AssertAllDirs(fs, {});
+    AssertAllFiles(fs, {});
   }
-  AssertAllFiles(fs, {"abc"});
 }
 
 void GenericFileSystemTest::TestDeleteFile(FileSystem* fs) {
@@ -312,6 +383,10 @@ void GenericFileSystemTest::TestDeleteFiles(FileSystem* fs) {
 }
 
 void GenericFileSystemTest::TestMoveFile(FileSystem* fs) {
+  if (!allow_move_file()) {
+    GTEST_SKIP() << "Filesystem doesn't allow moving files";
+  }
+
   ASSERT_OK(fs->CreateDir("AB/CD"));
   ASSERT_OK(fs->CreateDir("EF"));
   CreateFile(fs, "abc", "data");
@@ -372,7 +447,9 @@ void GenericFileSystemTest::TestMoveFile(FileSystem* fs) {
   }
   // Parent destination is not a directory
   CreateFile(fs, "xxx", "");
-  ASSERT_RAISES(IOError, fs->Move("AB/pqr", "xxx/mno"));
+  if (!allow_write_implicit_dir_over_file()) {
+    ASSERT_RAISES(IOError, fs->Move("AB/pqr", "xxx/mno"));
+  }
   if (!allow_write_file_over_dir()) {
     // Destination is a directory
     ASSERT_RAISES(IOError, fs->Move("AB/pqr", "EF"));
@@ -383,9 +460,9 @@ void GenericFileSystemTest::TestMoveFile(FileSystem* fs) {
 
 void GenericFileSystemTest::TestMoveDir(FileSystem* fs) {
   if (!allow_move_dir()) {
-    // XXX skip
-    return;
+    GTEST_SKIP() << "Filesystem doesn't allow moving directories";
   }
+
   ASSERT_OK(fs->CreateDir("AB/CD"));
   ASSERT_OK(fs->CreateDir("EF"));
   CreateFile(fs, "AB/abc", "abc data");
@@ -420,20 +497,28 @@ void GenericFileSystemTest::TestMoveDir(FileSystem* fs) {
   AssertAllDirs(fs, {"EF", "KL", "KL/CD"});
   AssertAllFiles(fs, {"EF/ghi", "KL/CD/def", "KL/abc"});
 
-  // Destination is a non-empty directory
-  ASSERT_RAISES(IOError, fs->Move("KL", "EF"));
-  AssertAllDirs(fs, {"EF", "KL", "KL/CD"});
-  AssertAllFiles(fs, {"EF/ghi", "KL/CD/def", "KL/abc"});
-
   // Cannot move directory inside itself
   ASSERT_RAISES(IOError, fs->Move("KL", "KL/ZZ"));
-
-  // (other errors tested in TestMoveFile)
 
   // Contents didn't change
   AssertAllDirs(fs, {"EF", "KL", "KL/CD"});
   AssertFileContents(fs, "KL/abc", "abc data");
   AssertFileContents(fs, "KL/CD/def", "def data");
+
+  // Destination is a non-empty directory
+  if (!allow_move_dir_over_non_empty_dir()) {
+    ASSERT_RAISES(IOError, fs->Move("KL", "EF"));
+    AssertAllDirs(fs, {"EF", "KL", "KL/CD"});
+    AssertAllFiles(fs, {"EF/ghi", "KL/CD/def", "KL/abc"});
+  } else {
+    // In some filesystems such as HDFS, this operation is interpreted
+    // as with the Unix `mv` command, i.e. move KL *inside* EF.
+    ASSERT_OK(fs->Move("KL", "EF"));
+    AssertAllDirs(fs, {"EF", "EF/KL", "EF/KL/CD"});
+    AssertAllFiles(fs, {"EF/KL/CD/def", "EF/KL/abc", "EF/ghi"});
+  }
+
+  // (other errors tested in TestMoveFile)
 }
 
 void GenericFileSystemTest::TestCopyFile(FileSystem* fs) {
@@ -485,10 +570,73 @@ void GenericFileSystemTest::TestCopyFile(FileSystem* fs) {
     // Parent destination doesn't exist
     ASSERT_RAISES(IOError, fs->CopyFile("AB/abc", "XX/mno"));
   }
-  // Parent destination is not a directory
-  ASSERT_RAISES(IOError, fs->CopyFile("AB/abc", "def/mno"));
+  // Parent destination is not a directory ("def" is a file)
+  if (!allow_write_implicit_dir_over_file()) {
+    ASSERT_RAISES(IOError, fs->CopyFile("AB/abc", "def/mno"));
+  }
   AssertAllDirs(fs, all_dirs);
   AssertAllFiles(fs, {"AB/abc", "EF/ghi", "def"});
+}
+
+void GenericFileSystemTest::TestCopyFiles(FileSystem* fs) {
+#if defined(ADDRESS_SANITIZER) || defined(ARROW_VALGRIND)
+  if (have_false_positive_memory_leak_with_async_close()) {
+    GTEST_SKIP() << "Filesystem have false positive memory leak with generator";
+  }
+#endif
+  auto io_thread_pool =
+      static_cast<arrow::internal::ThreadPool*>(fs->io_context().executor());
+  auto original_threads = io_thread_pool->GetCapacity();
+  // Needs to be smaller than the number of files we test with to catch GH-15233
+  ASSERT_OK(io_thread_pool->SetCapacity(2));
+  // Ensure the thread pool capacity is set back to the original value after the test
+  auto reset_thread_pool = [io_thread_pool, original_threads](void*) {
+    ASSERT_OK(io_thread_pool->SetCapacity(original_threads));
+  };
+  std::unique_ptr<void, decltype(reset_thread_pool)> reset_thread_pool_guard(
+      nullptr, reset_thread_pool);
+
+  auto mock_fs = std::make_shared<arrow::fs::internal::MockFileSystem>(
+      std::chrono::system_clock::now());
+  std::vector<std::string> dirs0{"0", "0/AB", "0/AB/CD"};
+  std::map<std::string, std::string> files0{
+      {"0/123", "123 data"}, {"0/AB/abc", "abc data"}, {"0/AB/CD/def", "def data"}};
+
+  std::vector<std::string> dirs0and1{"0", "0/AB", "0/AB/CD", "1", "1/AB", "1/AB/CD"};
+  std::map<std::string, std::string> files0and1{
+      {"0/123", "123 data"}, {"0/AB/abc", "abc data"}, {"0/AB/CD/def", "def data"},
+      {"1/123", "123 data"}, {"1/AB/abc", "abc data"}, {"1/AB/CD/def", "def data"}};
+
+  ASSERT_OK(mock_fs->CreateDir("0/AB/CD"));
+  for (const auto& kv : files0) {
+    CreateFile(mock_fs.get(), kv.first, kv.second);
+  }
+
+  auto selector0 = arrow::fs::FileSelector{};
+  selector0.base_dir = "0";
+  selector0.recursive = true;
+
+  ASSERT_OK(CopyFiles(mock_fs, selector0, fs->shared_from_this(), "0"));
+  AssertAllDirs(fs, dirs0);
+  for (const auto& kv : files0) {
+    AssertFileContents(fs, kv.first, kv.second);
+  }
+
+  ASSERT_OK(CopyFiles(fs->shared_from_this(), selector0, fs->shared_from_this(), "1"));
+  AssertAllDirs(fs, dirs0and1);
+  for (const auto& kv : files0and1) {
+    AssertFileContents(fs, kv.first, kv.second);
+  }
+
+  auto selector1 = arrow::fs::FileSelector{};
+  selector1.base_dir = "1";
+  selector1.recursive = true;
+
+  ASSERT_OK(CopyFiles(fs->shared_from_this(), selector1, mock_fs, "1"));
+  AssertAllDirs(mock_fs.get(), dirs0and1);
+  for (const auto& kv : files0and1) {
+    AssertFileContents(mock_fs.get(), kv.first, kv.second);
+  }
 }
 
 void GenericFileSystemTest::TestGetFileInfo(FileSystem* fs) {
@@ -537,6 +685,23 @@ void GenericFileSystemTest::TestGetFileInfo(FileSystem* fs) {
   ASSERT_EQ(info.base_name(), "zz");
   ASSERT_EQ(info.size(), kNoSize);
   ASSERT_EQ(info.mtime(), kNoTime);
+}
+
+void GenericFileSystemTest::TestGetFileInfoAsync(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("AB/CD"));
+  CreateFile(fs, "AB/CD/ghi", "some data");
+
+  std::vector<FileInfo> infos;
+  auto fut = fs->GetFileInfoAsync({"AB", "AB/CD", "AB/zz", "zz", "XX/zz", "AB/CD/ghi"});
+  ASSERT_FINISHES_OK_AND_ASSIGN(infos, fut);
+
+  ASSERT_EQ(infos.size(), 6);
+  AssertFileInfo(infos[0], "AB", FileType::Directory);
+  AssertFileInfo(infos[1], "AB/CD", FileType::Directory);
+  AssertFileInfo(infos[2], "AB/zz", FileType::NotFound);
+  AssertFileInfo(infos[3], "zz", FileType::NotFound);
+  AssertFileInfo(infos[4], "XX/zz", FileType::NotFound);
+  AssertFileInfo(infos[5], "AB/CD/ghi", FileType::File, 9);
 }
 
 void GenericFileSystemTest::TestGetFileInfoVector(FileSystem* fs) {
@@ -649,6 +814,52 @@ void GenericFileSystemTest::TestGetFileInfoSelector(FileSystem* fs) {
   // Not a dir
   s.base_dir = "abc";
   ASSERT_RAISES(IOError, fs->GetFileInfo(s));
+}
+
+void GenericFileSystemTest::TestGetFileInfoGenerator(FileSystem* fs) {
+#if defined(ADDRESS_SANITIZER) || defined(ARROW_VALGRIND)
+  if (have_false_positive_memory_leak_with_generator()) {
+    GTEST_SKIP() << "Filesystem have false positive memory leak with generator";
+  }
+#endif
+
+  ASSERT_OK(fs->CreateDir("AB/CD"));
+  CreateFile(fs, "abc", "data");
+  CreateFile(fs, "AB/def", "some data");
+  CreateFile(fs, "AB/CD/ghi", "some other data");
+  CreateFile(fs, "AB/CD/jkl", "yet other data");
+
+  FileSelector s;
+  s.base_dir = "";
+  std::vector<FileInfo> infos;
+  std::vector<std::vector<FileInfo>> nested_infos;
+
+  // Non-recursive
+  auto gen = fs->GetFileInfoGenerator(s);
+  CollectFileInfoGenerator(std::move(gen), &infos);
+  SortInfos(&infos);
+  ASSERT_EQ(infos.size(), 2);
+  AssertFileInfo(infos[0], "AB", FileType::Directory);
+  AssertFileInfo(infos[1], "abc", FileType::File, 4);
+
+  // Recursive
+  s.base_dir = "AB";
+  s.recursive = true;
+  CollectFileInfoGenerator(fs->GetFileInfoGenerator(s), &infos);
+  SortInfos(&infos);
+  ASSERT_EQ(infos.size(), 4);
+  AssertFileInfo(infos[0], "AB/CD", FileType::Directory);
+  AssertFileInfo(infos[1], "AB/CD/ghi", FileType::File, 15);
+  AssertFileInfo(infos[2], "AB/CD/jkl", FileType::File, 14);
+  AssertFileInfo(infos[3], "AB/def", FileType::File, 9);
+
+  // Doesn't exist
+  s.base_dir = "XX";
+  auto fut = CollectAsyncGenerator(fs->GetFileInfoGenerator(s));
+  ASSERT_FINISHES_AND_RAISES(IOError, fut);
+  s.allow_not_found = true;
+  CollectFileInfoGenerator(fs->GetFileInfoGenerator(s), &infos);
+  ASSERT_EQ(infos.size(), 0);
 }
 
 void GetSortedInfos(FileSystem* fs, FileSelector s, std::vector<FileInfo>& infos) {
@@ -767,6 +978,27 @@ void GenericFileSystemTest::TestOpenOutputStream(FileSystem* fs) {
 
   ASSERT_RAISES(Invalid, stream->Write("x"));  // Stream is closed
 
+  // Trailing slash rejected
+  ASSERT_RAISES(IOError, fs->OpenOutputStream("CD/ghi/"));
+
+  // Storing metadata along file
+  auto metadata = KeyValueMetadata::Make({"Content-Type", "Content-Language"},
+                                         {"x-arrow/filesystem-test", "fr_FR"});
+  ASSERT_OK_AND_ASSIGN(stream, fs->OpenOutputStream("jkl", metadata));
+  ASSERT_OK(stream->Write("data"));
+  ASSERT_OK(stream->Close());
+  ASSERT_OK_AND_ASSIGN(auto input, fs->OpenInputStream("jkl"));
+  ASSERT_OK_AND_ASSIGN(auto got_metadata, input->ReadMetadata());
+  if (have_file_metadata()) {
+    ASSERT_NE(got_metadata, nullptr);
+    ASSERT_GE(got_metadata->size(), 2);
+    ASSERT_OK_AND_EQ("x-arrow/filesystem-test", got_metadata->Get("Content-Type"));
+  } else {
+    if (got_metadata) {
+      ASSERT_EQ(got_metadata->size(), 0);
+    }
+  }
+
   if (!allow_write_file_over_dir()) {
     // Cannot turn dir into file
     ASSERT_RAISES(IOError, fs->OpenOutputStream("CD"));
@@ -776,12 +1008,19 @@ void GenericFileSystemTest::TestOpenOutputStream(FileSystem* fs) {
 
 void GenericFileSystemTest::TestOpenAppendStream(FileSystem* fs) {
   if (!allow_append_to_file()) {
-    // XXX skip
-    return;
+    GTEST_SKIP() << "Filesystem doesn't allow file appends";
   }
+
   std::shared_ptr<io::OutputStream> stream;
 
-  ASSERT_OK_AND_ASSIGN(stream, fs->OpenAppendStream("abc"));
+  // Trailing slash rejected
+  ASSERT_RAISES(IOError, fs->OpenAppendStream("abc/"));
+
+  if (allow_append_to_new_file()) {
+    ASSERT_OK_AND_ASSIGN(stream, fs->OpenAppendStream("abc"));
+  } else {
+    ASSERT_OK_AND_ASSIGN(stream, fs->OpenOutputStream("abc"));
+  }
   ASSERT_OK_AND_EQ(0, stream->Tell());
   ASSERT_OK(stream->Write("some "));
   ASSERT_OK(stream->Write(Buffer::FromString("data")));
@@ -809,21 +1048,93 @@ void GenericFileSystemTest::TestOpenInputStream(FileSystem* fs) {
   std::shared_ptr<io::InputStream> stream;
   std::shared_ptr<Buffer> buffer;
   ASSERT_OK_AND_ASSIGN(stream, fs->OpenInputStream("AB/abc"));
+  ASSERT_OK_AND_ASSIGN(auto metadata, stream->ReadMetadata());
+  // XXX we cannot really test anything more about metadata...
+  ASSERT_OK_AND_EQ(0, stream->Tell());
   ASSERT_OK_AND_ASSIGN(buffer, stream->Read(4));
   AssertBufferEqual(*buffer, "some");
-  ASSERT_OK_AND_ASSIGN(buffer, stream->Read(6));
+  ASSERT_OK_AND_ASSIGN(buffer, stream->Read(6 /*Remaining + 1*/));
   AssertBufferEqual(*buffer, " data");
   ASSERT_OK_AND_ASSIGN(buffer, stream->Read(1));
   AssertBufferEqual(*buffer, "");
+  ASSERT_OK_AND_EQ(9, stream->Tell());
+  ASSERT_OK(stream->Close());
+
+  ASSERT_OK_AND_ASSIGN(stream, fs->OpenInputStream("AB/abc"));
+  ASSERT_OK(stream->Advance(4));
+  ASSERT_OK_AND_EQ(4, stream->Tell());
+  ASSERT_OK_AND_ASSIGN(buffer, stream->Read(6 /*Remaining + 1*/));
+  AssertBufferEqual(*buffer, " data");
   ASSERT_OK(stream->Close());
   ASSERT_RAISES(Invalid, stream->Read(1));  // Stream is closed
 
+  // Trailing slash rejected
+  ASSERT_RAISES(IOError, fs->OpenInputStream("AB/abc/"));
+
   // File does not exist
-  ASSERT_RAISES(IOError, fs->OpenInputStream("AB/def"));
-  ASSERT_RAISES(IOError, fs->OpenInputStream("def"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputStream("AB/def"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputStream("def"));
 
   // Cannot open directory
-  ASSERT_RAISES(IOError, fs->OpenInputStream("AB"));
+  if (!allow_read_dir_as_file()) {
+    ASSERT_RAISES(IOError, fs->OpenInputStream("AB"));
+  }
+}
+
+void GenericFileSystemTest::TestOpenInputStreamWithFileInfo(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("AB"));
+  CreateFile(fs, "AB/abc", "some data");
+
+  ASSERT_OK_AND_ASSIGN(auto info, fs->GetFileInfo("AB/abc"));
+
+  ASSERT_OK_AND_ASSIGN(auto stream, fs->OpenInputStream(info));
+  ASSERT_OK_AND_ASSIGN(auto buffer, stream->Read(9));
+  AssertBufferEqual(*buffer, "some data");
+
+  // Passing an incomplete FileInfo should also work
+  info.set_type(FileType::Unknown);
+  info.set_size(kNoSize);
+  info.set_mtime(kNoTime);
+  ASSERT_OK_AND_ASSIGN(stream, fs->OpenInputStream(info));
+  ASSERT_OK_AND_ASSIGN(buffer, stream->Read(4));
+  AssertBufferEqual(*buffer, "some");
+
+  // File does not exist
+  ASSERT_OK_AND_ASSIGN(info, fs->GetFileInfo("zzzzt"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputStream(info));
+  // (same, with incomplete FileInfo)
+  info.set_type(FileType::Unknown);
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputStream(info));
+
+  // Trailing slash rejected
+  auto maybe_info = fs->GetFileInfo("AB/abc/");
+  if (maybe_info.ok()) {
+    ASSERT_OK_AND_ASSIGN(info, maybe_info);
+    ASSERT_RAISES(IOError, fs->OpenInputStream(info));
+  } else {
+    ASSERT_RAISES(IOError, maybe_info);
+  }
+
+  // Cannot open directory
+  ASSERT_OK_AND_ASSIGN(info, fs->GetFileInfo("AB"));
+  ASSERT_RAISES(IOError, fs->OpenInputStream(info));
+}
+
+void GenericFileSystemTest::TestOpenInputStreamAsync(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("AB"));
+  CreateFile(fs, "AB/abc", "some data");
+
+  std::shared_ptr<io::InputStream> stream;
+  std::shared_ptr<Buffer> buffer;
+  std::shared_ptr<const KeyValueMetadata> metadata;
+  ASSERT_FINISHES_OK_AND_ASSIGN(stream, fs->OpenInputStreamAsync("AB/abc"));
+  ASSERT_FINISHES_OK_AND_ASSIGN(metadata, stream->ReadMetadataAsync());
+  ASSERT_OK_AND_ASSIGN(buffer, stream->Read(4));
+  AssertBufferEqual(*buffer, "some");
+  ASSERT_OK(stream->Close());
+
+  // File does not exist
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputStreamAsync("AB/def").result());
 }
 
 void GenericFileSystemTest::TestOpenInputFile(FileSystem* fs) {
@@ -833,18 +1144,119 @@ void GenericFileSystemTest::TestOpenInputFile(FileSystem* fs) {
   std::shared_ptr<io::RandomAccessFile> file;
   std::shared_ptr<Buffer> buffer;
   ASSERT_OK_AND_ASSIGN(file, fs->OpenInputFile("AB/abc"));
-  ASSERT_OK_AND_ASSIGN(buffer, file->ReadAt(5, 6));
+  ASSERT_OK_AND_EQ(0, file->Tell());
+  ASSERT_OK(file->Seek(10));
+  ASSERT_OK_AND_EQ(10, file->Tell());
+  ASSERT_OK_AND_ASSIGN(buffer, file->Read(6 /*Remaining + 1*/));
+  AssertBufferEqual(*buffer, " data");
+  ASSERT_OK_AND_ASSIGN(buffer, file->Read(1));
+  AssertBufferEqual(*buffer, "");
+  ASSERT_OK_AND_EQ(15, file->Tell());
+  ASSERT_OK(file->Seek(5));
+  ASSERT_OK_AND_EQ(5, file->Tell());
+  ASSERT_OK_AND_ASSIGN(buffer, file->Read(6));
   AssertBufferEqual(*buffer, "other ");
+  // Should return the same slice independent of the current position
+  ASSERT_OK_AND_ASSIGN(buffer, file->ReadAt(2, 3));
+  AssertBufferEqual(*buffer, "me ");
   ASSERT_OK_AND_EQ(15, file->GetSize());
   ASSERT_OK(file->Close());
   ASSERT_RAISES(Invalid, file->ReadAt(1, 1));  // Stream is closed
 
+  // Trailing slash rejected
+  ASSERT_RAISES(IOError, fs->OpenInputFile("AB/abc/"));
+
   // File does not exist
-  ASSERT_RAISES(IOError, fs->OpenInputFile("AB/def"));
-  ASSERT_RAISES(IOError, fs->OpenInputFile("def"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputFile("AB/def"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputFile("def"));
 
   // Cannot open directory
-  ASSERT_RAISES(IOError, fs->OpenInputFile("AB"));
+  if (!allow_read_dir_as_file()) {
+    ASSERT_RAISES(IOError, fs->OpenInputFile("AB"));
+  }
+}
+
+void GenericFileSystemTest::TestOpenInputFileAsync(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("AB"));
+  CreateFile(fs, "AB/abc", "some other data");
+
+  std::shared_ptr<io::RandomAccessFile> file;
+  std::shared_ptr<Buffer> buffer;
+  ASSERT_FINISHES_OK_AND_ASSIGN(file, fs->OpenInputFileAsync("AB/abc"));
+  ASSERT_OK_AND_ASSIGN(buffer, file->ReadAt(5, 6));
+  AssertBufferEqual(*buffer, "other ");
+  ASSERT_OK(file->Close());
+
+  // File does not exist
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputFileAsync("AB/def").result());
+
+  // Trailing slash rejected
+  ASSERT_RAISES(IOError, fs->OpenInputFileAsync("AB/abc/").result());
+}
+
+void GenericFileSystemTest::TestOpenInputFileWithFileInfo(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("AB"));
+  CreateFile(fs, "AB/abc", "some data");
+
+  ASSERT_OK_AND_ASSIGN(auto info, fs->GetFileInfo("AB/abc"));
+
+  ASSERT_OK_AND_ASSIGN(auto file, fs->OpenInputFile(info));
+  ASSERT_OK_AND_EQ(9, file->GetSize());
+  ASSERT_OK_AND_ASSIGN(auto buffer, file->Read(9));
+  AssertBufferEqual(*buffer, "some data");
+
+  // Passing an incomplete FileInfo should also work
+  info.set_type(FileType::Unknown);
+  info.set_size(kNoSize);
+  info.set_mtime(kNoTime);
+  ASSERT_OK_AND_ASSIGN(file, fs->OpenInputFile(info));
+  ASSERT_OK_AND_EQ(9, file->GetSize());
+  ASSERT_OK_AND_ASSIGN(buffer, file->Read(4));
+  AssertBufferEqual(*buffer, "some");
+
+  // File does not exist
+  ASSERT_OK_AND_ASSIGN(info, fs->GetFileInfo("zzzzt"));
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputFile(info));
+  // (same, with incomplete FileInfo)
+  info.set_type(FileType::Unknown);
+  AssertRaisesWithErrno(ENOENT, fs->OpenInputFile(info));
+
+  // Trailing slash rejected
+  auto maybe_info = fs->GetFileInfo("AB/abc/");
+  if (maybe_info.ok()) {
+    ASSERT_OK_AND_ASSIGN(info, maybe_info);
+    ASSERT_RAISES(IOError, fs->OpenInputFile(info));
+  } else {
+    ASSERT_RAISES(IOError, maybe_info);
+  }
+
+  // Cannot open directory
+  ASSERT_OK_AND_ASSIGN(info, fs->GetFileInfo("AB"));
+  ASSERT_RAISES(IOError, fs->OpenInputFile(info));
+}
+
+void GenericFileSystemTest::TestSpecialChars(FileSystem* fs) {
+  ASSERT_OK(fs->CreateDir("Blank Char"));
+  CreateFile(fs, "Blank Char/Special%Char.txt", "data");
+  std::vector<std::string> all_dirs{"Blank Char"};
+
+  AssertAllDirs(fs, all_dirs);
+  AssertAllFiles(fs, {"Blank Char/Special%Char.txt"});
+  AssertFileContents(fs, "Blank Char/Special%Char.txt", "data");
+
+  ASSERT_OK(fs->CopyFile("Blank Char/Special%Char.txt", "Special and%different.txt"));
+  AssertAllDirs(fs, all_dirs);
+  AssertAllFiles(fs, {"Blank Char/Special%Char.txt", "Special and%different.txt"});
+  AssertFileContents(fs, "Special and%different.txt", "data");
+
+  ASSERT_OK(fs->DeleteFile("Special and%different.txt"));
+  if (have_flaky_directory_tree_deletion()) {
+    ASSERT_OK(fs->DeleteFile("Blank Char/Special%Char.txt"));
+  } else {
+    ASSERT_OK(fs->DeleteDir("Blank Char"));
+    AssertAllDirs(fs, {});
+  }
+  AssertAllFiles(fs, {});
 }
 
 #define GENERIC_FS_TEST_DEFINE(FUNC_NAME) \
@@ -855,19 +1267,30 @@ GENERIC_FS_TEST_DEFINE(TestNormalizePath)
 GENERIC_FS_TEST_DEFINE(TestCreateDir)
 GENERIC_FS_TEST_DEFINE(TestDeleteDir)
 GENERIC_FS_TEST_DEFINE(TestDeleteDirContents)
+GENERIC_FS_TEST_DEFINE(TestDeleteRootDirContents)
 GENERIC_FS_TEST_DEFINE(TestDeleteFile)
 GENERIC_FS_TEST_DEFINE(TestDeleteFiles)
 GENERIC_FS_TEST_DEFINE(TestMoveFile)
 GENERIC_FS_TEST_DEFINE(TestMoveDir)
 GENERIC_FS_TEST_DEFINE(TestCopyFile)
+GENERIC_FS_TEST_DEFINE(TestCopyFiles)
 GENERIC_FS_TEST_DEFINE(TestGetFileInfo)
 GENERIC_FS_TEST_DEFINE(TestGetFileInfoVector)
 GENERIC_FS_TEST_DEFINE(TestGetFileInfoSelector)
 GENERIC_FS_TEST_DEFINE(TestGetFileInfoSelectorWithRecursion)
+GENERIC_FS_TEST_DEFINE(TestGetFileInfoAsync)
+GENERIC_FS_TEST_DEFINE(TestGetFileInfoGenerator)
 GENERIC_FS_TEST_DEFINE(TestOpenOutputStream)
 GENERIC_FS_TEST_DEFINE(TestOpenAppendStream)
 GENERIC_FS_TEST_DEFINE(TestOpenInputStream)
+GENERIC_FS_TEST_DEFINE(TestOpenInputStreamWithFileInfo)
+GENERIC_FS_TEST_DEFINE(TestOpenInputStreamAsync)
 GENERIC_FS_TEST_DEFINE(TestOpenInputFile)
+GENERIC_FS_TEST_DEFINE(TestOpenInputFileWithFileInfo)
+GENERIC_FS_TEST_DEFINE(TestOpenInputFileAsync)
+GENERIC_FS_TEST_DEFINE(TestSpecialChars)
+
+#undef GENERIC_FS_TEST_DEFINE
 
 }  // namespace fs
 }  // namespace arrow

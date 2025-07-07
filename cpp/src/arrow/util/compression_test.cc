@@ -30,6 +30,7 @@
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
 #include "arrow/util/compression.h"
+#include "arrow/util/config.h"
 
 namespace arrow {
 namespace util {
@@ -55,7 +56,7 @@ std::vector<uint8_t> MakeCompressibleData(int data_size) {
 
 // Check roundtrip of one-shot compression and decompression functions.
 void CheckCodecRoundtrip(std::unique_ptr<Codec>& c1, std::unique_ptr<Codec>& c2,
-                         const std::vector<uint8_t>& data) {
+                         const std::vector<uint8_t>& data, bool check_reverse = true) {
   int max_compressed_len =
       static_cast<int>(c1->MaxCompressedLen(data.size(), data.data()));
   std::vector<uint8_t> compressed(max_compressed_len);
@@ -76,26 +77,29 @@ void CheckCodecRoundtrip(std::unique_ptr<Codec>& c1, std::unique_ptr<Codec>& c2,
   ASSERT_EQ(data, decompressed);
   ASSERT_EQ(data.size(), actual_decompressed_size);
 
-  // compress with c2
-  ASSERT_EQ(max_compressed_len,
-            static_cast<int>(c2->MaxCompressedLen(data.size(), data.data())));
-  // Resize to prevent ASAN from detecting container overflow.
-  compressed.resize(max_compressed_len);
+  if (check_reverse) {
+    // compress with c2
+    ASSERT_EQ(max_compressed_len,
+              static_cast<int>(c2->MaxCompressedLen(data.size(), data.data())));
+    // Resize to prevent ASAN from detecting container overflow.
+    compressed.resize(max_compressed_len);
 
-  int64_t actual_size2;
-  ASSERT_OK_AND_ASSIGN(actual_size2, c2->Compress(data.size(), data.data(),
-                                                  max_compressed_len, compressed.data()));
-  ASSERT_EQ(actual_size2, actual_size);
-  compressed.resize(actual_size2);
+    int64_t actual_size2;
+    ASSERT_OK_AND_ASSIGN(
+        actual_size2,
+        c2->Compress(data.size(), data.data(), max_compressed_len, compressed.data()));
+    ASSERT_EQ(actual_size2, actual_size);
+    compressed.resize(actual_size2);
 
-  // decompress with c1
-  int64_t actual_decompressed_size2;
-  ASSERT_OK_AND_ASSIGN(actual_decompressed_size2,
-                       c1->Decompress(compressed.size(), compressed.data(),
-                                      decompressed.size(), decompressed.data()));
+    // decompress with c1
+    int64_t actual_decompressed_size2;
+    ASSERT_OK_AND_ASSIGN(actual_decompressed_size2,
+                         c1->Decompress(compressed.size(), compressed.data(),
+                                        decompressed.size(), decompressed.data()));
 
-  ASSERT_EQ(data, decompressed);
-  ASSERT_EQ(data.size(), actual_decompressed_size2);
+    ASSERT_EQ(data, decompressed);
+    ASSERT_EQ(data.size(), actual_decompressed_size2);
+  }
 }
 
 // Check the streaming compressor against one-shot decompression
@@ -317,37 +321,36 @@ class CodecTest : public ::testing::TestWithParam<Compression::type> {
 };
 
 TEST(TestCodecMisc, GetCodecAsString) {
-  ASSERT_EQ("UNCOMPRESSED", Codec::GetCodecAsString(Compression::UNCOMPRESSED));
-  ASSERT_EQ("SNAPPY", Codec::GetCodecAsString(Compression::SNAPPY));
-  ASSERT_EQ("GZIP", Codec::GetCodecAsString(Compression::GZIP));
-  ASSERT_EQ("LZO", Codec::GetCodecAsString(Compression::LZO));
-  ASSERT_EQ("BROTLI", Codec::GetCodecAsString(Compression::BROTLI));
-  ASSERT_EQ("LZ4_RAW", Codec::GetCodecAsString(Compression::LZ4));
-  ASSERT_EQ("LZ4", Codec::GetCodecAsString(Compression::LZ4_FRAME));
-  ASSERT_EQ("ZSTD", Codec::GetCodecAsString(Compression::ZSTD));
-  ASSERT_EQ("BZ2", Codec::GetCodecAsString(Compression::BZ2));
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::UNCOMPRESSED), "uncompressed");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::SNAPPY), "snappy");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::GZIP), "gzip");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::LZO), "lzo");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::BROTLI), "brotli");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::LZ4), "lz4_raw");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::LZ4_FRAME), "lz4");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::ZSTD), "zstd");
+  EXPECT_EQ(Codec::GetCodecAsString(Compression::BZ2), "bz2");
 }
 
 TEST(TestCodecMisc, GetCompressionType) {
-  ASSERT_OK_AND_EQ(Compression::UNCOMPRESSED, Codec::GetCompressionType("UNCOMPRESSED"));
-  ASSERT_OK_AND_EQ(Compression::SNAPPY, Codec::GetCompressionType("SNAPPY"));
-  ASSERT_OK_AND_EQ(Compression::GZIP, Codec::GetCompressionType("GZIP"));
-  ASSERT_OK_AND_EQ(Compression::LZO, Codec::GetCompressionType("LZO"));
-  ASSERT_OK_AND_EQ(Compression::BROTLI, Codec::GetCompressionType("BROTLI"));
-  ASSERT_OK_AND_EQ(Compression::LZ4, Codec::GetCompressionType("LZ4_RAW"));
-  ASSERT_OK_AND_EQ(Compression::LZ4_FRAME, Codec::GetCompressionType("LZ4"));
-  ASSERT_OK_AND_EQ(Compression::ZSTD, Codec::GetCompressionType("ZSTD"));
-  ASSERT_OK_AND_EQ(Compression::BZ2, Codec::GetCompressionType("BZ2"));
+  ASSERT_OK_AND_EQ(Compression::UNCOMPRESSED, Codec::GetCompressionType("uncompressed"));
+  ASSERT_OK_AND_EQ(Compression::SNAPPY, Codec::GetCompressionType("snappy"));
+  ASSERT_OK_AND_EQ(Compression::GZIP, Codec::GetCompressionType("gzip"));
+  ASSERT_OK_AND_EQ(Compression::LZO, Codec::GetCompressionType("lzo"));
+  ASSERT_OK_AND_EQ(Compression::BROTLI, Codec::GetCompressionType("brotli"));
+  ASSERT_OK_AND_EQ(Compression::LZ4, Codec::GetCompressionType("lz4_raw"));
+  ASSERT_OK_AND_EQ(Compression::LZ4_FRAME, Codec::GetCompressionType("lz4"));
+  ASSERT_OK_AND_EQ(Compression::ZSTD, Codec::GetCompressionType("zstd"));
+  ASSERT_OK_AND_EQ(Compression::BZ2, Codec::GetCompressionType("bz2"));
 
   ASSERT_RAISES(Invalid, Codec::GetCompressionType("unk"));
-  ASSERT_RAISES(Invalid, Codec::GetCompressionType("snappy"));
+  ASSERT_RAISES(Invalid, Codec::GetCompressionType("SNAPPY"));
 }
 
 TEST_P(CodecTest, CodecRoundtrip) {
   const auto compression = GetCompression();
   if (compression == Compression::BZ2) {
-    // SKIP: BZ2 doesn't support one-shot compression
-    return;
+    GTEST_SKIP() << "BZ2 does not support one-shot compression";
   }
 
   int sizes[] = {0, 10000, 100000};
@@ -366,6 +369,50 @@ TEST_P(CodecTest, CodecRoundtrip) {
   }
 }
 
+TEST(CodecTest, CodecRoundtripGzipMembers) {
+#ifndef ARROW_WITH_ZLIB
+  GTEST_SKIP() << "Test requires Zlib compression";
+#endif
+  std::unique_ptr<Codec> gzip_codec;
+  ASSERT_OK_AND_ASSIGN(gzip_codec, Codec::Create(Compression::GZIP));
+
+  for (int data_size : {0, 10000, 100000}) {
+    int64_t compressed_size_p1, compressed_size_p2;
+    uint32_t p1_size = data_size / 4;
+    uint32_t p2_size = data_size - p1_size;
+    std::vector<uint8_t> data_full = MakeRandomData(data_size);
+    std::vector<uint8_t> data_p1(data_full.begin(), data_full.begin() + p1_size);
+    std::vector<uint8_t> data_p2(data_full.begin() + p1_size, data_full.end());
+
+    int max_compressed_len_p1 =
+        static_cast<int>(gzip_codec->MaxCompressedLen(p1_size, data_p1.data()));
+    int max_compressed_len_p2 =
+        static_cast<int>(gzip_codec->MaxCompressedLen(p2_size, data_p2.data()));
+    std::vector<uint8_t> compressed(max_compressed_len_p1 + max_compressed_len_p2);
+
+    // Compress in 2 parts separately
+    ASSERT_OK_AND_ASSIGN(compressed_size_p1,
+                         gzip_codec->Compress(p1_size, data_p1.data(),
+                                              max_compressed_len_p1, compressed.data()));
+    ASSERT_OK_AND_ASSIGN(
+        compressed_size_p2,
+        gzip_codec->Compress(p2_size, data_p2.data(), max_compressed_len_p2,
+                             compressed.data() + compressed_size_p1));
+    compressed.resize(compressed_size_p1 + compressed_size_p2);
+
+    // Decompress the concatenated compressed gzip members
+    std::vector<uint8_t> decompressed(data_size);
+    int64_t actual_decompressed_size;
+    ASSERT_OK_AND_ASSIGN(
+        actual_decompressed_size,
+        gzip_codec->Decompress(compressed.size(), compressed.data(), decompressed.size(),
+                               decompressed.data()));
+
+    ASSERT_EQ(data_size, actual_decompressed_size);
+    ASSERT_EQ(data_full, decompressed);
+  }
+}
+
 TEST(TestCodecMisc, SpecifyCompressionLevel) {
   struct CombinationOption {
     Compression::type codec;
@@ -374,9 +421,10 @@ TEST(TestCodecMisc, SpecifyCompressionLevel) {
   };
   constexpr CombinationOption combinations[] = {
       {Compression::GZIP, 2, true},     {Compression::BROTLI, 10, true},
-      {Compression::ZSTD, 4, true},     {Compression::LZ4, -10, false},
+      {Compression::ZSTD, 4, true},     {Compression::LZ4, 10, true},
       {Compression::LZO, -22, false},   {Compression::UNCOMPRESSED, 10, false},
-      {Compression::SNAPPY, 16, false}, {Compression::GZIP, -992, false}};
+      {Compression::SNAPPY, 16, false}, {Compression::GZIP, -992, false},
+      {Compression::LZ4_FRAME, 9, true}};
 
   std::vector<uint8_t> data = MakeRandomData(2000);
   for (const auto& combination : combinations) {
@@ -386,14 +434,112 @@ TEST(TestCodecMisc, SpecifyCompressionLevel) {
       continue;
     }
     const auto level = combination.level;
+    const auto codec_options = arrow::util::CodecOptions(level);
     const auto expect_success = combination.expect_success;
-    auto result1 = Codec::Create(compression, level);
-    auto result2 = Codec::Create(compression, level);
+    auto result1 = Codec::Create(compression, codec_options);
+    auto result2 = Codec::Create(compression, codec_options);
     ASSERT_EQ(expect_success, result1.ok());
     ASSERT_EQ(expect_success, result2.ok());
     if (expect_success) {
       CheckCodecRoundtrip(*result1, *result2, data);
     }
+  }
+}
+
+TEST(TestCodecMisc, SpecifyCodecOptionsGZip) {
+  // for now only GZIP & Brotli codec options supported, since it has specific parameters
+  // to be customized, other codecs could directly go with CodecOptions, could add more
+  // specific codec options if needed.
+  struct CombinationOption {
+    int level;
+    GZipFormat format;
+    int window_bits;
+    bool expect_success;
+  };
+  constexpr CombinationOption combinations[] = {{2, GZipFormat::ZLIB, 12, true},
+                                                {9, GZipFormat::GZIP, 9, true},
+                                                {9, GZipFormat::GZIP, 20, false},
+                                                {5, GZipFormat::DEFLATE, -12, false},
+                                                {-992, GZipFormat::GZIP, 15, false}};
+
+  std::vector<uint8_t> data = MakeRandomData(2000);
+  for (const auto& combination : combinations) {
+    const auto compression = Compression::GZIP;
+    if (!Codec::IsAvailable(compression)) {
+      // Support for this codec hasn't been built
+      continue;
+    }
+    auto codec_options = arrow::util::GZipCodecOptions();
+    codec_options.compression_level = combination.level;
+    codec_options.gzip_format = combination.format;
+    codec_options.window_bits = combination.window_bits;
+    const auto expect_success = combination.expect_success;
+    auto result1 = Codec::Create(compression, codec_options);
+    auto result2 = Codec::Create(compression, codec_options);
+    ASSERT_EQ(expect_success, result1.ok());
+    ASSERT_EQ(expect_success, result2.ok());
+    if (expect_success) {
+      CheckCodecRoundtrip(*result1, *result2, data);
+    }
+  }
+}
+
+TEST(TestCodecMisc, SpecifyCodecOptionsBrotli) {
+  // for now only GZIP & Brotli codec options supported, since it has specific parameters
+  // to be customized, other codecs could directly go with CodecOptions, could add more
+  // specific codec options if needed.
+  struct CombinationOption {
+    int level;
+    int window_bits;
+    bool expect_success;
+  };
+  constexpr CombinationOption combinations[] = {
+      {8, 22, true}, {11, 10, true}, {1, 24, true}, {5, -12, false}, {-992, 25, false}};
+
+  std::vector<uint8_t> data = MakeRandomData(2000);
+  for (const auto& combination : combinations) {
+    const auto compression = Compression::BROTLI;
+    if (!Codec::IsAvailable(compression)) {
+      // Support for this codec hasn't been built
+      continue;
+    }
+    auto codec_options = arrow::util::BrotliCodecOptions();
+    codec_options.compression_level = combination.level;
+    codec_options.window_bits = combination.window_bits;
+    const auto expect_success = combination.expect_success;
+    auto result1 = Codec::Create(compression, codec_options);
+    auto result2 = Codec::Create(compression, codec_options);
+    ASSERT_EQ(expect_success, result1.ok());
+    ASSERT_EQ(expect_success, result2.ok());
+    if (expect_success) {
+      CheckCodecRoundtrip(*result1, *result2, data);
+    }
+  }
+}
+
+TEST_P(CodecTest, MinMaxCompressionLevel) {
+  auto type = GetCompression();
+  ASSERT_OK_AND_ASSIGN(auto codec, Codec::Create(type));
+
+  if (Codec::SupportsCompressionLevel(type)) {
+    ASSERT_OK_AND_ASSIGN(auto min_level, Codec::MinimumCompressionLevel(type));
+    ASSERT_OK_AND_ASSIGN(auto max_level, Codec::MaximumCompressionLevel(type));
+    ASSERT_OK_AND_ASSIGN(auto default_level, Codec::DefaultCompressionLevel(type));
+    ASSERT_NE(min_level, Codec::UseDefaultCompressionLevel());
+    ASSERT_NE(max_level, Codec::UseDefaultCompressionLevel());
+    ASSERT_NE(default_level, Codec::UseDefaultCompressionLevel());
+    ASSERT_LT(min_level, max_level);
+    ASSERT_EQ(min_level, codec->minimum_compression_level());
+    ASSERT_EQ(max_level, codec->maximum_compression_level());
+    ASSERT_GE(default_level, min_level);
+    ASSERT_LE(default_level, max_level);
+  } else {
+    ASSERT_RAISES(Invalid, Codec::MinimumCompressionLevel(type));
+    ASSERT_RAISES(Invalid, Codec::MaximumCompressionLevel(type));
+    ASSERT_RAISES(Invalid, Codec::DefaultCompressionLevel(type));
+    ASSERT_EQ(codec->minimum_compression_level(), Codec::UseDefaultCompressionLevel());
+    ASSERT_EQ(codec->maximum_compression_level(), Codec::UseDefaultCompressionLevel());
+    ASSERT_EQ(codec->default_compression_level(), Codec::UseDefaultCompressionLevel());
   }
 }
 
@@ -426,16 +572,14 @@ TEST_P(CodecTest, OutputBufferIsSmall) {
 
 TEST_P(CodecTest, StreamingCompressor) {
   if (GetCompression() == Compression::SNAPPY) {
-    // SKIP: snappy doesn't support streaming compression
-    return;
+    GTEST_SKIP() << "snappy doesn't support streaming compression";
   }
   if (GetCompression() == Compression::BZ2) {
-    // SKIP: BZ2 doesn't support one-shot decompression
-    return;
+    GTEST_SKIP() << "Z2 doesn't support one-shot decompression";
   }
-  if (GetCompression() == Compression::LZ4) {
-    // SKIP: LZ4 raw format doesn't support streaming compression.
-    return;
+  if (GetCompression() == Compression::LZ4 ||
+      GetCompression() == Compression::LZ4_HADOOP) {
+    GTEST_SKIP() << "LZ4 raw format doesn't support streaming compression.";
   }
 
   int sizes[] = {0, 10, 100000};
@@ -452,16 +596,14 @@ TEST_P(CodecTest, StreamingCompressor) {
 
 TEST_P(CodecTest, StreamingDecompressor) {
   if (GetCompression() == Compression::SNAPPY) {
-    // SKIP: snappy doesn't support streaming decompression
-    return;
+    GTEST_SKIP() << "snappy doesn't support streaming decompression.";
   }
   if (GetCompression() == Compression::BZ2) {
-    // SKIP: BZ2 doesn't support one-shot compression
-    return;
+    GTEST_SKIP() << "Z2 doesn't support one-shot compression";
   }
-  if (GetCompression() == Compression::LZ4) {
-    // SKIP: LZ4 raw format doesn't support streaming decompression.
-    return;
+  if (GetCompression() == Compression::LZ4 ||
+      GetCompression() == Compression::LZ4_HADOOP) {
+    GTEST_SKIP() << "LZ4 raw format doesn't support streaming decompression.";
   }
 
   int sizes[] = {0, 10, 100000};
@@ -478,12 +620,11 @@ TEST_P(CodecTest, StreamingDecompressor) {
 
 TEST_P(CodecTest, StreamingRoundtrip) {
   if (GetCompression() == Compression::SNAPPY) {
-    // SKIP: snappy doesn't support streaming decompression
-    return;
+    GTEST_SKIP() << "snappy doesn't support streaming decompression";
   }
-  if (GetCompression() == Compression::LZ4) {
-    // SKIP: LZ4 raw format doesn't support streaming compression.
-    return;
+  if (GetCompression() == Compression::LZ4 ||
+      GetCompression() == Compression::LZ4_HADOOP) {
+    GTEST_SKIP() << "LZ4 raw format doesn't support streaming compression.";
   }
 
   int sizes[] = {0, 10, 100000};
@@ -500,12 +641,11 @@ TEST_P(CodecTest, StreamingRoundtrip) {
 
 TEST_P(CodecTest, StreamingDecompressorReuse) {
   if (GetCompression() == Compression::SNAPPY) {
-    // SKIP: snappy doesn't support streaming decompression
-    return;
+    GTEST_SKIP() << "snappy doesn't support streaming decompression";
   }
-  if (GetCompression() == Compression::LZ4) {
-    // SKIP: LZ4 raw format doesn't support streaming decompression.
-    return;
+  if (GetCompression() == Compression::LZ4 ||
+      GetCompression() == Compression::LZ4_HADOOP) {
+    GTEST_SKIP() << "LZ4 raw format doesn't support streaming decompression.";
   }
 
   auto codec = MakeCodec();
@@ -523,6 +663,50 @@ TEST_P(CodecTest, StreamingDecompressorReuse) {
   CheckStreamingRoundtrip(compressor, decompressor, data);
 }
 
+TEST_P(CodecTest, StreamingMultiFlush) {
+  // Regression test for ARROW-11937
+  if (GetCompression() == Compression::SNAPPY) {
+    GTEST_SKIP() << "snappy doesn't support streaming decompression";
+  }
+  if (GetCompression() == Compression::LZ4 ||
+      GetCompression() == Compression::LZ4_HADOOP) {
+    GTEST_SKIP() << "LZ4 raw format doesn't support streaming decompression.";
+  }
+  auto type = GetCompression();
+  ASSERT_OK_AND_ASSIGN(auto codec, Codec::Create(type));
+
+  std::shared_ptr<Compressor> compressor;
+  ASSERT_OK_AND_ASSIGN(compressor, codec->MakeCompressor());
+
+  // Grow the buffer and flush again while requested (up to a bounded number of times)
+  std::vector<uint8_t> compressed(1024);
+  Compressor::FlushResult result;
+  int attempts = 0;
+  int64_t actual_size = 0;
+  int64_t output_len = 0;
+  uint8_t* output = compressed.data();
+  do {
+    compressed.resize(compressed.capacity() * 2);
+    output_len = compressed.size() - actual_size;
+    output = compressed.data() + actual_size;
+    ASSERT_OK_AND_ASSIGN(result, compressor->Flush(output_len, output));
+    actual_size += result.bytes_written;
+    attempts++;
+  } while (attempts < 8 && result.should_retry);
+  // The LZ4 codec actually needs this many attempts to settle
+
+  // Flush again having done nothing - should not require retry
+  output_len = compressed.size() - actual_size;
+  output = compressed.data() + actual_size;
+  ASSERT_OK_AND_ASSIGN(result, compressor->Flush(output_len, output));
+  ASSERT_FALSE(result.should_retry);
+}
+
+#if !defined ARROW_WITH_ZLIB && !defined ARROW_WITH_SNAPPY && !defined ARROW_WITH_LZ4 && \
+    !defined ARROW_WITH_BROTLI && !defined ARROW_WITH_BZ2 && !defined ARROW_WITH_ZSTD
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(CodecTest);
+#endif
+
 #ifdef ARROW_WITH_ZLIB
 INSTANTIATE_TEST_SUITE_P(TestGZip, CodecTest, ::testing::Values(Compression::GZIP));
 #endif
@@ -533,6 +717,8 @@ INSTANTIATE_TEST_SUITE_P(TestSnappy, CodecTest, ::testing::Values(Compression::S
 
 #ifdef ARROW_WITH_LZ4
 INSTANTIATE_TEST_SUITE_P(TestLZ4, CodecTest, ::testing::Values(Compression::LZ4));
+INSTANTIATE_TEST_SUITE_P(TestLZ4Hadoop, CodecTest,
+                         ::testing::Values(Compression::LZ4_HADOOP));
 #endif
 
 #ifdef ARROW_WITH_LZ4
@@ -544,12 +730,23 @@ INSTANTIATE_TEST_SUITE_P(TestLZ4Frame, CodecTest,
 INSTANTIATE_TEST_SUITE_P(TestBrotli, CodecTest, ::testing::Values(Compression::BROTLI));
 #endif
 
-#if ARROW_WITH_BZ2
+#ifdef ARROW_WITH_BZ2
 INSTANTIATE_TEST_SUITE_P(TestBZ2, CodecTest, ::testing::Values(Compression::BZ2));
 #endif
 
 #ifdef ARROW_WITH_ZSTD
 INSTANTIATE_TEST_SUITE_P(TestZSTD, CodecTest, ::testing::Values(Compression::ZSTD));
+#endif
+
+#ifdef ARROW_WITH_LZ4
+TEST(TestCodecLZ4Hadoop, Compatibility) {
+  // LZ4 Hadoop codec should be able to read back LZ4 raw blocks
+  ASSERT_OK_AND_ASSIGN(auto c1, Codec::Create(Compression::LZ4));
+  ASSERT_OK_AND_ASSIGN(auto c2, Codec::Create(Compression::LZ4_HADOOP));
+
+  std::vector<uint8_t> data = MakeRandomData(100);
+  CheckCodecRoundtrip(c1, c2, data, /*check_reverse=*/false);
+}
 #endif
 
 }  // namespace util

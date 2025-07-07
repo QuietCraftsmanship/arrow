@@ -19,15 +19,29 @@
 import functools
 import operator
 import sys
-from setuptools import setup
+from setuptools import setup, find_packages
 
-if sys.version_info < (3, 5):
-    sys.exit('Python < 3.5 is not supported')
+if sys.version_info < (3, 9):
+    sys.exit('Python < 3.9 is not supported')
+
+# For pathlib.Path compatibility
+jinja_req = 'jinja2>=2.11'
 
 extras = {
-    'bot': ['ruamel.yaml', 'pygithub'],
-    'docker': ['ruamel.yaml', 'python-dotenv']
+    'benchmark': ['pandas'],
+    'crossbow': ['github3.py', jinja_req, 'pygit2>=1.14.0', 'requests',
+                 'ruamel.yaml', 'setuptools_scm>=8.0.0'],
+    'crossbow-upload': ['github3.py', jinja_req, 'ruamel.yaml',
+                        'setuptools_scm'],
+    'docker': ['ruamel.yaml', 'python-dotenv'],
+    'integration': ['cffi', 'numpy'],
+    'integration-java': ['jpype1'],
+    'lint': ['numpydoc==1.1.0', 'autopep8', 'flake8==6.1.0', 'cython-lint',
+             'cmake_format==0.6.13', 'sphinx-lint==0.9.1'],
+    'numpydoc': ['numpydoc==1.1.0'],
+    'release': ['pygithub', jinja_req, 'semver', 'gitpython'],
 }
+extras['bot'] = extras['crossbow'] + ['pygithub']
 extras['all'] = list(set(functools.reduce(operator.add, extras.values())))
 
 setup(
@@ -37,13 +51,9 @@ setup(
     url='http://github.com/apache/arrow',
     maintainer='Arrow Developers',
     maintainer_email='dev@arrow.apache.org',
-    packages=[
-        'archery',
-        'archery.benchmark',
-        'archery.integration',
-        'archery.lang',
-        'archery.utils'
-    ],
+    packages=find_packages(),
+    include_package_data=True,
+    python_requires='>=3.9',
     install_requires=['click>=7'],
     tests_require=['pytest', 'responses'],
     extras_require=extras,

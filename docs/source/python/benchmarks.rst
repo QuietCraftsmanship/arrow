@@ -27,8 +27,7 @@ run with `ASV`_.  You'll need to install the ``asv`` package first
 Running the benchmarks
 ----------------------
 
-To run the benchmarks for a locally-built Arrow, run ``asv dev`` or
-``asv run --python=same``.
+To run the benchmarks for a locally-built Arrow, run ``asv run --python=same``.
 
 We use conda environments as part of running the benchmarks. To use the ``asv``
 setup, you must set the ``$CONDA_HOME`` environment variable to point to the
@@ -51,7 +50,6 @@ to be rebuilt for each Git revision you're running the benchmarks for.
 Compatibility
 -------------
 
-We only expect the benchmarking setup to work with Python 3.6 or later,
-on a Unix-like system with bash.
+We only expect the benchmarking setup to work on a Unix-like system with bash.
 
 .. _asv: https://asv.readthedocs.org/

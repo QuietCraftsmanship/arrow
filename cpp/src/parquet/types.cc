@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -23,14 +24,14 @@
 
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/compression.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 #include "parquet/exception.h"
 #include "parquet/types.h"
 
 #include "generated/parquet_types.h"
 
-using ::arrow::internal::checked_cast;
+using arrow::internal::checked_cast;
 using arrow::util::Codec;
 
 namespace parquet {
@@ -43,6 +44,7 @@ bool IsCodecSupported(Compression::type codec) {
     case Compression::BROTLI:
     case Compression::ZSTD:
     case Compression::LZ4:
+    case Compression::LZ4_HADOOP:
       return true;
     default:
       return false;
@@ -50,11 +52,18 @@ bool IsCodecSupported(Compression::type codec) {
 }
 
 std::unique_ptr<Codec> GetCodec(Compression::type codec) {
-  return GetCodec(codec, Codec::UseDefaultCompressionLevel());
+  return GetCodec(codec, CodecOptions());
 }
 
-std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level) {
+std::unique_ptr<Codec> GetCodec(Compression::type codec,
+                                const CodecOptions& codec_options) {
   std::unique_ptr<Codec> result;
+  if (codec == Compression::LZO) {
+    throw ParquetException(
+        "While LZO compression is supported by the Parquet format in "
+        "general, it is currently not supported by the C++ implementation.");
+  }
+
   if (!IsCodecSupported(codec)) {
     std::stringstream ss;
     ss << "Codec type " << Codec::GetCodecAsString(codec)
@@ -62,40 +71,71 @@ std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level) 
     throw ParquetException(ss.str());
   }
 
-  PARQUET_ASSIGN_OR_THROW(result, Codec::Create(codec, compression_level));
+  PARQUET_ASSIGN_OR_THROW(result, Codec::Create(codec, codec_options));
   return result;
 }
 
-std::string FormatStatValue(Type::type parquet_type, ::arrow::util::string_view val) {
+// use compression level to create Codec
+std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level) {
+  return GetCodec(codec, CodecOptions{compression_level});
+}
+
+bool PageCanUseChecksum(PageType::type pageType) {
+  switch (pageType) {
+    case PageType::type::DATA_PAGE:
+    case PageType::type::DATA_PAGE_V2:
+    case PageType::type::DICTIONARY_PAGE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string FormatStatValue(Type::type parquet_type, ::std::string_view val) {
   std::stringstream result;
 
   const char* bytes = val.data();
   switch (parquet_type) {
-    case Type::BOOLEAN:
-      result << reinterpret_cast<const bool*>(bytes)[0];
+    case Type::BOOLEAN: {
+      bool value{};
+      std::memcpy(&value, bytes, sizeof(bool));
+      result << value;
       break;
-    case Type::INT32:
-      result << reinterpret_cast<const int32_t*>(bytes)[0];
+    }
+    case Type::INT32: {
+      int32_t value{};
+      std::memcpy(&value, bytes, sizeof(int32_t));
+      result << value;
       break;
-    case Type::INT64:
-      result << reinterpret_cast<const int64_t*>(bytes)[0];
+    }
+    case Type::INT64: {
+      int64_t value{};
+      std::memcpy(&value, bytes, sizeof(int64_t));
+      result << value;
       break;
-    case Type::DOUBLE:
-      result << reinterpret_cast<const double*>(bytes)[0];
+    }
+    case Type::DOUBLE: {
+      double value{};
+      std::memcpy(&value, bytes, sizeof(double));
+      result << value;
       break;
-    case Type::FLOAT:
-      result << reinterpret_cast<const float*>(bytes)[0];
+    }
+    case Type::FLOAT: {
+      float value{};
+      std::memcpy(&value, bytes, sizeof(float));
+      result << value;
       break;
+    }
     case Type::INT96: {
-      auto const i32_val = reinterpret_cast<const int32_t*>(bytes);
-      result << i32_val[0] << " " << i32_val[1] << " " << i32_val[2];
+      std::array<int32_t, 3> values{};
+      std::memcpy(values.data(), bytes, 3 * sizeof(int32_t));
+      result << values[0] << " " << values[1] << " " << values[2];
       break;
     }
-    case Type::BYTE_ARRAY: {
-      return std::string(val);
-    }
+    case Type::BYTE_ARRAY:
     case Type::FIXED_LEN_BYTE_ARRAY: {
-      return std::string(val);
+      result << val;
+      break;
     }
     case Type::UNDEFINED:
     default:
@@ -151,6 +191,16 @@ std::string TypeToString(Type::type t) {
     default:
       return "UNKNOWN";
   }
+}
+
+std::string TypeToString(Type::type t, int type_length) {
+  auto s = TypeToString(t);
+  if (t == Type::FIXED_LEN_BYTE_ARRAY) {
+    s += '(';
+    s += std::to_string(type_length);
+    s += ')';
+  }
+  return s;
 }
 
 std::string ConvertedTypeToString(ConvertedType::type t) {
@@ -321,15 +371,25 @@ std::shared_ptr<const LogicalType> LogicalType::FromConvertedType(
     case ConvertedType::DATE:
       return DateLogicalType::Make();
     case ConvertedType::TIME_MILLIS:
-      return TimeLogicalType::Make(true, LogicalType::TimeUnit::MILLIS);
+      // ConvertedType::TIME_{*} are deprecated in favor of LogicalType::Time, the
+      // compatibility for ConvertedType::TIME_{*} are listed in
+      // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#deprecated-time-convertedtype
+      return TimeLogicalType::Make(/*is_adjusted_to_utc=*/true,
+                                   LogicalType::TimeUnit::MILLIS);
     case ConvertedType::TIME_MICROS:
-      return TimeLogicalType::Make(true, LogicalType::TimeUnit::MICROS);
+      return TimeLogicalType::Make(/*is_adjusted_to_utc=*/true,
+                                   LogicalType::TimeUnit::MICROS);
     case ConvertedType::TIMESTAMP_MILLIS:
-      return TimestampLogicalType::Make(true, LogicalType::TimeUnit::MILLIS,
+      // ConvertedType::TIMESTAMP_{*} are deprecated in favor of LogicalType::Timestamp,
+      // the compatibility for ConvertedType::TIMESTAMP_{*} are listed in
+      // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#deprecated-timestamp-convertedtype
+      return TimestampLogicalType::Make(/*is_adjusted_to_utc=*/true,
+                                        LogicalType::TimeUnit::MILLIS,
                                         /*is_from_converted_type=*/true,
                                         /*force_set_converted_type=*/false);
     case ConvertedType::TIMESTAMP_MICROS:
-      return TimestampLogicalType::Make(true, LogicalType::TimeUnit::MICROS,
+      return TimestampLogicalType::Make(/*is_adjusted_to_utc=*/true,
+                                        LogicalType::TimeUnit::MICROS,
                                         /*is_from_converted_type=*/true,
                                         /*force_set_converted_type=*/false);
     case ConvertedType::INTERVAL:
@@ -354,13 +414,14 @@ std::shared_ptr<const LogicalType> LogicalType::FromConvertedType(
       return JSONLogicalType::Make();
     case ConvertedType::BSON:
       return BSONLogicalType::Make();
+    case ConvertedType::NA:
+      return NullLogicalType::Make();
     case ConvertedType::NONE:
       return NoLogicalType::Make();
-    case ConvertedType::NA:
     case ConvertedType::UNDEFINED:
-      return UnknownLogicalType::Make();
+      return UndefinedLogicalType::Make();
   }
-  return UnknownLogicalType::Make();
+  return UndefinedLogicalType::Make();
 }
 
 std::shared_ptr<const LogicalType> LogicalType::FromThrift(
@@ -416,8 +477,11 @@ std::shared_ptr<const LogicalType> LogicalType::FromThrift(
     return BSONLogicalType::Make();
   } else if (type.__isset.UUID) {
     return UUIDLogicalType::Make();
+  } else if (type.__isset.FLOAT16) {
+    return Float16LogicalType::Make();
   } else {
-    throw ParquetException("Metadata contains Thrift LogicalType that is not recognized");
+    // Sentinel type for one we do not recognize
+    return UndefinedLogicalType::Make();
   }
 }
 
@@ -469,11 +533,11 @@ std::shared_ptr<const LogicalType> LogicalType::BSON() { return BSONLogicalType:
 
 std::shared_ptr<const LogicalType> LogicalType::UUID() { return UUIDLogicalType::Make(); }
 
-std::shared_ptr<const LogicalType> LogicalType::None() { return NoLogicalType::Make(); }
-
-std::shared_ptr<const LogicalType> LogicalType::Unknown() {
-  return UnknownLogicalType::Make();
+std::shared_ptr<const LogicalType> LogicalType::Float16() {
+  return Float16LogicalType::Make();
 }
+
+std::shared_ptr<const LogicalType> LogicalType::None() { return NoLogicalType::Make(); }
 
 /*
  * The logical type implementation classes are built in four layers: (1) the base
@@ -504,7 +568,7 @@ class LogicalType::Impl {
   virtual std::string ToString() const = 0;
 
   virtual bool is_serialized() const {
-    return !(type_ == LogicalType::Type::NONE || type_ == LogicalType::Type::UNKNOWN);
+    return !(type_ == LogicalType::Type::NONE || type_ == LogicalType::Type::UNDEFINED);
   }
 
   virtual std::string ToJSON() const {
@@ -554,15 +618,16 @@ class LogicalType::Impl {
   class JSON;
   class BSON;
   class UUID;
+  class Float16;
   class No;
-  class Unknown;
+  class Undefined;
 
  protected:
   Impl(LogicalType::Type::type t, SortOrder::type o) : type_(t), order_(o) {}
   Impl() = default;
 
  private:
-  LogicalType::Type::type type_ = LogicalType::Type::UNKNOWN;
+  LogicalType::Type::type type_ = LogicalType::Type::UNDEFINED;
   SortOrder::type order_ = SortOrder::UNKNOWN;
 };
 
@@ -623,8 +688,13 @@ bool LogicalType::is_null() const { return impl_->type() == LogicalType::Type::N
 bool LogicalType::is_JSON() const { return impl_->type() == LogicalType::Type::JSON; }
 bool LogicalType::is_BSON() const { return impl_->type() == LogicalType::Type::BSON; }
 bool LogicalType::is_UUID() const { return impl_->type() == LogicalType::Type::UUID; }
+bool LogicalType::is_float16() const {
+  return impl_->type() == LogicalType::Type::FLOAT16;
+}
 bool LogicalType::is_none() const { return impl_->type() == LogicalType::Type::NONE; }
-bool LogicalType::is_valid() const { return impl_->type() != LogicalType::Type::UNKNOWN; }
+bool LogicalType::is_valid() const {
+  return impl_->type() != LogicalType::Type::UNDEFINED;
+}
 bool LogicalType::is_invalid() const { return !is_valid(); }
 bool LogicalType::is_nested() const {
   return (impl_->type() == LogicalType::Type::LIST) ||
@@ -903,8 +973,14 @@ bool LogicalType::Impl::Decimal::is_applicable(parquet::Type::type primitive_typ
       }
     } break;
     case parquet::Type::FIXED_LEN_BYTE_ARRAY: {
+      // If the primitive length is larger than this we will overflow int32 when
+      // calculating precision.
+      if (primitive_length <= 0 || primitive_length > 891723282) {
+        ok = false;
+        break;
+      }
       ok = precision_ <= static_cast<int32_t>(std::floor(
-                             std::log10(std::pow(2.0, (8.0 * primitive_length) - 1.0))));
+                             std::log10(2) * ((8.0 * primitive_length) - 1.0)));
     } break;
     case parquet::Type::BYTE_ARRAY: {
       ok = true;
@@ -1528,6 +1604,22 @@ class LogicalType::Impl::UUID final : public LogicalType::Impl::Incompatible,
 
 GENERATE_MAKE(UUID)
 
+class LogicalType::Impl::Float16 final : public LogicalType::Impl::Incompatible,
+                                         public LogicalType::Impl::TypeLengthApplicable {
+ public:
+  friend class Float16LogicalType;
+
+  OVERRIDE_TOSTRING(Float16)
+  OVERRIDE_TOTHRIFT(Float16Type, FLOAT16)
+
+ private:
+  Float16()
+      : LogicalType::Impl(LogicalType::Type::FLOAT16, SortOrder::SIGNED),
+        LogicalType::Impl::TypeLengthApplicable(parquet::Type::FIXED_LEN_BYTE_ARRAY, 2) {}
+};
+
+GENERATE_MAKE(Float16)
+
 class LogicalType::Impl::No final : public LogicalType::Impl::SimpleCompatible,
                                     public LogicalType::Impl::UniversalApplicable {
  public:
@@ -1543,95 +1635,19 @@ class LogicalType::Impl::No final : public LogicalType::Impl::SimpleCompatible,
 
 GENERATE_MAKE(No)
 
-class LogicalType::Impl::Unknown final : public LogicalType::Impl::SimpleCompatible,
-                                         public LogicalType::Impl::UniversalApplicable {
+class LogicalType::Impl::Undefined final : public LogicalType::Impl::SimpleCompatible,
+                                           public LogicalType::Impl::UniversalApplicable {
  public:
-  friend class UnknownLogicalType;
+  friend class UndefinedLogicalType;
 
-  OVERRIDE_TOSTRING(Unknown)
+  OVERRIDE_TOSTRING(Undefined)
 
  private:
-  Unknown()
-      : LogicalType::Impl(LogicalType::Type::UNKNOWN, SortOrder::UNKNOWN),
-        LogicalType::Impl::SimpleCompatible(ConvertedType::NA) {}
+  Undefined()
+      : LogicalType::Impl(LogicalType::Type::UNDEFINED, SortOrder::UNKNOWN),
+        LogicalType::Impl::SimpleCompatible(ConvertedType::UNDEFINED) {}
 };
 
-GENERATE_MAKE(Unknown)
-
-namespace internal {
-
-/// \brief Compute the number of bytes required to represent a decimal of a
-/// given precision. Taken from the Apache Impala codebase. The comments next
-/// to the return values are the maximum value that can be represented in 2's
-/// complement with the returned number of bytes.
-int32_t DecimalSize(int32_t precision) {
-  DCHECK_GE(precision, 1) << "decimal precision must be greater than or equal to 1, got "
-                          << precision;
-  DCHECK_LE(precision, 38) << "decimal precision must be less than or equal to 38, got "
-                           << precision;
-
-  switch (precision) {
-    case 1:
-    case 2:
-      return 1;  // 127
-    case 3:
-    case 4:
-      return 2;  // 32,767
-    case 5:
-    case 6:
-      return 3;  // 8,388,607
-    case 7:
-    case 8:
-    case 9:
-      return 4;  // 2,147,483,427
-    case 10:
-    case 11:
-      return 5;  // 549,755,813,887
-    case 12:
-    case 13:
-    case 14:
-      return 6;  // 140,737,488,355,327
-    case 15:
-    case 16:
-      return 7;  // 36,028,797,018,963,967
-    case 17:
-    case 18:
-      return 8;  // 9,223,372,036,854,775,807
-    case 19:
-    case 20:
-    case 21:
-      return 9;  // 2,361,183,241,434,822,606,847
-    case 22:
-    case 23:
-      return 10;  // 604,462,909,807,314,587,353,087
-    case 24:
-    case 25:
-    case 26:
-      return 11;  // 154,742,504,910,672,534,362,390,527
-    case 27:
-    case 28:
-      return 12;  // 39,614,081,257,132,168,796,771,975,167
-    case 29:
-    case 30:
-    case 31:
-      return 13;  // 10,141,204,801,825,835,211,973,625,643,007
-    case 32:
-    case 33:
-      return 14;  // 2,596,148,429,267,413,814,265,248,164,610,047
-    case 34:
-    case 35:
-      return 15;  // 664,613,997,892,457,936,451,903,530,140,172,287
-    case 36:
-    case 37:
-    case 38:
-      return 16;  // 170,141,183,460,469,231,731,687,303,715,884,105,727
-    default:
-      break;
-  }
-  DCHECK(false);
-  return -1;
-}
-
-}  // namespace internal
+GENERATE_MAKE(Undefined)
 
 }  // namespace parquet

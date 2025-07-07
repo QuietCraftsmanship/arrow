@@ -25,8 +25,8 @@ namespace Apache.Arrow.Ipc
         private readonly List<Block> _dictionaries;
         private readonly List<Block> _recordBatches;
 
-        public IEnumerable<Block> Dictionaries => _dictionaries;
-        public IEnumerable<Block> RecordBatches => _recordBatches;
+        public IReadOnlyList<Block> Dictionaries => _dictionaries;
+        public IReadOnlyList<Block> RecordBatches => _recordBatches;
 
         public Block GetRecordBatchBlock(int i) => _recordBatches[i];
 
@@ -61,8 +61,8 @@ namespace Apache.Arrow.Ipc
 #endif
         }
 
-        public ArrowFooter(Flatbuf.Footer footer)
-            : this(Ipc.MessageSerializer.GetSchema(footer.Schema.GetValueOrDefault()), GetDictionaries(footer),
+        public ArrowFooter(Flatbuf.Footer footer, ref DictionaryMemo dictionaryMemo)
+            : this(Ipc.MessageSerializer.GetSchema(footer.Schema.GetValueOrDefault(), ref dictionaryMemo), GetDictionaries(footer),
                 GetRecordBatches(footer))
         { }
 

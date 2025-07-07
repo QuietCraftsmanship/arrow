@@ -19,16 +19,16 @@
 
 // sys/mman.h not present in Visual Studio or Cygwin
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include "arrow/io/mman.h"
-#undef Realloc
-#undef Free
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include "arrow/io/mman.h"
+#  undef Realloc
+#  undef Free
 #else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>  // IWYU pragma: keep
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <unistd.h>  // IWYU pragma: keep
 #endif
 
 #include <algorithm>
@@ -36,6 +36,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -54,20 +55,17 @@
 #include "arrow/status.h"
 #include "arrow/util/future.h"
 #include "arrow/util/io_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
+using internal::FileDescriptor;
 using internal::IOErrorFromErrno;
 
 namespace io {
 
 class OSFile {
  public:
-  OSFile() : fd_(-1), is_open_(false), size_(-1), need_seeking_(false) {}
-
-  ~OSFile() {}
-
   // Note: only one of the Open* methods below may be called on a given instance
 
   Status OpenWritable(const std::string& path, bool truncate, bool append,
@@ -76,11 +74,10 @@ class OSFile {
 
     ARROW_ASSIGN_OR_RAISE(fd_, ::arrow::internal::FileOpenWritable(file_name_, write_only,
                                                                    truncate, append));
-    is_open_ = true;
     mode_ = write_only ? FileMode::WRITE : FileMode::READWRITE;
 
     if (!truncate) {
-      ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_));
+      ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_.fd()));
     } else {
       size_ = 0;
     }
@@ -98,9 +95,8 @@ class OSFile {
       size_ = -1;
     }
     RETURN_NOT_OK(SetFileName(fd));
-    is_open_ = true;
     mode_ = FileMode::WRITE;
-    fd_ = fd;
+    fd_ = FileDescriptor(fd);
     return Status::OK();
   }
 
@@ -108,9 +104,8 @@ class OSFile {
     RETURN_NOT_OK(SetFileName(path));
 
     ARROW_ASSIGN_OR_RAISE(fd_, ::arrow::internal::FileOpenReadable(file_name_));
-    ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_));
+    ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_.fd()));
 
-    is_open_ = true;
     mode_ = FileMode::READ;
     return Status::OK();
   }
@@ -118,35 +113,24 @@ class OSFile {
   Status OpenReadable(int fd) {
     ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd));
     RETURN_NOT_OK(SetFileName(fd));
-    is_open_ = true;
     mode_ = FileMode::READ;
-    fd_ = fd;
+    fd_ = FileDescriptor(fd);
     return Status::OK();
   }
 
   Status CheckClosed() const {
-    if (!is_open_) {
+    if (fd_.closed()) {
       return Status::Invalid("Invalid operation on closed file");
     }
     return Status::OK();
   }
 
-  Status Close() {
-    if (is_open_) {
-      // Even if closing fails, the fd will likely be closed (perhaps it's
-      // already closed).
-      is_open_ = false;
-      int fd = fd_;
-      fd_ = -1;
-      RETURN_NOT_OK(::arrow::internal::FileClose(fd));
-    }
-    return Status::OK();
-  }
+  Status Close() { return fd_.Close(); }
 
   Result<int64_t> Read(int64_t nbytes, void* out) {
     RETURN_NOT_OK(CheckClosed());
     RETURN_NOT_OK(CheckPositioned());
-    return ::arrow::internal::FileRead(fd_, reinterpret_cast<uint8_t*>(out), nbytes);
+    return ::arrow::internal::FileRead(fd_.fd(), reinterpret_cast<uint8_t*>(out), nbytes);
   }
 
   Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) {
@@ -155,8 +139,8 @@ class OSFile {
     // ReadAt() leaves the file position undefined, so require that we seek
     // before calling Read() or Write().
     need_seeking_.store(true);
-    return ::arrow::internal::FileReadAt(fd_, reinterpret_cast<uint8_t*>(out), position,
-                                         nbytes);
+    return ::arrow::internal::FileReadAt(fd_.fd(), reinterpret_cast<uint8_t*>(out),
+                                         position, nbytes);
   }
 
   Status Seek(int64_t pos) {
@@ -164,7 +148,7 @@ class OSFile {
     if (pos < 0) {
       return Status::Invalid("Invalid position");
     }
-    Status st = ::arrow::internal::FileSeek(fd_, pos);
+    Status st = ::arrow::internal::FileSeek(fd_.fd(), pos);
     if (st.ok()) {
       need_seeking_.store(false);
     }
@@ -173,7 +157,7 @@ class OSFile {
 
   Result<int64_t> Tell() const {
     RETURN_NOT_OK(CheckClosed());
-    return ::arrow::internal::FileTell(fd_);
+    return ::arrow::internal::FileTell(fd_.fd());
   }
 
   Status Write(const void* data, int64_t length) {
@@ -184,13 +168,13 @@ class OSFile {
     if (length < 0) {
       return Status::IOError("Length must be non-negative");
     }
-    return ::arrow::internal::FileWrite(fd_, reinterpret_cast<const uint8_t*>(data),
+    return ::arrow::internal::FileWrite(fd_.fd(), reinterpret_cast<const uint8_t*>(data),
                                         length);
   }
 
-  int fd() const { return fd_; }
+  int fd() const { return fd_.fd(); }
 
-  bool is_open() const { return is_open_; }
+  bool is_open() const { return !fd_.closed(); }
 
   int64_t size() const { return size_; }
 
@@ -221,16 +205,11 @@ class OSFile {
   ::arrow::internal::PlatformFilename file_name_;
 
   std::mutex lock_;
-
-  // File descriptor
-  int fd_;
-
+  FileDescriptor fd_;
   FileMode::type mode_;
-
-  bool is_open_;
-  int64_t size_;
+  int64_t size_{-1};
   // Whether ReadAt made the file position non-deterministic.
-  std::atomic<bool> need_seeking_;
+  std::atomic<bool> need_seeking_{false};
 };
 
 // ----------------------------------------------------------------------
@@ -251,7 +230,8 @@ class ReadableFile::ReadableFileImpl : public OSFile {
       RETURN_NOT_OK(buffer->Resize(bytes_read));
       buffer->ZeroPadding();
     }
-    return std::move(buffer);
+    // R build with openSUSE155 requires an explicit shared_ptr construction
+    return std::shared_ptr<Buffer>(std::move(buffer));
   }
 
   Result<std::shared_ptr<Buffer>> ReadBufferAt(int64_t position, int64_t nbytes) {
@@ -263,25 +243,45 @@ class ReadableFile::ReadableFileImpl : public OSFile {
       RETURN_NOT_OK(buffer->Resize(bytes_read));
       buffer->ZeroPadding();
     }
-    return std::move(buffer);
+    // R build with openSUSE155 requires an explicit shared_ptr construction
+    return std::shared_ptr<Buffer>(std::move(buffer));
   }
 
   Status WillNeed(const std::vector<ReadRange>& ranges) {
+    auto report_error = [](int errnum, const char* msg) -> Status {
+      if (errnum == EBADF || errnum == EINVAL) {
+        // These are logic errors, so raise them
+        return IOErrorFromErrno(errnum, msg);
+      }
+#ifndef NDEBUG
+      // Other errors may be encountered if the target device or filesystem
+      // does not support fadvise advisory (for example, macOS can return
+      // ENOTTY on macOS: ARROW-13983).  Log the error for diagnosis
+      // on debug builds, but avoid bothering the user otherwise.
+      ARROW_LOG(WARNING) << IOErrorFromErrno(errnum, msg).ToString();
+#else
+      ARROW_UNUSED(msg);
+#endif
+      return Status::OK();
+    };
     RETURN_NOT_OK(CheckClosed());
     for (const auto& range : ranges) {
       RETURN_NOT_OK(internal::ValidateRange(range.offset, range.length));
 #if defined(POSIX_FADV_WILLNEED)
-      if (posix_fadvise(fd_, range.offset, range.length, POSIX_FADV_WILLNEED)) {
-        return IOErrorFromErrno(errno, "posix_fadvise failed");
+      int ret = posix_fadvise(fd_.fd(), range.offset, range.length, POSIX_FADV_WILLNEED);
+      if (ret) {
+        RETURN_NOT_OK(report_error(ret, "posix_fadvise failed"));
       }
 #elif defined(F_RDADVISE)  // macOS, BSD?
       struct {
         off_t ra_offset;
         int ra_count;
       } radvisory{range.offset, static_cast<int>(range.length)};
-      if (radvisory.ra_count > 0 && fcntl(fd_, F_RDADVISE, &radvisory) == -1) {
-        return IOErrorFromErrno(errno, "fcntl(fd, F_RDADVISE, ...) failed");
+      if (radvisory.ra_count > 0 && fcntl(fd_.fd(), F_RDADVISE, &radvisory) == -1) {
+        RETURN_NOT_OK(report_error(errno, "fcntl(fd, F_RDADVISE, ...) failed"));
       }
+#else
+      ARROW_UNUSED(report_error);
 #endif
     }
     return Status::OK();
@@ -390,21 +390,24 @@ class MemoryMappedFile::MemoryMap
   // An object representing the entire memory-mapped region.
   // It can be sliced in order to return individual subregions, which
   // will then keep the original region alive as long as necessary.
-  class Region : public MutableBuffer {
+  class Region : public Buffer {
    public:
     Region(std::shared_ptr<MemoryMappedFile::MemoryMap> memory_map, uint8_t* data,
            int64_t size)
-        : MutableBuffer(data, size) {
+        : Buffer(data, size) {
       is_mutable_ = memory_map->writable();
-      if (!is_mutable_) {
-        mutable_data_ = nullptr;
-      }
     }
 
     ~Region() {
       if (data_ != nullptr) {
+#ifndef __EMSCRIPTEN__
         int result = munmap(data(), static_cast<size_t>(size_));
+        // emscripten erroneously reports failures in munmap
+        // https://github.com/emscripten-core/emscripten/issues/20459
         ARROW_CHECK_EQ(result, 0) << "munmap failed";
+#else
+        munmap(data(), static_cast<size_t>(size_));
+#endif
       }
     }
 
@@ -440,7 +443,7 @@ class MemoryMappedFile::MemoryMap
 
   Status Open(const std::string& path, FileMode::type mode, const int64_t offset = 0,
               const int64_t length = -1) {
-    file_.reset(new OSFile());
+    file_ = std::make_unique<OSFile>();
 
     if (mode != FileMode::READ) {
       // Memory mapping has permission failures if PROT_READ not set
@@ -542,9 +545,9 @@ class MemoryMappedFile::MemoryMap
 
   void advance(int64_t nbytes) { position_ = position_ + nbytes; }
 
-  uint8_t* head() { return data() + position_; }
-
   uint8_t* data() { return region_ ? region_->data() : nullptr; }
+
+  uint8_t* head() { return data() + position_; }
 
   bool writable() { return file_->mode() != FileMode::READ; }
 
@@ -566,17 +569,22 @@ class MemoryMappedFile::MemoryMap
       RETURN_NOT_OK(::arrow::internal::FileTruncate(file_->fd(), initial_size));
     }
 
-    size_t mmap_length = static_cast<size_t>(initial_size);
-    if (length > initial_size) {
-      return Status::Invalid("mapping length is beyond file size");
-    }
-    if (length >= 0 && length < initial_size) {
+    int64_t mmap_length = initial_size;
+    if (length >= 0) {
       // memory mapping a file region
-      mmap_length = static_cast<size_t>(length);
+      if (length > initial_size) {
+        return Status::Invalid("mapping length is beyond file size");
+      }
+      mmap_length = length;
+    }
+    if (static_cast<int64_t>(static_cast<size_t>(mmap_length)) != mmap_length) {
+      return Status::CapacityError("Requested memory map length ", mmap_length,
+                                   " does not fit in a C size_t "
+                                   "(are you using a 32-bit build of Arrow?)");
     }
 
-    void* result = mmap(nullptr, mmap_length, prot_flags_, map_mode_, file_->fd(),
-                        static_cast<off_t>(offset));
+    void* result = mmap(nullptr, static_cast<size_t>(mmap_length), prot_flags_, map_mode_,
+                        file_->fd(), static_cast<off_t>(offset));
     if (result == MAP_FAILED) {
       return Status::IOError("Memory mapping file failed: ",
                              ::arrow::internal::ErrnoMessage(errno));
@@ -699,7 +707,7 @@ Result<std::shared_ptr<Buffer>> MemoryMappedFile::Read(int64_t nbytes) {
   return buffer;
 }
 
-Future<std::shared_ptr<Buffer>> MemoryMappedFile::ReadAsync(const AsyncContext&,
+Future<std::shared_ptr<Buffer>> MemoryMappedFile::ReadAsync(const IOContext&,
                                                             int64_t position,
                                                             int64_t nbytes) {
   return Future<std::shared_ptr<Buffer>>::MakeFinished(ReadAt(position, nbytes));

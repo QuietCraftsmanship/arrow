@@ -20,7 +20,7 @@ using System.Linq;
 
 namespace Apache.Arrow
 {
-    public abstract class PrimitiveArrayBuilder<TFrom, TTo, TArray, TBuilder> : IArrowArrayBuilder<TArray, TBuilder>
+    public abstract class PrimitiveArrayBuilder<TFrom, TTo, TArray, TBuilder> : IArrowArrayBuilder<TFrom, TArray, TBuilder>
         where TTo : struct
         where TArray : IArrowArray
         where TBuilder : class, IArrowArrayBuilder<TArray>
@@ -30,7 +30,7 @@ namespace Apache.Arrow
 
         public int Length => ArrayBuilder.Length;
 
-        internal PrimitiveArrayBuilder(IArrowArrayBuilder<TTo, TArray, IArrowArrayBuilder<TArray>> builder)
+        public PrimitiveArrayBuilder(IArrowArrayBuilder<TTo, TArray, IArrowArrayBuilder<TArray>> builder)
         {
             ArrayBuilder = builder ?? throw new ArgumentNullException(nameof(builder));
         }
@@ -105,15 +105,15 @@ namespace Apache.Arrow
     {
         protected TBuilder Instance => this as TBuilder;
         protected ArrowBuffer.Builder<T> ValueBuffer { get; }
-        protected BooleanArray.Builder ValidityBuffer { get; }
+        protected ArrowBuffer.BitmapBuilder ValidityBuffer { get; }
 
         public int Length => ValueBuffer.Length;
-        protected int NullCount { get; set; }
+        protected int NullCount => ValidityBuffer.UnsetBitCount;
 
-        internal PrimitiveArrayBuilder()
+        public PrimitiveArrayBuilder()
         {
             ValueBuffer = new ArrowBuffer.Builder<T>();
-            ValidityBuffer = new BooleanArray.Builder();
+            ValidityBuffer = new ArrowBuffer.BitmapBuilder();
         }
 
         public TBuilder Resize(int length)
@@ -137,11 +137,15 @@ namespace Apache.Arrow
             return Instance;
         }
 
+        public TBuilder Append(T? value) =>
+            (value == null) ? AppendNull() : Append(value.Value);
+
         public TBuilder Append(ReadOnlySpan<T> span)
         {
             int len = ValueBuffer.Length;
             ValueBuffer.Append(span);
-            ValidityBuffer.AppendRange(Enumerable.Repeat(true, ValueBuffer.Length - len));
+            int additionalBitsCount = ValueBuffer.Length - len;
+            ValidityBuffer.AppendRange(true, additionalBitsCount);
             return Instance;
         }
 
@@ -149,14 +153,14 @@ namespace Apache.Arrow
         {
             int len = ValueBuffer.Length;
             ValueBuffer.AppendRange(values);
-            ValidityBuffer.AppendRange(Enumerable.Repeat(true, ValueBuffer.Length - len));
+            var additionalBitsCount = ValueBuffer.Length - len;
+            ValidityBuffer.AppendRange(true, additionalBitsCount);
             return Instance;
         }
 
         public TBuilder AppendNull()
         {
             ValidityBuffer.Append(false);
-            NullCount++;
             ValueBuffer.Append(default(T));
             return Instance;
         }
@@ -187,7 +191,7 @@ namespace Apache.Arrow
         public TArray Build(MemoryAllocator allocator = default)
         {
             ArrowBuffer validityBuffer = NullCount > 0
-                                    ? ValidityBuffer.Build(allocator).ValueBuffer
+                                    ? ValidityBuffer.Build(allocator)
                                     : ArrowBuffer.Empty;
 
             return Build(

@@ -17,9 +17,11 @@
 
 #include "arrow/testing/util.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <random>
+#include <sstream>
 
 #ifdef _WIN32
 // clang-format off
@@ -28,21 +30,27 @@
 #include <winsock2.h>
 // clang-format on
 #else
-#include <arpa/inet.h>   // IWYU pragma: keep
-#include <netinet/in.h>  // IWYU pragma: keep
-#include <sys/socket.h>  // IWYU pragma: keep
-#include <sys/stat.h>    // IWYU pragma: keep
-#include <sys/types.h>   // IWYU pragma: keep
-#include <sys/wait.h>    // IWYU pragma: keep
-#include <unistd.h>      // IWYU pragma: keep
+#  include <arpa/inet.h>   // IWYU pragma: keep
+#  include <netinet/in.h>  // IWYU pragma: keep
+#  include <sys/socket.h>  // IWYU pragma: keep
+#  include <sys/stat.h>    // IWYU pragma: keep
+#  include <sys/types.h>   // IWYU pragma: keep
+#  include <sys/wait.h>    // IWYU pragma: keep
+#  include <unistd.h>      // IWYU pragma: keep
 #endif
 
+#include "arrow/config.h"
 #include "arrow/table.h"
 #include "arrow/testing/random.h"
+#include "arrow/type.h"
+#include "arrow/util/cpu_info.h"
 #include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/pcg_random.h"
 
 namespace arrow {
+
+using random::pcg32_fast;
 
 uint64_t random_seed() {
   return std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -50,23 +58,23 @@ uint64_t random_seed() {
 
 void random_null_bytes(int64_t n, double pct_null, uint8_t* null_bytes) {
   const int random_seed = 0;
-  std::default_random_engine gen(random_seed);
-  std::uniform_real_distribution<double> d(0.0, 1.0);
+  pcg32_fast gen(random_seed);
+  ::arrow::random::uniform_real_distribution<double> d(0.0, 1.0);
   std::generate(null_bytes, null_bytes + n,
                 [&d, &gen, &pct_null] { return d(gen) > pct_null; });
 }
 
 void random_is_valid(int64_t n, double pct_null, std::vector<bool>* is_valid,
                      int random_seed) {
-  std::default_random_engine gen(random_seed);
-  std::uniform_real_distribution<double> d(0.0, 1.0);
+  pcg32_fast gen(random_seed);
+  ::arrow::random::uniform_real_distribution<double> d(0.0, 1.0);
   is_valid->resize(n, false);
   std::generate(is_valid->begin(), is_valid->end(),
                 [&d, &gen, &pct_null] { return d(gen) > pct_null; });
 }
 
 void random_bytes(int64_t n, uint32_t seed, uint8_t* out) {
-  std::default_random_engine gen(seed);
+  pcg32_fast gen(seed);
   std::uniform_int_distribution<uint32_t> d(0, std::numeric_limits<uint8_t>::max());
   std::generate(out, out + n, [&d, &gen] { return static_cast<uint8_t>(d(gen)); });
 }
@@ -76,93 +84,6 @@ std::string random_string(int64_t n, uint32_t seed) {
   s.resize(static_cast<size_t>(n));
   random_bytes(n, seed, reinterpret_cast<uint8_t*>(&s[0]));
   return s;
-}
-
-int32_t DecimalSize(int32_t precision) {
-  DCHECK_GE(precision, 1) << "decimal precision must be greater than or equal to 1, got "
-                          << precision;
-  DCHECK_LE(precision, 38) << "decimal precision must be less than or equal to 38, got "
-                           << precision;
-
-  switch (precision) {
-    case 1:
-    case 2:
-      return 1;  // 127
-    case 3:
-    case 4:
-      return 2;  // 32,767
-    case 5:
-    case 6:
-      return 3;  // 8,388,607
-    case 7:
-    case 8:
-    case 9:
-      return 4;  // 2,147,483,427
-    case 10:
-    case 11:
-      return 5;  // 549,755,813,887
-    case 12:
-    case 13:
-    case 14:
-      return 6;  // 140,737,488,355,327
-    case 15:
-    case 16:
-      return 7;  // 36,028,797,018,963,967
-    case 17:
-    case 18:
-      return 8;  // 9,223,372,036,854,775,807
-    case 19:
-    case 20:
-    case 21:
-      return 9;  // 2,361,183,241,434,822,606,847
-    case 22:
-    case 23:
-      return 10;  // 604,462,909,807,314,587,353,087
-    case 24:
-    case 25:
-    case 26:
-      return 11;  // 154,742,504,910,672,534,362,390,527
-    case 27:
-    case 28:
-      return 12;  // 39,614,081,257,132,168,796,771,975,167
-    case 29:
-    case 30:
-    case 31:
-      return 13;  // 10,141,204,801,825,835,211,973,625,643,007
-    case 32:
-    case 33:
-      return 14;  // 2,596,148,429,267,413,814,265,248,164,610,047
-    case 34:
-    case 35:
-      return 15;  // 664,613,997,892,457,936,451,903,530,140,172,287
-    case 36:
-    case 37:
-    case 38:
-      return 16;  // 170,141,183,460,469,231,731,687,303,715,884,105,727
-    default:
-      DCHECK(false);
-      break;
-  }
-  return -1;
-}
-
-void random_decimals(int64_t n, uint32_t seed, int32_t precision, uint8_t* out) {
-  std::default_random_engine gen(seed);
-  std::uniform_int_distribution<uint32_t> d(0, std::numeric_limits<uint8_t>::max());
-  const int32_t required_bytes = DecimalSize(precision);
-  constexpr int32_t byte_width = 16;
-  std::fill(out, out + byte_width * n, '\0');
-
-  for (int64_t i = 0; i < n; ++i, out += byte_width) {
-    std::generate(out, out + required_bytes,
-                  [&d, &gen] { return static_cast<uint8_t>(d(gen)); });
-
-    // sign extend if the sign bit is set for the last byte generated
-    // 0b10000000 == 0x80 == 128
-    if ((out[required_bytes - 1] & '\x80') != 0) {
-      std::fill(out + required_bytes, out + byte_width, '\xFF');
-    }
-  }
 }
 
 void random_ascii(int64_t n, uint32_t seed, uint8_t* out) {
@@ -181,6 +102,35 @@ Status MakeRandomByteBuffer(int64_t length, MemoryPool* pool,
   return Status::OK();
 }
 
+Status GetTestResourceRoot(std::string* out) {
+  const char* c_root = std::getenv("ARROW_TEST_DATA");
+  if (!c_root) {
+    return Status::IOError(
+        "Test resources not found, set ARROW_TEST_DATA to <repo root>/testing/data");
+  }
+  *out = std::string(c_root);
+  return Status::OK();
+}
+
+std::optional<std::string> GetTestTimezoneDatabaseRoot() {
+  const char* c_root = std::getenv("ARROW_TIMEZONE_DATABASE");
+  if (!c_root) {
+    return std::optional<std::string>();
+  }
+  return std::make_optional(std::string(c_root));
+}
+
+Status InitTestTimezoneDatabase() {
+  auto maybe_tzdata = GetTestTimezoneDatabaseRoot();
+  // If missing, timezone database will default to %USERPROFILE%\Downloads\tzdata
+  if (!maybe_tzdata.has_value()) return Status::OK();
+
+  auto tzdata_path = std::string(maybe_tzdata.value());
+  arrow::GlobalOptions options = {std::make_optional(tzdata_path)};
+  ARROW_RETURN_NOT_OK(arrow::Initialize(options));
+  return Status::OK();
+}
+
 int GetListenPort() {
   // Get a new available port number by binding a socket to an ephemeral port
   // and then closing it.  Since ephemeral port allocation tends to avoid
@@ -194,8 +144,8 @@ int GetListenPort() {
     return internal::WinErrorMessage(WSAGetLastError());
   };
 #else
-#define INVALID_SOCKET -1
-#define SOCKET_ERROR -1
+#  define INVALID_SOCKET -1
+#  define SOCKET_ERROR -1
   int sock_fd;
   auto sin_len = static_cast<socklen_t>(sizeof(sin));
   auto errno_message = []() -> std::string { return internal::ErrnoMessage(errno); };
@@ -231,6 +181,55 @@ int GetListenPort() {
 #endif
 
   return port;
+}
+
+std::string GetListenAddress() {
+  // Using GetListenPort() alone may still suffer from race conditions,
+  // so this function maximizes the chances of finding an available address
+  // by using a different loopback address every time (there are 2**24 of them).
+  std::stringstream ss;
+#ifndef __APPLE__
+  static std::atomic<uint32_t> next_addr{1U};     // start at "127.0.0.1"
+  const uint32_t addr = next_addr++ & 0xffffffU;  // keep bottom 24 bits
+  // Format loopback IPv4 address
+  ss << "127";
+  for (int shift = 16; shift >= 0; shift -= 8) {
+    const auto byte = (addr >> shift) & 0xFFU;
+    ss << "." << byte;
+  }
+#else
+  // On macOS, only 127.0.0.1 is a valid loopback address by default.
+  ss << "127.0.0.1";
+#endif
+  // Append port number
+  ss << ":" << GetListenPort();
+  return ss.str();
+}
+
+std::string GetListenAddress(const std::string& host) {
+  std::stringstream ss;
+  ss << host << ":" << GetListenPort();
+  return ss.str();
+}
+
+const std::vector<std::shared_ptr<DataType>>& all_dictionary_index_types() {
+  static std::vector<std::shared_ptr<DataType>> types = {
+      int8(), uint8(), int16(), uint16(), int32(), uint32(), int64(), uint64()};
+  return types;
+}
+
+std::vector<int64_t> GetSupportedHardwareFlags(
+    const std::vector<int64_t>& candidate_flags) {
+  std::vector<int64_t> hardware_flags;
+  // Always test fallback codepaths
+  hardware_flags.push_back(0);
+  for (const int64_t candidate_flag : candidate_flags) {
+    if (candidate_flag != 0 &&
+        internal::CpuInfo::GetInstance()->IsSupported(candidate_flag)) {
+      hardware_flags.push_back(candidate_flag);
+    }
+  }
+  return hardware_flags;
 }
 
 }  // namespace arrow

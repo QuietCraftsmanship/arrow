@@ -16,22 +16,34 @@
 // under the License.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 #include "arrow/buffer.h"
 #include "arrow/io/caching.h"
 #include "arrow/io/util_internal.h"
 #include "arrow/result.h"
 #include "arrow/util/future.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 namespace io {
 
 CacheOptions CacheOptions::Defaults() {
   return CacheOptions{internal::ReadRangeCache::kDefaultHoleSizeLimit,
-                      internal::ReadRangeCache::kDefaultRangeSizeLimit};
+                      internal::ReadRangeCache::kDefaultRangeSizeLimit,
+                      /*lazy=*/false,
+                      /*prefetch_limit=*/0};
+}
+
+CacheOptions CacheOptions::LazyDefaults() {
+  return CacheOptions{internal::ReadRangeCache::kDefaultHoleSizeLimit,
+                      internal::ReadRangeCache::kDefaultRangeSizeLimit,
+                      /*lazy=*/true,
+                      /*prefetch_limit=*/0};
 }
 
 CacheOptions CacheOptions::MakeFromNetworkMetrics(int64_t time_to_first_byte_millis,
@@ -115,7 +127,7 @@ CacheOptions CacheOptions::MakeFromNetworkMetrics(int64_t time_to_first_byte_mil
                                       (1 - ideal_bandwidth_utilization_frac))));
   DCHECK_GT(range_size_limit, 0) << "Computed range_size_limit must be > 0";
 
-  return {hole_size_limit, range_size_limit};
+  return {hole_size_limit, range_size_limit, /*lazy=*/false, /*prefetch_limit=*/0};
 }
 
 namespace internal {
@@ -124,21 +136,49 @@ struct RangeCacheEntry {
   ReadRange range;
   Future<std::shared_ptr<Buffer>> future;
 
+  RangeCacheEntry() = default;
+  RangeCacheEntry(const ReadRange& range_, Future<std::shared_ptr<Buffer>> future_)
+      : range(range_), future(std::move(future_)) {}
+
   friend bool operator<(const RangeCacheEntry& left, const RangeCacheEntry& right) {
     return left.range.offset < right.range.offset;
   }
 };
 
 struct ReadRangeCache::Impl {
-  std::shared_ptr<RandomAccessFile> file;
-  AsyncContext ctx;
+  std::shared_ptr<RandomAccessFile> owned_file;
+  RandomAccessFile* file;
+  IOContext ctx;
   CacheOptions options;
 
   // Ordered by offset (so as to find a matching region by binary search)
   std::vector<RangeCacheEntry> entries;
 
-  // Add new entries, themselves ordered by offset
-  void AddEntries(std::vector<RangeCacheEntry> new_entries) {
+  virtual ~Impl() = default;
+
+  // Get the future corresponding to a range
+  virtual Future<std::shared_ptr<Buffer>> MaybeRead(RangeCacheEntry* entry) {
+    return entry->future;
+  }
+
+  // Make cache entries for ranges
+  virtual std::vector<RangeCacheEntry> MakeCacheEntries(
+      const std::vector<ReadRange>& ranges) {
+    std::vector<RangeCacheEntry> new_entries;
+    new_entries.reserve(ranges.size());
+    for (const auto& range : ranges) {
+      new_entries.emplace_back(range, file->ReadAsync(ctx, range.offset, range.length));
+    }
+    return new_entries;
+  }
+
+  // Add the given ranges to the cache, coalescing them where possible
+  virtual Status Cache(std::vector<ReadRange> ranges) {
+    ARROW_ASSIGN_OR_RAISE(
+        ranges, internal::CoalesceReadRanges(std::move(ranges), options.hole_size_limit,
+                                             options.range_size_limit));
+    std::vector<RangeCacheEntry> new_entries = MakeCacheEntries(ranges);
+    // Add new entries, themselves ordered by offset
     if (entries.size() > 0) {
       std::vector<RangeCacheEntry> merged(entries.size() + new_entries.size());
       std::merge(entries.begin(), entries.end(), new_entries.begin(), new_entries.end(),
@@ -147,50 +187,148 @@ struct ReadRangeCache::Impl {
     } else {
       entries = std::move(new_entries);
     }
+    // Prefetch immediately, regardless of executor availability, if possible
+    return file->WillNeed(ranges);
+  }
+
+  // Read the given range from the cache, blocking if needed. Cannot read a range
+  // that spans cache entries.
+  virtual Result<std::shared_ptr<Buffer>> Read(ReadRange range) {
+    if (range.length == 0) {
+      static const uint8_t byte = 0;
+      return std::make_shared<Buffer>(&byte, 0);
+    }
+
+    const auto it = std::lower_bound(
+        entries.begin(), entries.end(), range,
+        [](const RangeCacheEntry& entry, const ReadRange& range) {
+          return entry.range.offset + entry.range.length < range.offset + range.length;
+        });
+    if (it != entries.end() && it->range.Contains(range)) {
+      auto fut = MaybeRead(&*it);
+      ARROW_ASSIGN_OR_RAISE(auto buf, fut.result());
+      if (options.lazy && options.prefetch_limit > 0) {
+        int64_t num_prefetched = 0;
+        for (auto next_it = it + 1;
+             next_it != entries.end() && num_prefetched < options.prefetch_limit;
+             ++next_it) {
+          if (!next_it->future.is_valid()) {
+            next_it->future =
+                file->ReadAsync(ctx, next_it->range.offset, next_it->range.length);
+          }
+          ++num_prefetched;
+        }
+      }
+      return SliceBuffer(std::move(buf), range.offset - it->range.offset, range.length);
+    }
+    return Status::Invalid("ReadRangeCache did not find matching cache entry");
+  }
+
+  virtual Future<> Wait() {
+    std::vector<Future<>> futures;
+    for (auto& entry : entries) {
+      futures.emplace_back(MaybeRead(&entry));
+    }
+    return AllComplete(futures);
+  }
+
+  // Return a Future that completes when the given ranges have been read.
+  virtual Future<> WaitFor(std::vector<ReadRange> ranges) {
+    auto end = std::remove_if(ranges.begin(), ranges.end(),
+                              [](const ReadRange& range) { return range.length == 0; });
+    ranges.resize(end - ranges.begin());
+    std::vector<Future<>> futures;
+    futures.reserve(ranges.size());
+    for (auto& range : ranges) {
+      const auto it = std::lower_bound(
+          entries.begin(), entries.end(), range,
+          [](const RangeCacheEntry& entry, const ReadRange& range) {
+            return entry.range.offset + entry.range.length < range.offset + range.length;
+          });
+      if (it != entries.end() && it->range.Contains(range)) {
+        futures.push_back(Future<>(MaybeRead(&*it)));
+      } else {
+        return Status::Invalid("Range was not requested for caching: offset=",
+                               range.offset, " length=", range.length);
+      }
+    }
+    return AllComplete(futures);
   }
 };
 
-ReadRangeCache::ReadRangeCache(std::shared_ptr<RandomAccessFile> file, AsyncContext ctx,
+// Don't read ranges when they're first added. Instead, wait until they're requested
+// (either through Read or WaitFor).
+struct ReadRangeCache::LazyImpl : public ReadRangeCache::Impl {
+  // Protect against concurrent modification of entries[i]->future
+  std::mutex entry_mutex;
+
+  virtual ~LazyImpl() = default;
+
+  Future<std::shared_ptr<Buffer>> MaybeRead(RangeCacheEntry* entry) override {
+    // Called by superclass Read()/WaitFor() so we have the lock
+    if (!entry->future.is_valid()) {
+      entry->future = file->ReadAsync(ctx, entry->range.offset, entry->range.length);
+    }
+    return entry->future;
+  }
+
+  std::vector<RangeCacheEntry> MakeCacheEntries(
+      const std::vector<ReadRange>& ranges) override {
+    std::vector<RangeCacheEntry> new_entries;
+    new_entries.reserve(ranges.size());
+    for (const auto& range : ranges) {
+      // In the lazy variant, don't read data here - later, a call to Read or WaitFor
+      // will call back to MaybeRead (under the lock) which will fill the future.
+      new_entries.emplace_back(range, Future<std::shared_ptr<Buffer>>());
+    }
+    return new_entries;
+  }
+
+  Status Cache(std::vector<ReadRange> ranges) override {
+    std::unique_lock<std::mutex> guard(entry_mutex);
+    return ReadRangeCache::Impl::Cache(std::move(ranges));
+  }
+
+  Result<std::shared_ptr<Buffer>> Read(ReadRange range) override {
+    std::unique_lock<std::mutex> guard(entry_mutex);
+    return ReadRangeCache::Impl::Read(range);
+  }
+
+  Future<> Wait() override {
+    std::unique_lock<std::mutex> guard(entry_mutex);
+    return ReadRangeCache::Impl::Wait();
+  }
+
+  Future<> WaitFor(std::vector<ReadRange> ranges) override {
+    std::unique_lock<std::mutex> guard(entry_mutex);
+    return ReadRangeCache::Impl::WaitFor(std::move(ranges));
+  }
+};
+
+ReadRangeCache::ReadRangeCache(std::shared_ptr<RandomAccessFile> owned_file,
+                               RandomAccessFile* file, IOContext ctx,
                                CacheOptions options)
-    : impl_(new Impl()) {
-  impl_->file = std::move(file);
+    : impl_(options.lazy ? new LazyImpl() : new Impl()) {
+  impl_->owned_file = std::move(owned_file);
+  impl_->file = file;
   impl_->ctx = std::move(ctx);
   impl_->options = options;
 }
 
-ReadRangeCache::~ReadRangeCache() {}
+ReadRangeCache::~ReadRangeCache() = default;
 
 Status ReadRangeCache::Cache(std::vector<ReadRange> ranges) {
-  ranges = internal::CoalesceReadRanges(std::move(ranges), impl_->options.hole_size_limit,
-                                        impl_->options.range_size_limit);
-  std::vector<RangeCacheEntry> entries;
-  entries.reserve(ranges.size());
-  for (const auto& range : ranges) {
-    auto fut = impl_->file->ReadAsync(impl_->ctx, range.offset, range.length);
-    entries.push_back({range, std::move(fut)});
-  }
-
-  impl_->AddEntries(std::move(entries));
-  // Prefetch immediately, regardless of executor availability, if possible
-  return impl_->file->WillNeed(ranges);
+  return impl_->Cache(std::move(ranges));
 }
 
 Result<std::shared_ptr<Buffer>> ReadRangeCache::Read(ReadRange range) {
-  if (range.length == 0) {
-    static const uint8_t byte = 0;
-    return std::make_shared<Buffer>(&byte, 0);
-  }
+  return impl_->Read(range);
+}
 
-  const auto it = std::lower_bound(
-      impl_->entries.begin(), impl_->entries.end(), range,
-      [](const RangeCacheEntry& entry, const ReadRange& range) {
-        return entry.range.offset + entry.range.length < range.offset + range.length;
-      });
-  if (it != impl_->entries.end() && it->range.Contains(range)) {
-    ARROW_ASSIGN_OR_RAISE(auto buf, it->future.result());
-    return SliceBuffer(std::move(buf), range.offset - it->range.offset, range.length);
-  }
-  return Status::Invalid("ReadRangeCache did not find matching cache entry");
+Future<> ReadRangeCache::Wait() { return impl_->Wait(); }
+
+Future<> ReadRangeCache::WaitFor(std::vector<ReadRange> ranges) {
+  return impl_->WaitFor(std::move(ranges));
 }
 
 }  // namespace internal

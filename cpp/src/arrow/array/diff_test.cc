@@ -16,10 +16,8 @@
 // under the License.
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstring>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -31,14 +29,13 @@
 
 #include "arrow/array.h"
 #include "arrow/array/diff.h"
-#include "arrow/buffer.h"
-#include "arrow/builder.h"
 #include "arrow/compute/api.h"
 #include "arrow/status.h"
-#include "arrow/testing/gtest_common.h"
+#include "arrow/testing/builder.h"
 #include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
 #include "arrow/type.h"
+#include "arrow/util/logging.h"
 
 namespace arrow {
 
@@ -109,11 +106,12 @@ class DiffTest : public ::testing::Test {
   }
 
   void AssertInsertIs(const std::string& insert_json) {
-    ASSERT_ARRAYS_EQUAL(*ArrayFromJSON(boolean(), insert_json), *insert_);
+    AssertArraysEqual(*ArrayFromJSON(boolean(), insert_json), *insert_, /*verbose=*/true);
   }
 
   void AssertRunLengthIs(const std::string& run_lengths_json) {
-    ASSERT_ARRAYS_EQUAL(*ArrayFromJSON(int64(), run_lengths_json), *run_lengths_);
+    AssertArraysEqual(*ArrayFromJSON(int64(), run_lengths_json), *run_lengths_,
+                      /*verbose=*/true);
   }
 
   void BaseAndTargetFromRandomFilter(std::shared_ptr<Array> values,
@@ -129,6 +127,141 @@ class DiffTest : public ::testing::Test {
 
     ASSERT_OK_AND_ASSIGN(out_datum, compute::Filter(values, target_filter));
     target_ = out_datum.make_array();
+  }
+
+  void TestBasicsWithUnions(UnionMode::type mode) {
+    ASSERT_OK_AND_ASSIGN(
+        auto type,
+        UnionType::Make({field("foo", utf8()), field("bar", int32())}, {2, 5}, mode));
+
+    // insert one
+    base_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
+    target_ = ArrayFromJSON(type, R"([[2, "!"], [2, "?"], [5, 3], [5, 13]])");
+    DoDiff();
+    AssertInsertIs("[false, true]");
+    AssertRunLengthIs("[1, 2]");
+
+    // delete one
+    base_ = ArrayFromJSON(type, R"([[2, "!"], [2, "?"], [5, 3], [5, 13]])");
+    target_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
+    DoDiff();
+    AssertInsertIs("[false, false]");
+    AssertRunLengthIs("[1, 2]");
+
+    // change one
+    base_ = ArrayFromJSON(type, R"([[5, 3], [2, "!"], [5, 13]])");
+    target_ = ArrayFromJSON(type, R"([[2, "3"], [2, "!"], [5, 13]])");
+    DoDiff();
+    AssertInsertIs("[false, false, true]");
+    AssertRunLengthIs("[0, 0, 2]");
+
+    // null out one
+    base_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
+    target_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], null])");
+    DoDiff();
+    AssertInsertIs("[false, false, true]");
+    AssertRunLengthIs("[2, 0, 0]");
+  }
+
+  std::shared_ptr<RunEndEncodedArray> RunEndEncodedArrayFromJSON(
+      int64_t logical_length, const std::shared_ptr<DataType>& ree_type,
+      std::string_view run_ends_json, std::string_view values_json,
+      int64_t logical_offset = 0) {
+    auto& ree_type_ref = checked_cast<const RunEndEncodedType&>(*ree_type);
+    auto run_ends = ArrayFromJSON(ree_type_ref.run_end_type(), run_ends_json);
+    auto values = ArrayFromJSON(ree_type_ref.value_type(), values_json);
+    return RunEndEncodedArray::Make(logical_length, std::move(run_ends),
+                                    std::move(values), logical_offset)
+        .ValueOrDie();
+  }
+
+  template <typename RunEndType>
+  void TestBasicsWithREEs() {
+    auto run_end_type = std::make_shared<RunEndType>();
+    auto value_type = utf8();
+    auto ree_type = run_end_encoded(run_end_type, value_type);
+
+    // empty REEs
+    base_ = RunEndEncodedArrayFromJSON(0, ree_type, "[]", "[]");
+    target_ = RunEndEncodedArrayFromJSON(0, ree_type, "[]", "[]");
+    DoDiff();
+    AssertInsertIs("[false]");
+    AssertRunLengthIs("[0]");
+
+    // null REE arrays of different lengths
+    base_ = RunEndEncodedArrayFromJSON(2, ree_type, "[2]", "[null]");
+    target_ = RunEndEncodedArrayFromJSON(4, ree_type, "[4]", "[null]");
+    DoDiff();
+    AssertInsertIs("[false, true, true]");
+    AssertRunLengthIs("[2, 0, 0]");
+
+    // identical REE arrays w/ offsets
+    base_ =
+        RunEndEncodedArrayFromJSON(110, ree_type, R"([20, 120])", R"(["a", "b"])", 10);
+    target_ =
+        RunEndEncodedArrayFromJSON(110, ree_type, R"([20, 120])", R"(["a", "b"])", 10);
+    DoDiff();
+    AssertInsertIs("[false]");
+    AssertRunLengthIs("[110]");
+
+    // equivalent REE arrays
+    base_ = RunEndEncodedArrayFromJSON(120, ree_type, R"([10, 20, 120])",
+                                       R"(["a", "a", "b"])");
+    target_ = RunEndEncodedArrayFromJSON(120, ree_type, R"([20, 30, 120])",
+                                         R"(["a", "b", "b"])");
+    DoDiff();
+    AssertInsertIs("[false]");
+    AssertRunLengthIs("[120]");
+
+    // slice so last run-end goes beyond length
+    base_ = base_->Slice(5, 105);
+    target_ = target_->Slice(5, 105);
+    DoDiff();
+    AssertInsertIs("[false]");
+    AssertRunLengthIs("[105]");
+
+    // insert one
+    base_ = RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 12])", R"(["a", "b"])");
+    target_ = RunEndEncodedArrayFromJSON(13, ree_type, R"([3, 13])", R"(["a", "b"])");
+    DoDiff();
+    AssertInsertIs("[false, true]");
+    AssertRunLengthIs("[2, 10]");
+
+    // delete one
+    base_ =
+        RunEndEncodedArrayFromJSON(13, ree_type, R"([2, 5, 13])", R"(["a", "b", "c"])");
+    target_ =
+        RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 4, 12])", R"(["a", "b", "c"])");
+    DoDiff();
+    AssertInsertIs("[false, false]");
+    AssertRunLengthIs("[4, 8]");
+
+    // null out one
+    base_ =
+        RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 5, 12])", R"(["a", "b", "c"])");
+    target_ = RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 4, 5, 12])",
+                                         R"(["a", "b", null, "c"])");
+    DoDiff();
+    AssertInsertIs("[false, false, true]");
+    AssertRunLengthIs("[4, 0, 7]");
+
+    // append some
+    base_ = RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 4, 8, 12])",
+                                       R"(["a", "b", "c", "d"])");
+    target_ = RunEndEncodedArrayFromJSON(15, ree_type, R"([2, 4, 8, 13, 15])",
+                                         R"(["a", "b", "c", "d", "e"])");
+    DoDiff();
+    AssertInsertIs("[false, true, true, true]");
+    AssertRunLengthIs("[12, 0, 0, 0]");
+
+    // prepend some
+    base_ = RunEndEncodedArrayFromJSON(12, ree_type, R"([2, 4, 8, 12])",
+                                       R"(["c", "d", "e", "f"])");
+    target_ = RunEndEncodedArrayFromJSON(15, ree_type, R"([1, 3, 5, 7, 11, 15])",
+                                         R"(["a", "b", "c", "d", "e", "f"])");
+    DoDiff();
+    AssertInsertIs("[false, true, true, true]");
+    AssertRunLengthIs("[0, 0, 0, 12]");
   }
 
   random::RandomArrayGenerator rng_;
@@ -255,6 +388,36 @@ TEST_F(DiffTest, CompareRandomStrings) {
   }
 }
 
+TEST_F(DiffTest, BasicsWithBooleans) {
+  // insert one
+  base_ = ArrayFromJSON(boolean(), R"([true, true, true])");
+  target_ = ArrayFromJSON(boolean(), R"([true, false, true, true])");
+  DoDiff();
+  AssertInsertIs("[false, true]");
+  AssertRunLengthIs("[1, 2]");
+
+  // delete one
+  base_ = ArrayFromJSON(boolean(), R"([true, false, true, true])");
+  target_ = ArrayFromJSON(boolean(), R"([true, true, true])");
+  DoDiff();
+  AssertInsertIs("[false, false]");
+  AssertRunLengthIs("[1, 2]");
+
+  // change one
+  base_ = ArrayFromJSON(boolean(), R"([false, false, true])");
+  target_ = ArrayFromJSON(boolean(), R"([true, false, true])");
+  DoDiff();
+  AssertInsertIs("[false, false, true]");
+  AssertRunLengthIs("[0, 0, 2]");
+
+  // null out one
+  base_ = ArrayFromJSON(boolean(), R"([true, false, true])");
+  target_ = ArrayFromJSON(boolean(), R"([true, false, null])");
+  DoDiff();
+  AssertInsertIs("[false, false, true]");
+  AssertRunLengthIs("[2, 0, 0]");
+}
+
 TEST_F(DiffTest, BasicsWithStrings) {
   // insert one
   base_ = ArrayFromJSON(utf8(), R"(["give", "a", "break"])");
@@ -349,36 +512,14 @@ TEST_F(DiffTest, BasicsWithStructs) {
   AssertRunLengthIs("[2, 0, 0]");
 }
 
-TEST_F(DiffTest, BasicsWithUnions) {
-  auto type = union_({field("foo", utf8()), field("bar", int32())}, {2, 5});
+TEST_F(DiffTest, BasicsWithSparseUnions) { TestBasicsWithUnions(UnionMode::SPARSE); }
 
-  // insert one
-  base_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
-  target_ = ArrayFromJSON(type, R"([[2, "!"], [2, "?"], [5, 3], [5, 13]])");
-  DoDiff();
-  AssertInsertIs("[false, true]");
-  AssertRunLengthIs("[1, 2]");
+TEST_F(DiffTest, BasicsWithDenseUnions) { TestBasicsWithUnions(UnionMode::DENSE); }
 
-  // delete one
-  base_ = ArrayFromJSON(type, R"([[2, "!"], [2, "?"], [5, 3], [5, 13]])");
-  target_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
-  DoDiff();
-  AssertInsertIs("[false, false]");
-  AssertRunLengthIs("[1, 2]");
-
-  // change one
-  base_ = ArrayFromJSON(type, R"([[5, 3], [2, "!"], [5, 13]])");
-  target_ = ArrayFromJSON(type, R"([[2, "3"], [2, "!"], [5, 13]])");
-  DoDiff();
-  AssertInsertIs("[false, false, true]");
-  AssertRunLengthIs("[0, 0, 2]");
-
-  // null out one
-  base_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
-  target_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], null])");
-  DoDiff();
-  AssertInsertIs("[false, false, true]");
-  AssertRunLengthIs("[2, 0, 0]");
+TEST_F(DiffTest, BasicsWithREEs) {
+  TestBasicsWithREEs<Int16Type>();
+  TestBasicsWithREEs<Int32Type>();
+  TestBasicsWithREEs<Int64Type>();
 }
 
 TEST_F(DiffTest, UnifiedDiffFormatter) {
@@ -468,6 +609,14 @@ TEST_F(DiffTest, UnifiedDiffFormatter) {
 +1970-01-02 03:04:05.000678
 )");
 
+  // Month, Day, Nano Intervals
+  base_ = ArrayFromJSON(month_day_nano_interval(), R"([[2, 3, 1]])");
+  target_ = ArrayFromJSON(month_day_nano_interval(), R"([])");
+  AssertDiffAndFormat(R"(
+@@ -0, +0 @@
+-2M3d1ns
+)");
+
   // lists
   base_ = ArrayFromJSON(list(int32()), R"([[2, 3, 1], [], [13], []])");
   target_ = ArrayFromJSON(list(int32()), R"([[2, 3, 1], [5, 9], [], [13]])");
@@ -509,8 +658,8 @@ TEST_F(DiffTest, UnifiedDiffFormatter) {
 )");
 
   // unions
-  for (auto mode : {UnionMode::SPARSE, UnionMode::DENSE}) {
-    type = union_({field("foo", utf8()), field("bar", int32())}, {2, 5}, mode);
+  for (auto union_ : UnionTypeFactories()) {
+    type = union_({field("foo", utf8()), field("bar", int32())}, {2, 5});
     base_ = ArrayFromJSON(type, R"([[2, "!"], [5, 3], [5, 13]])");
     target_ = ArrayFromJSON(type, R"([[2, "!"], [2, "3"], [5, 13]])");
     AssertDiffAndFormat(R"(
@@ -556,6 +705,21 @@ TEST_F(DiffTest, UnifiedDiffFormatter) {
 +11
 )");
   }
+
+  for (const auto& type : {
+           decimal32(8, 4),
+           decimal64(10, 4),
+           decimal128(10, 4),
+           decimal256(10, 4),
+       }) {
+    base_ = ArrayFromJSON(type, R"(["123.4567", "-78.9000"])");
+    target_ = ArrayFromJSON(type, R"(["123.4567", "-123.4567"])");
+    AssertDiffAndFormat(R"(
+@@ -1, +1 @@
+--78.9000
++-123.4567
+)");
+  }
 }
 
 TEST_F(DiffTest, DictionaryDiffFormatter) {
@@ -585,6 +749,9 @@ TEST_F(DiffTest, DictionaryDiffFormatter) {
 +1
 )";
   ASSERT_EQ(formatted.str(), formatted_expected_indices);
+
+  // Note: Diff doesn't work at the moment with dictionary arrays
+  ASSERT_RAISES(NotImplemented, Diff(*base_, *target_));
 
   // differing dictionaries
   target_dict = ArrayFromJSON(utf8(), R"(["b", "c", "a"])");

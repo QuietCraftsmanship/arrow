@@ -15,26 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Vector } from '../vector';
-import { MapRow, StructRow } from '../vector/row';
-import { compareArrayLike } from '../util/buffer';
-import { BigInt, BigIntAvailable } from './compat';
+import { Vector } from '../vector.js';
+import { MapRow } from '../row/map.js';
+import { StructRow } from '../row/struct.js';
+import { compareArrayLike } from '../util/buffer.js';
 
 /** @ignore */
 type RangeLike = { length: number; stride?: number };
 /** @ignore */
-type ClampThen<T extends RangeLike> = (source: T, index: number) => any;
-/** @ignore */
 type ClampRangeThen<T extends RangeLike> = (source: T, offset: number, length: number) => any;
-
-export function clampIndex<T extends RangeLike>(source: T, index: number): number;
-export function clampIndex<T extends RangeLike, N extends ClampThen<T> = ClampThen<T>>(source: T, index: number, then: N): ReturnType<N>;
-/** @ignore */
-export function clampIndex<T extends RangeLike, N extends ClampThen<T> = ClampThen<T>>(source: T, index: number, then?: N) {
-    const length = source.length;
-    const adjust = index > -1 ? index : (length + (index % length));
-    return then ? then(source, adjust) : adjust;
-}
 
 /** @ignore */
 let tmp: number;
@@ -46,7 +35,7 @@ export function clampRange<T extends RangeLike, N extends ClampRangeThen<T> = Cl
     // Adjust args similar to Array.prototype.slice. Normalize begin/end to
     // clamp between 0 and length, and wrap around on negative indices, e.g.
     // slice(-1, 5) or slice(5, -1)
-    let { length: len = 0 } = source;
+    const { length: len = 0 } = source;
     let lhs = typeof begin !== 'number' ? 0 : begin;
     let rhs = typeof end !== 'number' ? len : end;
     // wrap around on negative start/end positions
@@ -54,27 +43,27 @@ export function clampRange<T extends RangeLike, N extends ClampRangeThen<T> = Cl
     (rhs < 0) && (rhs = ((rhs % len) + len) % len);
     // ensure lhs <= rhs
     (rhs < lhs) && (tmp = lhs, lhs = rhs, rhs = tmp);
-     // ensure rhs <= length
+    // ensure rhs <= length
     (rhs > len) && (rhs = len);
 
     return then ? then(source, lhs, rhs) : [lhs, rhs];
 }
 
-const big0 = BigIntAvailable ? BigInt(0) : 0;
+/** @ignore */
+export const wrapIndex = (index: number, len: number) => index < 0 ? (len + index) : index;
+
 const isNaNFast = (value: any) => value !== value;
 
 /** @ignore */
 export function createElementComparator(search: any) {
-    let typeofSearch = typeof search;
+    const typeofSearch = typeof search;
     // Compare primitives
     if (typeofSearch !== 'object' || search === null) {
         // Compare NaN
         if (isNaNFast(search)) {
             return isNaNFast;
         }
-        return typeofSearch !== 'bigint'
-            ? (value: any) => value === search
-            : (value: any) => (big0 + value) === search;
+        return (value: any) => value === search;
     }
     // Compare Dates
     if (search instanceof Date) {
@@ -86,13 +75,14 @@ export function createElementComparator(search: any) {
         return (value: any) => value ? compareArrayLike(search, value) : false;
     }
     // Compare Maps and Rows
-    if (search instanceof Map) { return creatMapComparator(search); }
+    if (search instanceof Map) { return createMapComparator(search); }
     // Compare Array-likes
     if (Array.isArray(search)) { return createArrayLikeComparator(search); }
     // Compare Vectors
     if (search instanceof Vector) { return createVectorComparator(search); }
+    return createObjectComparator(search, true);
     // Compare non-empty Objects
-    return createObjectComparator(search);
+    // return createObjectComparator(search, search instanceof Proxy);
 }
 
 /** @ignore */
@@ -105,10 +95,10 @@ function createArrayLikeComparator(lhs: ArrayLike<any>) {
 }
 
 /** @ignore */
-function creatMapComparator(lhs: Map<any, any>) {
+function createMapComparator(lhs: Map<any, any>) {
     let i = -1;
     const comparators = [] as ((x: any) => boolean)[];
-    lhs.forEach((v) => comparators[++i] = createElementComparator(v));
+    for (const v of lhs.values()) comparators[++i] = createElementComparator(v);
     return createSubElementsComparator(comparators);
 }
 
@@ -122,10 +112,10 @@ function createVectorComparator(lhs: Vector<any>) {
 }
 
 /** @ignore */
-function createObjectComparator(lhs: any) {
+function createObjectComparator(lhs: any, allowEmpty = false) {
     const keys = Object.keys(lhs);
     // Only compare non-empty Objects
-    if (keys.length === 0) { return () => false; }
+    if (!allowEmpty && keys.length === 0) { return () => false; }
     const comparators = [] as ((x: any) => boolean)[];
     for (let i = -1, n = keys.length; ++i < n;) {
         comparators[i] = createElementComparator(lhs[keys[i]]);
@@ -141,9 +131,9 @@ function createSubElementsComparator(comparators: ((x: any) => boolean)[], keys?
         switch (rhs.constructor) {
             case Array: return compareArray(comparators, rhs);
             case Map:
+                return compareObject(comparators, rhs, rhs.keys());
             case MapRow:
             case StructRow:
-                return compareObject(comparators, rhs, rhs.keys());
             case Object:
             case undefined: // support `Object.create(null)` objects
                 return compareObject(comparators, rhs, keys || Object.keys(rhs));
@@ -177,13 +167,13 @@ function compareObject(comparators: ((x: any) => boolean)[], obj: Map<any, any>,
     const rValItr = obj instanceof Map ? obj.values() : Object.values(obj)[Symbol.iterator]();
 
     let i = 0;
-    let n = comparators.length;
+    const n = comparators.length;
     let rVal = rValItr.next();
     let lKey = lKeyItr.next();
     let rKey = rKeyItr.next();
 
     for (; i < n && !lKey.done && !rKey.done && !rVal.done;
-         ++i, lKey = lKeyItr.next(), rKey = rKeyItr.next(), rVal = rValItr.next()) {
+        ++i, lKey = lKeyItr.next(), rKey = rKeyItr.next(), rVal = rValItr.next()) {
         if (lKey.value !== rKey.value || !comparators[i](rVal.value)) {
             break;
         }

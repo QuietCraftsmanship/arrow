@@ -20,14 +20,13 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "arrow/filesystem/filesystem.h"
 #include "arrow/util/windows_fixup.h"
 
-namespace arrow {
-namespace fs {
-namespace internal {
+namespace arrow::fs::internal {
 
 struct MockDirInfo {
   std::string full_path;
@@ -37,19 +36,19 @@ struct MockDirInfo {
     return mtime == other.mtime && full_path == other.full_path;
   }
 
-  friend ARROW_EXPORT std::ostream& operator<<(std::ostream&, const MockDirInfo&);
+  ARROW_FRIEND_EXPORT friend std::ostream& operator<<(std::ostream&, const MockDirInfo&);
 };
 
 struct MockFileInfo {
   std::string full_path;
   TimePoint mtime;
-  std::string data;
+  std::string_view data;
 
   bool operator==(const MockFileInfo& other) const {
     return mtime == other.mtime && full_path == other.full_path && data == other.data;
   }
 
-  friend ARROW_EXPORT std::ostream& operator<<(std::ostream&, const MockFileInfo&);
+  ARROW_FRIEND_EXPORT friend std::ostream& operator<<(std::ostream&, const MockFileInfo&);
 };
 
 /// A mock FileSystem implementation that holds its contents in memory.
@@ -58,23 +57,31 @@ struct MockFileInfo {
 /// and bootstrapping FileSystem-based APIs.
 class ARROW_EXPORT MockFileSystem : public FileSystem {
  public:
-  explicit MockFileSystem(TimePoint current_time);
+  explicit MockFileSystem(TimePoint current_time,
+                          const io::IOContext& = io::default_io_context());
   ~MockFileSystem() override;
 
   std::string type_name() const override { return "mock"; }
 
   bool Equals(const FileSystem& other) const override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
 
-  // XXX It's not very practical to have to explicitly declare inheritance
-  // of default overrides.
+  /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
   using FileSystem::GetFileInfo;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
+  /// \endcond
+
   Result<FileInfo> GetFileInfo(const std::string& path) override;
   Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
-  Status DeleteDirContents(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -87,9 +94,11 @@ class ARROW_EXPORT MockFileSystem : public FileSystem {
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) override;
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
   // Contents-dumping helpers to ease testing.
   // Output is lexicographically-ordered by full path.
@@ -97,7 +106,7 @@ class ARROW_EXPORT MockFileSystem : public FileSystem {
   std::vector<MockFileInfo> AllFiles();
 
   // Create a File with a content from a string.
-  Status CreateFile(const std::string& path, const std::string& content,
+  Status CreateFile(const std::string& path, std::string_view content,
                     bool recursive = true);
 
   // Create a MockFileSystem out of (empty) FileInfo. The content of every
@@ -111,6 +120,15 @@ class ARROW_EXPORT MockFileSystem : public FileSystem {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace internal
-}  // namespace fs
-}  // namespace arrow
+class ARROW_EXPORT MockAsyncFileSystem : public MockFileSystem {
+ public:
+  explicit MockAsyncFileSystem(TimePoint current_time,
+                               const io::IOContext& io_context = io::default_io_context())
+      : MockFileSystem(current_time, io_context) {
+    default_async_is_sync_ = false;
+  }
+
+  FileInfoGenerator GetFileInfoGenerator(const FileSelector& select) override;
+};
+
+}  // namespace arrow::fs::internal

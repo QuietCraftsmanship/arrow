@@ -38,24 +38,11 @@ Inter-Process Communication
    ipc.read_tensor
    ipc.write_tensor
    ipc.get_tensor_size
+   ipc.IpcReadOptions
+   ipc.IpcWriteOptions
    ipc.Message
    ipc.MessageReader
    ipc.RecordBatchFileReader
    ipc.RecordBatchFileWriter
    ipc.RecordBatchStreamReader
    ipc.RecordBatchStreamWriter
-
-Serialization
--------------
-
-.. autosummary::
-   :toctree: ../generated/
-
-   serialize
-   serialize_to
-   deserialize
-   deserialize_components
-   deserialize_from
-   read_serialized
-   SerializedPyObject
-   SerializationContext

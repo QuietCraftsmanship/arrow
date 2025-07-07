@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM fedora:31
+FROM fedora:39
 
 RUN dnf update -y && \
     dnf install -y \
@@ -27,5 +27,7 @@ RUN dnf update -y && \
         make \
         cmake \
         ninja-build \
-        python3-devel \
-        python3-virtualenv
+        python3-devel && \
+    dnf clean all
+
+RUN pip3 install --no-cache-dir -U pip setuptools

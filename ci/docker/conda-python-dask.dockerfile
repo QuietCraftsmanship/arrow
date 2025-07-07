@@ -17,12 +17,21 @@
 
 ARG repo
 ARG arch=amd64
-ARG python=3.6
+ARG python=3.9
 FROM ${repo}:${arch}-conda-python-${python}
 
 ARG dask=latest
 COPY ci/scripts/install_dask.sh /arrow/ci/scripts/
 RUN /arrow/ci/scripts/install_dask.sh ${dask}
 
-# The Spark tests currently break with pandas >= 1.0
-RUN if [ ${dask} == "latest" ]; then conda install pandas=0.25.3; fi
+ENV ARROW_ACERO=OFF \
+    ARROW_COMPUTE=ON \
+    ARROW_CSV=ON \
+    ARROW_DATASET=ON \
+    ARROW_FLIGHT=OFF \
+    ARROW_FLIGHT_SQL=OFF \
+    ARROW_FILESYSTEM=ON \
+    ARROW_GANDIVA=OFF \
+    ARROW_ORC=ON \
+    ARROW_SUBSTRAIT=OFF \
+    ARROW_TENSORFLOW=OFF

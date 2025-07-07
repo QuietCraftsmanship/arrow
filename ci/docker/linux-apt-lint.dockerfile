@@ -35,8 +35,30 @@ RUN apt-get update && \
         python3-dev \
         python3-pip \
         ruby \
+        apt-transport-https \
+        software-properties-common \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+ARG r=4.4
+RUN wget -qO- https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc | \
+        tee -a /etc/apt/trusted.gpg.d/cran_ubuntu_key.asc && \
+    # NOTE: Only R >= 4.0 is available in this repo
+    add-apt-repository 'deb https://cloud.r-project.org/bin/linux/ubuntu '$(lsb_release -cs)'-cran40/' && \
+    apt-get install -y \
+        r-base=${r}* \
+        r-recommended=${r}* \
+        libxml2-dev
+
+# Ensure parallel R package installation, set CRAN repo mirror,
+# and use pre-built binaries where possible
+COPY ci/etc/rprofile /arrow/ci/etc/
+RUN cat /arrow/ci/etc/rprofile >> $(R RHOME)/etc/Rprofile.site
+# Also ensure parallel compilation of C/C++ code
+RUN echo "MAKEFLAGS=-j$(R -s -e 'cat(parallel::detectCores())')" >> $(R RHOME)/etc/Renviron.site
+# We don't need arrow's dependencies, only lintr (and its dependencies)
+RUN R -e "install.packages('lintr')"
+RUN R -e "install.packages('cyclocomp')"
 
 # Docker linter
 COPY --from=hadolint /bin/hadolint /usr/bin/hadolint
@@ -45,25 +67,8 @@ COPY --from=hadolint /bin/hadolint /usr/bin/hadolint
 COPY ci/scripts/install_iwyu.sh /arrow/ci/scripts/
 RUN arrow/ci/scripts/install_iwyu.sh /tmp/iwyu /usr/local ${clang_tools}
 
-# Rust linter
-ARG rust=nightly-2019-09-25
-RUN curl https://sh.rustup.rs -sSf | \
-    sh -s -- --default-toolchain stable -y
-ENV PATH /root/.cargo/bin:$PATH
-RUN rustup install ${rust} && \
-    rustup default ${rust} && \
-    rustup component add rustfmt
-
 # Use python3 by default in scripts
-RUN ln -s /usr/bin/python3 /usr/local/bin/python && \
-    ln -s /usr/bin/pip3 /usr/local/bin/pip
-
-COPY dev/archery/requirements.txt \
-     dev/archery/requirements-lint.txt \
-     /arrow/dev/archery/
-RUN pip install \
-      -r arrow/dev/archery/requirements.txt \
-      -r arrow/dev/archery/requirements-lint.txt
+RUN ln -s /usr/bin/python3 /usr/local/bin/python
 
 ENV LC_ALL=C.UTF-8 \
     LANG=C.UTF-8

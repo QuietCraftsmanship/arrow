@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { FileHandle } from './interfaces';
-import { ByteStream, AsyncByteStream } from './stream';
-import { ArrayBufferViewInput, toUint8Array } from '../util/buffer';
+import { FileHandle } from './interfaces.js';
+import { ByteStream, AsyncByteStream } from './stream.js';
+import { ArrayBufferViewInput, toUint8Array } from '../util/buffer.js';
 
 /** @ignore */
 export class RandomAccessFile extends ByteStream {
     public size: number;
-    public position: number = 0;
+    public position = 0;
     protected buffer: Uint8Array | null;
     constructor(buffer: ArrayBufferViewInput, byteLength?: number) {
         super();
         this.buffer = toUint8Array(buffer);
-        this.size = typeof byteLength === 'undefined' ? this.buffer.byteLength : byteLength;
+        this.size = byteLength === undefined ? this.buffer!.byteLength : byteLength;
     }
     public readInt32(position: number) {
         const { buffer, byteOffset } = this.readAt(position, 4);
@@ -40,9 +40,9 @@ export class RandomAccessFile extends ByteStream {
     public read(nBytes?: number | null) {
         const { buffer, size, position } = this;
         if (buffer && position < size) {
-            if (typeof nBytes !== 'number') { nBytes = Infinity; }
+            if (typeof nBytes !== 'number') { nBytes = Number.POSITIVE_INFINITY; }
             this.position = Math.min(size,
-                 position + Math.min(size - position, nBytes));
+                position + Math.min(size - position, nBytes));
             return buffer.subarray(position, this.position);
         }
         return null;
@@ -59,9 +59,8 @@ export class RandomAccessFile extends ByteStream {
 
 /** @ignore */
 export class AsyncRandomAccessFile extends AsyncByteStream {
-    // @ts-ignore
-    public size: number;
-    public position: number = 0;
+    declare public size: number;
+    public position = 0;
     public _pending?: Promise<void>;
     protected _handle: FileHandle | null;
     constructor(file: FileHandle, byteLength?: number) {
@@ -89,10 +88,10 @@ export class AsyncRandomAccessFile extends AsyncByteStream {
         this._pending && await this._pending;
         const { _handle: file, size, position } = this;
         if (file && position < size) {
-            if (typeof nBytes !== 'number') { nBytes = Infinity; }
+            if (typeof nBytes !== 'number') { nBytes = Number.POSITIVE_INFINITY; }
             let pos = position, offset = 0, bytesRead = 0;
-            let end = Math.min(size, pos + Math.min(size - pos, nBytes));
-            let buffer = new Uint8Array(Math.max(0, (this.position = end) - pos));
+            const end = Math.min(size, pos + Math.min(size - pos, nBytes));
+            const buffer = new Uint8Array(Math.max(0, (this.position = end) - pos));
             while ((pos += bytesRead) < end && (offset += bytesRead) < buffer.byteLength) {
                 ({ bytesRead } = await file.read(buffer, offset, buffer.byteLength - offset, pos));
             }

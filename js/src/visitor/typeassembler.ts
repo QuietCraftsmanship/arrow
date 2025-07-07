@@ -15,32 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { flatbuffers } from 'flatbuffers';
-import Long = flatbuffers.Long;
+import * as flatbuffers from 'flatbuffers';
 import Builder = flatbuffers.Builder;
-import * as Schema_ from '../fb/Schema';
 
-import * as type from '../type';
-import { Visitor } from '../visitor';
+import * as type from '../type.js';
+import { Visitor } from '../visitor.js';
 
-import Null = Schema_.org.apache.arrow.flatbuf.Null;
-import Int = Schema_.org.apache.arrow.flatbuf.Int;
-import FloatingPoint = Schema_.org.apache.arrow.flatbuf.FloatingPoint;
-import Binary = Schema_.org.apache.arrow.flatbuf.Binary;
-import Bool = Schema_.org.apache.arrow.flatbuf.Bool;
-import Utf8 = Schema_.org.apache.arrow.flatbuf.Utf8;
-import Decimal = Schema_.org.apache.arrow.flatbuf.Decimal;
-import Date = Schema_.org.apache.arrow.flatbuf.Date;
-import Time = Schema_.org.apache.arrow.flatbuf.Time;
-import Timestamp = Schema_.org.apache.arrow.flatbuf.Timestamp;
-import Interval = Schema_.org.apache.arrow.flatbuf.Interval;
-import List = Schema_.org.apache.arrow.flatbuf.List;
-import Struct = Schema_.org.apache.arrow.flatbuf.Struct_;
-import Union = Schema_.org.apache.arrow.flatbuf.Union;
-import DictionaryEncoding = Schema_.org.apache.arrow.flatbuf.DictionaryEncoding;
-import FixedSizeBinary = Schema_.org.apache.arrow.flatbuf.FixedSizeBinary;
-import FixedSizeList = Schema_.org.apache.arrow.flatbuf.FixedSizeList;
-import Map_ = Schema_.org.apache.arrow.flatbuf.Map;
+import { Null } from '../fb/null.js';
+import { Int } from '../fb/int.js';
+import { FloatingPoint } from '../fb/floating-point.js';
+import { Binary } from '../fb/binary.js';
+import { LargeBinary } from '../fb/large-binary.js';
+import { Bool } from '../fb/bool.js';
+import { Utf8 } from '../fb/utf8.js';
+import { LargeUtf8 } from '../fb/large-utf8.js';
+import { Decimal } from '../fb/decimal.js';
+import { Date } from '../fb/date.js';
+import { Time } from '../fb/time.js';
+import { Timestamp } from '../fb/timestamp.js';
+import { Interval } from '../fb/interval.js';
+import { Duration } from '../fb/duration.js';
+import { List } from '../fb/list.js';
+import { Struct_ as Struct } from '../fb/struct-.js';
+import { Union } from '../fb/union.js';
+import { DictionaryEncoding } from '../fb/dictionary-encoding.js';
+import { FixedSizeBinary } from '../fb/fixed-size-binary.js';
+import { FixedSizeList } from '../fb/fixed-size-list.js';
+import { Map as Map_ } from '../fb/map.js';
 
 /** @ignore */
 export interface TypeAssembler extends Visitor {
@@ -71,6 +72,10 @@ export class TypeAssembler extends Visitor {
         Binary.startBinary(b);
         return Binary.endBinary(b);
     }
+    public visitLargeBinary<T extends type.LargeBinary>(_node: T, b: Builder) {
+        LargeBinary.startLargeBinary(b);
+        return LargeBinary.endLargeBinary(b);
+    }
     public visitBool<T extends type.Bool>(_node: T, b: Builder) {
         Bool.startBool(b);
         return Bool.endBool(b);
@@ -79,10 +84,15 @@ export class TypeAssembler extends Visitor {
         Utf8.startUtf8(b);
         return Utf8.endUtf8(b);
     }
+    public visitLargeUtf8<T extends type.LargeUtf8>(_node: T, b: Builder) {
+        LargeUtf8.startLargeUtf8(b);
+        return LargeUtf8.endLargeUtf8(b);
+    }
     public visitDecimal<T extends type.Decimal>(node: T, b: Builder) {
         Decimal.startDecimal(b);
         Decimal.addScale(b, node.scale);
         Decimal.addPrecision(b, node.precision);
+        Decimal.addBitWidth(b, node.bitWidth);
         return Decimal.endDecimal(b);
     }
     public visitDate<T extends type.Date_>(node: T, b: Builder) {
@@ -110,6 +120,11 @@ export class TypeAssembler extends Visitor {
         Interval.addUnit(b, node.unit);
         return Interval.endInterval(b);
     }
+    public visitDuration<T extends type.Duration>(node: T, b: Builder) {
+        Duration.startDuration(b);
+        Duration.addUnit(b, node.unit);
+        return Duration.endDuration(b);
+    }
     public visitList<T extends type.List>(_node: T, b: Builder) {
         List.startList(b);
         return List.endList(b);
@@ -129,7 +144,7 @@ export class TypeAssembler extends Visitor {
     public visitDictionary<T extends type.Dictionary>(node: T, b: Builder) {
         const indexType = this.visit(node.indices, b);
         DictionaryEncoding.startDictionaryEncoding(b);
-        DictionaryEncoding.addId(b, new Long(node.id, 0));
+        DictionaryEncoding.addId(b, BigInt(node.id));
         DictionaryEncoding.addIsOrdered(b, node.isOrdered);
         if (indexType !== undefined) {
             DictionaryEncoding.addIndexType(b, indexType);

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "arrow/util/bit_util.h"
+#include "arrow/util/endian.h"
 
 #include "gandiva/selection_vector_impl.h"
 
@@ -49,21 +50,21 @@ Status SelectionVector::PopulateFromBitMap(const uint8_t* bitmap, int64_t bitmap
   int64_t selection_idx = 0;
   const uint64_t* bitmap_64 = reinterpret_cast<const uint64_t*>(bitmap);
   for (int64_t bitmap_idx = 0; bitmap_idx < bitmap_size / 8; ++bitmap_idx) {
-    uint64_t current_word = arrow::BitUtil::ToLittleEndian(bitmap_64[bitmap_idx]);
+    uint64_t current_word = arrow::bit_util::ToLittleEndian(bitmap_64[bitmap_idx]);
 
     while (current_word != 0) {
 #if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4146)
+#  pragma warning(push)
+#  pragma warning(disable : 4146)
 #endif
       // MSVC warns about negating an unsigned type. We suppress it for now
       uint64_t highest_only = current_word & -current_word;
 
 #if defined(_MSC_VER)
-#pragma warning(pop)
+#  pragma warning(pop)
 #endif
 
-      int pos_in_word = arrow::BitUtil::CountTrailingZeros(highest_only);
+      int pos_in_word = arrow::bit_util::CountTrailingZeros(highest_only);
 
       int64_t pos_in_bitmap = bitmap_idx * 64 + pos_in_word;
       if (pos_in_bitmap > max_bitmap_index) {

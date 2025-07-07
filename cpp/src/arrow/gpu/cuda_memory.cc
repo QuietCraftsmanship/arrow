@@ -27,10 +27,11 @@
 #include <cuda.h>
 
 #include "arrow/buffer.h"
+#include "arrow/device.h"
 #include "arrow/io/memory.h"
 #include "arrow/memory_pool.h"
 #include "arrow/status.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 #include "arrow/gpu/cuda_context.h"
 #include "arrow/gpu/cuda_internal.h"
@@ -76,11 +77,6 @@ Result<std::shared_ptr<CudaIpcMemHandle>> CudaIpcMemHandle::FromBuffer(
   return std::shared_ptr<CudaIpcMemHandle>(new CudaIpcMemHandle(opaque_handle));
 }
 
-Status CudaIpcMemHandle::FromBuffer(const void* opaque_handle,
-                                    std::shared_ptr<CudaIpcMemHandle>* handle) {
-  return FromBuffer(opaque_handle).Value(handle);
-}
-
 Result<std::shared_ptr<Buffer>> CudaIpcMemHandle::Serialize(MemoryPool* pool) const {
   int64_t size = impl_->memory_size;
   const size_t handle_size =
@@ -93,11 +89,7 @@ Result<std::shared_ptr<Buffer>> CudaIpcMemHandle::Serialize(MemoryPool* pool) co
     memcpy(buffer->mutable_data() + sizeof(impl_->memory_size), &impl_->ipc_handle,
            sizeof(impl_->ipc_handle));
   }
-  return std::move(buffer);
-}
-
-Status CudaIpcMemHandle::Serialize(MemoryPool* pool, std::shared_ptr<Buffer>* out) const {
-  return Serialize(pool).Value(out);
+  return buffer;
 }
 
 const void* CudaIpcMemHandle::handle() const { return &impl_->ipc_handle; }
@@ -111,7 +103,6 @@ CudaBuffer::CudaBuffer(uint8_t* data, int64_t size,
                        bool is_ipc)
     : Buffer(data, size), context_(context), own_data_(own_data), is_ipc_(is_ipc) {
   is_mutable_ = true;
-  mutable_data_ = data;
   SetMemoryManager(context_->memory_manager());
 }
 
@@ -127,7 +118,7 @@ Status CudaBuffer::Close() {
     if (is_ipc_) {
       return context_->CloseIpcBuffer(this);
     } else {
-      return context_->Free(mutable_data_, size_);
+      return context_->Free(const_cast<uint8_t*>(data_), size_);
     }
   }
   return Status::OK();
@@ -139,10 +130,7 @@ CudaBuffer::CudaBuffer(const std::shared_ptr<CudaBuffer>& parent, const int64_t 
       context_(parent->context()),
       own_data_(false),
       is_ipc_(false) {
-  if (parent->is_mutable()) {
-    is_mutable_ = true;
-    mutable_data_ = const_cast<uint8_t*>(data_);
-  }
+  is_mutable_ = parent->is_mutable();
 }
 
 Result<std::shared_ptr<CudaBuffer>> CudaBuffer::FromBuffer(
@@ -170,11 +158,6 @@ Result<std::shared_ptr<CudaBuffer>> CudaBuffer::FromBuffer(
   return cuda_buffer;
 }
 
-Status CudaBuffer::FromBuffer(std::shared_ptr<Buffer> buffer,
-                              std::shared_ptr<CudaBuffer>* out) {
-  return FromBuffer(std::move(buffer)).Value(out);
-}
-
 Status CudaBuffer::CopyToHost(const int64_t position, const int64_t nbytes,
                               void* out) const {
   return context_->CopyDeviceToHost(out, data_ + position, nbytes);
@@ -185,7 +168,7 @@ Status CudaBuffer::CopyFromHost(const int64_t position, const void* data,
   if (nbytes > size_ - position) {
     return Status::Invalid("Copy would overflow buffer");
   }
-  return context_->CopyHostToDevice(mutable_data_ + position, data, nbytes);
+  return context_->CopyHostToDevice(const_cast<uint8_t*>(data_) + position, data, nbytes);
 }
 
 Status CudaBuffer::CopyFromDevice(const int64_t position, const void* data,
@@ -193,7 +176,8 @@ Status CudaBuffer::CopyFromDevice(const int64_t position, const void* data,
   if (nbytes > size_ - position) {
     return Status::Invalid("Copy would overflow buffer");
   }
-  return context_->CopyDeviceToDevice(mutable_data_ + position, data, nbytes);
+  return context_->CopyDeviceToDevice(const_cast<uint8_t*>(data_) + position, data,
+                                      nbytes);
 }
 
 Status CudaBuffer::CopyFromAnotherDevice(const std::shared_ptr<CudaContext>& src_ctx,
@@ -202,27 +186,28 @@ Status CudaBuffer::CopyFromAnotherDevice(const std::shared_ptr<CudaContext>& src
   if (nbytes > size_ - position) {
     return Status::Invalid("Copy would overflow buffer");
   }
-  return src_ctx->CopyDeviceToAnotherDevice(context_, mutable_data_ + position, data,
-                                            nbytes);
+  return src_ctx->CopyDeviceToAnotherDevice(
+      context_, const_cast<uint8_t*>(data_) + position, data, nbytes);
 }
 
 Result<std::shared_ptr<CudaIpcMemHandle>> CudaBuffer::ExportForIpc() {
   if (is_ipc_) {
     return Status::Invalid("Buffer has already been exported for IPC");
   }
-  ARROW_ASSIGN_OR_RAISE(auto handle, context_->ExportIpcBuffer(mutable_data_, size_));
+  ARROW_ASSIGN_OR_RAISE(auto handle, context_->ExportIpcBuffer(data_, size_));
   own_data_ = false;
   return handle;
 }
 
-Status CudaBuffer::ExportForIpc(std::shared_ptr<CudaIpcMemHandle>* handle) {
-  return ExportForIpc().Value(handle);
+CudaHostBuffer::CudaHostBuffer(uint8_t* data, const int64_t size)
+    : MutableBuffer(data, size) {
+  device_type_ = DeviceAllocationType::kCUDA_HOST;
 }
 
 CudaHostBuffer::~CudaHostBuffer() {
   auto maybe_manager = CudaDeviceManager::Instance();
   ARROW_CHECK_OK(maybe_manager.status());
-  ARROW_CHECK_OK((*maybe_manager)->FreeHost(mutable_data_, size_));
+  ARROW_CHECK_OK((*maybe_manager)->FreeHost(const_cast<uint8_t*>(data_), size_));
 }
 
 Result<uintptr_t> CudaHostBuffer::GetDeviceAddress(
@@ -482,11 +467,6 @@ Result<std::shared_ptr<CudaHostBuffer>> AllocateCudaHostBuffer(int device_number
   return manager->AllocateHost(device_number, size);
 }
 
-Status AllocateCudaHostBuffer(int device_number, const int64_t size,
-                              std::shared_ptr<CudaHostBuffer>* out) {
-  return AllocateCudaHostBuffer(device_number, size).Value(out);
-}
-
 Result<uintptr_t> GetDeviceAddress(const uint8_t* cpu_data,
                                    const std::shared_ptr<CudaContext>& ctx) {
   ContextSaver context_saver(*ctx);
@@ -505,6 +485,42 @@ Result<uint8_t*> GetHostAddress(uintptr_t device_ptr) {
       cuPointerGetAttribute(&ptr, CU_POINTER_ATTRIBUTE_HOST_POINTER, device_ptr));
   return static_cast<uint8_t*>(ptr);
 }
+
+Result<std::shared_ptr<MemoryManager>> DefaultMemoryMapper(ArrowDeviceType device_type,
+                                                           int64_t device_id) {
+  switch (device_type) {
+    case ARROW_DEVICE_CPU:
+      return default_cpu_memory_manager();
+    case ARROW_DEVICE_CUDA:
+    case ARROW_DEVICE_CUDA_HOST:
+    case ARROW_DEVICE_CUDA_MANAGED: {
+      ARROW_ASSIGN_OR_RAISE(auto device,
+                            arrow::cuda::CudaDevice::Make(static_cast<int>(device_id)));
+      return device->default_memory_manager();
+    }
+    default:
+      return Status::NotImplemented("memory manager not implemented for device");
+  }
+}
+
+namespace {
+
+Result<std::shared_ptr<MemoryManager>> DefaultCUDADeviceMapper(int64_t device_id) {
+  ARROW_ASSIGN_OR_RAISE(auto device,
+                        arrow::cuda::CudaDevice::Make(static_cast<int>(device_id)));
+  return device->default_memory_manager();
+}
+
+bool RegisterCUDADeviceInternal() {
+  DCHECK_OK(RegisterDeviceMapper(DeviceAllocationType::kCUDA, DefaultCUDADeviceMapper));
+  // TODO add the CUDA_HOST and CUDA_MANAGED allocation types when they are supported in
+  // the CudaDevice
+  return true;
+}
+
+static auto cuda_registered = RegisterCUDADeviceInternal();
+
+}  // namespace
 
 }  // namespace cuda
 }  // namespace arrow

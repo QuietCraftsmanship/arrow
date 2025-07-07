@@ -17,6 +17,20 @@
 
 module Arrow
   class Decimal128
+    class << self
+      # @api private
+      def try_convert(value)
+        case value
+        when String
+          new(value)
+        when Float
+          new(value.to_s)
+        else
+          nil
+        end
+      end
+    end
+
     alias_method :to_s_raw, :to_s
 
     # @overload to_s
@@ -37,6 +51,24 @@ module Arrow
       else
         to_s_raw
       end
+    end
+
+    alias_method :abs!, :abs
+
+    # @since 3.0.0
+    def abs
+      copied = dup
+      copied.abs!
+      copied
+    end
+
+    alias_method :negate!, :negate
+
+    # @since 3.0.0
+    def negate
+      copied = dup
+      copied.negate!
+      copied
     end
   end
 end

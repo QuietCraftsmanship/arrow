@@ -19,14 +19,64 @@
 
 namespace arrow {
 
-template <typename T>
-class Future;
+namespace internal {
+struct Empty;
+}  // namespace internal
+
+template <typename T = internal::Empty>
+class WeakFuture;
+class FutureWaiter;
+
+class TimestampParser;
 
 namespace internal {
 
 class Executor;
 class TaskGroup;
 class ThreadPool;
+class CpuInfo;
 
+namespace tracing {
+
+struct Scope;
+
+}  // namespace tracing
 }  // namespace internal
+
+struct Compression {
+  /// \brief Compression algorithm
+  enum type {
+    UNCOMPRESSED,
+    SNAPPY,
+    GZIP,
+    BROTLI,
+    ZSTD,
+    LZ4,
+    LZ4_FRAME,
+    LZO,
+    BZ2,
+    LZ4_HADOOP
+  };
+};
+
+namespace util {
+class AsyncTaskScheduler;
+class Compressor;
+class Decompressor;
+class Codec;
+class Uri;
+}  // namespace util
+
+template <typename T>
+struct Enumerated {
+  T value;
+  int index;
+  bool last;
+
+  friend inline bool operator==(const Enumerated<T>& left, const Enumerated<T>& right) {
+    return left.index == right.index && left.last == right.last &&
+           left.value == right.value;
+  }
+};
+
 }  // namespace arrow

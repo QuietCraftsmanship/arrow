@@ -17,16 +17,12 @@
  * under the License.
  */
 
-#ifdef HAVE_CONFIG_H
-#  include <config.h>
-#endif
-
 #include <arrow-glib/metadata-version.hpp>
 
 /**
  * SECTION: metadata-version
  * @title: GArrowMetadataVersion
- * @short_description: Metadata version mapgging between Arrow and arrow-glib
+ * @short_description: Metadata version mapping between Arrow and arrow-glib
  *
  * #GArrowMetadataVersion provides metadata versions corresponding
  * to `arrow::ipc::MetadataVersion` values.

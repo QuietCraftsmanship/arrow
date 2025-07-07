@@ -16,16 +16,23 @@
 # under the License.
 
 from collections import OrderedDict
-import pickle
 import sys
-
-from distutils.version import LooseVersion
+import weakref
 
 import pytest
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 import pyarrow as pa
 
 import pyarrow.tests.util as test_util
+from pyarrow.vendored.version import Version
+
+try:
+    import pandas as pd
+except ImportError:
+    pass
 
 
 def test_schema_constructor_errors():
@@ -45,8 +52,11 @@ def test_type_integers():
         assert str(t) == name
 
 
+@pytest.mark.pandas
 def test_type_to_pandas_dtype():
-    M8_ns = np.dtype('datetime64[ns]')
+    M8 = np.dtype('datetime64[ms]')
+    if Version(pd.__version__) < Version("2.0.0"):
+        M8 = np.dtype('datetime64[ns]')
     cases = [
         (pa.null(), np.object_),
         (pa.bool_(), np.bool_),
@@ -61,20 +71,26 @@ def test_type_to_pandas_dtype():
         (pa.float16(), np.float16),
         (pa.float32(), np.float32),
         (pa.float64(), np.float64),
-        (pa.date32(), M8_ns),
-        (pa.date64(), M8_ns),
-        (pa.timestamp('ms'), M8_ns),
+        (pa.date32(), M8),
+        (pa.date64(), M8),
+        (pa.timestamp('ms'), M8),
         (pa.binary(), np.object_),
+        (pa.large_binary(), np.object_),
+        (pa.binary_view(), np.object_),
         (pa.binary(12), np.object_),
         (pa.string(), np.object_),
+        (pa.large_string(), np.object_),
+        (pa.string_view(), np.object_),
         (pa.list_(pa.int8()), np.object_),
         # (pa.list_(pa.int8(), 2), np.object_),  # TODO needs pandas conversion
+        (pa.map_(pa.int64(), pa.float64()), np.object_),
     ]
     for arrow_type, numpy_type in cases:
         assert arrow_type.to_pandas_dtype() == numpy_type
 
 
 @pytest.mark.pandas
+@pytest.mark.processes
 def test_type_to_pandas_dtype_check_import():
     # ARROW-7980
     test_util.invoke_script('arrow_7980.py')
@@ -136,6 +152,7 @@ def test_type_for_alias():
         ('duration[ms]', pa.duration('ms')),
         ('duration[us]', pa.duration('us')),
         ('duration[ns]', pa.duration('ns')),
+        ('month_day_nano_interval', pa.month_day_nano_interval()),
     ]
 
     for val, expected in cases:
@@ -175,6 +192,7 @@ def test_time_types():
         pa.time64('s')
 
 
+@pytest.mark.numpy
 def test_from_numpy_dtype():
     cases = [
         (np.dtype('bool'), pa.bool_()),
@@ -206,7 +224,7 @@ def test_from_numpy_dtype():
 
     # Things convertible to numpy dtypes work
     assert pa.from_numpy_dtype('U') == pa.string()
-    assert pa.from_numpy_dtype(np.unicode) == pa.string()
+    assert pa.from_numpy_dtype(np.str_) == pa.string()
     assert pa.from_numpy_dtype('int32') == pa.int32()
     assert pa.from_numpy_dtype(bool) == pa.bool_()
 
@@ -242,6 +260,19 @@ baz: list<item: int8>
 
     with pytest.raises(TypeError):
         pa.schema([None])
+
+
+def test_schema_weakref():
+    fields = [
+        pa.field('foo', pa.int32()),
+        pa.field('bar', pa.string()),
+        pa.field('baz', pa.list_(pa.int8()))
+    ]
+    schema = pa.schema(fields)
+    wr = weakref.ref(schema)
+    assert wr() is not None
+    del schema
+    assert wr() is None
 
 
 def test_schema_to_string_with_metadata():
@@ -562,7 +593,7 @@ two: int32""")
     assert repr(sch) == expected
 
 
-def test_type_schema_pickling():
+def test_type_schema_pickling(pickle_module):
     cases = [
         pa.int8(),
         pa.string(),
@@ -588,12 +619,19 @@ def test_type_schema_pickling():
         pa.date64(),
         pa.timestamp('ms'),
         pa.timestamp('ns'),
+        pa.decimal32(9, 3),
+        pa.decimal64(11, 4),
         pa.decimal128(12, 2),
-        pa.field('a', 'string', metadata={b'foo': b'bar'})
+        pa.decimal256(76, 38),
+        pa.field('a', 'string', metadata={b'foo': b'bar'}),
+        pa.list_(pa.field("element", pa.int64())),
+        pa.large_list(pa.field("element", pa.int64())),
+        pa.map_(pa.field("key", pa.string(), nullable=False),
+                pa.field("value", pa.int8()))
     ]
 
     for val in cases:
-        roundtripped = pickle.loads(pickle.dumps(val))
+        roundtripped = pickle_module.loads(pickle_module.dumps(val))
         assert val == roundtripped
 
     fields = []
@@ -604,20 +642,27 @@ def test_type_schema_pickling():
             fields.append(pa.field('_f{}'.format(i), f))
 
     schema = pa.schema(fields, metadata={b'foo': b'bar'})
-    roundtripped = pickle.loads(pickle.dumps(schema))
+    roundtripped = pickle_module.loads(pickle_module.dumps(schema))
     assert schema == roundtripped
 
 
 def test_empty_table():
-    schema = pa.schema([
+    schema1 = pa.schema([
         pa.field('f0', pa.int64()),
         pa.field('f1', pa.dictionary(pa.int32(), pa.string())),
         pa.field('f2', pa.list_(pa.list_(pa.int64()))),
     ])
-    table = schema.empty_table()
-    assert isinstance(table, pa.Table)
-    assert table.num_rows == 0
-    assert table.schema == schema
+    # test it preserves field nullability
+    schema2 = pa.schema([
+        pa.field('a', pa.int64(), nullable=False),
+        pa.field('b', pa.int64())
+    ])
+
+    for schema in [schema1, schema2]:
+        table = schema.empty_table()
+        assert isinstance(table, pa.Table)
+        assert table.num_rows == 0
+        assert table.schema == schema
 
 
 @pytest.mark.pandas
@@ -632,11 +677,10 @@ def test_schema_from_pandas():
             '2006-01-13T12:34:56.432539784',
             '2010-08-13T05:46:57.437699912'
         ], dtype='datetime64[ns]'),
+        pd.array([1, 2, None], dtype=pd.Int32Dtype()),
     ]
-    if LooseVersion(pd.__version__) >= '1.0.0':
-        inputs.append(pd.array([1, 2, None], dtype=pd.Int32Dtype()))
     for data in inputs:
-        df = pd.DataFrame({'a': data})
+        df = pd.DataFrame({'a': data}, index=data)
         schema = pa.Schema.from_pandas(df)
         expected = pa.Table.from_pandas(df).schema
         assert schema == expected
@@ -648,7 +692,8 @@ def test_schema_sizeof():
         pa.field('bar', pa.string()),
     ])
 
-    assert sys.getsizeof(schema) > 30
+    # Note: pa.schema is twice as large on 64-bit systems
+    assert sys.getsizeof(schema) > (30 if sys.maxsize > 2**32 else 15)
 
     schema2 = schema.with_metadata({"key": "some metadata"})
     assert sys.getsizeof(schema2) > sys.getsizeof(schema)
@@ -684,5 +729,27 @@ def test_schema_merge():
     ])
     assert result.equals(expected)
 
-    with pytest.raises(pa.ArrowInvalid):
+    with pytest.raises(pa.ArrowTypeError):
         pa.unify_schemas([b, d])
+
+    # ARROW-14002: Try with tuple instead of list
+    result = pa.unify_schemas((a, b, c))
+    assert result.equals(expected)
+
+    result = pa.unify_schemas([b, d], promote_options="permissive")
+    assert result.equals(d)
+
+    # raise proper error when passing a non-Schema value
+    with pytest.raises(TypeError):
+        pa.unify_schemas([a, 1])
+
+
+def test_undecodable_metadata():
+    # ARROW-10214: undecodable metadata shouldn't fail repr()
+    data1 = b'abcdef\xff\x00'
+    data2 = b'ghijkl\xff\x00'
+    schema = pa.schema(
+        [pa.field('ints', pa.int16(), metadata={'key': data1})],
+        metadata={'key': data2})
+    assert 'abcdef' in str(schema)
+    assert 'ghijkl' in str(schema)

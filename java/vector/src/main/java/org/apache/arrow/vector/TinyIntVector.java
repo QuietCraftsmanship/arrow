@@ -19,23 +19,32 @@ package org.apache.arrow.vector;
 
 import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
 
-import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.TinyIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableTinyIntHolder;
 import org.apache.arrow.vector.holders.TinyIntHolder;
 import org.apache.arrow.vector.types.Types.MinorType;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
+
+import io.netty.buffer.ArrowBuf;
 
 /**
  * TinyIntVector implements a fixed width (1 bytes) vector of
  * byte values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
+<<<<<<< HEAD
+<<<<<<< HEAD
 public final class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 1;
   private final FieldReader reader;
 
@@ -59,18 +68,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
    * @param allocator allocator for memory management.
    */
   public TinyIntVector(String name, FieldType fieldType, BufferAllocator allocator) {
-    this(new Field(name, fieldType, null), allocator);
-  }
-
-  /**
-   * Instantiate a TinyIntVector. This doesn't allocate any memory for
-   * the data in vector.
-   *
-   * @param field field materialized by this vector
-   * @param allocator allocator for memory management.
-   */
-  public TinyIntVector(Field field, BufferAllocator allocator) {
-    super(field, allocator, TYPE_WIDTH);
+    super(name, allocator, fieldType, TYPE_WIDTH);
     reader = new TinyIntReaderImpl(TinyIntVector.this);
   }
 
@@ -146,6 +144,34 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
     }
   }
 
+  /**
+   * Copy a cell value from a particular index in source vector to a particular
+   * position in this vector.
+   *
+   * @param fromIndex position to copy from in source vector
+   * @param thisIndex position to copy to in this vector
+   * @param from source vector
+   */
+  public void copyFrom(int fromIndex, int thisIndex, TinyIntVector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final byte value = from.valueBuffer.getByte(fromIndex * TYPE_WIDTH);
+    valueBuffer.setByte(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Same as {@link #copyFrom(int, int, TinyIntVector)} except that
+   * it handles the case when the capacity of the vector needs to be expanded
+   * before copy.
+   *
+   * @param fromIndex position to copy from in source vector
+   * @param thisIndex position to copy to in this vector
+   * @param from source vector
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, TinyIntVector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
+  }
+
 
   /*----------------------------------------------------------------*
    |                                                                |
@@ -168,7 +194,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
    * @param value   value of element
    */
   public void set(int index, int value) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, value);
   }
 
@@ -179,7 +205,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
    * @param value   value of element
    */
   public void set(int index, byte value) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, value);
   }
 
@@ -195,10 +221,10 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
     if (holder.isSet < 0) {
       throw new IllegalArgumentException();
     } else if (holder.isSet > 0) {
-      BitVectorHelper.setBit(validityBuffer, index);
+      BitVectorHelper.setValidityBitToOne(validityBuffer, index);
       setValue(index, holder.value);
     } else {
-      BitVectorHelper.unsetBit(validityBuffer, index);
+      BitVectorHelper.setValidityBit(validityBuffer, index, 0);
     }
   }
 
@@ -209,7 +235,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
    * @param holder  data holder for value of element
    */
   public void set(int index, TinyIntHolder holder) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, holder.value);
   }
 
@@ -266,6 +292,18 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
   }
 
   /**
+   * Set the element at the given index to null.
+   *
+   * @param index   position of element
+   */
+  public void setNull(int index) {
+    handleSafe(index);
+    // not really needed to set the bit to 0 as long as
+    // the buffer always starts from 0.
+    BitVectorHelper.setValidityBit(validityBuffer, index, 0);
+  }
+
+  /**
    * Store the given value at a particular position in the vector. isSet indicates
    * whether the value is NULL or not.
    *
@@ -277,7 +315,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
     if (isSet > 0) {
       set(index, value);
     } else {
-      BitVectorHelper.unsetBit(validityBuffer, index);
+      BitVectorHelper.setValidityBit(validityBuffer, index, 0);
     }
   }
 
@@ -318,7 +356,7 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
 
 
   /**
-   * Construct a TransferPair comprising of this and a target vector of
+   * Construct a TransferPair comprising of this and and a target vector of
    * the same type.
    *
    * @param ref name of the target vector
@@ -342,6 +380,8 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
   }
 
   @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
   public void setWithPossibleTruncate(int index, long value) {
     this.setSafe(index, (int) value);
   }
@@ -354,6 +394,16 @@ public final class TinyIntVector extends BaseFixedWidthVector implements BaseInt
   @Override
   public long getValueAsLong(int index) {
     return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Byte.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Byte.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

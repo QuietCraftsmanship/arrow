@@ -12,18 +12,16 @@ by \link{ParquetFileReader}.
 
 
 The \code{ParquetReaderProperties$create()} factory method instantiates the object
-and takes the following arguments:
-\itemize{
-\item \code{use_threads} Logical: whether to use multithreading (default \code{TRUE})
-}
+and takes no arguments.
 }
 
 \section{Methods}{
 
 \itemize{
-\item \verb{$read_dictionary(column_index)}
-\item \verb{$set_read_dictionary(column_index, read_dict)}
-\item \verb{$use_threads(use_threads)}
+\item \verb{$thrift_string_size_limit()}
+\item \verb{$set_thrift_string_size_limit()}
+\item \verb{$thrift_container_size_limit()}
+\item \verb{$set_thrift_container_size_limit()}
 }
 }
 
