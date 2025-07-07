@@ -918,9 +918,14 @@ Status ExecComputedBitmap(KernelContext* ctx, const ExecSpan& batch, ExecResult*
                          out_arr->offset, batch.length));
   }
 
+  internal::CopyBitmap(arg0.buffers[0]->data(), arg0.offset, batch.length,
+                       out_arr->buffers[0]->mutable_data(), out_arr->offset);
+  ExecCopy(ctx, batch, out);
+
   CopyBitmap(arg0.buffers[0].data, arg0.offset, batch.length, out_arr->buffers[0].data,
              out_arr->offset);
   return ExecCopyArraySpan(ctx, batch, out);
+
 }
 
 Status ExecNoPreallocatedData(KernelContext* ctx, const ExecSpan& batch,

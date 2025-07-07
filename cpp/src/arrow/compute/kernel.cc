@@ -24,7 +24,12 @@
 
 #include "arrow/buffer.h"
 #include "arrow/compute/exec.h"
+
+#include "arrow/compute/util_internal.h"
+
 #include "arrow/device_allocation_type_set.h"
+
+
 #include "arrow/result.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_util.h"
@@ -45,6 +50,25 @@ namespace compute {
 // ----------------------------------------------------------------------
 // KernelContext
 
+
+Result<std::shared_ptr<Buffer>> KernelContext::Allocate(int64_t nbytes) {
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Buffer> result,
+                        AllocateBuffer(nbytes, exec_ctx_->memory_pool()));
+  result->ZeroPadding();
+  return result;
+}
+
+Result<std::shared_ptr<Buffer>> KernelContext::AllocateBitmap(int64_t num_bits) {
+  const int64_t nbytes = BitUtil::BytesForBits(num_bits);
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Buffer> result,
+                        AllocateBuffer(nbytes, exec_ctx_->memory_pool()));
+  // Some utility methods access the last byte before it might be
+  // initialized this makes valgrind/asan unhappy, so we proactively
+  // zero it.
+  if (nbytes > 0) {
+    internal::ZeroByte(result.get(), result->size() - 1);
+    result->ZeroPadding();
+
 Result<std::shared_ptr<ResizableBuffer>> KernelContext::Allocate(int64_t nbytes) {
   return AllocateResizableBuffer(nbytes, exec_ctx_->memory_pool());
 }
@@ -63,6 +87,7 @@ Status Kernel::InitAll(KernelContext* ctx, const KernelInitArgs& args,
                        std::vector<std::unique_ptr<KernelState>>* states) {
   for (auto& state : *states) {
     ARROW_ASSIGN_OR_RAISE(state, args.kernel->init(ctx, args));
+
   }
   return Status::OK();
 }

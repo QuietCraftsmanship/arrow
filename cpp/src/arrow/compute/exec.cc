@@ -36,6 +36,7 @@
 #include "arrow/compute/function_internal.h"
 #include "arrow/compute/kernel.h"
 #include "arrow/compute/registry.h"
+#include "arrow/compute/util_internal.h"
 #include "arrow/datum.h"
 #include "arrow/pretty_print.h"
 #include "arrow/record_batch.h"
@@ -731,7 +732,18 @@ class KernelExecutorImpl : public KernelExecutor {
     out->buffers.resize(output_num_buffers_);
 
     if (validity_preallocated_) {
+
+      ARROW_ASSIGN_OR_RAISE(out->buffers[0], kernel_ctx_.AllocateBitmap(length));
+#ifdef ARROW_VALGRIND
+      // ARROW-8976: When writing kernel results chunkwise into larger
+      // preallocations, if the exec_chunksize is not a multiple of 8, then
+      // functions in NullPropagator will access bits that have not yet been
+      // intialized, triggering benign valgrind warnings.
+      internal::ZeroMemory(out->buffers[0].get());
+#endif
+
       ARROW_ASSIGN_OR_RAISE(out->buffers[0], kernel_ctx_->AllocateBitmap(length));
+
     }
     if (kernel_->null_handling == NullHandling::OUTPUT_NOT_NULL) {
       out->null_count = 0;
