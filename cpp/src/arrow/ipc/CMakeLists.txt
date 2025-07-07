@@ -18,25 +18,30 @@
 #
 # Messaging and interprocess communication
 
+function(ADD_ARROW_IPC_TEST REL_TEST_NAME)
+  set(options)
+  set(one_value_args PREFIX)
+  set(multi_value_args)
+  cmake_parse_arguments(ARG
+                        "${options}"
+                        "${one_value_args}"
+                        "${multi_value_args}"
+                        ${ARGN})
+
+  if(ARG_PREFIX)
+    set(PREFIX ${ARG_PREFIX})
+  else()
+    set(PREFIX "arrow-ipc")
+  endif()
+
+  add_arrow_test(${REL_TEST_NAME} PREFIX ${PREFIX} ${ARG_UNPARSED_ARGUMENTS})
+endfunction()
+
 add_arrow_test(feather_test)
-add_arrow_test(read_write_test PREFIX "arrow-ipc")
-add_arrow_test(json_simple_test PREFIX "arrow-ipc")
-add_arrow_test(json_test PREFIX "arrow-ipc")
-
-# json_integration_test is two things at the same time:
-# - an executable that can be called to answer integration test requests
-# - a self-(unit)test for the C++ side of integration testing
-if(ARROW_BUILD_TESTS)
-  add_arrow_test(json_integration_test EXTRA_LINK_LIBS ${GFLAGS_LIBRARIES})
-  add_dependencies(arrow-integration arrow-json-integration-test)
-elseif(ARROW_BUILD_INTEGRATION)
-  add_executable(arrow-json-integration-test json_integration_test.cc)
-  target_link_libraries(arrow-json-integration-test ${ARROW_TEST_LINK_LIBS}
-                        ${GFLAGS_LIBRARIES} GTest::gtest)
-
-  add_dependencies(arrow-json-integration-test arrow arrow_testing)
-  add_dependencies(arrow-integration arrow-json-integration-test)
-endif()
+add_arrow_ipc_test(json_simple_test)
+add_arrow_ipc_test(message_internal_test)
+add_arrow_ipc_test(read_write_test)
+add_arrow_ipc_test(tensor_test)
 
 # Headers: top level
 arrow_install_all_headers("arrow/ipc")
@@ -53,6 +58,11 @@ if(ARROW_BUILD_UTILITIES OR ARROW_BUILD_INTEGRATION)
   add_executable(arrow-stream-to-file stream_to_file.cc)
   target_link_libraries(arrow-stream-to-file ${ARROW_UTIL_LIB})
 
+  if(ARROW_BUILD_UTILITIES)
+    install(TARGETS arrow-file-to-stream arrow-stream-to-file ${INSTALL_IS_OPTIONAL}
+            DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
+
   if(ARROW_BUILD_INTEGRATION)
     add_dependencies(arrow-integration arrow-file-to-stream)
     add_dependencies(arrow-integration arrow-stream-to-file)
@@ -61,11 +71,21 @@ endif()
 
 add_arrow_benchmark(read_write_benchmark PREFIX "arrow-ipc")
 
-if(ARROW_FUZZING)
+if(ARROW_FUZZING
+   OR (ARROW_BUILD_UTILITIES
+       AND ARROW_TESTING
+       AND ARROW_WITH_LZ4
+       AND ARROW_WITH_ZSTD
+      ))
   add_executable(arrow-ipc-generate-fuzz-corpus generate_fuzz_corpus.cc)
   target_link_libraries(arrow-ipc-generate-fuzz-corpus ${ARROW_UTIL_LIB}
+                        ${ARROW_TEST_LINK_LIBS})
+
+  add_executable(arrow-ipc-generate-tensor-fuzz-corpus generate_tensor_fuzz_corpus.cc)
+  target_link_libraries(arrow-ipc-generate-tensor-fuzz-corpus ${ARROW_UTIL_LIB}
                         ${ARROW_TEST_LINK_LIBS})
 endif()
 
 add_arrow_fuzz_target(file_fuzz PREFIX "arrow-ipc")
 add_arrow_fuzz_target(stream_fuzz PREFIX "arrow-ipc")
+add_arrow_fuzz_target(tensor_stream_fuzz PREFIX "arrow-ipc")

@@ -17,74 +17,72 @@
 
 #include <iostream>
 
-#include "arrow/api.h"
 #include "arrow/io/memory.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
 #include "arrow/util/cpu_info.h"
-#include "arrow/util/neon_util.h"
-#include "arrow/util/sse_util.h"
+#include "arrow/util/simd.h"
 
 #include "benchmark/benchmark.h"
 
 namespace arrow {
 
 using internal::CpuInfo;
-static CpuInfo* cpu_info = CpuInfo::GetInstance();
+static const CpuInfo* cpu_info = CpuInfo::GetInstance();
 
 static const int kNumCores = cpu_info->num_cores();
-static const int64_t kL1Size = cpu_info->CacheSize(CpuInfo::L1_CACHE);
-static const int64_t kL2Size = cpu_info->CacheSize(CpuInfo::L2_CACHE);
-static const int64_t kL3Size = cpu_info->CacheSize(CpuInfo::L3_CACHE);
+static const int64_t kL1Size = cpu_info->CacheSize(CpuInfo::CacheLevel::L1);
+static const int64_t kL2Size = cpu_info->CacheSize(CpuInfo::CacheLevel::L2);
+static const int64_t kL3Size = cpu_info->CacheSize(CpuInfo::CacheLevel::L3);
 
 constexpr size_t kMemoryPerCore = 32 * 1024 * 1024;
 using BufferPtr = std::shared_ptr<Buffer>;
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
-#ifndef _MSC_VER
+#  ifndef _MSC_VER
 
-#ifdef ARROW_HAVE_SSE4_2
+#    ifdef ARROW_HAVE_SSE4_2
 
-#ifdef ARROW_AVX512
+#      ifdef ARROW_HAVE_AVX512
 
 using VectorType = __m512i;
-#define VectorSet _mm512_set1_epi32
-#define VectorLoad _mm512_stream_load_si512
-#define VectorLoadAsm(SRC, DST) \
-  asm volatile("vmovaps %[src], %[dst]" : [ dst ] "=v"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamLoad _mm512_stream_load_si512
-#define VectorStreamLoadAsm(SRC, DST) \
-  asm volatile("vmovntdqa %[src], %[dst]" : [ dst ] "=v"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamWrite _mm512_stream_si512
+#        define VectorSet _mm512_set1_epi32
+#        define VectorLoad _mm512_stream_load_si512
+#        define VectorLoadAsm(SRC, DST) \
+          asm volatile("vmovaps %[src], %[dst]" : [dst] "=v"(DST) : [src] "m"(SRC) :)
+#        define VectorStreamLoad _mm512_stream_load_si512
+#        define VectorStreamLoadAsm(SRC, DST) \
+          asm volatile("vmovntdqa %[src], %[dst]" : [dst] "=v"(DST) : [src] "m"(SRC) :)
+#        define VectorStreamWrite _mm512_stream_si512
 
-#else
+#      else
 
-#ifdef ARROW_AVX2
+#        ifdef ARROW_HAVE_AVX2
 
 using VectorType = __m256i;
-#define VectorSet _mm256_set1_epi32
-#define VectorLoad _mm256_stream_load_si256
-#define VectorLoadAsm(SRC, DST) \
-  asm volatile("vmovaps %[src], %[dst]" : [ dst ] "=v"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamLoad _mm256_stream_load_si256
-#define VectorStreamLoadAsm(SRC, DST) \
-  asm volatile("vmovntdqa %[src], %[dst]" : [ dst ] "=v"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamWrite _mm256_stream_si256
+#          define VectorSet _mm256_set1_epi32
+#          define VectorLoad _mm256_stream_load_si256
+#          define VectorLoadAsm(SRC, DST) \
+            asm volatile("vmovaps %[src], %[dst]" : [dst] "=v"(DST) : [src] "m"(SRC) :)
+#          define VectorStreamLoad _mm256_stream_load_si256
+#          define VectorStreamLoadAsm(SRC, DST) \
+            asm volatile("vmovntdqa %[src], %[dst]" : [dst] "=v"(DST) : [src] "m"(SRC) :)
+#          define VectorStreamWrite _mm256_stream_si256
 
-#else  // ARROW_AVX2 not set
+#        else  // ARROW_HAVE_AVX2 not set
 
 using VectorType = __m128i;
-#define VectorSet _mm_set1_epi32
-#define VectorLoad _mm_stream_load_si128
-#define VectorLoadAsm(SRC, DST) \
-  asm volatile("movaps %[src], %[dst]" : [ dst ] "=x"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamLoad _mm_stream_load_si128
-#define VectorStreamLoadAsm(SRC, DST) \
-  asm volatile("movntdqa %[src], %[dst]" : [ dst ] "=x"(DST) : [ src ] "m"(SRC) :)
-#define VectorStreamWrite _mm_stream_si128
+#          define VectorSet _mm_set1_epi32
+#          define VectorLoad _mm_stream_load_si128
+#          define VectorLoadAsm(SRC, DST) \
+            asm volatile("movaps %[src], %[dst]" : [dst] "=x"(DST) : [src] "m"(SRC) :)
+#          define VectorStreamLoad _mm_stream_load_si128
+#          define VectorStreamLoadAsm(SRC, DST) \
+            asm volatile("movntdqa %[src], %[dst]" : [dst] "=x"(DST) : [src] "m"(SRC) :)
+#          define VectorStreamWrite _mm_stream_si128
 
-#endif  // ARROW_AVX2
-#endif  // ARROW_AVX512
+#        endif  // ARROW_HAVE_AVX2
+#      endif    // ARROW_HAVE_AVX512
 
 static void Read(void* src, void* dst, size_t size) {
   const auto simd = static_cast<VectorType*>(src);
@@ -103,7 +101,8 @@ static void Read(void* src, void* dst, size_t size) {
   memset(&c, 0, sizeof(c));
   memset(&d, 0, sizeof(d));
 
-  benchmark::DoNotOptimize(a + b + c + d);
+  auto result = a + b + c + d;
+  benchmark::DoNotOptimize(result);
 }
 
 // See http://codearcana.com/posts/2013/05/18/achieving-maximum-memory-bandwidth.html
@@ -126,7 +125,8 @@ static void StreamRead(void* src, void* dst, size_t size) {
     VectorStreamLoadAsm(simd[i + 3], d);
   }
 
-  benchmark::DoNotOptimize(a + b + c + d);
+  auto result = a + b + c + d;
+  benchmark::DoNotOptimize(result);
 }
 
 static void StreamWrite(void* src, void* dst, size_t size) {
@@ -154,26 +154,26 @@ static void StreamReadWrite(void* src, void* dst, size_t size) {
   }
 }
 
-#endif  // ARROW_HAVE_SSE4_2
+#    endif  // ARROW_HAVE_SSE4_2
 
-#ifdef ARROW_HAVE_ARMV8_CRYPTO
+#    ifdef ARROW_HAVE_NEON
 
 using VectorType = uint8x16_t;
 using VectorTypeDual = uint8x16x2_t;
 
-#define VectorSet vdupq_n_u8
-#define VectorLoadAsm vld1q_u8
+#      define VectorSet vdupq_n_u8
+#      define VectorLoadAsm vld1q_u8
 
 static void armv8_stream_load_pair(VectorType* src, VectorType* dst) {
   asm volatile("LDNP %[reg1], %[reg2], [%[from]]\n\t"
-               : [ reg1 ] "+r"(*dst), [ reg2 ] "+r"(*(dst + 1))
-               : [ from ] "r"(src));
+               : [reg1] "+r"(*dst), [reg2] "+r"(*(dst + 1))
+               : [from] "r"(src));
 }
 
 static void armv8_stream_store_pair(VectorType* src, VectorType* dst) {
   asm volatile("STNP %[reg1], %[reg2], [%[to]]\n\t"
-               : [ to ] "+r"(dst)
-               : [ reg1 ] "r"(*src), [ reg2 ] "r"(*(src + 1))
+               : [to] "+r"(dst)
+               : [reg1] "r"(*src), [reg2] "r"(*(src + 1))
                : "memory");
 }
 
@@ -181,7 +181,7 @@ static void armv8_stream_ldst_pair(VectorType* src, VectorType* dst) {
   asm volatile(
       "LDNP q1, q2, [%[from]]\n\t"
       "STNP q1, q2, [%[to]]\n\t"
-      : [ from ] "+r"(src), [ to ] "+r"(dst)
+      : [from] "+r"(src), [to] "+r"(dst)
       :
       : "memory", "v0", "v1", "v2", "v3");
 }
@@ -239,7 +239,7 @@ static void StreamReadWrite(void* src, void* dst, size_t size) {
   }
 }
 
-#endif  // ARROW_HAVE_ARMV8_CRYPTO
+#    endif  // ARROW_HAVE_NEON
 
 static void PlatformMemcpy(void* src, void* dst, size_t size) { memcpy(src, dst, size); }
 
@@ -250,8 +250,8 @@ static void MemoryBandwidth(benchmark::State& state) {  // NOLINT non-const refe
   const size_t buffer_size = state.range(0);
   BufferPtr src, dst;
 
-  ABORT_NOT_OK(AllocateBuffer(buffer_size, &dst));
-  ABORT_NOT_OK(AllocateBuffer(buffer_size, &src));
+  dst = *AllocateBuffer(buffer_size);
+  src = *AllocateBuffer(buffer_size);
   random_bytes(buffer_size, 0, src->mutable_data());
 
   while (state.KeepRunning()) {
@@ -261,7 +261,7 @@ static void MemoryBandwidth(benchmark::State& state) {  // NOLINT non-const refe
   state.SetBytesProcessed(state.iterations() * buffer_size);
 }
 
-#ifdef ARROW_HAVE_SSE4_2
+#    ifdef ARROW_HAVE_SSE4_2
 static void SetCacheBandwidthArgs(benchmark::internal::Benchmark* bench) {
   auto cache_sizes = {kL1Size, kL2Size, kL3Size};
   for (auto size : cache_sizes) {
@@ -274,7 +274,7 @@ static void SetCacheBandwidthArgs(benchmark::internal::Benchmark* bench) {
 }
 
 BENCHMARK_TEMPLATE(MemoryBandwidth, Read)->Apply(SetCacheBandwidthArgs);
-#endif  // ARROW_HAVE_SSE4_2
+#    endif  // ARROW_HAVE_SSE4_2
 
 static void SetMemoryBandwidthArgs(benchmark::internal::Benchmark* bench) {
   // `UseRealTime` is required due to threads, otherwise the cumulative CPU time
@@ -287,16 +287,15 @@ BENCHMARK_TEMPLATE(MemoryBandwidth, StreamWrite)->Apply(SetMemoryBandwidthArgs);
 BENCHMARK_TEMPLATE(MemoryBandwidth, StreamReadWrite)->Apply(SetMemoryBandwidthArgs);
 BENCHMARK_TEMPLATE(MemoryBandwidth, PlatformMemcpy)->Apply(SetMemoryBandwidthArgs);
 
-#endif  // _MSC_VER
-#endif  // ARROW_WITH_BENCHMARKS_REFERENCE
+#  endif  // _MSC_VER
+#endif    // ARROW_WITH_BENCHMARKS_REFERENCE
 
 static void ParallelMemoryCopy(benchmark::State& state) {  // NOLINT non-const reference
   const int64_t n_threads = state.range(0);
   const int64_t buffer_size = kMemoryPerCore;
 
-  std::shared_ptr<Buffer> src, dst;
-  ABORT_NOT_OK(AllocateBuffer(buffer_size, &src));
-  ABORT_NOT_OK(AllocateBuffer(buffer_size, &dst));
+  auto src = *AllocateBuffer(buffer_size);
+  std::shared_ptr<Buffer> dst = *AllocateBuffer(buffer_size);
 
   random_bytes(buffer_size, 0, src->mutable_data());
 

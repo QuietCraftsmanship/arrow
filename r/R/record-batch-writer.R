@@ -18,7 +18,8 @@
 
 #' @title RecordBatchWriter classes
 #' @description Apache Arrow defines two formats for [serializing data for interprocess
-#' communication (IPC)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc):
+#' communication
+#' (IPC)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc):
 #' a "stream" format and a "file" format, known as Feather.
 #' `RecordBatchStreamWriter` and `RecordBatchFileWriter` are
 #' interfaces for writing record batches to those formats, respectively.
@@ -39,8 +40,12 @@
 #' - `sink` An `OutputStream`
 #' - `schema` A [Schema] for the data to be written
 #' - `use_legacy_format` logical: write data formatted so that Arrow libraries
-#'   versions 0.14 and lower can read it? Default is `FALSE`. You can also
+#'   versions 0.14 and lower can read it. Default is `FALSE`. You can also
 #'   enable this by setting the environment variable `ARROW_PRE_0_15_IPC_FORMAT=1`.
+#' - `metadata_version`: A string like "V5" or the equivalent integer indicating
+#'   the Arrow IPC MetadataVersion. Default (NULL) will use the latest version,
+#'   unless the environment variable `ARROW_PRE_1_0_METADATA_VERSION=1`, in
+#'   which case it will be V4.
 #'
 #' @section Methods:
 #'
@@ -54,13 +59,12 @@
 #'
 #' @rdname RecordBatchWriter
 #' @name RecordBatchWriter
-#' @include arrow-package.R
+#' @include arrow-object.R
 #' @examples
-#' \donttest{
 #' tf <- tempfile()
 #' on.exit(unlink(tf))
 #'
-#' batch <- record_batch(iris)
+#' batch <- record_batch(chickwts)
 #'
 #' # This opens a connection to the file in Arrow
 #' file_obj <- FileOutputStream$create(tf)
@@ -86,26 +90,24 @@
 #' # Call as.data.frame to turn that Table into an R data.frame
 #' df <- as.data.frame(tab)
 #' # This should be the same data we sent
-#' all.equal(df, iris, check.attributes = FALSE)
+#' all.equal(df, chickwts, check.attributes = FALSE)
 #' # Unlike the Writers, we don't have to close RecordBatchReaders,
 #' # but we do still need to close the file connection
 #' read_file_obj$close()
-#' }
-RecordBatchWriter <- R6Class("RecordBatchWriter", inherit = ArrowObject,
+RecordBatchWriter <- R6Class("RecordBatchWriter",
+  inherit = ArrowObject,
   public = list(
     write_batch = function(batch) ipc___RecordBatchWriter__WriteRecordBatch(self, batch),
     write_table = function(table) ipc___RecordBatchWriter__WriteTable(self, table),
-
     write = function(x) {
       if (inherits(x, "RecordBatch")) {
         self$write_batch(x)
       } else if (inherits(x, "Table")) {
         self$write_table(x)
       } else {
-        self$write_table(Table$create(x))
+        self$write_table(as_arrow_table(x))
       }
     },
-
     close = function() ipc___RecordBatchWriter__Close(self)
   )
 )
@@ -115,19 +117,26 @@ RecordBatchWriter <- R6Class("RecordBatchWriter", inherit = ArrowObject,
 #' @rdname RecordBatchWriter
 #' @export
 RecordBatchStreamWriter <- R6Class("RecordBatchStreamWriter", inherit = RecordBatchWriter)
-RecordBatchStreamWriter$create <- function(sink, schema, use_legacy_format = NULL) {
-  if (is.character(sink) && length(sink) == 1) {
+RecordBatchStreamWriter$create <- function(sink,
+                                           schema,
+                                           use_legacy_format = NULL,
+                                           metadata_version = NULL) {
+  if (is.string(sink)) {
     stop(
       "RecordBatchStreamWriter$create() requires an Arrow InputStream. ",
       "Try providing FileOutputStream$create(", substitute(sink), ")",
       call. = FALSE
     )
   }
-  use_legacy_format <- use_legacy_format %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1")
   assert_is(sink, "OutputStream")
   assert_is(schema, "Schema")
 
-  shared_ptr(RecordBatchStreamWriter, ipc___RecordBatchStreamWriter__Open(sink, schema, use_legacy_format))
+  ipc___RecordBatchStreamWriter__Open(
+    sink,
+    schema,
+    get_ipc_use_legacy_format(use_legacy_format),
+    get_ipc_metadata_version(metadata_version)
+  )
 }
 
 #' @usage NULL
@@ -135,17 +144,51 @@ RecordBatchStreamWriter$create <- function(sink, schema, use_legacy_format = NUL
 #' @rdname RecordBatchWriter
 #' @export
 RecordBatchFileWriter <- R6Class("RecordBatchFileWriter", inherit = RecordBatchStreamWriter)
-RecordBatchFileWriter$create <- function(sink, schema, use_legacy_format = NULL) {
-  if (is.character(sink) && length(sink) == 1) {
+RecordBatchFileWriter$create <- function(sink,
+                                         schema,
+                                         use_legacy_format = NULL,
+                                         metadata_version = NULL) {
+  if (is.string(sink)) {
     stop(
       "RecordBatchFileWriter$create() requires an Arrow InputStream. ",
       "Try providing FileOutputStream$create(", substitute(sink), ")",
       call. = FALSE
     )
   }
-  use_legacy_format <- use_legacy_format %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1")
   assert_is(sink, "OutputStream")
   assert_is(schema, "Schema")
 
-  shared_ptr(RecordBatchFileWriter, ipc___RecordBatchFileWriter__Open(sink, schema, use_legacy_format))
+  ipc___RecordBatchFileWriter__Open(
+    sink,
+    schema,
+    get_ipc_use_legacy_format(use_legacy_format),
+    get_ipc_metadata_version(metadata_version)
+  )
+}
+
+get_ipc_metadata_version <- function(x) {
+  input <- x
+  if (is_integerish(x)) {
+    # 4 means "V4", which actually happens to be 3L
+    x <- paste0("V", x)
+  } else if (is.null(x)) {
+    if (identical(Sys.getenv("ARROW_PRE_1_0_METADATA_VERSION"), "1") ||
+      identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1")) {
+      # PRE_1_0 is specific for this;
+      # if you already set PRE_0_15, PRE_1_0 should be implied
+      x <- "V4"
+    } else {
+      # Take the latest
+      x <- length(MetadataVersion)
+    }
+  }
+  out <- MetadataVersion[[x]]
+  if (is.null(out)) {
+    stop(deparse(input), " is not a valid IPC MetadataVersion", call. = FALSE)
+  }
+  out
+}
+
+get_ipc_use_legacy_format <- function(x) {
+  isTRUE(x %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1"))
 }

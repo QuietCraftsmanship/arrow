@@ -33,6 +33,11 @@ module Arrow
         end
         if builder_info
           builder = builder_info[:builder]
+          if builder.nil? and builder_info[:builder_type]
+            builder = create_builder(builder_info)
+          end
+        end
+        if builder
           builder.build(values)
         else
           Arrow::StringArray.new(values)
@@ -56,6 +61,11 @@ module Arrow
         when String
           {
             builder: StringArrayBuilder.new,
+            detected: true,
+          }
+        when Symbol
+          {
+            builder: StringDictionaryArrayBuilder.new,
             detected: true,
           }
         when Float
@@ -115,6 +125,30 @@ module Arrow
             builder: Date32ArrayBuilder.new,
             detected: true,
           }
+        when BigDecimal
+          builder_info ||= {}
+          if builder_info[:builder] or value.nan? or value.infinite?
+            {
+              builder: StringArrayBuilder.new,
+              detected: true,
+            }
+          else
+            precision = [builder_info[:precision] || 0, value.precision].max
+            scale = [builder_info[:scale] || 0, value.scale].max
+            if precision <= Decimal128DataType::MAX_PRECISION
+              {
+                builder_type: :decimal128,
+                precision: precision,
+                scale: scale,
+              }
+            else
+              {
+                builder_type: :decimal256,
+                precision: precision,
+                scale: scale,
+              }
+            end
+          end
         when ::Array
           sub_builder_info = nil
           value.each do |sub_value|
@@ -136,6 +170,22 @@ module Arrow
             builder: StringArrayBuilder.new,
             detected: true,
           }
+        end
+      end
+
+      def create_builder(builder_info)
+        builder_type = builder_info[:builder_type]
+        case builder_type
+        when :decimal128
+          data_type = Decimal128DataType.new(builder_info[:precision],
+                                             builder_info[:scale])
+          Decimal128ArrayBuilder.new(data_type)
+        when :decimal256
+          data_type = Decimal256DataType.new(builder_info[:precision],
+                                             builder_info[:scale])
+          Decimal256ArrayBuilder.new(data_type)
+        else
+          nil
         end
       end
     end
@@ -192,12 +242,6 @@ module Arrow
         else
           append_nulls(current_index - start_index)
         end
-      end
-    end
-
-    def append_nulls(n)
-      n.times do
-        append_null
       end
     end
   end

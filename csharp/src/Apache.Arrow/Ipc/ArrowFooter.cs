@@ -25,8 +25,8 @@ namespace Apache.Arrow.Ipc
         private readonly List<Block> _dictionaries;
         private readonly List<Block> _recordBatches;
 
-        public IEnumerable<Block> Dictionaries => _dictionaries;
-        public IEnumerable<Block> RecordBatches => _recordBatches;
+        public IReadOnlyList<Block> Dictionaries => _dictionaries;
+        public IReadOnlyList<Block> RecordBatches => _recordBatches;
 
         public Block GetRecordBatchBlock(int i) => _recordBatches[i];
 
@@ -61,16 +61,16 @@ namespace Apache.Arrow.Ipc
 #endif
         }
 
-        public ArrowFooter(Flatbuf.Footer footer)
-            : this(Ipc.MessageSerializer.GetSchema(footer.Schema.GetValueOrDefault()), GetDictionaries(footer),
+        public ArrowFooter(Flatbuf.Footer footer, ref DictionaryMemo dictionaryMemo)
+            : this(Ipc.MessageSerializer.GetSchema(footer.Schema.GetValueOrDefault(), ref dictionaryMemo), GetDictionaries(footer),
                 GetRecordBatches(footer))
         { }
 
         private static IEnumerable<Block> GetDictionaries(Flatbuf.Footer footer)
         {
-            for (var i = 0; i < footer.DictionariesLength; i++)
+            for (int i = 0; i < footer.DictionariesLength; i++)
             {
-                var block = footer.Dictionaries(i);
+                Flatbuf.Block? block = footer.Dictionaries(i);
 
                 if (block.HasValue)
                 {
@@ -81,9 +81,9 @@ namespace Apache.Arrow.Ipc
 
         private static IEnumerable<Block> GetRecordBatches(Flatbuf.Footer footer)
         {
-            for (var i = 0; i < footer.RecordBatchesLength; i++)
+            for (int i = 0; i < footer.RecordBatchesLength; i++)
             {
-                var block = footer.RecordBatches(i);
+                Flatbuf.Block? block = footer.RecordBatches(i);
 
                 if (block.HasValue)
                 {

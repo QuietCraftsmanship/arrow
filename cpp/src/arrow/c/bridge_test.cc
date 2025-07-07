@@ -15,32 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cerrno>
 #include <deque>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include "arrow/array.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "arrow/c/util_internal.h"
 #include "arrow/ipc/json_simple.h"
 #include "arrow/memory_pool.h"
+#include "arrow/testing/builder.h"
+#include "arrow/testing/extension_type.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/testing/matchers.h"
 #include "arrow/testing/util.h"
+#include "arrow/util/async_generator.h"
+#include "arrow/util/binary_view_util.h"
+#include "arrow/util/checked_cast.h"
+#include "arrow/util/endian.h"
 #include "arrow/util/key_value_metadata.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/string_view.h"
+#include "arrow/util/range.h"
+#include "arrow/util/thread_pool.h"
+
+// TODO(GH-37221): Remove these ifdef checks when compute dependency is removed
+#ifdef ARROW_COMPUTE
+#  include "arrow/compute/api_vector.h"
+#endif
 
 namespace arrow {
 
+using internal::ArrayDeviceExportTraits;
+using internal::ArrayDeviceStreamExportTraits;
 using internal::ArrayExportGuard;
 using internal::ArrayExportTraits;
+using internal::ArrayStreamExportGuard;
+using internal::ArrayStreamExportTraits;
+using internal::checked_cast;
+using internal::DeviceArrayExportGuard;
+using internal::DeviceArrayStreamExportGuard;
 using internal::SchemaExportGuard;
 using internal::SchemaExportTraits;
+using internal::Zip;
 
 template <typename T>
 struct ExportTraits {};
@@ -74,14 +100,14 @@ class ReleaseCallback {
  public:
   using CType = typename Traits::CType;
 
-  explicit ReleaseCallback(CType* c_struct) : called_(false) {
+  explicit ReleaseCallback(CType* c_struct) {
     orig_release_ = c_struct->release;
     orig_private_data_ = c_struct->private_data;
-    c_struct->release = ReleaseUnbound;
+    c_struct->release = StaticRelease;
     c_struct->private_data = this;
   }
 
-  static void ReleaseUnbound(CType* c_struct) {
+  static void StaticRelease(CType* c_struct) {
     reinterpret_cast<ReleaseCallback*>(c_struct->private_data)->Release(c_struct);
   }
 
@@ -106,7 +132,7 @@ class ReleaseCallback {
  private:
   ARROW_DISALLOW_COPY_AND_ASSIGN(ReleaseCallback);
 
-  bool called_;
+  bool called_{false};
   void (*orig_release_)(CType*);
   void* orig_private_data_;
 };
@@ -114,22 +140,96 @@ class ReleaseCallback {
 using SchemaReleaseCallback = ReleaseCallback<SchemaExportTraits>;
 using ArrayReleaseCallback = ReleaseCallback<ArrayExportTraits>;
 
+// Whether c_struct or any of its descendents have non-null data pointers.
+bool HasData(const ArrowArray* c_struct) {
+  for (int64_t i = 0; i < c_struct->n_buffers; ++i) {
+    if (c_struct->buffers[i] != nullptr) {
+      return true;
+    }
+  }
+  if (c_struct->dictionary && HasData(c_struct->dictionary)) {
+    return true;
+  }
+  for (int64_t i = 0; i < c_struct->n_children; ++i) {
+    if (HasData(c_struct->children[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static const std::vector<std::string> kMetadataKeys1{"key1", "key2"};
 static const std::vector<std::string> kMetadataValues1{"", "bar"};
-// clang-format off
-static const std::string kEncodedMetadata1{  // NOLINT: runtime/string
-    2, 0, 0, 0,
-    4, 0, 0, 0, 'k', 'e', 'y', '1', 0, 0, 0, 0,
-    4, 0, 0, 0, 'k', 'e', 'y', '2', 3, 0, 0, 0, 'b', 'a', 'r'};
-// clang-format off
 
 static const std::vector<std::string> kMetadataKeys2{"key"};
 static const std::vector<std::string> kMetadataValues2{"abcde"};
+
 // clang-format off
+static const std::string kEncodedMetadata1{  // NOLINT: runtime/string
+#if ARROW_LITTLE_ENDIAN
+    2, 0, 0, 0,
+    4, 0, 0, 0, 'k', 'e', 'y', '1', 0, 0, 0, 0,
+    4, 0, 0, 0, 'k', 'e', 'y', '2', 3, 0, 0, 0, 'b', 'a', 'r'};
+#else
+    0, 0, 0, 2,
+    0, 0, 0, 4, 'k', 'e', 'y', '1', 0, 0, 0, 0,
+    0, 0, 0, 4, 'k', 'e', 'y', '2', 0, 0, 0, 3, 'b', 'a', 'r'};
+#endif
+
 static const std::string kEncodedMetadata2{  // NOLINT: runtime/string
+#if ARROW_LITTLE_ENDIAN
     1, 0, 0, 0,
     3, 0, 0, 0, 'k', 'e', 'y', 5, 0, 0, 0, 'a', 'b', 'c', 'd', 'e'};
-// clang-format off
+#else
+    0, 0, 0, 1,
+    0, 0, 0, 3, 'k', 'e', 'y', 0, 0, 0, 5, 'a', 'b', 'c', 'd', 'e'};
+#endif
+
+static const std::string kEncodedUuidMetadata =  // NOLINT: runtime/string
+#if ARROW_LITTLE_ENDIAN
+    std::string {2, 0, 0, 0} +
+    std::string {20, 0, 0, 0} + kExtensionTypeKeyName +
+    std::string {4, 0, 0, 0} + "uuid" +
+    std::string {24, 0, 0, 0} + kExtensionMetadataKeyName +
+    std::string {15, 0, 0, 0} + "uuid-serialized";
+#else
+    std::string {0, 0, 0, 2} +
+    std::string {0, 0, 0, 20} + kExtensionTypeKeyName +
+    std::string {0, 0, 0, 4} + "uuid" +
+    std::string {0, 0, 0, 24} + kExtensionMetadataKeyName +
+    std::string {0, 0, 0, 15} + "uuid-serialized";
+#endif
+
+static const std::string kEncodedDictExtensionMetadata =  // NOLINT: runtime/string
+#if ARROW_LITTLE_ENDIAN
+    std::string {2, 0, 0, 0} +
+    std::string {20, 0, 0, 0} + kExtensionTypeKeyName +
+    std::string {14, 0, 0, 0} + "dict-extension" +
+    std::string {24, 0, 0, 0} + kExtensionMetadataKeyName +
+    std::string {25, 0, 0, 0} + "dict-extension-serialized";
+#else
+    std::string {0, 0, 0, 2} +
+    std::string {0, 0, 0, 20} + kExtensionTypeKeyName +
+    std::string {0, 0, 0, 14} + "dict-extension" +
+    std::string {0, 0, 0, 24} + kExtensionMetadataKeyName +
+    std::string {0, 0, 0, 25} + "dict-extension-serialized";
+#endif
+
+static const std::string kEncodedComplex128Metadata =  // NOLINT: runtime/string
+#if ARROW_LITTLE_ENDIAN
+    std::string {2, 0, 0, 0} +
+    std::string {20, 0, 0, 0} + kExtensionTypeKeyName +
+    std::string {10, 0, 0, 0} + "complex128" +
+    std::string {24, 0, 0, 0} + kExtensionMetadataKeyName +
+    std::string {21, 0, 0, 0} + "complex128-serialized";
+#else
+    std::string {0, 0, 0, 2} +
+    std::string {0, 0, 0, 20} + kExtensionTypeKeyName +
+    std::string {0, 0, 0, 10} + "complex128" +
+    std::string {0, 0, 0, 24} + kExtensionMetadataKeyName +
+    std::string {0, 0, 0, 21} + "complex128-serialized";
+#endif
+// clang-format on
 
 static constexpr int64_t kDefaultFlags = ARROW_FLAG_NULLABLE;
 
@@ -147,8 +247,7 @@ struct SchemaExportChecker {
             flattened_flags.empty()
                 ? std::vector<int64_t>(flattened_formats_.size(), kDefaultFlags)
                 : std::move(flattened_flags)),
-        flattened_metadata_(std::move(flattened_metadata)),
-        flattened_index_(0) {}
+        flattened_metadata_(std::move(flattened_metadata)) {}
 
   void operator()(struct ArrowSchema* c_export, bool inner = false) {
     ASSERT_LT(flattened_index_, flattened_formats_.size());
@@ -197,7 +296,7 @@ struct SchemaExportChecker {
   const std::vector<std::string> flattened_names_;
   std::vector<int64_t> flattened_flags_;
   const std::vector<std::string> flattened_metadata_;
-  size_t flattened_index_;
+  size_t flattened_index_{0};
 };
 
 class TestSchemaExport : public ::testing::Test {
@@ -211,7 +310,8 @@ class TestSchemaExport : public ::testing::Test {
                   std::vector<int64_t> flattened_flags = {},
                   std::vector<std::string> flattened_metadata = {}) {
     SchemaExportChecker checker(std::move(flattened_formats), std::move(flattened_names),
-                          std::move(flattened_flags), std::move(flattened_metadata));
+                                std::move(flattened_flags),
+                                std::move(flattened_metadata));
 
     auto orig_bytes = pool_->bytes_allocated();
 
@@ -230,9 +330,9 @@ class TestSchemaExport : public ::testing::Test {
   }
 
   template <typename T>
-  void TestPrimitive(const std::shared_ptr<T>& schema_like,
-                     const char* format, const std::string& name = "",
-                     int64_t flags = kDefaultFlags, const std::string& metadata = "") {
+  void TestPrimitive(const std::shared_ptr<T>& schema_like, const char* format,
+                     const std::string& name = "", int64_t flags = kDefaultFlags,
+                     const std::string& metadata = "") {
     TestNested(schema_like, {format}, {name}, {flags}, {metadata});
   }
 
@@ -262,8 +362,23 @@ TEST_F(TestSchemaExport, Primitive) {
   TestPrimitive(large_binary(), "Z");
   TestPrimitive(utf8(), "u");
   TestPrimitive(large_utf8(), "U");
+  TestPrimitive(binary_view(), "vz");
+  TestPrimitive(utf8_view(), "vu");
 
-  TestPrimitive(decimal(16, 4), "d:16,4");
+  TestPrimitive(smallest_decimal(8, 4), "d:8,4,32");
+  TestPrimitive(smallest_decimal(16, 4), "d:16,4,64");
+  TestPrimitive(decimal128(16, 4), "d:16,4");
+  TestPrimitive(decimal256(16, 4), "d:16,4,256");
+
+  TestPrimitive(smallest_decimal(8, 0), "d:8,0,32");
+  TestPrimitive(smallest_decimal(15, 0), "d:15,0,64");
+  TestPrimitive(decimal128(15, 0), "d:15,0");
+  TestPrimitive(decimal256(15, 0), "d:15,0,256");
+
+  TestPrimitive(smallest_decimal(8, -4), "d:8,-4,32");
+  TestPrimitive(smallest_decimal(15, -4), "d:15,-4,64");
+  TestPrimitive(decimal128(15, -4), "d:15,-4");
+  TestPrimitive(decimal256(15, -4), "d:15,-4,256");
 }
 
 TEST_F(TestSchemaExport, Temporal) {
@@ -278,7 +393,7 @@ TEST_F(TestSchemaExport, Temporal) {
   TestPrimitive(duration(TimeUnit::MICRO), "tDu");
   TestPrimitive(duration(TimeUnit::NANO), "tDn");
   TestPrimitive(month_interval(), "tiM");
-
+  TestPrimitive(month_day_nano_interval(), "tin");
   TestPrimitive(day_time_interval(), "tiD");
 
   TestPrimitive(timestamp(TimeUnit::SECOND), "tss:");
@@ -293,12 +408,17 @@ TEST_F(TestSchemaExport, Temporal) {
 
 TEST_F(TestSchemaExport, List) {
   TestNested(list(int8()), {"+l", "c"}, {"", "item"});
-  TestNested(large_list(uint16()), {"+L", "S"},
-             {"", "item"});
-  TestNested(fixed_size_list(int64(), 2), {"+w:2", "l"},
-             {"", "item"});
+  TestNested(large_list(uint16()), {"+L", "S"}, {"", "item"});
+  TestNested(fixed_size_list(int64(), 2), {"+w:2", "l"}, {"", "item"});
 
-  TestNested(list(large_list(int32())), {"+l", "+L", "i"},
+  TestNested(list(large_list(int32())), {"+l", "+L", "i"}, {"", "item", "item"});
+}
+
+TEST_F(TestSchemaExport, ListView) {
+  TestNested(list_view(int8()), {"+vl", "c"}, {"", "item"});
+  TestNested(large_list_view(uint16()), {"+vL", "S"}, {"", "item"});
+
+  TestNested(list_view(large_list_view(int32())), {"+vl", "+vL", "i"},
              {"", "item", "item"});
 }
 
@@ -313,48 +433,105 @@ TEST_F(TestSchemaExport, Struct) {
              {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE});
 
   // With metadata
-  auto f0 = type->child(0);
-  auto f1 = type->child(1)->WithMetadata(
-      key_value_metadata(kMetadataKeys1, kMetadataValues1));
+  auto f0 = type->field(0);
+  auto f1 =
+      type->field(1)->WithMetadata(key_value_metadata(kMetadataKeys1, kMetadataValues1));
   type = struct_({f0, f1});
   TestNested(type, {"+s", "c", "u"}, {"", "a", "b"},
-             {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE},
-             {"", "", kEncodedMetadata1});
+             {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE}, {"", "", kEncodedMetadata1});
 }
 
 TEST_F(TestSchemaExport, Map) {
-  TestNested(map(int8(), utf8()),
-             {"+m", "+s", "c", "u"}, {"", "entries", "key", "value"},
+  TestNested(map(int8(), utf8()), {"+m", "+s", "c", "u"}, {"", "entries", "key", "value"},
              {ARROW_FLAG_NULLABLE, 0, 0, ARROW_FLAG_NULLABLE});
-  TestNested(map(int8(), utf8(), /*keys_sorted=*/ true),
-             {"+m", "+s", "c", "u"}, {"", "entries", "key", "value"},
-             {ARROW_FLAG_NULLABLE | ARROW_FLAG_MAP_KEYS_SORTED, 0, 0,
-              ARROW_FLAG_NULLABLE});
+  TestNested(
+      map(int8(), utf8(), /*keys_sorted=*/true), {"+m", "+s", "c", "u"},
+      {"", "entries", "key", "value"},
+      {ARROW_FLAG_NULLABLE | ARROW_FLAG_MAP_KEYS_SORTED, 0, 0, ARROW_FLAG_NULLABLE});
+
+  // Exports field names and nullability
+  TestNested(map(int8(), field("something", utf8(), false)), {"+m", "+s", "c", "u"},
+             {"", "entries", "key", "something"}, {ARROW_FLAG_NULLABLE, 0, 0, 0});
 }
 
 TEST_F(TestSchemaExport, Union) {
   // Dense
   auto field_a = field("a", int8());
   auto field_b = field("b", boolean(), /*nullable=*/false);
-  auto type = union_({field_a, field_b}, {42, 43}, UnionMode::DENSE);
+  auto type = dense_union({field_a, field_b}, {42, 43});
   TestNested(type, {"+ud:42,43", "c", "b"}, {"", "a", "b"},
              {ARROW_FLAG_NULLABLE, ARROW_FLAG_NULLABLE, 0});
+  TestNested(dense_union(arrow::FieldVector{}, std::vector<int8_t>{}), {"+ud:"}, {""},
+             {ARROW_FLAG_NULLABLE});
   // Sparse
   field_a = field("a", int8(), /*nullable=*/false);
   field_b = field("b", boolean());
-  type = union_({field_a, field_b}, {42, 43}, UnionMode::SPARSE);
+  type = sparse_union({field_a, field_b}, {42, 43});
   TestNested(type, {"+us:42,43", "c", "b"}, {"", "a", "b"},
              {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE});
+  TestNested(sparse_union(arrow::FieldVector{}, std::vector<int8_t>{}), {"+us:"}, {""},
+             {ARROW_FLAG_NULLABLE});
+}
+
+#ifdef ARROW_COMPUTE
+TEST_F(TestSchemaExport, RunEndEncoded) {
+  TestNested(run_end_encoded(int16(), uint8()), {"+r", "s", "C"},
+             {"", "run_ends", "values"}, {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE});
+  TestNested(run_end_encoded(int32(), float64()), {"+r", "i", "g"},
+             {"", "run_ends", "values"}, {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE});
+  TestNested(run_end_encoded(int64(), utf8()), {"+r", "l", "u"},
+             {"", "run_ends", "values"}, {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE});
+  TestNested(run_end_encoded(int32(), list(utf8())), {"+r", "i", "+l", "u"},
+             {"", "run_ends", "values", "item"},
+             {ARROW_FLAG_NULLABLE, 0, ARROW_FLAG_NULLABLE, ARROW_FLAG_NULLABLE});
+}
+#endif
+
+std::string GetIndexFormat(Type::type type_id) {
+  switch (type_id) {
+    case Type::UINT8:
+      return "C";
+    case Type::INT8:
+      return "c";
+    case Type::UINT16:
+      return "S";
+    case Type::INT16:
+      return "s";
+    case Type::UINT32:
+      return "I";
+    case Type::INT32:
+      return "i";
+    case Type::UINT64:
+      return "L";
+    case Type::INT64:
+      return "l";
+    default:
+      DCHECK(false);
+      return "";
+  }
 }
 
 TEST_F(TestSchemaExport, Dictionary) {
-  TestNested(dictionary(int32(), utf8()), {"i", "u"}, {"", ""});
-  TestNested(dictionary(int32(), list(utf8()), /*ordered=*/true),
-             {"i", "+l", "u"}, {"", "", "item"},
-             {ARROW_FLAG_NULLABLE | ARROW_FLAG_DICTIONARY_ORDERED,
-              ARROW_FLAG_NULLABLE, ARROW_FLAG_NULLABLE});
-  TestNested(large_list(dictionary(int32(), list(utf8()))),
-             {"+L", "i", "+l", "u"}, {"", "item", "", "item"});
+  for (auto index_ty : all_dictionary_index_types()) {
+    std::string index_fmt = GetIndexFormat(index_ty->id());
+    TestNested(dictionary(index_ty, utf8()), {index_fmt, "u"}, {"", ""});
+    TestNested(dictionary(index_ty, list(utf8()), /*ordered=*/true),
+               {index_fmt, "+l", "u"}, {"", "", "item"},
+               {ARROW_FLAG_NULLABLE | ARROW_FLAG_DICTIONARY_ORDERED, ARROW_FLAG_NULLABLE,
+                ARROW_FLAG_NULLABLE});
+    TestNested(large_list(dictionary(index_ty, list(utf8()))),
+               {"+L", index_fmt, "+l", "u"}, {"", "item", "", "item"});
+  }
+}
+
+TEST_F(TestSchemaExport, Extension) {
+  TestPrimitive(uuid(), "w:16", "", kDefaultFlags, kEncodedUuidMetadata);
+
+  TestNested(dict_extension_type(), {"c", "u"}, {"", ""}, {kDefaultFlags, kDefaultFlags},
+             {kEncodedDictExtensionMetadata, ""});
+
+  TestNested(complex128(), {"+s", "g", "g"}, {"", "real", "imag"},
+             {ARROW_FLAG_NULLABLE, 0, 0}, {kEncodedComplex128Metadata, "", ""});
 }
 
 TEST_F(TestSchemaExport, ExportField) {
@@ -398,24 +575,41 @@ struct ArrayExportChecker {
     ASSERT_EQ(c_export->null_count, expected_data.null_count);
     ASSERT_EQ(c_export->offset, expected_data.offset);
 
-    ASSERT_EQ(c_export->n_buffers, static_cast<int64_t>(expected_data.buffers.size()));
-    ASSERT_EQ(c_export->n_children,
-              static_cast<int64_t>(expected_data.child_data.size()));
+    auto expected_n_buffers = static_cast<int64_t>(expected_data.buffers.size());
+    auto expected_buffers = expected_data.buffers.data();
+    if (!internal::may_have_validity_bitmap(expected_data.type->id())) {
+      --expected_n_buffers;
+      ++expected_buffers;
+    }
+    bool has_variadic_buffer_sizes = expected_data.type->id() == Type::STRING_VIEW ||
+                                     expected_data.type->id() == Type::BINARY_VIEW;
+    ASSERT_EQ(c_export->n_buffers, expected_n_buffers + has_variadic_buffer_sizes);
     ASSERT_NE(c_export->buffers, nullptr);
-    for (int64_t i = 0; i < c_export->n_buffers; ++i) {
-      auto expected_ptr =
-          expected_data.buffers[i] ? expected_data.buffers[i]->data() : nullptr;
+
+    for (int64_t i = 0; i < expected_n_buffers; ++i) {
+      auto expected_ptr = expected_buffers[i] ? expected_buffers[i]->data() : nullptr;
       ASSERT_EQ(c_export->buffers[i], expected_ptr);
+    }
+    if (has_variadic_buffer_sizes) {
+      auto variadic_buffers = util::span(expected_data.buffers).subspan(2);
+      auto variadic_buffer_sizes = util::span(
+          static_cast<const int64_t*>(c_export->buffers[c_export->n_buffers - 1]),
+          variadic_buffers.size());
+      for (auto [buf, size] : Zip(variadic_buffers, variadic_buffer_sizes)) {
+        ASSERT_EQ(buf->size(), size);
+      }
     }
 
     if (expected_data.dictionary != nullptr) {
       // Recurse into dictionary
       ASSERT_NE(c_export->dictionary, nullptr);
-      operator()(c_export->dictionary, *expected_data.dictionary->data());
+      operator()(c_export->dictionary, *expected_data.dictionary);
     } else {
       ASSERT_EQ(c_export->dictionary, nullptr);
     }
 
+    ASSERT_EQ(c_export->n_children,
+              static_cast<int64_t>(expected_data.child_data.size()));
     if (c_export->n_children > 0) {
       ASSERT_NE(c_export->children, nullptr);
       // Recurse into children
@@ -426,6 +620,15 @@ struct ArrayExportChecker {
     } else {
       ASSERT_EQ(c_export->children, nullptr);
     }
+  }
+
+  void operator()(struct ArrowDeviceArray* c_export, const ArrayData& expected_data,
+                  const ArrowDeviceType device_type, const int64_t device_id,
+                  const void* sync_event) {
+    ASSERT_EQ(c_export->device_type, device_type);
+    ASSERT_EQ(c_export->device_id, device_id);
+    ASSERT_EQ(c_export->sync_event, sync_event);
+    this->operator()(&c_export->array, expected_data);
   }
 };
 
@@ -448,12 +651,20 @@ struct RecordBatchExportChecker {
       // Recurse into children
       for (int i = 0; i < expected_batch.num_columns(); ++i) {
         ASSERT_NE(c_export->children[i], nullptr);
-        array_checker(c_export->children[i],
-                      *expected_batch.column(i)->data());
+        array_checker(c_export->children[i], *expected_batch.column(i)->data());
       }
     } else {
       ASSERT_EQ(c_export->children, nullptr);
     }
+  }
+
+  void operator()(struct ArrowDeviceArray* c_export, const RecordBatch& expected_data,
+                  const ArrowDeviceType device_type, const int64_t device_id,
+                  const void* sync_event) {
+    ASSERT_EQ(c_export->device_type, device_type);
+    ASSERT_EQ(c_export->device_id, device_id);
+    ASSERT_EQ(c_export->sync_event, sync_event);
+    this->operator()(&c_export->array, expected_data);
   }
 };
 
@@ -461,11 +672,9 @@ class TestArrayExport : public ::testing::Test {
  public:
   void SetUp() override { pool_ = default_memory_pool(); }
 
-  static std::function<Status(std::shared_ptr<Array>*)> JSONArrayFactory(
+  static std::function<Result<std::shared_ptr<Array>>()> JSONArrayFactory(
       std::shared_ptr<DataType> type, const char* json) {
-    return [=](std::shared_ptr<Array>* out) -> Status {
-      return ::arrow::ipc::internal::json::ArrayFromJSON(type, json, out);
-    };
+    return [=]() { return ArrayFromJSON(type, json); };
   }
 
   template <typename ArrayFactory, typename ExportCheckFunc>
@@ -473,7 +682,9 @@ class TestArrayExport : public ::testing::Test {
     auto orig_bytes = pool_->bytes_allocated();
 
     std::shared_ptr<Array> arr;
-    ASSERT_OK(factory(&arr));
+    ASSERT_OK_AND_ASSIGN(arr, ToResult(factory()));
+    ARROW_SCOPED_TRACE("type = ", arr->type()->ToString(),
+                       ", array data = ", arr->ToString());
     const ArrayData& data = *arr->data();  // non-owning reference
     struct ArrowArray c_export;
     ASSERT_OK(ExportArray(*arr, &c_export));
@@ -516,7 +727,7 @@ class TestArrayExport : public ::testing::Test {
     auto orig_bytes = pool_->bytes_allocated();
 
     std::shared_ptr<Array> arr;
-    ASSERT_OK(factory(&arr));
+    ASSERT_OK_AND_ASSIGN(arr, ToResult(factory()));
     const ArrayData& data = *arr->data();  // non-owning reference
     struct ArrowArray c_export_temp, c_export_final;
     ASSERT_OK(ExportArray(*arr, &c_export_temp));
@@ -561,7 +772,7 @@ class TestArrayExport : public ::testing::Test {
     auto orig_bytes = pool_->bytes_allocated();
 
     std::shared_ptr<Array> arr;
-    ASSERT_OK(factory(&arr));
+    ASSERT_OK_AND_ASSIGN(arr, ToResult(factory()));
     struct ArrowArray c_export_parent, c_export_child;
     ASSERT_OK(ExportArray(*arr, &c_export_parent));
 
@@ -608,6 +819,73 @@ class TestArrayExport : public ::testing::Test {
     TestMoveChild(JSONArrayFactory(type, json), child_id);
   }
 
+  template <typename ArrayFactory, typename ExportCheckFunc>
+  void TestMoveChildrenWithArrayFactory(ArrayFactory&& factory,
+                                        const std::vector<int64_t> children_ids,
+                                        ExportCheckFunc&& check_func) {
+    auto orig_bytes = pool_->bytes_allocated();
+
+    std::shared_ptr<Array> arr;
+    ASSERT_OK_AND_ASSIGN(arr, ToResult(factory()));
+    struct ArrowArray c_export_parent;
+    ASSERT_OK(ExportArray(*arr, &c_export_parent));
+
+    auto bytes_with_parent = pool_->bytes_allocated();
+    ASSERT_GT(bytes_with_parent, orig_bytes);
+
+    // Move the children ArrowArrays to their final locations
+    std::vector<struct ArrowArray> c_export_children(children_ids.size());
+    std::vector<ArrayExportGuard> child_guards;
+    std::vector<const ArrayData*> child_data;
+    {
+      ArrayExportGuard parent_guard(&c_export_parent);
+      for (size_t i = 0; i < children_ids.size(); ++i) {
+        const auto child_id = children_ids[i];
+        ASSERT_LT(child_id, c_export_parent.n_children);
+        ArrowArrayMove(c_export_parent.children[child_id], &c_export_children[i]);
+        child_guards.emplace_back(&c_export_children[i]);
+        // Keep non-owning pointer to the child ArrayData
+        child_data.push_back(arr->data()->child_data[child_id].get());
+      }
+    }
+
+    // Now parent is released
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_export_parent));
+    auto bytes_with_child = pool_->bytes_allocated();
+    ASSERT_LT(bytes_with_child, bytes_with_parent);
+    ASSERT_GT(bytes_with_child, orig_bytes);
+    for (size_t i = 0; i < children_ids.size(); ++i) {
+      check_func(&c_export_children[i], *child_data[i]);
+    }
+
+    // Release the shared_ptr<Array>, the children data should be held alive
+    arr.reset();
+    ASSERT_LT(pool_->bytes_allocated(), bytes_with_child);
+    ASSERT_GT(pool_->bytes_allocated(), orig_bytes);
+    for (size_t i = 0; i < children_ids.size(); ++i) {
+      check_func(&c_export_children[i], *child_data[i]);
+    }
+
+    // Release the ArrowArrays, underlying data should be destroyed
+    for (auto& child_guard : child_guards) {
+      child_guard.Release();
+    }
+    ASSERT_EQ(pool_->bytes_allocated(), orig_bytes);
+  }
+
+  template <typename ArrayFactory>
+  void TestMoveChildren(ArrayFactory&& factory, const std::vector<int64_t> children_ids) {
+    ArrayExportChecker checker;
+
+    TestMoveChildrenWithArrayFactory(std::forward<ArrayFactory>(factory), children_ids,
+                                     checker);
+  }
+
+  void TestMoveChildren(const std::shared_ptr<DataType>& type, const char* json,
+                        const std::vector<int64_t> children_ids) {
+    TestMoveChildren(JSONArrayFactory(type, json), children_ids);
+  }
+
  protected:
   MemoryPool* pool_;
 };
@@ -633,17 +911,54 @@ TEST_F(TestArrayExport, Primitive) {
   TestPrimitive(large_binary(), R"(["foo", "bar", null])");
   TestPrimitive(utf8(), R"(["foo", "bar", null])");
   TestPrimitive(large_utf8(), R"(["foo", "bar", null])");
+  TestPrimitive(binary_view(), R"(["foo", "bar", null])");
+  TestPrimitive(utf8_view(), R"(["foo", "bar", null])");
 
-  TestPrimitive(decimal(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(decimal32(9, 4), R"(["1234.5670", null])");
+  TestPrimitive(decimal64(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(decimal128(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(decimal256(16, 4), R"(["1234.5670", null])");
+
+  TestPrimitive(month_day_nano_interval(), R"([[-1, 5, 20], null])");
 }
 
 TEST_F(TestArrayExport, PrimitiveSliced) {
-  auto factory = [](std::shared_ptr<Array>* out) -> Status {
-    *out = ArrayFromJSON(int16(), "[1, 2, null, -3]")->Slice(1, 2);
-    return Status::OK();
-  };
+  auto factory = []() { return ArrayFromJSON(int16(), "[1, 2, null, -3]")->Slice(1, 2); };
 
   TestPrimitive(factory);
+}
+
+constexpr std::string_view binary_view_buffer_content0 = "12345foo bar baz quux",
+                           binary_view_buffer_content1 = "BinaryViewMultipleBuffers";
+
+static const BinaryViewType::c_type binary_view_buffer1[] = {
+    util::ToBinaryView(binary_view_buffer_content0, 0, 0),
+    util::ToInlineBinaryView("foo"),
+    util::ToBinaryView(binary_view_buffer_content1, 1, 0),
+    util::ToInlineBinaryView("bar"),
+    util::ToBinaryView(binary_view_buffer_content0.substr(5), 0, 5),
+    util::ToInlineBinaryView("baz"),
+    util::ToBinaryView(binary_view_buffer_content1.substr(6, 13), 1, 6),
+    util::ToInlineBinaryView("quux"),
+};
+
+static auto MakeBinaryViewArrayWithMultipleDataBuffers() {
+  static const auto kLength = static_cast<int64_t>(std::size(binary_view_buffer1));
+  return std::make_shared<BinaryViewArray>(
+      binary_view(), kLength,
+      Buffer::FromVector(std::vector(binary_view_buffer1, binary_view_buffer1 + kLength)),
+      BufferVector{
+          Buffer::FromString(std::string{binary_view_buffer_content0}),
+          Buffer::FromString(std::string{binary_view_buffer_content1}),
+      });
+}
+
+TEST_F(TestArrayExport, BinaryViewMultipleBuffers) {
+  TestPrimitive(MakeBinaryViewArrayWithMultipleDataBuffers);
+  TestPrimitive([&] {
+    auto arr = MakeBinaryViewArrayWithMultipleDataBuffers();
+    return arr->Slice(1, arr->length() - 2);
+  });
 }
 
 TEST_F(TestArrayExport, Null) {
@@ -688,18 +1003,44 @@ TEST_F(TestArrayExport, List) {
 
 TEST_F(TestArrayExport, ListSliced) {
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
-      *out = ArrayFromJSON(list(int8()), "[[1, 2], [3, null], [4, 5, 6], null]")
-                 ->Slice(1, 2);
-      return Status::OK();
+    auto factory = []() {
+      return ArrayFromJSON(list(int8()), "[[1, 2], [3, null], [4, 5, 6], null]")
+          ->Slice(1, 2);
     };
     TestNested(factory);
   }
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(int16(), "[1, 2, 3, 4, null, 5, 6, 7, 8]")->Slice(1, 6);
       auto offsets = ArrayFromJSON(int32(), "[0, 2, 3, 5, 6]")->Slice(2, 4);
-      return ListArray::FromArrays(*offsets, *values, default_memory_pool(), out);
+      return ListArray::FromArrays(*offsets, *values);
+    };
+    TestNested(factory);
+  }
+}
+
+TEST_F(TestArrayExport, ListView) {
+  TestNested(list_view(int8()), "[[1, 2], [3, null], null]");
+  TestNested(large_list_view(uint16()), "[[1, 2], [3, null], null]");
+  TestNested(fixed_size_list(int64(), 2), "[[1, 2], [3, null], null]");
+
+  TestNested(list_view(large_list_view(int32())), "[[[1, 2], [3], null], null]");
+}
+
+TEST_F(TestArrayExport, ListViewSliced) {
+  {
+    auto factory = []() {
+      return ArrayFromJSON(list_view(int8()), "[[1, 2], [3, null], [4, 5, 6], null]")
+          ->Slice(1, 2);
+    };
+    TestNested(factory);
+  }
+  {
+    auto factory = []() {
+      auto values = ArrayFromJSON(int16(), "[1, 2, 3, 4, null, 5, 6, 7, 8]")->Slice(1, 6);
+      auto offsets = ArrayFromJSON(int32(), "[5, 2, 0, 3]")->Slice(1, 2);
+      auto sizes = ArrayFromJSON(int32(), "[2, 3, 6, 1]")->Slice(1, 2);
+      return ListViewArray::FromArrays(*offsets, *sizes, *values);
     };
     TestNested(factory);
   }
@@ -714,7 +1055,7 @@ TEST_F(TestArrayExport, Struct) {
 TEST_F(TestArrayExport, Map) {
   const char* json = R"([[[1, "foo"], [2, null]], [[3, "bar"]]])";
   TestNested(map(int8(), utf8()), json);
-  TestNested(map(int8(), utf8(), /*keys_sorted=*/ true), json);
+  TestNested(map(int8(), utf8(), /*keys_sorted=*/true), json);
 }
 
 TEST_F(TestArrayExport, Union) {
@@ -722,49 +1063,85 @@ TEST_F(TestArrayExport, Union) {
   // Dense
   auto field_a = field("a", int8());
   auto field_b = field("b", boolean(), /*nullable=*/false);
-  auto type = union_({field_a, field_b}, {42, 43}, UnionMode::DENSE);
+  auto type = dense_union({field_a, field_b}, {42, 43});
   TestNested(type, data);
   // Sparse
   field_a = field("a", int8(), /*nullable=*/false);
   field_b = field("b", boolean());
-  type = union_({field_a, field_b}, {42, 43}, UnionMode::SPARSE);
+  type = sparse_union({field_a, field_b}, {42, 43});
   TestNested(type, data);
 }
 
+#ifdef ARROW_COMPUTE
+Result<std::shared_ptr<Array>> REEFromJSON(const std::shared_ptr<DataType>& ree_type,
+                                           const std::string& json) {
+  auto ree_type_ptr = checked_cast<const RunEndEncodedType*>(ree_type.get());
+  auto array = ArrayFromJSON(ree_type_ptr->value_type(), json);
+  ARROW_ASSIGN_OR_RAISE(
+      auto datum,
+      RunEndEncode(array, compute::RunEndEncodeOptions{ree_type_ptr->run_end_type()}));
+  return datum.make_array();
+}
+
+TEST_F(TestArrayExport, RunEndEncoded) {
+  auto factory = []() {
+    return REEFromJSON(run_end_encoded(int32(), int8()),
+                       "[1, 2, 2, 3, null, null, null, 4]");
+  };
+  TestNested(factory);
+}
+
+TEST_F(TestArrayExport, RunEndEncodedSliced) {
+  auto factory = []() -> Result<std::shared_ptr<Array>> {
+    ARROW_ASSIGN_OR_RAISE(auto ree_array,
+                          REEFromJSON(run_end_encoded(int32(), int8()),
+                                      "[1, 2, 2, 3, null, null, null, 4]"));
+    return ree_array->Slice(1, 5);
+  };
+  TestNested(factory);
+}
+#endif
+
 TEST_F(TestArrayExport, Dictionary) {
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
-      auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
+      auto indices = ArrayFromJSON(uint16(), "[0, 2, 1, null, 1]");
       return DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
-                                         indices, values, out);
+                                         indices, values);
     };
     TestNested(factory);
   }
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(list(utf8()), R"([["abc", "def"], ["efg"], []])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
       return DictionaryArray::FromArrays(
-          dictionary(indices->type(), values->type(), /*ordered=*/true), indices, values,
-          out);
+          dictionary(indices->type(), values->type(), /*ordered=*/true), indices, values);
     };
     TestNested(factory);
   }
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() -> Result<std::shared_ptr<Array>> {
       auto values = ArrayFromJSON(list(utf8()), R"([["abc", "def"], ["efg"], []])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
-      std::shared_ptr<Array> dict_array;
-      RETURN_NOT_OK(DictionaryArray::FromArrays(
-          dictionary(indices->type(), values->type()), indices, values, &dict_array));
+      ARROW_ASSIGN_OR_RAISE(
+          auto dict_array,
+          DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
+                                      indices, values));
       auto offsets = ArrayFromJSON(int64(), "[0, 2, 5]");
-      RETURN_NOT_OK(
-          LargeListArray::FromArrays(*offsets, *dict_array, default_memory_pool(), out));
-      return (*out)->ValidateFull();
+      ARROW_ASSIGN_OR_RAISE(auto arr, LargeListArray::FromArrays(*offsets, *dict_array));
+      RETURN_NOT_OK(arr->ValidateFull());
+      return arr;
     };
     TestNested(factory);
   }
+}
+
+TEST_F(TestArrayExport, Extension) {
+  TestPrimitive(ExampleUuid);
+  TestPrimitive(ExampleSmallint);
+  TestPrimitive(ExampleComplex128);
 }
 
 TEST_F(TestArrayExport, MovePrimitive) {
@@ -782,25 +1159,26 @@ TEST_F(TestArrayExport, MoveNested) {
 
 TEST_F(TestArrayExport, MoveDictionary) {
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
       return DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
-                                         indices, values, out);
+                                         indices, values);
     };
     TestMoveNested(factory);
   }
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() -> Result<std::shared_ptr<Array>> {
       auto values = ArrayFromJSON(list(utf8()), R"([["abc", "def"], ["efg"], []])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
-      std::shared_ptr<Array> dict_array;
-      RETURN_NOT_OK(DictionaryArray::FromArrays(
-          dictionary(indices->type(), values->type()), indices, values, &dict_array));
+      ARROW_ASSIGN_OR_RAISE(
+          auto dict_array,
+          DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
+                                      indices, values));
       auto offsets = ArrayFromJSON(int64(), "[0, 2, 5]");
-      RETURN_NOT_OK(
-          LargeListArray::FromArrays(*offsets, *dict_array, default_memory_pool(), out));
-      return (*out)->ValidateFull();
+      ARROW_ASSIGN_OR_RAISE(auto arr, LargeListArray::FromArrays(*offsets, *dict_array));
+      RETURN_NOT_OK(arr->ValidateFull());
+      return arr;
     };
     TestMoveNested(factory);
   }
@@ -817,24 +1195,31 @@ TEST_F(TestArrayExport, MoveChild) {
                 R"([[1, "foo"], [2, null]])",
                 /*child_id=*/1);
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() -> Result<std::shared_ptr<Array>> {
       auto values = ArrayFromJSON(list(utf8()), R"([["abc", "def"], ["efg"], []])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
-      std::shared_ptr<Array> dict_array;
-      RETURN_NOT_OK(DictionaryArray::FromArrays(
-          dictionary(indices->type(), values->type()), indices, values, &dict_array));
+      ARROW_ASSIGN_OR_RAISE(
+          auto dict_array,
+          DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
+                                      indices, values));
       auto offsets = ArrayFromJSON(int64(), "[0, 2, 5]");
-      RETURN_NOT_OK(
-          LargeListArray::FromArrays(*offsets, *dict_array, default_memory_pool(), out));
-      return (*out)->ValidateFull();
+      ARROW_ASSIGN_OR_RAISE(auto arr, LargeListArray::FromArrays(*offsets, *dict_array));
+      RETURN_NOT_OK(arr->ValidateFull());
+      return arr;
     };
     TestMoveChild(factory, /*child_id=*/0);
   }
 }
 
+TEST_F(TestArrayExport, MoveSeveralChildren) {
+  TestMoveChildren(
+      struct_({field("ints", int8()), field("floats", float64()), field("strs", utf8())}),
+      R"([[1, 1.5, "foo"], [2, 0.0, null]])", /*children_ids=*/{0, 2});
+}
+
 TEST_F(TestArrayExport, ExportArrayAndType) {
-  struct ArrowSchema c_schema{};
-  struct ArrowArray c_array{};
+  struct ArrowSchema c_schema {};
+  struct ArrowArray c_array {};
   SchemaExportGuard schema_guard(&c_schema);
   ArrayExportGuard array_guard(&c_array);
 
@@ -851,8 +1236,8 @@ TEST_F(TestArrayExport, ExportArrayAndType) {
 }
 
 TEST_F(TestArrayExport, ExportRecordBatch) {
-  struct ArrowSchema c_schema{};
-  struct ArrowArray c_array{};
+  struct ArrowSchema c_schema {};
+  struct ArrowArray c_array {};
 
   auto schema = ::arrow::schema(
       {field("ints", int16()), field("bools", boolean(), /*nullable=*/false)});
@@ -860,9 +1245,7 @@ TEST_F(TestArrayExport, ExportRecordBatch) {
   auto arr0 = ArrayFromJSON(int16(), "[1, 2, null]");
   auto arr1 = ArrayFromJSON(boolean(), "[false, true, false]");
 
-  auto batch_factory = [&]() {
-    return RecordBatch::Make(schema, 3, {arr0, arr1});
-  };
+  auto batch_factory = [&]() { return RecordBatch::Make(schema, 3, {arr0, arr1}); };
 
   {
     auto batch = batch_factory();
@@ -898,11 +1281,493 @@ TEST_F(TestArrayExport, ExportRecordBatch) {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Device Array Export Tests
+
+static const char kMyDeviceTypeName[] = "arrowtest::MyDevice";
+static const ArrowDeviceType kMyDeviceType = ARROW_DEVICE_EXT_DEV;
+static const void* kMyEventPtr =
+    reinterpret_cast<void*>(static_cast<uintptr_t>(0xBAADF00D));
+
+class MyBuffer final : public MutableBuffer {
+ public:
+  using MutableBuffer::MutableBuffer;
+
+  ~MyBuffer() override {
+    default_memory_pool()->Free(const_cast<uint8_t*>(data_), size_);
+  }
+
+  std::shared_ptr<Device::SyncEvent> device_sync_event() const override {
+    return device_sync_;
+  }
+
+ protected:
+  std::shared_ptr<Device::SyncEvent> device_sync_;
+};
+
+class MyDevice : public Device {
+ public:
+  explicit MyDevice(int64_t value) : Device(true), value_(value) {}
+  const char* type_name() const override { return kMyDeviceTypeName; }
+  std::string ToString() const override { return kMyDeviceTypeName; }
+  bool Equals(const Device& other) const override {
+    if (other.type_name() != kMyDeviceTypeName || other.device_type() != device_type()) {
+      return false;
+    }
+    return checked_cast<const MyDevice&>(other).value_ == value_;
+  }
+  DeviceAllocationType device_type() const override {
+    return static_cast<DeviceAllocationType>(kMyDeviceType);
+  }
+  int64_t device_id() const override { return value_; }
+  std::shared_ptr<MemoryManager> default_memory_manager() override;
+
+  class MySyncEvent final : public Device::SyncEvent {
+   public:
+    explicit MySyncEvent(void* sync_event, release_fn_t release_sync_event)
+        : Device::SyncEvent(sync_event, release_sync_event) {}
+
+    ~MySyncEvent() override = default;
+    Status Wait() override { return Status::OK(); }
+    Status Record(const Device::Stream&) override { return Status::OK(); }
+  };
+
+ protected:
+  int64_t value_;
+};
+
+class MyMemoryManager : public CPUMemoryManager {
+ public:
+  explicit MyMemoryManager(const std::shared_ptr<Device>& device)
+      : CPUMemoryManager(device, default_memory_pool()) {}
+
+  Result<std::unique_ptr<Buffer>> AllocateBuffer(int64_t size) override {
+    uint8_t* data;
+    RETURN_NOT_OK(pool_->Allocate(size, &data));
+    return std::make_unique<MyBuffer>(data, size, shared_from_this());
+  }
+
+  Result<std::shared_ptr<Device::SyncEvent>> MakeDeviceSyncEvent() override {
+    return std::make_shared<MyDevice::MySyncEvent>(const_cast<void*>(kMyEventPtr),
+                                                   [](void*) {});
+  }
+
+  Result<std::shared_ptr<Device::SyncEvent>> WrapDeviceSyncEvent(
+      void* sync_event, Device::SyncEvent::release_fn_t release_sync_event) override {
+    return std::make_shared<MyDevice::MySyncEvent>(sync_event, release_sync_event);
+  }
+
+ protected:
+  Result<std::shared_ptr<Buffer>> CopyBufferFrom(
+      const std::shared_ptr<Buffer>& buf,
+      const std::shared_ptr<MemoryManager>& from) override {
+    return CopyNonOwnedFrom(*buf, from);
+  }
+  Result<std::unique_ptr<Buffer>> CopyNonOwnedFrom(
+      const Buffer& buf, const std::shared_ptr<MemoryManager>& from) override {
+    if (!from->is_cpu()) {
+      return nullptr;
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto dest, AllocateBuffer(buf.size()));
+    if (buf.size() > 0) {
+      memcpy(dest->mutable_data(), buf.data(), static_cast<size_t>(buf.size()));
+    }
+    return dest;
+  }
+};
+
+std::shared_ptr<MemoryManager> MyDevice::default_memory_manager() {
+  return std::make_shared<MyMemoryManager>(shared_from_this());
+}
+
+class TestDeviceArrayExport : public ::testing::Test {
+ public:
+  void SetUp() override { pool_ = default_memory_pool(); }
+
+  static Result<std::shared_ptr<ArrayData>> ToDeviceData(
+      const std::shared_ptr<MemoryManager>& mm, const ArrayData& data) {
+    arrow::BufferVector buffers;
+    for (const auto& buf : data.buffers) {
+      if (buf) {
+        ARROW_ASSIGN_OR_RAISE(auto dest, mm->CopyBuffer(buf, mm));
+        buffers.push_back(dest);
+      } else {
+        buffers.push_back(nullptr);
+      }
+    }
+
+    arrow::ArrayDataVector children;
+    for (const auto& child : data.child_data) {
+      ARROW_ASSIGN_OR_RAISE(auto dest, ToDeviceData(mm, *child));
+      children.push_back(dest);
+    }
+
+    return ArrayData::Make(data.type, data.length, buffers, children, data.null_count,
+                           data.offset);
+  }
+
+  static Result<std::shared_ptr<Array>> ToDevice(const std::shared_ptr<MemoryManager>& mm,
+                                                 const ArrayData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto result, ToDeviceData(mm, data));
+    return MakeArray(result);
+  }
+
+  template <typename ArrayFactory>
+  static std::function<Result<std::shared_ptr<Array>>()> ToDeviceFactory(
+      const std::shared_ptr<MemoryManager>& mm, ArrayFactory&& factory) {
+    return [&]() { return ToDevice(mm, *factory()->data()); };
+  }
+
+  static std::function<Result<std::shared_ptr<Array>>()> JSONArrayFactory(
+      const std::shared_ptr<MemoryManager>& mm, std::shared_ptr<DataType> type,
+      const char* json) {
+    return [=]() { return ToDevice(mm, *ArrayFromJSON(type, json)->data()); };
+  }
+
+#ifdef ARROW_COMPUTE
+  static std::function<Result<std::shared_ptr<Array>>()> JSONREEArrayFactory(
+      const std::shared_ptr<MemoryManager>& mm, std::shared_ptr<DataType> type,
+      const char* json) {
+    return [=]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto result, REEFromJSON(type, json));
+      return ToDevice(mm, *result->data());
+    };
+  }
+#endif
+
+  template <typename ArrayFactory, typename ExportCheckFunc>
+  void TestWithArrayFactory(ArrayFactory&& factory, ExportCheckFunc&& check_func) {
+    auto orig_bytes = pool_->bytes_allocated();
+
+    std::shared_ptr<Array> arr;
+    ASSERT_OK_AND_ASSIGN(arr, ToResult(factory()));
+    ARROW_SCOPED_TRACE("type = ", arr->type()->ToString(),
+                       ", array data = ", arr->ToString());
+    const ArrayData& data = *arr->data();  // non-owning reference
+    struct ArrowDeviceArray c_export;
+    std::shared_ptr<Device::SyncEvent> sync{nullptr};
+    ASSERT_OK(ExportDeviceArray(*arr, sync, &c_export));
+
+    ArrayExportGuard guard(&c_export.array);
+    auto new_bytes = pool_->bytes_allocated();
+    ASSERT_GT(new_bytes, orig_bytes);
+
+    // Release the shared_ptr<Array>, underlying data should be held alive
+    arr.reset();
+    ASSERT_EQ(pool_->bytes_allocated(), new_bytes);
+    check_func(&c_export, data, kMyDeviceType, 1, nullptr);
+
+    // Release the ArrowArray, underlying data should be destroyed
+    guard.Release();
+    ASSERT_EQ(pool_->bytes_allocated(), orig_bytes);
+  }
+
+  template <typename ArrayFactory>
+  void TestNested(ArrayFactory&& factory) {
+    ArrayExportChecker checker;
+    TestWithArrayFactory(std::forward<ArrayFactory>(factory), checker);
+  }
+
+  void TestNested(const std::shared_ptr<MemoryManager>& mm,
+                  const std::shared_ptr<DataType>& type, const char* json) {
+    TestNested(JSONArrayFactory(mm, type, json));
+  }
+
+  template <typename ArrayFactory>
+  void TestPrimitive(ArrayFactory&& factory) {
+    TestNested(std::forward<ArrayFactory>(factory));
+  }
+
+  void TestPrimitive(const std::shared_ptr<MemoryManager>& mm,
+                     const std::shared_ptr<DataType>& type, const char* json) {
+    TestNested(mm, type, json);
+  }
+
+ protected:
+  MemoryPool* pool_;
+};
+
+TEST_F(TestDeviceArrayExport, Primitive) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  TestPrimitive(mm, int8(), "[1, 2, null, -3]");
+  TestPrimitive(mm, int16(), "[1, 2, -3]");
+  TestPrimitive(mm, int32(), "[1, 2, null, -3]");
+  TestPrimitive(mm, int64(), "[1, 2, -3]");
+  TestPrimitive(mm, uint8(), "[1, 2, 3]");
+  TestPrimitive(mm, uint16(), "[1, 2, null, 3]");
+  TestPrimitive(mm, uint32(), "[1, 2, 3]");
+  TestPrimitive(mm, uint64(), "[1, 2, null, 3]");
+
+  TestPrimitive(mm, boolean(), "[true, false, null]");
+
+  TestPrimitive(mm, float32(), "[1.5, null]");
+  TestPrimitive(mm, float64(), "[1.5, null]");
+
+  TestPrimitive(mm, fixed_size_binary(3), R"(["foo", "bar", null])");
+  TestPrimitive(mm, binary(), R"(["foo", "bar", null])");
+  TestPrimitive(mm, large_binary(), R"(["foo", "bar", null])");
+  TestPrimitive(mm, utf8(), R"(["foo", "bar", null])");
+  TestPrimitive(mm, large_utf8(), R"(["foo", "bar", null])");
+
+  TestPrimitive(mm, decimal32(9, 4), R"(["1234.5670", null])");
+  TestPrimitive(mm, decimal64(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(mm, decimal128(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(mm, decimal256(16, 4), R"(["1234.5670", null])");
+
+  TestPrimitive(mm, month_day_nano_interval(), R"([[-1, 5, 20], null])");
+}
+
+TEST_F(TestDeviceArrayExport, PrimitiveSliced) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  auto factory = [=]() {
+    return (*ToDevice(mm, *ArrayFromJSON(int16(), "[1, 2, null, -3]")->data()))
+        ->Slice(1, 2);
+  };
+  TestPrimitive(factory);
+}
+
+TEST_F(TestDeviceArrayExport, Temporal) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  const char* json = "[1, 2, null, 42]";
+  TestPrimitive(mm, date32(), json);
+  TestPrimitive(mm, date64(), json);
+  TestPrimitive(mm, time32(TimeUnit::SECOND), json);
+  TestPrimitive(mm, time32(TimeUnit::MILLI), json);
+  TestPrimitive(mm, time64(TimeUnit::MICRO), json);
+  TestPrimitive(mm, time64(TimeUnit::NANO), json);
+  TestPrimitive(mm, duration(TimeUnit::SECOND), json);
+  TestPrimitive(mm, duration(TimeUnit::MILLI), json);
+  TestPrimitive(mm, duration(TimeUnit::MICRO), json);
+  TestPrimitive(mm, duration(TimeUnit::NANO), json);
+  TestPrimitive(mm, month_interval(), json);
+
+  TestPrimitive(mm, day_time_interval(), "[[7, 600], null]");
+
+  json = R"(["1970-01-01","2000-02-29","1900-02-28"])";
+  TestPrimitive(mm, timestamp(TimeUnit::SECOND), json);
+  TestPrimitive(mm, timestamp(TimeUnit::SECOND, "Europe/Paris"), json);
+  TestPrimitive(mm, timestamp(TimeUnit::MILLI), json);
+  TestPrimitive(mm, timestamp(TimeUnit::MILLI, "Europe/Paris"), json);
+  TestPrimitive(mm, timestamp(TimeUnit::MICRO), json);
+  TestPrimitive(mm, timestamp(TimeUnit::MICRO, "Europe/Paris"), json);
+  TestPrimitive(mm, timestamp(TimeUnit::NANO), json);
+  TestPrimitive(mm, timestamp(TimeUnit::NANO, "Europe/Paris"), json);
+}
+
+TEST_F(TestDeviceArrayExport, List) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  TestNested(mm, list(int8()), "[[1, 2], [3, null], null]");
+  TestNested(mm, large_list(uint16()), "[[1, 2], [3, null], null]");
+  TestNested(mm, fixed_size_list(int64(), 2), "[[1, 2], [3, null], null]");
+
+  TestNested(mm, list(large_list(int32())), "[[[1, 2], [3], null], null]");
+}
+
+TEST_F(TestDeviceArrayExport, ListSliced) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  {
+    auto factory = [=]() {
+      return (*ToDevice(
+                  mm, *ArrayFromJSON(list(int8()), "[[1, 2], [3, null], [4, 5, 6], null]")
+                           ->data()))
+          ->Slice(1, 2);
+    };
+    TestNested(factory);
+  }
+  {
+    auto factory = [=]() {
+      auto values =
+          (*ToDevice(mm,
+                     *ArrayFromJSON(int16(), "[1, 2, 3, 4, null, 5, 6, 7, 8]")->data()))
+              ->Slice(1, 6);
+      auto offsets = (*ToDevice(mm, *ArrayFromJSON(int32(), "[0, 2, 3, 5, 6]")->data()))
+                         ->Slice(2, 4);
+      return ListArray::FromArrays(*offsets, *values);
+    };
+    TestNested(factory);
+  }
+}
+
+TEST_F(TestDeviceArrayExport, ListView) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  TestNested(mm, list_view(int8()), "[[1, 2], [3, null], null]");
+  TestNested(mm, large_list_view(uint16()), "[[1, 2], [3, null], null]");
+
+  TestNested(mm, list_view(large_list_view(int32())), "[[[1, 2], [3], null], null]");
+}
+
+TEST_F(TestDeviceArrayExport, ListViewSliced) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  {
+    auto factory = [=]() {
+      return (*ToDevice(mm, *ArrayFromJSON(list_view(int8()),
+                                           "[[1, 2], [3, null], [4, 5, 6], null]")
+                                 ->data()))
+          ->Slice(1, 2);
+    };
+    TestNested(factory);
+  }
+  {
+    auto factory = [=]() {
+      auto values =
+          (*ToDevice(mm,
+                     *ArrayFromJSON(int16(), "[1, 2, 3, 4, null, 5, 6, 7, 8]")->data()))
+              ->Slice(1, 6);
+      auto offsets =
+          (*ToDevice(mm, *ArrayFromJSON(int32(), "[5, 2, 0, 3]")->data()))->Slice(1, 2);
+      auto sizes =
+          (*ToDevice(mm, *ArrayFromJSON(int32(), "[2, 3, 6, 1]")->data()))->Slice(1, 2);
+      return ListViewArray::FromArrays(*offsets, *sizes, *values);
+    };
+    TestNested(factory);
+  }
+}
+
+TEST_F(TestDeviceArrayExport, Struct) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  const char* data = R"([[1, "foo"], [2, null]])";
+  auto type = struct_({field("a", int8()), field("b", utf8())});
+  TestNested(mm, type, data);
+}
+
+TEST_F(TestDeviceArrayExport, Map) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  const char* json = R"([[[1, "foo"], [2, null]], [[3, "bar"]]])";
+  TestNested(mm, map(int8(), utf8()), json);
+  TestNested(mm, map(int8(), utf8(), /*keys_sorted=*/true), json);
+}
+
+TEST_F(TestDeviceArrayExport, Union) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  const char* data = "[null, [42, 1], [43, true], [42, null], [42, 2]]";
+  // Dense
+  auto field_a = field("a", int8());
+  auto field_b = field("b", boolean(), /*nullable=*/false);
+  auto type = dense_union({field_a, field_b}, {42, 43});
+  TestNested(mm, type, data);
+  // Sparse
+  field_a = field("a", int8(), /*nullable=*/false);
+  field_b = field("b", boolean());
+  type = sparse_union({field_a, field_b}, {42, 43});
+  TestNested(mm, type, data);
+}
+
+#ifdef ARROW_COMPUTE
+TEST_F(TestDeviceArrayExport, RunEndEncoded) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  auto type = run_end_encoded(int32(), int32());
+  const char* data = "[1, null, 2, 2, 4, 5]";
+  TestNested(JSONREEArrayFactory(mm, type, data));
+}
+#endif
+
+TEST_F(TestDeviceArrayExport, Extension) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  TestPrimitive(ToDeviceFactory(mm, ExampleUuid));
+  TestPrimitive(ToDeviceFactory(mm, ExampleSmallint));
+  TestPrimitive(ToDeviceFactory(mm, ExampleComplex128));
+}
+
+TEST_F(TestDeviceArrayExport, ExportArrayAndType) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  struct ArrowSchema c_schema {};
+  struct ArrowDeviceArray c_array {};
+  SchemaExportGuard schema_guard(&c_schema);
+  ArrayExportGuard array_guard(&c_array.array);
+
+  auto array = ToDevice(mm, *ArrayFromJSON(int8(), "[1, 2, 3]")->data()).ValueOrDie();
+  auto sync = mm->MakeDeviceSyncEvent().ValueOrDie();
+  ASSERT_OK(ExportDeviceArray(*array, sync, &c_array, &c_schema));
+  const ArrayData& data = *array->data();
+  array.reset();
+  ASSERT_FALSE(ArrowSchemaIsReleased(&c_schema));
+  ASSERT_FALSE(ArrowArrayIsReleased(&c_array.array));
+  ASSERT_EQ(c_schema.format, std::string("c"));
+  ASSERT_EQ(c_schema.n_children, 0);
+  ArrayExportChecker checker{};
+  checker(&c_array, data, kMyDeviceType, 1, kMyEventPtr);
+}
+
+TEST_F(TestDeviceArrayExport, ExportRecordBatch) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  struct ArrowSchema c_schema {};
+  struct ArrowDeviceArray c_array {};
+
+  auto schema = ::arrow::schema(
+      {field("ints", int16()), field("bools", boolean(), /*nullable=*/false)});
+  schema = schema->WithMetadata(key_value_metadata(kMetadataKeys2, kMetadataValues2));
+  auto arr0 = ToDevice(mm, *ArrayFromJSON(int16(), "[1, 2, null]")->data()).ValueOrDie();
+  auto arr1 = ToDevice(mm, *ArrayFromJSON(boolean(), "[false, true, false]")->data())
+                  .ValueOrDie();
+
+  auto batch_factory = [&]() { return RecordBatch::Make(schema, 3, {arr0, arr1}); };
+  auto sync = mm->MakeDeviceSyncEvent().ValueOrDie();
+  {
+    auto batch = batch_factory();
+
+    ASSERT_OK(ExportDeviceRecordBatch(*batch, sync, &c_array, &c_schema));
+    SchemaExportGuard schema_guard(&c_schema);
+    ArrayExportGuard array_guard(&c_array.array);
+    RecordBatchExportChecker checker{};
+    checker(&c_array, *batch, kMyDeviceType, 1, kMyEventPtr);
+
+    // create batch anew, with the same buffer pointers
+    batch = batch_factory();
+    checker(&c_array, *batch, kMyDeviceType, 1, kMyEventPtr);
+  }
+  {
+    // Check one can export both schema and record batch at once
+    auto batch = batch_factory();
+
+    ASSERT_OK(ExportDeviceRecordBatch(*batch, sync, &c_array, &c_schema));
+    SchemaExportGuard schema_guard(&c_schema);
+    ArrayExportGuard array_guard(&c_array.array);
+    ASSERT_EQ(c_schema.format, std::string("+s"));
+    ASSERT_EQ(c_schema.n_children, 2);
+    ASSERT_NE(c_schema.metadata, nullptr);
+    ASSERT_EQ(kEncodedMetadata2,
+              std::string(c_schema.metadata, kEncodedMetadata2.size()));
+    RecordBatchExportChecker checker{};
+    checker(&c_array, *batch, kMyDeviceType, 1, kMyEventPtr);
+
+    // Create batch anew, with the same buffer pointers
+    batch = batch_factory();
+    checker(&c_array, *batch, kMyDeviceType, 1, kMyEventPtr);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////
 // Schema import tests
 
-void NoOpSchemaRelease(struct ArrowSchema* schema) {
-  ArrowSchemaMarkReleased(schema);
-}
+void NoOpSchemaRelease(struct ArrowSchema* schema) { ArrowSchemaMarkReleased(schema); }
 
 class SchemaStructBuilder {
  public:
@@ -917,11 +1782,10 @@ class SchemaStructBuilder {
 
   // Create a new ArrowSchema struct with a stable C pointer
   struct ArrowSchema* AddChild() {
-    nested_structs_.emplace_back();
-    struct ArrowSchema* result = &nested_structs_.back();
-    memset(result, 0, sizeof(*result));
-    result->release = NoOpSchemaRelease;
-    return result;
+    auto& result = nested_structs_.emplace_back();
+    memset(&result, 0, sizeof(result));
+    result.release = NoOpSchemaRelease;
+    return &result;
   }
 
   // Create a stable C pointer to the N last structs in nested_structs_
@@ -954,8 +1818,8 @@ class SchemaStructBuilder {
 
   void FillDictionary(struct ArrowSchema* c) { c->dictionary = LastChild(c); }
 
-  void FillListLike(struct ArrowSchema* c, const char* format,
-                    const char* name = nullptr, int64_t flags = kDefaultFlags) {
+  void FillListLike(struct ArrowSchema* c, const char* format, const char* name = nullptr,
+                    int64_t flags = kDefaultFlags) {
     c->flags = flags;
     c->format = format;
     c->name = name;
@@ -964,14 +1828,24 @@ class SchemaStructBuilder {
     c->children[0]->name = "item";
   }
 
-  void FillStructLike(struct ArrowSchema* c, const char* format,
-                      int64_t n_children, const char* name = nullptr,
-                      int64_t flags = kDefaultFlags) {
+  void FillStructLike(struct ArrowSchema* c, const char* format, int64_t n_children,
+                      const char* name = nullptr, int64_t flags = kDefaultFlags) {
     c->flags = flags;
     c->format = format;
     c->name = name;
     c->n_children = n_children;
     c->children = NLastChildren(c->n_children, c);
+  }
+
+  void FillRunEndEncoded(struct ArrowSchema* c, const char* format,
+                         const char* name = nullptr, int64_t flags = kDefaultFlags) {
+    c->flags = flags;
+    c->format = format;
+    c->name = name;
+    c->n_children = 2;
+    c->children = NLastChildren(2, c);
+    c->children[0]->name = "run_ends";
+    c->children[1]->name = "values";
   }
 
   void FillPrimitive(const char* format, const char* name = nullptr,
@@ -986,9 +1860,14 @@ class SchemaStructBuilder {
     FillListLike(&c_struct_, format, name, flags);
   }
 
-  void FillStructLike(const char* format, int64_t n_children,
-                      const char* name = nullptr, int64_t flags = kDefaultFlags) {
+  void FillStructLike(const char* format, int64_t n_children, const char* name = nullptr,
+                      int64_t flags = kDefaultFlags) {
     FillStructLike(&c_struct_, format, n_children, name, flags);
+  }
+
+  void FillRunEndEncoded(const char* format, const char* name = nullptr,
+                         int64_t flags = kDefaultFlags) {
+    FillRunEndEncoded(&c_struct_, format, name, flags);
   }
 
   struct ArrowSchema c_struct_;
@@ -1000,18 +1879,16 @@ class SchemaStructBuilder {
 
 class TestSchemaImport : public ::testing::Test, public SchemaStructBuilder {
  public:
-  void SetUp() override {
-    Reset();
-  }
+  void SetUp() override { Reset(); }
 
   void CheckImport(const std::shared_ptr<DataType>& expected) {
     SchemaReleaseCallback cb(&c_struct_);
 
     ASSERT_OK_AND_ASSIGN(auto type, ImportType(&c_struct_));
     ASSERT_TRUE(ArrowSchemaIsReleased(&c_struct_));
-    Reset();  // for further tests
+    Reset();            // for further tests
     cb.AssertCalled();  // was released
-    AssertTypeEqual(*expected, *type);
+    AssertTypeEqual(*expected, *type, /*check_metadata=*/true);
   }
 
   void CheckImport(const std::shared_ptr<Field>& expected) {
@@ -1019,7 +1896,7 @@ class TestSchemaImport : public ::testing::Test, public SchemaStructBuilder {
 
     ASSERT_OK_AND_ASSIGN(auto field, ImportField(&c_struct_));
     ASSERT_TRUE(ArrowSchemaIsReleased(&c_struct_));
-    Reset();  // for further tests
+    Reset();            // for further tests
     cb.AssertCalled();  // was released
     AssertFieldEqual(*expected, *field);
   }
@@ -1029,9 +1906,9 @@ class TestSchemaImport : public ::testing::Test, public SchemaStructBuilder {
 
     ASSERT_OK_AND_ASSIGN(auto schema, ImportSchema(&c_struct_));
     ASSERT_TRUE(ArrowSchemaIsReleased(&c_struct_));
-    Reset();  // for further tests
+    Reset();            // for further tests
     cb.AssertCalled();  // was released
-    AssertSchemaEqual(*expected, *schema);
+    AssertSchemaEqual(*expected, *schema, /*check_metadata=*/true);
   }
 
   void CheckImportError() {
@@ -1079,6 +1956,39 @@ TEST_F(TestSchemaImport, Primitive) {
   CheckImport(field("", float32()));
   FillPrimitive("g");
   CheckImport(field("", float64()));
+
+  FillPrimitive("d:16,4");
+  CheckImport(field("", decimal128(16, 4)));
+  FillPrimitive("d:16,4,128");
+  CheckImport(field("", decimal128(16, 4)));
+  FillPrimitive("d:16,4,256");
+  CheckImport(field("", decimal256(16, 4)));
+  FillPrimitive("d:4,4,32");
+  CheckImport(field("", decimal32(4, 4)));
+  FillPrimitive("d:16,4,64");
+  CheckImport(field("", decimal64(16, 4)));
+
+  FillPrimitive("d:16,0");
+  CheckImport(field("", decimal128(16, 0)));
+  FillPrimitive("d:16,0,128");
+  CheckImport(field("", decimal128(16, 0)));
+  FillPrimitive("d:16,0,256");
+  CheckImport(field("", decimal256(16, 0)));
+  FillPrimitive("d:4,0,32");
+  CheckImport(field("", decimal32(4, 0)));
+  FillPrimitive("d:16,0,64");
+  CheckImport(field("", decimal64(16, 0)));
+
+  FillPrimitive("d:16,-4");
+  CheckImport(field("", decimal128(16, -4)));
+  FillPrimitive("d:16,-4,128");
+  CheckImport(field("", decimal128(16, -4)));
+  FillPrimitive("d:16,-4,256");
+  CheckImport(field("", decimal256(16, -4)));
+  FillPrimitive("d:4,-4,32");
+  CheckImport(field("", decimal32(4, -4)));
+  FillPrimitive("d:16,-4,64");
+  CheckImport(field("", decimal64(16, -4)));
 }
 
 TEST_F(TestSchemaImport, Temporal) {
@@ -1109,6 +2019,8 @@ TEST_F(TestSchemaImport, Temporal) {
   CheckImport(month_interval());
   FillPrimitive("tiD");
   CheckImport(day_time_interval());
+  FillPrimitive("tin");
+  CheckImport(month_day_nano_interval());
 
   FillPrimitive("tss:");
   CheckImport(timestamp(TimeUnit::SECOND));
@@ -1138,11 +2050,15 @@ TEST_F(TestSchemaImport, String) {
   CheckImport(large_utf8());
   FillPrimitive("Z");
   CheckImport(large_binary());
+  FillPrimitive("vu");
+  CheckImport(utf8_view());
+  FillPrimitive("vz");
+  CheckImport(binary_view());
 
   FillPrimitive("w:3");
   CheckImport(fixed_size_binary(3));
   FillPrimitive("d:15,4");
-  CheckImport(decimal(15, 4));
+  CheckImport(decimal128(15, 4));
 }
 
 TEST_F(TestSchemaImport, List) {
@@ -1152,7 +2068,7 @@ TEST_F(TestSchemaImport, List) {
 
   FillPrimitive(AddChild(), "s", "item", 0);
   FillListLike("+l");
-  CheckImport(list(field("item", int16(), /*nullable=*/ false)));
+  CheckImport(list(field("item", int16(), /*nullable=*/false)));
 
   // Large list
   FillPrimitive(AddChild(), "s");
@@ -1177,6 +2093,33 @@ TEST_F(TestSchemaImport, NestedList) {
   CheckImport(list(fixed_size_list(int8(), 3)));
 }
 
+TEST_F(TestSchemaImport, ListView) {
+  FillPrimitive(AddChild(), "c");
+  FillListLike("+vl");
+  CheckImport(list_view(int8()));
+
+  FillPrimitive(AddChild(), "s", "item", 0);
+  FillListLike("+vl");
+  CheckImport(list_view(field("item", int16(), /*nullable=*/false)));
+
+  // Large list-view
+  FillPrimitive(AddChild(), "s");
+  FillListLike("+vL");
+  CheckImport(large_list_view(int16()));
+}
+
+TEST_F(TestSchemaImport, NestedListView) {
+  FillPrimitive(AddChild(), "c");
+  FillListLike(AddChild(), "+vl");
+  FillListLike("+vL");
+  CheckImport(large_list_view(list_view(int8())));
+
+  FillPrimitive(AddChild(), "c");
+  FillListLike(AddChild(), "+w:3");
+  FillListLike("+vl");
+  CheckImport(list_view(fixed_size_list(int8(), 3)));
+}
+
 TEST_F(TestSchemaImport, Struct) {
   FillPrimitive(AddChild(), "u", "strs");
   FillPrimitive(AddChild(), "S", "ints");
@@ -1187,8 +2130,8 @@ TEST_F(TestSchemaImport, Struct) {
   FillPrimitive(AddChild(), "u", "strs", 0);
   FillPrimitive(AddChild(), "S", "ints", kDefaultFlags);
   FillStructLike("+s", 2);
-  expected = struct_({field("strs", utf8(), /*nullable=*/false),
-                      field("ints", uint16())});
+  expected =
+      struct_({field("strs", utf8(), /*nullable=*/false), field("ints", uint16())});
   CheckImport(expected);
 
   // With metadata
@@ -1197,10 +2140,9 @@ TEST_F(TestSchemaImport, Struct) {
   c->metadata = kEncodedMetadata2.c_str();
   FillPrimitive(AddChild(), "S", "ints", kDefaultFlags);
   FillStructLike("+s", 2);
-  expected = struct_(
-      {field("strs", utf8(), /*nullable=*/false,
-             key_value_metadata(kMetadataKeys2, kMetadataValues2)),
-       field("ints", uint16())});
+  expected = struct_({field("strs", utf8(), /*nullable=*/false,
+                            key_value_metadata(kMetadataKeys2, kMetadataValues2)),
+                      field("ints", uint16())});
   CheckImport(expected);
 }
 
@@ -1209,16 +2151,14 @@ TEST_F(TestSchemaImport, Union) {
   FillPrimitive(AddChild(), "u", "strs");
   FillPrimitive(AddChild(), "c", "ints");
   FillStructLike("+us:43,42", 2);
-  auto expected =
-      union_({field("strs", utf8()), field("ints", int8())}, {43, 42}, UnionMode::SPARSE);
+  auto expected = sparse_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
   CheckImport(expected);
 
   // Dense
   FillPrimitive(AddChild(), "u", "strs");
   FillPrimitive(AddChild(), "c", "ints");
   FillStructLike("+ud:43,42", 2);
-  expected =
-      union_({field("strs", utf8()), field("ints", int8())}, {43, 42}, UnionMode::DENSE);
+  expected = dense_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
   CheckImport(expected);
 }
 
@@ -1234,9 +2174,18 @@ TEST_F(TestSchemaImport, Map) {
   FillPrimitive(AddChild(), "i", "value");
   FillStructLike(AddChild(), "+s", 2, "entries");
   FillListLike("+m", "", ARROW_FLAG_MAP_KEYS_SORTED);
-  expected = map(utf8(), int32(), /*keys_sorted=*/ true);
+  expected = map(utf8(), int32(), /*keys_sorted=*/true);
   CheckImport(expected);
 }
+
+#ifdef ARROW_COMPUTE
+TEST_F(TestSchemaImport, RunEndEncoded) {
+  FillPrimitive(AddChild(), "s", "run_ends");
+  FillPrimitive(AddChild(), "I", "values");
+  FillRunEndEncoded("+r");
+  CheckImport(run_end_encoded(int16(), uint32()));
+}
+#endif
 
 TEST_F(TestSchemaImport, Dictionary) {
   FillPrimitive(AddChild(), "u");
@@ -1266,6 +2215,32 @@ TEST_F(TestSchemaImport, Dictionary) {
   CheckImport(expected);
 }
 
+TEST_F(TestSchemaImport, UnregisteredExtension) {
+  FillPrimitive("w:16");
+  c_struct_.metadata = kEncodedUuidMetadata.c_str();
+  auto expected = fixed_size_binary(16);
+  CheckImport(expected);
+}
+
+TEST_F(TestSchemaImport, RegisteredExtension) {
+  {
+    ExtensionTypeGuard guard(uuid());
+    FillPrimitive("w:16");
+    c_struct_.metadata = kEncodedUuidMetadata.c_str();
+    auto expected = uuid();
+    CheckImport(expected);
+  }
+  {
+    ExtensionTypeGuard guard(dict_extension_type());
+    FillPrimitive(AddChild(), "u");
+    FillPrimitive("c");
+    FillDictionary();
+    c_struct_.metadata = kEncodedDictExtensionMetadata.c_str();
+    auto expected = dict_extension_type();
+    CheckImport(expected);
+  }
+}
+
 TEST_F(TestSchemaImport, FormatStringError) {
   FillPrimitive("");
   CheckImportError();
@@ -1280,6 +2255,8 @@ TEST_F(TestSchemaImport, FormatStringError) {
   FillPrimitive("d:15");
   CheckImportError();
   FillPrimitive("d:15.4");
+  CheckImportError();
+  FillPrimitive("d:15,z");
   CheckImportError();
   FillPrimitive("t");
   CheckImportError();
@@ -1329,6 +2306,33 @@ TEST_F(TestSchemaImport, UnionError) {
   CheckImportError();
 }
 
+TEST_F(TestSchemaImport, RunEndEncodedError) {
+  // Bad run-end type
+  FillPrimitive(AddChild(), "c", "run_ends");
+  FillPrimitive(AddChild(), "u", "values");
+  FillRunEndEncoded("+r");
+  CheckImportError();
+
+  // REE of a REE also causes an error
+  ArrowSchema* run_ends = AddChild();
+  ArrowSchema* values;
+  FillPrimitive(run_ends, "i", "run_ends");
+  {
+    FillPrimitive(AddChild(), "i", "run_ends");
+    FillPrimitive(AddChild(), "u", "values");
+    values = AddChild();
+    FillRunEndEncoded(values, "+r", "values");
+  }
+  // Fill the top-level REE
+  ArrowSchema* children[2] = {run_ends, values};
+  c_struct_.flags = kDefaultFlags;
+  c_struct_.format = "+r";
+  c_struct_.name = "";
+  c_struct_.n_children = 2;
+  c_struct_.children = children;
+  CheckImportError();
+}
+
 TEST_F(TestSchemaImport, DictionaryError) {
   // Bad index type
   FillPrimitive(AddChild(), "c");
@@ -1345,6 +2349,22 @@ TEST_F(TestSchemaImport, DictionaryError) {
   CheckImportError();
 }
 
+TEST_F(TestSchemaImport, ExtensionError) {
+  ExtensionTypeGuard guard(uuid());
+
+  // Storage type doesn't match
+  FillPrimitive("w:15");
+  c_struct_.metadata = kEncodedUuidMetadata.c_str();
+  CheckImportError();
+
+  // Invalid serialization
+  std::string bogus_metadata = kEncodedUuidMetadata;
+  bogus_metadata[bogus_metadata.size() - 5] += 1;
+  FillPrimitive("w:16");
+  c_struct_.metadata = bogus_metadata.c_str();
+  CheckImportError();
+}
+
 TEST_F(TestSchemaImport, RecursionError) {
   FillPrimitive(AddChild(), "c", "unused");
   auto c = AddChild();
@@ -1358,11 +2378,11 @@ TEST_F(TestSchemaImport, ImportField) {
   FillPrimitive("c", "thing", kDefaultFlags);
   CheckImport(field("thing", int8()));
   FillPrimitive("c", "thing", 0);
-  CheckImport(field("thing", int8(), /*nullable=*/ false));
+  CheckImport(field("thing", int8(), /*nullable=*/false));
   // With metadata
   FillPrimitive("c", "thing", kDefaultFlags);
   c_struct_.metadata = kEncodedMetadata1.c_str();
-  CheckImport(field("thing", int8(), /*nullable=*/ true,
+  CheckImport(field("thing", int8(), /*nullable=*/true,
                     key_value_metadata(kMetadataKeys1, kMetadataValues1)));
 }
 
@@ -1408,17 +2428,43 @@ static const uint8_t bits_buffer1[] = {0xed, 0xed};
 static const void* buffers_no_nulls_no_data[1] = {nullptr};
 static const void* buffers_nulls_no_data1[1] = {bits_buffer1};
 
+static const void* all_buffers_omitted[3] = {nullptr, nullptr, nullptr};
+
 static const uint8_t data_buffer1[] = {1, 2,  3,  4,  5,  6,  7,  8,
                                        9, 10, 11, 12, 13, 14, 15, 16};
 static const uint8_t data_buffer2[] = "abcdefghijklmnopqrstuvwxyz";
+#if ARROW_LITTLE_ENDIAN
 static const uint64_t data_buffer3[] = {123456789, 0, 987654321, 0};
+#else
+static const uint64_t data_buffer3[] = {0, 123456789, 0, 987654321};
+#endif
 static const uint8_t data_buffer4[] = {1, 2, 0, 1, 3, 0};
 static const float data_buffer5[] = {0.0f, 1.5f, -2.0f, 3.0f, 4.0f, 5.0f};
 static const double data_buffer6[] = {0.0, 1.5, -2.0, 3.0, 4.0, 5.0};
 static const int32_t data_buffer7[] = {1234, 5678, 9012, 3456};
 static const int64_t data_buffer8[] = {123456789, 987654321, -123456789, -987654321};
-static const void* primitive_buffers_no_nulls1[2] = {nullptr, data_buffer1};
-static const void* primitive_buffers_nulls1[2] = {bits_buffer1, data_buffer1};
+static const int64_t date64_data_buffer8[] = {86400000, 172800000, -86400000, -172800000};
+#if ARROW_LITTLE_ENDIAN
+static const void* primitive_buffers_no_nulls1_8[2] = {nullptr, data_buffer1};
+static const void* primitive_buffers_no_nulls1_16[2] = {nullptr, data_buffer1};
+static const void* primitive_buffers_no_nulls1_32[2] = {nullptr, data_buffer1};
+static const void* primitive_buffers_no_nulls1_64[2] = {nullptr, data_buffer1};
+static const void* primitive_buffers_nulls1_8[2] = {bits_buffer1, data_buffer1};
+static const void* primitive_buffers_nulls1_16[2] = {bits_buffer1, data_buffer1};
+#else
+static const uint8_t data_buffer1_16[] = {2,  1, 4,  3,  6,  5,  8,  7,
+                                          10, 9, 12, 11, 14, 13, 16, 15};
+static const uint8_t data_buffer1_32[] = {4,  3,  2,  1, 8,  7,  6,  5,
+                                          12, 11, 10, 9, 16, 15, 14, 13};
+static const uint8_t data_buffer1_64[] = {8,  7,  6,  5,  4,  3,  2,  1,
+                                          16, 15, 14, 13, 12, 11, 10, 9};
+static const void* primitive_buffers_no_nulls1_8[2] = {nullptr, data_buffer1};
+static const void* primitive_buffers_no_nulls1_16[2] = {nullptr, data_buffer1_16};
+static const void* primitive_buffers_no_nulls1_32[2] = {nullptr, data_buffer1_32};
+static const void* primitive_buffers_no_nulls1_64[2] = {nullptr, data_buffer1_64};
+static const void* primitive_buffers_nulls1_8[2] = {bits_buffer1, data_buffer1};
+static const void* primitive_buffers_nulls1_16[2] = {bits_buffer1, data_buffer1_16};
+#endif
 static const void* primitive_buffers_no_nulls2[2] = {nullptr, data_buffer2};
 static const void* primitive_buffers_no_nulls3[2] = {nullptr, data_buffer3};
 static const void* primitive_buffers_no_nulls4[2] = {nullptr, data_buffer4};
@@ -1428,6 +2474,9 @@ static const void* primitive_buffers_no_nulls7[2] = {nullptr, data_buffer7};
 static const void* primitive_buffers_nulls7[2] = {bits_buffer1, data_buffer7};
 static const void* primitive_buffers_no_nulls8[2] = {nullptr, data_buffer8};
 static const void* primitive_buffers_nulls8[2] = {bits_buffer1, data_buffer8};
+
+static const void* date64_buffers_no_nulls8[2] = {nullptr, date64_data_buffer8};
+static const void* date64_buffers_nulls8[2] = {bits_buffer1, date64_data_buffer8};
 
 static const int64_t timestamp_data_buffer1[] = {0, 951782400, -2203977600LL};
 static const int64_t timestamp_data_buffer2[] = {0, 951782400000LL, -2203977600000LL};
@@ -1441,15 +2490,32 @@ static const void* timestamp_buffers_no_nulls2[2] = {nullptr, timestamp_data_buf
 static const void* timestamp_buffers_no_nulls3[2] = {nullptr, timestamp_data_buffer3};
 static const void* timestamp_buffers_no_nulls4[2] = {nullptr, timestamp_data_buffer4};
 
+static const uint16_t run_ends_data_buffer5[5] = {1, 2, 4, 7, 9};
+[[maybe_unused]] static const void* run_ends_buffers5[2] = {nullptr,
+                                                            run_ends_data_buffer5};
+
 static const uint8_t string_data_buffer1[] = "foobarquuxxyzzy";
 
 static const int32_t string_offsets_buffer1[] = {0, 3, 3, 6, 10, 15};
 static const void* string_buffers_no_nulls1[3] = {nullptr, string_offsets_buffer1,
                                                   string_data_buffer1};
+static const void* string_buffers_omitted[3] = {nullptr, string_offsets_buffer1, nullptr};
 
 static const int64_t large_string_offsets_buffer1[] = {0, 3, 3, 6, 10};
 static const void* large_string_buffers_no_nulls1[3] = {
     nullptr, large_string_offsets_buffer1, string_data_buffer1};
+static const void* large_string_buffers_omitted[3] = {
+    nullptr, large_string_offsets_buffer1, nullptr};
+
+constexpr int64_t binary_view_buffer_sizes1[] = {binary_view_buffer_content0.size(),
+                                                 binary_view_buffer_content1.size()};
+static const void* binary_view_buffers_no_nulls1[] = {
+    nullptr,
+    binary_view_buffer1,
+    binary_view_buffer_content0.data(),
+    binary_view_buffer_content1.data(),
+    binary_view_buffer_sizes1,
+};
 
 static const int32_t list_offsets_buffer1[] = {0, 2, 2, 5, 6, 8};
 static const void* list_buffers_no_nulls1[2] = {nullptr, list_offsets_buffer1};
@@ -1459,22 +2525,31 @@ static const int64_t large_list_offsets_buffer1[] = {0, 2, 2, 5, 6, 8};
 static const void* large_list_buffers_no_nulls1[2] = {nullptr,
                                                       large_list_offsets_buffer1};
 
+static const int32_t list_view_offsets_buffer1[] = {0, 2, 2, 5, 6};
+static const int32_t list_view_sizes_buffer1[] = {2, 0, 3, 1, 2};
+static const void* list_view_buffers_no_nulls1[3] = {nullptr, list_view_offsets_buffer1,
+                                                     list_view_sizes_buffer1};
+static const void* list_view_buffers_nulls1[3] = {bits_buffer1, list_view_offsets_buffer1,
+                                                  list_view_sizes_buffer1};
+
+static const int64_t large_list_view_offsets_buffer1[] = {0, 2, 2, 5, 6};
+static const int64_t large_list_view_sizes_buffer1[] = {2, 0, 3, 1, 2};
+static const void* large_list_view_buffers_no_nulls1[3] = {
+    nullptr, large_list_view_offsets_buffer1, large_list_view_sizes_buffer1};
+
 static const int8_t type_codes_buffer1[] = {42, 42, 43, 43, 42};
 static const int32_t union_offsets_buffer1[] = {0, 1, 0, 1, 2};
-static const void* sparse_union_buffers_no_nulls1[3] = {nullptr, type_codes_buffer1,
-                                                        nullptr};
-static const void* dense_union_buffers_no_nulls1[3] = {nullptr, type_codes_buffer1,
-                                                       union_offsets_buffer1};
+static const void* sparse_union_buffers1_legacy[2] = {nullptr, type_codes_buffer1};
+static const void* dense_union_buffers1_legacy[3] = {nullptr, type_codes_buffer1,
+                                                     union_offsets_buffer1};
+static const void* sparse_union_buffers1[1] = {type_codes_buffer1};
+static const void* dense_union_buffers1[2] = {type_codes_buffer1, union_offsets_buffer1};
 
-void NoOpArrayRelease(struct ArrowArray* schema) {
-  ArrowArrayMarkReleased(schema);
-}
+void NoOpArrayRelease(struct ArrowArray* schema) { ArrowArrayMarkReleased(schema); }
 
 class TestArrayImport : public ::testing::Test {
  public:
-  void SetUp() override {
-    Reset();
-  }
+  void SetUp() override { Reset(); }
 
   void Reset() {
     memset(&c_struct_, 0, sizeof(c_struct_));
@@ -1513,8 +2588,8 @@ class TestArrayImport : public ::testing::Test {
     return *NLastChildren(1, parent);
   }
 
-  void FillPrimitive(struct ArrowArray* c, int64_t length,
-                     int64_t null_count, int64_t offset, const void** buffers) {
+  void FillPrimitive(struct ArrowArray* c, int64_t length, int64_t null_count,
+                     int64_t offset, const void** buffers) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
@@ -1524,8 +2599,8 @@ class TestArrayImport : public ::testing::Test {
 
   void FillDictionary(struct ArrowArray* c) { c->dictionary = LastChild(c); }
 
-  void FillStringLike(struct ArrowArray* c, int64_t length,
-                      int64_t null_count, int64_t offset, const void** buffers) {
+  void FillStringLike(struct ArrowArray* c, int64_t length, int64_t null_count,
+                      int64_t offset, const void** buffers) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
@@ -1533,8 +2608,18 @@ class TestArrayImport : public ::testing::Test {
     c->buffers = buffers;
   }
 
-  void FillListLike(struct ArrowArray* c, int64_t length,
-                    int64_t null_count, int64_t offset, const void** buffers) {
+  void FillStringViewLike(struct ArrowArray* c, int64_t length, int64_t null_count,
+                          int64_t offset, const void** buffers,
+                          int32_t data_buffer_count) {
+    c->length = length;
+    c->null_count = null_count;
+    c->offset = offset;
+    c->n_buffers = 2 + data_buffer_count + 1;
+    c->buffers = buffers;
+  }
+
+  void FillListLike(struct ArrowArray* c, int64_t length, int64_t null_count,
+                    int64_t offset, const void** buffers) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
@@ -1544,8 +2629,19 @@ class TestArrayImport : public ::testing::Test {
     c->children = NLastChildren(1, c);
   }
 
-  void FillFixedSizeListLike(struct ArrowArray* c, int64_t length,
-                             int64_t null_count, int64_t offset, const void** buffers) {
+  void FillListView(struct ArrowArray* c, int64_t length, int64_t null_count,
+                    int64_t offset, const void** buffers) {
+    c->length = length;
+    c->null_count = null_count;
+    c->offset = offset;
+    c->n_buffers = 3;
+    c->buffers = buffers;
+    c->n_children = 1;
+    c->children = NLastChildren(1, c);
+  }
+
+  void FillFixedSizeListLike(struct ArrowArray* c, int64_t length, int64_t null_count,
+                             int64_t offset, const void** buffers) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
@@ -1555,9 +2651,8 @@ class TestArrayImport : public ::testing::Test {
     c->children = NLastChildren(1, c);
   }
 
-  void FillStructLike(struct ArrowArray* c, int64_t length,
-                      int64_t null_count, int64_t offset,
-                      int64_t n_children, const void** buffers) {
+  void FillStructLike(struct ArrowArray* c, int64_t length, int64_t null_count,
+                      int64_t offset, int64_t n_children, const void** buffers) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
@@ -1567,50 +2662,80 @@ class TestArrayImport : public ::testing::Test {
     c->children = NLastChildren(c->n_children, c);
   }
 
-  void FillUnionLike(struct ArrowArray* c, int64_t length,
-                     int64_t null_count, int64_t offset,
-                     int64_t n_children, const void** buffers) {
+  // `legacy` selects pre-ARROW-14179 behaviour
+  void FillUnionLike(struct ArrowArray* c, UnionMode::type mode, int64_t length,
+                     int64_t null_count, int64_t offset, int64_t n_children,
+                     const void** buffers, bool legacy) {
     c->length = length;
     c->null_count = null_count;
     c->offset = offset;
-    c->n_buffers = 3;
+    if (mode == UnionMode::SPARSE) {
+      c->n_buffers = legacy ? 2 : 1;
+    } else {
+      c->n_buffers = legacy ? 3 : 2;
+    }
     c->buffers = buffers;
     c->n_children = n_children;
     c->children = NLastChildren(c->n_children, c);
   }
 
-  void FillPrimitive(int64_t length, int64_t null_count,
-                     int64_t offset, const void** buffers) {
+  void FillPrimitive(int64_t length, int64_t null_count, int64_t offset,
+                     const void** buffers) {
     FillPrimitive(&c_struct_, length, null_count, offset, buffers);
   }
 
   void FillDictionary() { FillDictionary(&c_struct_); }
 
-  void FillStringLike(int64_t length, int64_t null_count,
-                      int64_t offset, const void** buffers) {
+  void FillStringLike(int64_t length, int64_t null_count, int64_t offset,
+                      const void** buffers) {
     FillStringLike(&c_struct_, length, null_count, offset, buffers);
   }
 
-  void FillListLike(int64_t length, int64_t null_count,
-                    int64_t offset, const void** buffers) {
+  void FillStringViewLike(int64_t length, int64_t null_count, int64_t offset,
+                          const void** buffers, int32_t data_buffer_count) {
+    FillStringViewLike(&c_struct_, length, null_count, offset, buffers,
+                       data_buffer_count);
+  }
+
+  void FillListLike(int64_t length, int64_t null_count, int64_t offset,
+                    const void** buffers) {
     FillListLike(&c_struct_, length, null_count, offset, buffers);
   }
 
-  void FillFixedSizeListLike(int64_t length, int64_t null_count,
-                             int64_t offset, const void** buffers) {
+  void FillListView(int64_t length, int64_t null_count, int64_t offset,
+                    const void** buffers) {
+    FillListView(&c_struct_, length, null_count, offset, buffers);
+  }
+
+  void FillFixedSizeListLike(int64_t length, int64_t null_count, int64_t offset,
+                             const void** buffers) {
     FillFixedSizeListLike(&c_struct_, length, null_count, offset, buffers);
   }
 
-  void FillStructLike(int64_t length, int64_t null_count,
-                      int64_t offset, int64_t n_children,
-                      const void** buffers) {
+  void FillStructLike(int64_t length, int64_t null_count, int64_t offset,
+                      int64_t n_children, const void** buffers) {
     FillStructLike(&c_struct_, length, null_count, offset, n_children, buffers);
   }
 
-  void FillUnionLike(int64_t length, int64_t null_count,
-                     int64_t offset, int64_t n_children,
-                     const void** buffers) {
-    FillUnionLike(&c_struct_, length, null_count, offset, n_children, buffers);
+  void FillUnionLike(UnionMode::type mode, int64_t length, int64_t null_count,
+                     int64_t offset, int64_t n_children, const void** buffers,
+                     bool legacy) {
+    FillUnionLike(&c_struct_, mode, length, null_count, offset, n_children, buffers,
+                  legacy);
+  }
+
+  void FillRunEndEncoded(int64_t length, int64_t offset) {
+    FillRunEndEncoded(&c_struct_, length, offset);
+  }
+
+  void FillRunEndEncoded(struct ArrowArray* c, int64_t length, int64_t offset) {
+    c->length = length;
+    c->null_count = 0;
+    c->offset = offset;
+    c->n_buffers = 0;
+    c->buffers = nullptr;
+    c->n_children = 2;
+    c->children = NLastChildren(2, c);
   }
 
   void CheckImport(const std::shared_ptr<Array>& expected) {
@@ -1619,12 +2744,12 @@ class TestArrayImport : public ::testing::Test {
     auto type = expected->type();
     ASSERT_OK_AND_ASSIGN(auto array, ImportArray(&c_struct_, type));
     ASSERT_TRUE(ArrowArrayIsReleased(&c_struct_));  // was moved
-    Reset();  // for further tests
+    Reset();                                        // for further tests
 
     ASSERT_OK(array->ValidateFull());
-    // Special case: Null array doesn't have any data, so it needn't
-    // keep the ArrowArray struct alive.
-    if (type->id() != Type::NA) {
+    // Special case: arrays without data (such as Null arrays) needn't keep
+    // the ArrowArray struct alive.
+    if (HasData(&c_struct_)) {
       cb.AssertNotCalled();
     }
     AssertArraysEqual(*expected, *array, true);
@@ -1638,7 +2763,7 @@ class TestArrayImport : public ::testing::Test {
     auto schema = expected->schema();
     ASSERT_OK_AND_ASSIGN(auto batch, ImportRecordBatch(&c_struct_, schema));
     ASSERT_TRUE(ArrowArrayIsReleased(&c_struct_));  // was moved
-    Reset();  // for further tests
+    Reset();                                        // for further tests
 
     ASSERT_OK(batch->ValidateFull());
     AssertBatchesEqual(*expected, *batch);
@@ -1652,7 +2777,7 @@ class TestArrayImport : public ::testing::Test {
 
     ASSERT_RAISES(Invalid, ImportArray(&c_struct_, type));
     ASSERT_TRUE(ArrowArrayIsReleased(&c_struct_));
-    Reset();  // for further tests
+    Reset();            // for further tests
     cb.AssertCalled();  // was released
   }
 
@@ -1661,7 +2786,7 @@ class TestArrayImport : public ::testing::Test {
 
     ASSERT_RAISES(Invalid, ImportRecordBatch(&c_struct_, schema));
     ASSERT_TRUE(ArrowArrayIsReleased(&c_struct_));
-    Reset();  // for further tests
+    Reset();            // for further tests
     cb.AssertCalled();  // was released
   }
 
@@ -1674,24 +2799,24 @@ class TestArrayImport : public ::testing::Test {
 };
 
 TEST_F(TestArrayImport, Primitive) {
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_8);
   CheckImport(ArrayFromJSON(int8(), "[1, 2, 3]"));
-  FillPrimitive(5, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(5, 0, 0, primitive_buffers_no_nulls1_8);
   CheckImport(ArrayFromJSON(uint8(), "[1, 2, 3, 4, 5]"));
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_16);
   CheckImport(ArrayFromJSON(int16(), "[513, 1027, 1541]"));
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_16);
   CheckImport(ArrayFromJSON(uint16(), "[513, 1027, 1541]"));
-  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1_32);
   CheckImport(ArrayFromJSON(int32(), "[67305985, 134678021]"));
-  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1_32);
   CheckImport(ArrayFromJSON(uint32(), "[67305985, 134678021]"));
-  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1_64);
   CheckImport(ArrayFromJSON(int64(), "[578437695752307201, 1157159078456920585]"));
-  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(2, 0, 0, primitive_buffers_no_nulls1_64);
   CheckImport(ArrayFromJSON(uint64(), "[578437695752307201, 1157159078456920585]"));
 
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_8);
   CheckImport(ArrayFromJSON(boolean(), "[true, false, false]"));
   FillPrimitive(6, 0, 0, primitive_buffers_no_nulls5);
   CheckImport(ArrayFromJSON(float32(), "[0.0, 1.5, -2.0, 3.0, 4.0, 5.0]"));
@@ -1699,25 +2824,29 @@ TEST_F(TestArrayImport, Primitive) {
   CheckImport(ArrayFromJSON(float64(), "[0.0, 1.5, -2.0, 3.0, 4.0, 5.0]"));
 
   // With nulls
-  FillPrimitive(9, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(9, -1, 0, primitive_buffers_nulls1_8);
   CheckImport(ArrayFromJSON(int8(), "[1, null, 3, 4, null, 6, 7, 8, 9]"));
-  FillPrimitive(9, 2, 0, primitive_buffers_nulls1);
+  FillPrimitive(9, 2, 0, primitive_buffers_nulls1_8);
   CheckImport(ArrayFromJSON(int8(), "[1, null, 3, 4, null, 6, 7, 8, 9]"));
-  FillPrimitive(3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(3, -1, 0, primitive_buffers_nulls1_16);
   CheckImport(ArrayFromJSON(int16(), "[513, null, 1541]"));
-  FillPrimitive(3, 1, 0, primitive_buffers_nulls1);
+  FillPrimitive(3, 1, 0, primitive_buffers_nulls1_16);
   CheckImport(ArrayFromJSON(int16(), "[513, null, 1541]"));
-  FillPrimitive(3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(3, -1, 0, primitive_buffers_nulls1_8);
   CheckImport(ArrayFromJSON(boolean(), "[true, null, false]"));
-  FillPrimitive(3, 1, 0, primitive_buffers_nulls1);
+  FillPrimitive(3, 1, 0, primitive_buffers_nulls1_8);
   CheckImport(ArrayFromJSON(boolean(), "[true, null, false]"));
+
+  // Empty array with null data pointers
+  FillPrimitive(0, 0, 0, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(int32(), "[]"));
 }
 
 TEST_F(TestArrayImport, Temporal) {
   FillPrimitive(3, 0, 0, primitive_buffers_no_nulls7);
   CheckImport(ArrayFromJSON(date32(), "[1234, 5678, 9012]"));
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls8);
-  CheckImport(ArrayFromJSON(date64(), "[123456789, 987654321, -123456789]"));
+  FillPrimitive(3, 0, 0, date64_buffers_no_nulls8);
+  CheckImport(ArrayFromJSON(date64(), "[86400000, 172800000, -86400000]"));
 
   FillPrimitive(2, 0, 0, primitive_buffers_no_nulls7);
   CheckImport(ArrayFromJSON(time32(TimeUnit::SECOND), "[1234, 5678]"));
@@ -1755,8 +2884,8 @@ TEST_F(TestArrayImport, Temporal) {
   // With nulls
   FillPrimitive(3, -1, 0, primitive_buffers_nulls7);
   CheckImport(ArrayFromJSON(date32(), "[1234, null, 9012]"));
-  FillPrimitive(3, -1, 0, primitive_buffers_nulls8);
-  CheckImport(ArrayFromJSON(date64(), "[123456789, null, -123456789]"));
+  FillPrimitive(3, -1, 0, date64_buffers_nulls8);
+  CheckImport(ArrayFromJSON(date64(), "[86400000, null, -86400000]"));
   FillPrimitive(2, -1, 0, primitive_buffers_nulls8);
   CheckImport(ArrayFromJSON(time64(TimeUnit::NANO), "[123456789, null]"));
   FillPrimitive(2, -1, 0, primitive_buffers_nulls8);
@@ -1771,23 +2900,32 @@ TEST_F(TestArrayImport, Temporal) {
 }
 
 TEST_F(TestArrayImport, Null) {
-  const void* buffers[] = {nullptr};
-  c_struct_.length = 3;
-  c_struct_.null_count = 3;
-  c_struct_.offset = 0;
-  c_struct_.n_buffers = 1;
-  c_struct_.buffers = buffers;
-  CheckImport(ArrayFromJSON(null(), "[null, null, null]"));
+  // Arrow C++ used to export null arrays with a null bitmap buffer
+  for (const int64_t n_buffers : {0, 1}) {
+    const void* buffers[] = {nullptr};
+    c_struct_.length = 3;
+    c_struct_.null_count = 3;
+    c_struct_.offset = 0;
+    c_struct_.buffers = buffers;
+    c_struct_.n_buffers = n_buffers;
+    CheckImport(ArrayFromJSON(null(), "[null, null, null]"));
+  }
 }
 
 TEST_F(TestArrayImport, PrimitiveWithOffset) {
-  FillPrimitive(3, 0, 2, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 2, primitive_buffers_no_nulls1_8);
   CheckImport(ArrayFromJSON(int8(), "[3, 4, 5]"));
-  FillPrimitive(3, 0, 1, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 1, primitive_buffers_no_nulls1_16);
   CheckImport(ArrayFromJSON(uint16(), "[1027, 1541, 2055]"));
 
-  FillPrimitive(4, 0, 7, primitive_buffers_no_nulls1);
+  FillPrimitive(4, 0, 7, primitive_buffers_no_nulls1_8);
   CheckImport(ArrayFromJSON(boolean(), "[false, false, true, false]"));
+
+  // Empty array with null data pointers
+  FillPrimitive(0, 0, 2, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(int32(), "[]"));
+  FillPrimitive(0, 0, 3, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(boolean(), "[]"));
 }
 
 TEST_F(TestArrayImport, NullWithOffset) {
@@ -1810,41 +2948,88 @@ TEST_F(TestArrayImport, String) {
   FillStringLike(4, 0, 0, large_string_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(large_binary(), R"(["foo", "", "bar", "quux"])"));
 
+  auto length = static_cast<int64_t>(std::size(binary_view_buffer1));
+  FillStringViewLike(length, 0, 0, binary_view_buffers_no_nulls1, 2);
+  CheckImport(MakeBinaryViewArrayWithMultipleDataBuffers());
+
+  // Empty array with null data pointers
+  FillStringLike(0, 0, 0, string_buffers_omitted);
+  CheckImport(ArrayFromJSON(utf8(), "[]"));
+  FillStringLike(0, 0, 0, large_string_buffers_omitted);
+  CheckImport(ArrayFromJSON(large_binary(), "[]"));
+}
+
+TEST_F(TestArrayImport, StringWithOffset) {
+  FillStringLike(3, 0, 1, string_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(utf8(), R"(["", "bar", "quux"])"));
+  FillStringLike(2, 0, 2, large_string_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(large_utf8(), R"(["bar", "quux"])"));
+
+  // Empty array with null data pointers
+  FillStringLike(0, 0, 1, string_buffers_omitted);
+  CheckImport(ArrayFromJSON(utf8(), "[]"));
+}
+
+TEST_F(TestArrayImport, FixedSizeBinary) {
   FillPrimitive(2, 0, 0, primitive_buffers_no_nulls2);
   CheckImport(ArrayFromJSON(fixed_size_binary(3), R"(["abc", "def"])"));
   FillPrimitive(2, 0, 0, primitive_buffers_no_nulls3);
-  CheckImport(ArrayFromJSON(decimal(15, 4), R"(["12345.6789", "98765.4321"])"));
+  CheckImport(ArrayFromJSON(decimal128(15, 4), R"(["12345.6789", "98765.4321"])"));
+
+  // Empty array with null data pointers
+  FillPrimitive(0, 0, 0, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(fixed_size_binary(3), "[]"));
+  FillPrimitive(0, 0, 0, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(decimal128(15, 4), "[]"));
+}
+
+TEST_F(TestArrayImport, FixedSizeBinaryWithOffset) {
+  FillPrimitive(1, 0, 1, primitive_buffers_no_nulls2);
+  CheckImport(ArrayFromJSON(fixed_size_binary(3), R"(["def"])"));
+  FillPrimitive(1, 0, 1, primitive_buffers_no_nulls3);
+  CheckImport(ArrayFromJSON(decimal128(15, 4), R"(["98765.4321"])"));
+
+  // Empty array with null data pointers
+  FillPrimitive(0, 0, 1, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(fixed_size_binary(3), "[]"));
+  FillPrimitive(0, 0, 1, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(decimal128(15, 4), "[]"));
 }
 
 TEST_F(TestArrayImport, List) {
-  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
   FillListLike(5, 0, 0, list_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(list(int8()), "[[1, 2], [], [3, 4, 5], [6], [7, 8]]"));
-  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1_16);
   FillListLike(3, 1, 0, list_buffers_nulls1);
   CheckImport(ArrayFromJSON(list(int16()), "[[513, 1027], null, [1541, 2055, 2569]]"));
 
   // Large list
-  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1_16);
   FillListLike(3, 0, 0, large_list_buffers_no_nulls1);
   CheckImport(
       ArrayFromJSON(large_list(int16()), "[[513, 1027], [], [1541, 2055, 2569]]"));
 
   // Fixed-size list
-  FillPrimitive(AddChild(), 9, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 9, 0, 0, primitive_buffers_no_nulls1_8);
   FillFixedSizeListLike(3, 0, 0, buffers_no_nulls_no_data);
   CheckImport(
       ArrayFromJSON(fixed_size_list(int8(), 3), "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]"));
+
+  // Empty child array with null data pointers
+  FillPrimitive(AddChild(), 0, 0, 0, all_buffers_omitted);
+  FillFixedSizeListLike(0, 0, 0, buffers_no_nulls_no_data);
+  CheckImport(ArrayFromJSON(fixed_size_list(int8(), 3), "[]"));
 }
 
 TEST_F(TestArrayImport, NestedList) {
-  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
   FillListLike(AddChild(), 5, 0, 0, list_buffers_no_nulls1);
   FillListLike(3, 0, 0, large_list_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(large_list(list(int8())),
                             "[[[1, 2], []], [], [[3, 4, 5], [6], [7, 8]]]"));
 
-  FillPrimitive(AddChild(), 6, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 6, 0, 0, primitive_buffers_no_nulls1_8);
   FillFixedSizeListLike(AddChild(), 2, 0, 0, buffers_no_nulls_no_data);
   FillListLike(2, 0, 0, list_buffers_no_nulls1);
   CheckImport(
@@ -1853,53 +3038,100 @@ TEST_F(TestArrayImport, NestedList) {
 
 TEST_F(TestArrayImport, ListWithOffset) {
   // Offset in child
-  FillPrimitive(AddChild(), 8, 0, 1, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 8, 0, 1, primitive_buffers_no_nulls1_8);
   FillListLike(5, 0, 0, list_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(list(int8()), "[[2, 3], [], [4, 5, 6], [7], [8, 9]]"));
 
-  FillPrimitive(AddChild(), 9, 0, 1, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 9, 0, 1, primitive_buffers_no_nulls1_8);
   FillFixedSizeListLike(3, 0, 0, buffers_no_nulls_no_data);
   CheckImport(
       ArrayFromJSON(fixed_size_list(int8(), 3), "[[2, 3, 4], [5, 6, 7], [8, 9, 10]]"));
 
   // Offset in parent
-  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
   FillListLike(4, 0, 1, list_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(list(int8()), "[[], [3, 4, 5], [6], [7, 8]]"));
 
-  FillPrimitive(AddChild(), 9, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 9, 0, 0, primitive_buffers_no_nulls1_8);
   FillFixedSizeListLike(3, 0, 1, buffers_no_nulls_no_data);
   CheckImport(
       ArrayFromJSON(fixed_size_list(int8(), 3), "[[4, 5, 6], [7, 8, 9], [10, 11, 12]]"));
 
   // Both
-  FillPrimitive(AddChild(), 8, 0, 2, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 8, 0, 2, primitive_buffers_no_nulls1_8);
   FillListLike(4, 0, 1, list_buffers_no_nulls1);
   CheckImport(ArrayFromJSON(list(int8()), "[[], [5, 6, 7], [8], [9, 10]]"));
 
-  FillPrimitive(AddChild(), 9, 0, 2, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 9, 0, 2, primitive_buffers_no_nulls1_8);
   FillFixedSizeListLike(3, 0, 1, buffers_no_nulls_no_data);
   CheckImport(ArrayFromJSON(fixed_size_list(int8(), 3),
                             "[[6, 7, 8], [9, 10, 11], [12, 13, 14]]"));
 }
 
+TEST_F(TestArrayImport, ListView) {
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
+  FillListView(5, 0, 0, list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(list_view(int8()), "[[1, 2], [], [3, 4, 5], [6], [7, 8]]"));
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1_16);
+  FillListView(3, 1, 0, list_view_buffers_nulls1);
+  CheckImport(
+      ArrayFromJSON(list_view(int16()), "[[513, 1027], null, [1541, 2055, 2569]]"));
+
+  // Large list-view
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1_16);
+  FillListView(3, 0, 0, large_list_view_buffers_no_nulls1);
+  CheckImport(
+      ArrayFromJSON(large_list_view(int16()), "[[513, 1027], [], [1541, 2055, 2569]]"));
+}
+
+TEST_F(TestArrayImport, NestedListView) {
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
+  FillListView(AddChild(), 5, 0, 0, list_view_buffers_no_nulls1);
+  FillListView(3, 0, 0, large_list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(large_list_view(list_view(int8())),
+                            "[[[1, 2], []], [], [[3, 4, 5], [6], [7, 8]]]"));
+
+  FillPrimitive(AddChild(), 6, 0, 0, primitive_buffers_no_nulls1_8);
+  FillFixedSizeListLike(AddChild(), 2, 0, 0, buffers_no_nulls_no_data);
+  FillListView(2, 0, 0, list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(list_view(fixed_size_list(int8(), 3)),
+                            "[[[1, 2, 3], [4, 5, 6]], []]"));
+}
+
+TEST_F(TestArrayImport, ListViewWithOffset) {
+  // Offset in child
+  FillPrimitive(AddChild(), 8, 0, 1, primitive_buffers_no_nulls1_8);
+  FillListView(5, 0, 0, list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(list_view(int8()), "[[2, 3], [], [4, 5, 6], [7], [8, 9]]"));
+
+  // Offset in parent
+  FillPrimitive(AddChild(), 8, 0, 0, primitive_buffers_no_nulls1_8);
+  FillListView(4, 0, 1, list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(list_view(int8()), "[[], [3, 4, 5], [6], [7, 8]]"));
+
+  // Both
+  FillPrimitive(AddChild(), 8, 0, 2, primitive_buffers_no_nulls1_8);
+  FillListView(4, 0, 1, list_view_buffers_no_nulls1);
+  CheckImport(ArrayFromJSON(list_view(int8()), "[[], [5, 6, 7], [8], [9, 10]]"));
+}
+
 TEST_F(TestArrayImport, Struct) {
   FillStringLike(AddChild(), 3, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_16);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
   auto expected = ArrayFromJSON(struct_({field("strs", utf8()), field("ints", uint16())}),
                                 R"([["foo", 513], ["", null], ["bar", 1541]])");
   CheckImport(expected);
 
   FillStringLike(AddChild(), 3, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1_16);
   FillStructLike(3, -1, 0, 2, buffers_nulls_no_data1);
   expected = ArrayFromJSON(struct_({field("strs", utf8()), field("ints", uint16())}),
                            R"([["foo", 513], null, ["bar", 1541]])");
   CheckImport(expected);
 
   FillStringLike(AddChild(), 3, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1_16);
   FillStructLike(3, -1, 0, 2, buffers_nulls_no_data1);
   expected = ArrayFromJSON(
       struct_({field("strs", utf8(), /*nullable=*/false), field("ints", uint16())}),
@@ -1907,32 +3139,109 @@ TEST_F(TestArrayImport, Struct) {
   CheckImport(expected);
 }
 
-TEST_F(TestArrayImport, Union) {
-  // Sparse
-  FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 4, -1, 0, primitive_buffers_nulls1);
-  FillUnionLike(4, 0, 0, 2, sparse_union_buffers_no_nulls1);
-  auto type =
-      union_({field("strs", utf8()), field("ints", int8())}, {43, 42}, UnionMode::SPARSE);
-  auto expected =
-      ArrayFromJSON(type, R"([[42, 1], [42, null], [43, "bar"], [43, "quux"]])");
+#ifdef ARROW_COMPUTE
+TEST_F(TestArrayImport, RunEndEncoded) {
+  FillPrimitive(AddChild(), 5, 0, 0, run_ends_buffers5);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls5);
+  FillRunEndEncoded(9, 0);
+  ASSERT_OK_AND_ASSIGN(auto expected,
+                       REEFromJSON(run_end_encoded(int16(), float32()),
+                                   "[0.0, 1.5, -2.0, -2.0, 3.0, 3.0, 3.0, 4.0, 4.0]"));
+  ASSERT_OK(expected->ValidateFull());
+  CheckImport(expected);
+}
+
+TEST_F(TestArrayImport, RunEndEncodedWithOffset) {
+  auto ree_type = run_end_encoded(int16(), float32());
+  // Offset in children
+  FillPrimitive(AddChild(), 3, 0, 2, run_ends_buffers5);
+  FillPrimitive(AddChild(), 3, 0, 2, primitive_buffers_no_nulls5);
+  FillRunEndEncoded(7, 0);
+  ASSERT_OK_AND_ASSIGN(auto expected,
+                       REEFromJSON(ree_type, "[-2.0, -2.0, -2.0, -2.0, 3.0, 3.0, 3.0]"));
   CheckImport(expected);
 
-  // Dense
-  FillStringLike(AddChild(), 2, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
-  FillUnionLike(5, 0, 0, 2, dense_union_buffers_no_nulls1);
-  type =
-      union_({field("strs", utf8()), field("ints", int8())}, {43, 42}, UnionMode::DENSE);
-  expected =
-      ArrayFromJSON(type, R"([[42, 1], [42, null], [43, "foo"], [43, ""], [42, 3]])");
+  // Offset in parent
+  FillPrimitive(AddChild(), 5, 0, 0, run_ends_buffers5);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls5);
+  FillRunEndEncoded(5, 2);
+  ASSERT_OK_AND_ASSIGN(expected, REEFromJSON(ree_type, "[-2.0, -2.0, 3.0, 3.0, 3.0]"));
   CheckImport(expected);
+
+  // Length in parent that cuts last run
+  FillPrimitive(AddChild(), 5, 0, 0, run_ends_buffers5);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls5);
+  FillRunEndEncoded(4, 2);
+  ASSERT_OK_AND_ASSIGN(expected, REEFromJSON(ree_type, "[-2.0, -2.0, 3.0, 3.0]"));
+  CheckImport(expected);
+
+  // Offset in both children and parent
+  FillPrimitive(AddChild(), 3, 0, 2, run_ends_buffers5);
+  FillPrimitive(AddChild(), 3, 0, 2, primitive_buffers_no_nulls5);
+  FillRunEndEncoded(4, 2);
+  ASSERT_OK_AND_ASSIGN(expected, REEFromJSON(ree_type, "[-2.0, -2.0, 3.0, 3.0]"));
+  CheckImport(expected);
+}
+#endif
+
+TEST_F(TestArrayImport, SparseUnion) {
+  auto type = sparse_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
+  auto expected =
+      ArrayFromJSON(type, R"([[42, 1], [42, null], [43, "bar"], [43, "quux"]])");
+
+  FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 4, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::SPARSE, 4, 0, 0, 2, sparse_union_buffers1, /*legacy=*/false);
+  CheckImport(expected);
+
+  // Legacy format with null bitmap (ARROW-14179)
+  FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 4, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::SPARSE, 4, 0, 0, 2, sparse_union_buffers1_legacy,
+                /*legacy=*/true);
+  CheckImport(expected);
+
+  // Empty array with null data pointers
+  expected = ArrayFromJSON(type, "[]");
+  FillStringLike(AddChild(), 0, 0, 0, string_buffers_omitted);
+  FillPrimitive(AddChild(), 0, 0, 0, all_buffers_omitted);
+  FillUnionLike(UnionMode::SPARSE, 0, 0, 0, 2, all_buffers_omitted, /*legacy=*/false);
+  FillStringLike(AddChild(), 0, 0, 0, string_buffers_omitted);
+  FillPrimitive(AddChild(), 0, 0, 0, all_buffers_omitted);
+  FillUnionLike(UnionMode::SPARSE, 0, 0, 3, 2, all_buffers_omitted, /*legacy=*/false);
+}
+
+TEST_F(TestArrayImport, DenseUnion) {
+  auto type = dense_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
+  auto expected =
+      ArrayFromJSON(type, R"([[42, 1], [42, null], [43, "foo"], [43, ""], [42, 3]])");
+
+  FillStringLike(AddChild(), 2, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::DENSE, 5, 0, 0, 2, dense_union_buffers1, /*legacy=*/false);
+  CheckImport(expected);
+
+  // Legacy format with null bitmap (ARROW-14179)
+  FillStringLike(AddChild(), 2, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::DENSE, 5, 0, 0, 2, dense_union_buffers1_legacy,
+                /*legacy=*/true);
+  CheckImport(expected);
+
+  // Empty array with null data pointers
+  expected = ArrayFromJSON(type, "[]");
+  FillStringLike(AddChild(), 0, 0, 0, string_buffers_omitted);
+  FillPrimitive(AddChild(), 0, 0, 0, all_buffers_omitted);
+  FillUnionLike(UnionMode::DENSE, 0, 0, 0, 2, all_buffers_omitted, /*legacy=*/false);
+  FillStringLike(AddChild(), 0, 0, 0, string_buffers_omitted);
+  FillPrimitive(AddChild(), 0, 0, 0, all_buffers_omitted);
+  FillUnionLike(UnionMode::DENSE, 0, 0, 3, 2, all_buffers_omitted, /*legacy=*/false);
 }
 
 TEST_F(TestArrayImport, StructWithOffset) {
   // Child
   FillStringLike(AddChild(), 3, 0, 1, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, 0, 2, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, 0, 2, primitive_buffers_no_nulls1_8);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
   auto expected = ArrayFromJSON(struct_({field("strs", utf8()), field("ints", int8())}),
                                 R"([["", 3], ["bar", 4], ["quux", 5]])");
@@ -1940,7 +3249,7 @@ TEST_F(TestArrayImport, StructWithOffset) {
 
   // Parent and child
   FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 4, 0, 2, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 4, 0, 2, primitive_buffers_no_nulls1_8);
   FillStructLike(3, 0, 1, 2, buffers_no_nulls_no_data);
   expected = ArrayFromJSON(struct_({field("strs", utf8()), field("ints", int8())}),
                            R"([["", 4], ["bar", 5], ["quux", 6]])");
@@ -1949,7 +3258,7 @@ TEST_F(TestArrayImport, StructWithOffset) {
 
 TEST_F(TestArrayImport, Map) {
   FillStringLike(AddChild(), 5, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 5, 0, 0, primitive_buffers_no_nulls1_8);
   FillStructLike(AddChild(), 5, 0, 0, 2, buffers_no_nulls_no_data);
   FillListLike(3, 1, 0, list_buffers_nulls1);
   auto expected = ArrayFromJSON(
@@ -1965,31 +3274,32 @@ TEST_F(TestArrayImport, Dictionary) {
 
   auto dict_values = ArrayFromJSON(utf8(), R"(["foo", "", "bar", "quux"])");
   auto indices = ArrayFromJSON(int8(), "[1, 2, 0, 1, 3, 0]");
-  std::shared_ptr<Array> expected;
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values,
-                                        &expected));
+  ASSERT_OK_AND_ASSIGN(
+      auto expected,
+      DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values));
   CheckImport(expected);
 
   FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
   FillPrimitive(6, 0, 0, primitive_buffers_no_nulls4);
   FillDictionary();
 
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), utf8(), /*ordered=*/true),
-                                        indices, dict_values, &expected));
+  ASSERT_OK_AND_ASSIGN(
+      expected, DictionaryArray::FromArrays(dictionary(int8(), utf8(), /*ordered=*/true),
+                                            indices, dict_values));
   CheckImport(expected);
 }
 
 TEST_F(TestArrayImport, NestedDictionary) {
-  FillPrimitive(AddChild(), 6, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 6, 0, 0, primitive_buffers_no_nulls1_8);
   FillListLike(AddChild(), 4, 0, 0, list_buffers_no_nulls1);
   FillPrimitive(6, 0, 0, primitive_buffers_no_nulls4);
   FillDictionary();
 
   auto dict_values = ArrayFromJSON(list(int8()), "[[1, 2], [], [3, 4, 5], [6]]");
   auto indices = ArrayFromJSON(int8(), "[1, 2, 0, 1, 3, 0]");
-  std::shared_ptr<Array> expected;
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), list(int8())),
-                                        indices, dict_values, &expected));
+  ASSERT_OK_AND_ASSIGN(auto expected,
+                       DictionaryArray::FromArrays(dictionary(int8(), list(int8())),
+                                                   indices, dict_values));
   CheckImport(expected);
 
   FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
@@ -1999,12 +3309,11 @@ TEST_F(TestArrayImport, NestedDictionary) {
 
   dict_values = ArrayFromJSON(utf8(), R"(["foo", "", "bar", "quux"])");
   indices = ArrayFromJSON(int8(), "[1, 2, 0, 1, 3, 0]");
-  std::shared_ptr<Array> dict_array;
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values,
-                                        &dict_array));
+  ASSERT_OK_AND_ASSIGN(
+      auto dict_array,
+      DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values));
   auto offsets = ArrayFromJSON(int32(), "[0, 2, 2, 5]");
-  ASSERT_OK(ListArray::FromArrays(*offsets, *dict_array, default_memory_pool(),
-                                  &expected));
+  ASSERT_OK_AND_ASSIGN(expected, ListArray::FromArrays(*offsets, *dict_array));
   CheckImport(expected);
 }
 
@@ -2013,41 +3322,105 @@ TEST_F(TestArrayImport, DictionaryWithOffset) {
   FillPrimitive(3, 0, 0, primitive_buffers_no_nulls4);
   FillDictionary();
 
-  auto dict_values = ArrayFromJSON(utf8(), R"(["", "bar", "quux"])");
-  auto indices = ArrayFromJSON(int8(), "[1, 2, 0]");
-  std::shared_ptr<Array> expected;
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values,
-                                        &expected));
+  auto expected = DictArrayFromJSON(dictionary(int8(), utf8()), "[1, 2, 0]",
+                                    R"(["", "bar", "quux"])");
   CheckImport(expected);
 
   FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
   FillPrimitive(4, 0, 2, primitive_buffers_no_nulls4);
   FillDictionary();
 
-  dict_values = ArrayFromJSON(utf8(), R"(["foo", "", "bar", "quux"])");
-  indices = ArrayFromJSON(int8(), "[0, 1, 3, 0]");
-  ASSERT_OK(DictionaryArray::FromArrays(dictionary(int8(), utf8()), indices, dict_values,
-                                        &expected));
+  expected = DictArrayFromJSON(dictionary(int8(), utf8()), "[0, 1, 3, 0]",
+                               R"(["foo", "", "bar", "quux"])");
+  CheckImport(expected);
+}
+
+TEST_F(TestArrayImport, RegisteredExtension) {
+  ExtensionTypeGuard guard({smallint(), dict_extension_type(), complex128()});
+
+  // smallint
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_16);
+  auto expected =
+      ExtensionType::WrapArray(smallint(), ArrayFromJSON(int16(), "[513, 1027, 1541]"));
+  CheckImport(expected);
+
+  // dict_extension_type
+  FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(6, 0, 0, primitive_buffers_no_nulls4);
+  FillDictionary();
+
+  auto storage = DictArrayFromJSON(dictionary(int8(), utf8()), "[1, 2, 0, 1, 3, 0]",
+                                   R"(["foo", "", "bar", "quux"])");
+  expected = ExtensionType::WrapArray(dict_extension_type(), storage);
+  CheckImport(expected);
+
+  // complex128
+  FillPrimitive(AddChild(), 3, 0, /*offset=*/0, primitive_buffers_no_nulls6);
+  FillPrimitive(AddChild(), 3, 0, /*offset=*/3, primitive_buffers_no_nulls6);
+  FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
+  expected = MakeComplex128(ArrayFromJSON(float64(), "[0.0, 1.5, -2.0]"),
+                            ArrayFromJSON(float64(), "[3.0, 4.0, 5.0]"));
   CheckImport(expected);
 }
 
 TEST_F(TestArrayImport, PrimitiveError) {
   // Bad number of buffers
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_8);
   c_struct_.n_buffers = 1;
   CheckImportError(int8());
 
   // Zero null bitmap but non-zero null_count
-  FillPrimitive(3, 1, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 1, 0, primitive_buffers_no_nulls1_8);
   CheckImportError(int8());
+
+  // Null data pointers with non-zero length
+  FillPrimitive(1, 0, 0, all_buffers_omitted);
+  CheckImportError(int8());
+  FillPrimitive(1, 0, 0, all_buffers_omitted);
+  CheckImportError(boolean());
+  FillPrimitive(1, 0, 0, all_buffers_omitted);
+  CheckImportError(fixed_size_binary(3));
+}
+
+TEST_F(TestArrayImport, StringError) {
+  // Bad number of buffers
+  FillStringLike(4, 0, 0, string_buffers_no_nulls1);
+  c_struct_.n_buffers = 2;
+  CheckImportError(utf8());
+
+  // Null data pointers with non-zero length
+  FillStringLike(4, 0, 0, string_buffers_omitted);
+  CheckImportError(utf8());
+
+  // Null offsets pointer
+  FillStringLike(0, 0, 0, all_buffers_omitted);
+  CheckImportError(utf8());
 }
 
 TEST_F(TestArrayImport, StructError) {
   // Bad number of children
   FillStringLike(AddChild(), 3, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_8);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
   CheckImportError(struct_({field("strs", utf8())}));
+}
+
+TEST_F(TestArrayImport, ListError) {
+  // Null offsets pointer
+  FillPrimitive(AddChild(), 0, 0, 0, primitive_buffers_no_nulls1_8);
+  FillListLike(0, 0, 0, all_buffers_omitted);
+  CheckImportError(list(int8()));
+}
+
+TEST_F(TestArrayImport, ListViewNoError) {
+  // Unlike with lists, importing a length-0 list-view with all buffers omitted is
+  // not an error. List-views don't need an extra offset value, so an empty offsets
+  // buffer is valid in this case.
+
+  // Null offsets pointer
+  FillPrimitive(AddChild(), 0, 0, 0, primitive_buffers_no_nulls1_8);
+  FillListView(0, 0, 0, all_buffers_omitted);
+  CheckImport(ArrayFromJSON(list_view(int8()), "[]"));
 }
 
 TEST_F(TestArrayImport, MapError) {
@@ -2056,6 +3429,21 @@ TEST_F(TestArrayImport, MapError) {
   FillStructLike(AddChild(), 5, 0, 0, 1, buffers_no_nulls_no_data);
   FillListLike(3, 1, 0, list_buffers_nulls1);
   CheckImportError(map(utf8(), uint8()));
+}
+
+TEST_F(TestArrayImport, UnionError) {
+  // Non-zero null count
+  auto type = sparse_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
+  FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 4, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::SPARSE, 4, -1, 0, 2, sparse_union_buffers1, /*legacy=*/false);
+  CheckImportError(type);
+
+  type = dense_union({field("strs", utf8()), field("ints", int8())}, {43, 42});
+  FillStringLike(AddChild(), 2, 0, 0, string_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_8);
+  FillUnionLike(UnionMode::DENSE, 5, -1, 0, 2, dense_union_buffers1, /*legacy=*/false);
+  CheckImportError(type);
 }
 
 TEST_F(TestArrayImport, DictionaryError) {
@@ -2086,7 +3474,7 @@ TEST_F(TestArrayImport, ImportRecordBatch) {
   auto expected_ints = ArrayFromJSON(uint16(), "[513, null, 1541]");
 
   FillStringLike(AddChild(), 3, 0, 1, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_16);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
 
   auto expected = RecordBatch::Make(schema, 3, {expected_strs, expected_ints});
@@ -2096,14 +3484,14 @@ TEST_F(TestArrayImport, ImportRecordBatch) {
 TEST_F(TestArrayImport, ImportRecordBatchError) {
   // Struct with non-zero parent offset
   FillStringLike(AddChild(), 4, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 4, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 4, 0, 0, primitive_buffers_no_nulls1_16);
   FillStructLike(3, 0, 1, 2, buffers_no_nulls_no_data);
   auto schema = ::arrow::schema({field("strs", utf8()), field("ints", uint16())});
   CheckImportError(schema);
 
   // Struct with nulls in parent
   FillStringLike(AddChild(), 3, 0, 0, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(AddChild(), 3, 0, 0, primitive_buffers_no_nulls1_8);
   FillStructLike(3, 1, 0, 2, buffers_nulls_no_data1);
   CheckImportError(schema);
 }
@@ -2114,7 +3502,7 @@ TEST_F(TestArrayImport, ImportArrayAndType) {
   schema_builder.FillPrimitive("c");
   SchemaReleaseCallback schema_cb(&schema_builder.c_struct_);
 
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_8);
   ArrayReleaseCallback array_cb(&c_struct_);
 
   ASSERT_OK_AND_ASSIGN(auto array, ImportArray(&c_struct_, &schema_builder.c_struct_));
@@ -2132,7 +3520,7 @@ TEST_F(TestArrayImport, ImportArrayAndTypeError) {
   schema_builder.FillPrimitive("cc");
   SchemaReleaseCallback schema_cb(&schema_builder.c_struct_);
 
-  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1);
+  FillPrimitive(3, 0, 0, primitive_buffers_no_nulls1_8);
   ArrayReleaseCallback array_cb(&c_struct_);
 
   ASSERT_RAISES(Invalid, ImportArray(&c_struct_, &schema_builder.c_struct_));
@@ -2153,7 +3541,7 @@ TEST_F(TestArrayImport, ImportRecordBatchAndSchema) {
   SchemaReleaseCallback schema_cb(&schema_builder.c_struct_);
 
   FillStringLike(AddChild(), 3, 0, 1, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_16);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
   ArrayReleaseCallback array_cb(&c_struct_);
 
@@ -2175,7 +3563,7 @@ TEST_F(TestArrayImport, ImportRecordBatchAndSchemaError) {
   SchemaReleaseCallback schema_cb(&schema_builder.c_struct_);
 
   FillStringLike(AddChild(), 3, 0, 1, string_buffers_no_nulls1);
-  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1);
+  FillPrimitive(AddChild(), 3, -1, 0, primitive_buffers_nulls1_8);
   FillStructLike(3, 0, 0, 2, buffers_no_nulls_no_data);
   ArrayReleaseCallback array_cb(&c_struct_);
 
@@ -2191,10 +3579,11 @@ class TestSchemaRoundtrip : public ::testing::Test {
  public:
   void SetUp() override { pool_ = default_memory_pool(); }
 
-  template <typename TypeFactory>
-  void TestWithTypeFactory(TypeFactory&& factory) {
+  template <typename TypeFactory, typename ExpectedTypeFactory>
+  void TestWithTypeFactory(TypeFactory&& factory,
+                           ExpectedTypeFactory&& factory_expected) {
     std::shared_ptr<DataType> type, actual;
-    struct ArrowSchema c_schema{};  // zeroed
+    struct ArrowSchema c_schema {};  // zeroed
     SchemaExportGuard schema_guard(&c_schema);
 
     auto orig_bytes = pool_->bytes_allocated();
@@ -2209,18 +3598,23 @@ class TestSchemaRoundtrip : public ::testing::Test {
 
     // Recreate the type
     ASSERT_OK_AND_ASSIGN(actual, ImportType(&c_schema));
-    type = factory();
-    AssertTypeEqual(*type, *actual);
+    type = factory_expected();
+    AssertTypeEqual(*type, *actual, /*check_metadata=*/true);
     type.reset();
     actual.reset();
 
     ASSERT_EQ(pool_->bytes_allocated(), orig_bytes);
   }
 
+  template <typename TypeFactory>
+  void TestWithTypeFactory(TypeFactory&& factory) {
+    TestWithTypeFactory(factory, factory);
+  }
+
   template <typename SchemaFactory>
   void TestWithSchemaFactory(SchemaFactory&& factory) {
     std::shared_ptr<Schema> schema, actual;
-    struct ArrowSchema c_schema{};  // zeroed
+    struct ArrowSchema c_schema {};  // zeroed
     SchemaExportGuard schema_guard(&c_schema);
 
     auto orig_bytes = pool_->bytes_allocated();
@@ -2236,7 +3630,7 @@ class TestSchemaRoundtrip : public ::testing::Test {
     // Recreate the schema
     ASSERT_OK_AND_ASSIGN(actual, ImportSchema(&c_schema));
     schema = factory();
-    AssertSchemaEqual(*schema, *actual);
+    AssertSchemaEqual(*schema, *actual, /*check_metadata=*/true);
     schema.reset();
     actual.reset();
 
@@ -2247,27 +3641,38 @@ class TestSchemaRoundtrip : public ::testing::Test {
   MemoryPool* pool_;
 };
 
-TEST_F(TestSchemaRoundtrip, Null) {
-  TestWithTypeFactory(null);
-}
+TEST_F(TestSchemaRoundtrip, Null) { TestWithTypeFactory(null); }
 
 TEST_F(TestSchemaRoundtrip, Primitive) {
   TestWithTypeFactory(int32);
   TestWithTypeFactory(boolean);
   TestWithTypeFactory(float16);
 
-  TestWithTypeFactory(std::bind(decimal, 19, 4));
-  TestWithTypeFactory(std::bind(fixed_size_binary, 3));
+  TestWithTypeFactory([] { return decimal32(8, 4); });
+  TestWithTypeFactory([] { return decimal64(16, 4); });
+  TestWithTypeFactory([] { return decimal128(19, 4); });
+  TestWithTypeFactory([] { return decimal256(19, 4); });
+  TestWithTypeFactory([] { return decimal32(8, 0); });
+  TestWithTypeFactory([] { return decimal64(16, 0); });
+  TestWithTypeFactory([] { return decimal128(19, 0); });
+  TestWithTypeFactory([] { return decimal256(19, 0); });
+  TestWithTypeFactory([] { return decimal32(8, -5); });
+  TestWithTypeFactory([] { return decimal64(16, -5); });
+  TestWithTypeFactory([] { return decimal128(19, -5); });
+  TestWithTypeFactory([] { return decimal256(19, -5); });
+  TestWithTypeFactory([] { return fixed_size_binary(3); });
   TestWithTypeFactory(binary);
   TestWithTypeFactory(large_utf8);
+  TestWithTypeFactory(binary_view);
 }
 
 TEST_F(TestSchemaRoundtrip, Temporal) {
   TestWithTypeFactory(date32);
   TestWithTypeFactory(day_time_interval);
   TestWithTypeFactory(month_interval);
-  TestWithTypeFactory(std::bind(time64, TimeUnit::NANO));
-  TestWithTypeFactory(std::bind(duration, TimeUnit::MICRO));
+  TestWithTypeFactory(month_day_nano_interval);
+  TestWithTypeFactory([] { return time64(TimeUnit::NANO); });
+  TestWithTypeFactory([] { return duration(TimeUnit::MICRO); });
   TestWithTypeFactory([]() { return arrow::timestamp(TimeUnit::MICRO, "Europe/Paris"); });
 }
 
@@ -2278,42 +3683,113 @@ TEST_F(TestSchemaRoundtrip, List) {
   TestWithTypeFactory([]() { return list(fixed_size_list(utf8(), 5)); });
 }
 
+TEST_F(TestSchemaRoundtrip, ListView) {
+  TestWithTypeFactory([]() { return list_view(utf8()); });
+  TestWithTypeFactory([]() { return large_list_view(list_view(utf8())); });
+  TestWithTypeFactory([]() { return list_view(fixed_size_list(utf8(), 5)); });
+}
+
 TEST_F(TestSchemaRoundtrip, Struct) {
-  auto f1 = field("f1", utf8(), /*nullable=*/ false);
-  auto f2 = field("f2", list(decimal(19, 4)));
+  auto f1 = field("f1", utf8(), /*nullable=*/false);
+  auto f2 = field("f2", list(decimal128(19, 4)));
 
   TestWithTypeFactory([&]() { return struct_({f1, f2}); });
   f2 = f2->WithMetadata(key_value_metadata(kMetadataKeys2, kMetadataValues2));
   TestWithTypeFactory([&]() { return struct_({f1, f2}); });
+  TestWithTypeFactory([&]() { return struct_(arrow::FieldVector{}); });
 }
 
 TEST_F(TestSchemaRoundtrip, Union) {
-  auto f1 = field("f1", utf8(), /*nullable=*/ false);
-  auto f2 = field("f2", list(decimal(19, 4)));
+  auto f1 = field("f1", utf8(), /*nullable=*/false);
+  auto f2 = field("f2", list(decimal128(19, 4)));
   auto type_codes = std::vector<int8_t>{42, 43};
 
-  TestWithTypeFactory([&]() { return union_({f1, f2}, type_codes, UnionMode::SPARSE); });
+  TestWithTypeFactory(
+      [&]() { return dense_union(arrow::FieldVector{}, std::vector<int8_t>{}); });
+  TestWithTypeFactory(
+      [&]() { return sparse_union(arrow::FieldVector{}, std::vector<int8_t>{}); });
+  TestWithTypeFactory([&]() { return sparse_union({f1, f2}, type_codes); });
   f2 = f2->WithMetadata(key_value_metadata(kMetadataKeys2, kMetadataValues2));
-  TestWithTypeFactory([&]() { return union_({f1, f2}, type_codes, UnionMode::DENSE); });
+  TestWithTypeFactory([&]() { return dense_union({f1, f2}, type_codes); });
 }
 
-TEST_F(TestSchemaRoundtrip, Dictionary) {
-  TestWithTypeFactory([&]() { return dictionary(int32(), utf8()); });
-  TestWithTypeFactory([&]() { return dictionary(int32(), utf8(), /*ordered=*/ true); });
+#ifdef ARROW_COMPUTE
+TEST_F(TestSchemaRoundtrip, RunEndEncoded) {
+  TestWithTypeFactory([]() { return run_end_encoded(int16(), float32()); });
+  TestWithTypeFactory([]() { return run_end_encoded(int32(), list(float32())); });
+}
+#endif
 
-  TestWithTypeFactory([&]() { return dictionary(int32(), list(utf8())); });
-  TestWithTypeFactory([&]() { return list(dictionary(int32(), list(utf8()))); });
+TEST_F(TestSchemaRoundtrip, Dictionary) {
+  for (auto index_ty : all_dictionary_index_types()) {
+    TestWithTypeFactory([&]() { return dictionary(index_ty, utf8()); });
+    TestWithTypeFactory([&]() { return dictionary(index_ty, utf8(), /*ordered=*/true); });
+    TestWithTypeFactory([&]() { return dictionary(index_ty, list(utf8())); });
+    TestWithTypeFactory([&]() { return list(dictionary(index_ty, list(utf8()))); });
+  }
+}
+
+// Given an extension type, return a field of its storage type + the
+// serialized extension metadata.
+std::shared_ptr<Field> GetStorageWithMetadata(const std::string& field_name,
+                                              const std::shared_ptr<DataType>& type) {
+  const auto& ext_type = checked_cast<const ExtensionType&>(*type);
+  auto storage_type = ext_type.storage_type();
+  auto md = KeyValueMetadata::Make({kExtensionTypeKeyName, kExtensionMetadataKeyName},
+                                   {ext_type.extension_name(), ext_type.Serialize()});
+  return field(field_name, storage_type, /*nullable=*/true, md);
+}
+
+TEST_F(TestSchemaRoundtrip, UnregisteredExtension) {
+  TestWithTypeFactory(uuid, []() { return fixed_size_binary(16); });
+  TestWithTypeFactory(dict_extension_type, []() { return dictionary(int8(), utf8()); });
+
+  // Inside nested type.
+  // When an extension type is not known by the importer, it is imported
+  // as its storage type and the extension metadata is preserved on the field.
+  TestWithTypeFactory(
+      []() { return list(dict_extension_type()); },
+      []() { return list(GetStorageWithMetadata("item", dict_extension_type())); });
+}
+
+TEST_F(TestSchemaRoundtrip, RegisteredExtension) {
+  ExtensionTypeGuard guard({uuid(), dict_extension_type(), complex128()});
+  TestWithTypeFactory(uuid);
+  TestWithTypeFactory(dict_extension_type);
+  TestWithTypeFactory(complex128);
+
+  // Inside nested type.
+  // When the extension type is registered, the extension metadata is removed
+  // from the storage type's field to ensure roundtripping (GH-39865).
+  TestWithTypeFactory([]() { return list(uuid()); });
+  TestWithTypeFactory([]() { return list(dict_extension_type()); });
+  TestWithTypeFactory([]() { return list(complex128()); });
 }
 
 TEST_F(TestSchemaRoundtrip, Map) {
   TestWithTypeFactory([&]() { return map(utf8(), int32()); });
+  TestWithTypeFactory([&]() { return map(utf8(), field("value", int32(), false)); });
+  TestWithTypeFactory([&]() {
+    return map(utf8(), field("value", int32(), false,
+                             KeyValueMetadata::Make({"meta key"}, {"meta value"})));
+  });
+  // Field names are brought in line with the spec on import.
+  TestWithTypeFactory(
+      [&]() {
+        return MapType::Make(field("some_entries",
+                                   struct_({field("some_key", utf8(), false),
+                                            field("some_value", int32())}),
+                                   false))
+            .ValueOrDie();
+      },
+      [&]() { return map(utf8(), int32()); });
   TestWithTypeFactory([&]() { return map(list(utf8()), int32()); });
   TestWithTypeFactory([&]() { return list(map(list(utf8()), int32())); });
 }
 
 TEST_F(TestSchemaRoundtrip, Schema) {
-  auto f1 = field("f1", utf8(), /*nullable=*/ false);
-  auto f2 = field("f2", list(decimal(19, 4)));
+  auto f1 = field("f1", utf8(), /*nullable=*/false);
+  auto f2 = field("f2", list(decimal256(19, 4)));
   auto md1 = key_value_metadata(kMetadataKeys1, kMetadataValues1);
   auto md2 = key_value_metadata(kMetadataKeys2, kMetadataValues2);
 
@@ -2328,37 +3804,39 @@ TEST_F(TestSchemaRoundtrip, Schema) {
 
 class TestArrayRoundtrip : public ::testing::Test {
  public:
-  using ArrayFactory = std::function<Status(std::shared_ptr<Array>*)>;
+  using ArrayFactory = std::function<Result<std::shared_ptr<Array>>()>;
 
   void SetUp() override { pool_ = default_memory_pool(); }
 
   static ArrayFactory JSONArrayFactory(std::shared_ptr<DataType> type, const char* json) {
-    return [=](std::shared_ptr<Array>* out) -> Status {
-      return ::arrow::ipc::internal::json::ArrayFromJSON(type, json, out);
-    };
+    return [=]() { return ArrayFromJSON(type, json); };
   }
 
   static ArrayFactory SlicedArrayFactory(ArrayFactory factory) {
-    return [=](std::shared_ptr<Array>* out) -> Status {
-      std::shared_ptr<Array> arr;
-      RETURN_NOT_OK(factory(&arr));
+    return [=]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto arr, factory());
       DCHECK_GE(arr->length(), 2);
-      *out = arr->Slice(1, arr->length() - 2);
-      return Status::OK();
+      return arr->Slice(1, arr->length() - 2);
     };
   }
 
   template <typename ArrayFactory>
   void TestWithArrayFactory(ArrayFactory&& factory) {
+    TestWithArrayFactory(factory, factory);
+  }
+
+  template <typename ArrayFactory, typename ExpectedArrayFactory>
+  void TestWithArrayFactory(ArrayFactory&& factory,
+                            ExpectedArrayFactory&& factory_expected) {
     std::shared_ptr<Array> array;
-    struct ArrowArray c_array{};
-    struct ArrowSchema c_schema{};
+    struct ArrowArray c_array {};
+    struct ArrowSchema c_schema {};
     ArrayExportGuard array_guard(&c_array);
     SchemaExportGuard schema_guard(&c_schema);
 
     auto orig_bytes = pool_->bytes_allocated();
 
-    ASSERT_OK(factory(&array));
+    ASSERT_OK_AND_ASSIGN(array, ToResult(factory()));
     ASSERT_OK(ExportType(*array->type(), &c_schema));
     ASSERT_OK(ExportArray(*array, &c_array));
 
@@ -2385,8 +3863,8 @@ class TestArrayRoundtrip : public ::testing::Test {
     // Check value of imported array
     {
       std::shared_ptr<Array> expected;
-      ASSERT_OK(factory(&expected));
-      AssertTypeEqual(*expected->type(), *array->type());
+      ASSERT_OK_AND_ASSIGN(expected, ToResult(factory_expected()));
+      AssertTypeEqual(*expected->type(), *array->type(), /*check_metadata=*/true);
       AssertArraysEqual(*expected, *array, true);
     }
     array.reset();
@@ -2396,13 +3874,13 @@ class TestArrayRoundtrip : public ::testing::Test {
   template <typename BatchFactory>
   void TestWithBatchFactory(BatchFactory&& factory) {
     std::shared_ptr<RecordBatch> batch;
-    struct ArrowArray c_array{};
-    struct ArrowSchema c_schema{};
+    struct ArrowArray c_array {};
+    struct ArrowSchema c_schema {};
     ArrayExportGuard array_guard(&c_array);
     SchemaExportGuard schema_guard(&c_schema);
 
     auto orig_bytes = pool_->bytes_allocated();
-    ASSERT_OK(factory(&batch));
+    ASSERT_OK_AND_ASSIGN(batch, ToResult(factory()));
     ASSERT_OK(ExportSchema(*batch->schema(), &c_schema));
     ASSERT_OK(ExportRecordBatch(*batch, &c_array));
 
@@ -2425,8 +3903,8 @@ class TestArrayRoundtrip : public ::testing::Test {
     // Check value of imported record batch
     {
       std::shared_ptr<RecordBatch> expected;
-      ASSERT_OK(factory(&expected));
-      AssertSchemaEqual(*expected->schema(), *batch->schema());
+      ASSERT_OK_AND_ASSIGN(expected, ToResult(factory()));
+      AssertSchemaEqual(*expected->schema(), *batch->schema(), /*check_metadata=*/true);
       AssertBatchesEqual(*expected, *batch);
     }
     batch.reset();
@@ -2457,16 +3935,79 @@ TEST_F(TestArrayRoundtrip, Primitive) {
   TestWithJSON(int32(), "[]");
   TestWithJSON(int32(), "[4, 5, null]");
 
+  TestWithJSON(decimal32(8, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSON(decimal64(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSON(decimal128(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSON(decimal256(16, 4), R"(["0.4759", "1234.5670", null])");
+
+  TestWithJSON(month_day_nano_interval(), R"([[1, -600, 5000], null])");
+
   TestWithJSONSliced(int32(), "[4, 5]");
   TestWithJSONSliced(int32(), "[4, 5, 6, null]");
+  TestWithJSONSliced(decimal32(8, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSONSliced(decimal64(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSONSliced(decimal128(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSONSliced(decimal256(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSONSliced(month_day_nano_interval(),
+                     R"([[4, 5, 6], [1, -600, 5000], null, null])");
 }
 
-TEST_F(TestArrayRoundtrip, Nested) {
+TEST_F(TestArrayRoundtrip, BinaryViewMultipleBuffers) {
+  TestWithArrayFactory(MakeBinaryViewArrayWithMultipleDataBuffers);
+  TestWithArrayFactory([&] {
+    auto arr = MakeBinaryViewArrayWithMultipleDataBuffers();
+    return arr->Slice(1, arr->length() - 2);
+  });
+}
+
+TEST_F(TestArrayRoundtrip, UnknownNullCount) {
+  TestWithArrayFactory([]() -> Result<std::shared_ptr<Array>> {
+    auto arr = ArrayFromJSON(int32(), "[0, 1, 2]");
+    if (arr->null_bitmap()) {
+      return Status::Invalid(
+          "Failed precondition: "
+          "the array shouldn't have a null bitmap.");
+    }
+    arr->data()->SetNullCount(kUnknownNullCount);
+    return arr;
+  });
+}
+
+TEST_F(TestArrayRoundtrip, List) {
   TestWithJSON(list(int32()), "[]");
   TestWithJSON(list(int32()), "[[4, 5], [6, null], null]");
+  TestWithJSON(fixed_size_list(int32(), 3), "[[4, 5, 6], null, [7, 8, null]]");
 
   TestWithJSONSliced(list(int32()), "[[4, 5], [6, null], null]");
+  TestWithJSONSliced(fixed_size_list(int32(), 3), "[[4, 5, 6], null, [7, 8, null]]");
+}
 
+TEST_F(TestArrayRoundtrip, ListView) {
+  TestWithJSON(list_view(int32()), "[]");
+  TestWithJSON(list_view(int32()), "[[4, 5], [6, null], null]");
+
+  TestWithJSONSliced(list_view(int32()), "[[4, 5], [6, null], null]");
+
+  // Out-of-order offsets
+  TestWithArrayFactory([this]() -> Result<std::shared_ptr<Array>> {
+    std::shared_ptr<Array> offsets;
+    ArrayFromVector<Int32Type>(int32(),
+                               std::vector<bool>{false, true, true, true, false, true},
+                               std::vector<int32_t>{4, 2, 1, 3, 3, 2}, &offsets);
+
+    std::shared_ptr<Array> sizes;
+    ArrayFromVector<Int32Type>(std::vector<int32_t>{2, 2, 3, 1, 2, 0}, &sizes);
+
+    auto values = ArrayFromJSON(int8(), "[4, 5, 6, null, 8, null]");
+    auto result = ListViewArray::FromArrays(*offsets, *sizes, *values, pool_);
+    if (result.ok()) {
+      RETURN_NOT_OK((*result)->ValidateFull());
+    }
+    return result;
+  });
+}
+
+TEST_F(TestArrayRoundtrip, Struct) {
   auto type = struct_({field("ints", int16()), field("bools", boolean())});
   TestWithJSON(type, "[]");
   TestWithJSON(type, "[[4, true], [5, false]]");
@@ -2484,40 +4025,150 @@ TEST_F(TestArrayRoundtrip, Nested) {
 
   TestWithJSONSliced(type, "[[4, true], [5, null], [6, false]]");
 
+  // With no fields
+  type = struct_({});
+  TestWithJSON(type, "[]");
+  TestWithJSON(type, "[[], null, [], null, []]");
+  TestWithJSONSliced(type, "[[], null, [], null, []]");
+}
+
+TEST_F(TestArrayRoundtrip, Map) {
   // Map type
-  type = map(utf8(), int32());
+  auto type = map(utf8(), int32());
   const char* json = R"([[["foo", 123], ["bar", -456]], null,
                         [["foo", null]], []])";
   TestWithJSON(type, json);
   TestWithJSONSliced(type, json);
 
-  type = map(utf8(), int32(), /*keys_sorted=*/ true);
+  type = map(utf8(), int32(), /*keys_sorted=*/true);
   TestWithJSON(type, json);
   TestWithJSONSliced(type, json);
 }
 
+TEST_F(TestArrayRoundtrip, Union) {
+  FieldVector fields = {field("strs", utf8()), field("ints", int8())};
+  std::vector<int8_t> type_codes = {43, 42};
+  DataTypeVector union_types = {sparse_union(fields, type_codes),
+                                dense_union(fields, type_codes)};
+  const char* json = R"([[42, 1], [42, null], [43, "foo"], [43, ""], [42, 3]])";
+
+  for (const auto& type : union_types) {
+    TestWithJSON(type, "[]");
+    TestWithJSON(type, json);
+    TestWithJSONSliced(type, json);
+  }
+
+  // With no fields
+  fields = {};
+  type_codes = {};
+  union_types = {sparse_union(fields, type_codes), dense_union(fields, type_codes)};
+
+  for (const auto& type : union_types) {
+    TestWithJSON(type, "[]");
+  }
+}
+
+#ifdef ARROW_COMPUTE
+TEST_F(TestArrayRoundtrip, RunEndEncoded) {
+  {
+    auto factory = []() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto ree_array,
+                            REEFromJSON(run_end_encoded(int32(), int8()),
+                                        "[1, 2, 2, 3, null, null, null, 4]"));
+      return ree_array->Slice(1, 5);
+    };
+    TestWithArrayFactory(factory);
+  }
+  {
+    auto factory = []() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(
+          auto ree_array,
+          RunEndEncodedArray::Make(
+              run_end_encoded(int64(), list(utf8())), 8,
+              ArrayFromJSON(int64(), "[1, 3, 4, 7, 8]"),
+              ArrayFromJSON(list(utf8()),
+                            R"([["abc", "def"], ["efg"], [], null, ["efg", "hij"]])")));
+      RETURN_NOT_OK(ree_array->ValidateFull());
+      return ree_array;
+    };
+    TestWithArrayFactory(factory);
+  }
+}
+#endif
+
 TEST_F(TestArrayRoundtrip, Dictionary) {
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
       return DictionaryArray::FromArrays(dictionary(indices->type(), values->type()),
-                                         indices, values, out);
+                                         indices, values);
     };
     TestWithArrayFactory(factory);
     TestWithArrayFactory(SlicedArrayFactory(factory));
   }
   {
-    auto factory = [](std::shared_ptr<Array>* out) -> Status {
+    auto factory = []() {
       auto values = ArrayFromJSON(list(utf8()), R"([["abc", "def"], ["efg"], []])");
       auto indices = ArrayFromJSON(int32(), "[0, 2, 1, null, 1]");
       return DictionaryArray::FromArrays(
-          dictionary(indices->type(), values->type(), /*ordered=*/true), indices, values,
-          out);
+          dictionary(indices->type(), values->type(), /*ordered=*/true), indices, values);
     };
     TestWithArrayFactory(factory);
     TestWithArrayFactory(SlicedArrayFactory(factory));
   }
+}
+
+TEST_F(TestArrayRoundtrip, RegisteredExtension) {
+  ExtensionTypeGuard guard({smallint(), complex128(), dict_extension_type(), uuid()});
+
+  TestWithArrayFactory(ExampleSmallint);
+  TestWithArrayFactory(ExampleUuid);
+  TestWithArrayFactory(ExampleComplex128);
+  TestWithArrayFactory(ExampleDictExtension);
+
+  // Nested inside outer array
+  auto NestedFactory = [](ArrayFactory factory) {
+    return [factory]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto arr, ToResult(factory()));
+      return FixedSizeListArray::FromArrays(arr, /*list_size=*/1);
+    };
+  };
+  TestWithArrayFactory(NestedFactory(ExampleSmallint));
+  TestWithArrayFactory(NestedFactory(ExampleUuid));
+  TestWithArrayFactory(NestedFactory(ExampleComplex128));
+  TestWithArrayFactory(NestedFactory(ExampleDictExtension));
+}
+
+TEST_F(TestArrayRoundtrip, RegisteredExtensionNoMetadata) {
+  auto ext_type = std::make_shared<MetadataOptionalExtensionType>();
+  ExtensionTypeGuard guard(ext_type);
+
+  auto ext_metadata =
+      KeyValueMetadata::Make({"ARROW:extension:name"}, {ext_type->extension_name()});
+  auto ext_field = field("", ext_type->storage_type(), true, std::move(ext_metadata));
+
+  struct ArrowSchema c_schema {};
+  SchemaExportGuard schema_guard(&c_schema);
+  ASSERT_OK(ExportField(*ext_field, &c_schema));
+
+  ASSERT_OK_AND_ASSIGN(auto ext_type_roundtrip, ImportType(&c_schema));
+  ASSERT_EQ(ext_type_roundtrip->id(), Type::EXTENSION);
+  AssertTypeEqual(ext_type_roundtrip, ext_type);
+}
+
+TEST_F(TestArrayRoundtrip, UnregisteredExtension) {
+  auto StorageExtractor = [](ArrayFactory factory) {
+    return [factory]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto arr, ToResult(factory()));
+      return checked_cast<const ExtensionArray&>(*arr).storage();
+    };
+  };
+
+  TestWithArrayFactory(ExampleSmallint, StorageExtractor(ExampleSmallint));
+  TestWithArrayFactory(ExampleUuid, StorageExtractor(ExampleUuid));
+  TestWithArrayFactory(ExampleComplex128, StorageExtractor(ExampleComplex128));
+  TestWithArrayFactory(ExampleDictExtension, StorageExtractor(ExampleDictExtension));
 }
 
 TEST_F(TestArrayRoundtrip, RecordBatch) {
@@ -2527,27 +4178,1258 @@ TEST_F(TestArrayRoundtrip, RecordBatch) {
   auto arr1 = ArrayFromJSON(boolean(), "[false, true, false]");
 
   {
-    auto factory = [&](std::shared_ptr<RecordBatch>* out) -> Status {
-      *out = RecordBatch::Make(schema, 3, {arr0, arr1});
-      return Status::OK();
-    };
+    auto factory = [&]() { return RecordBatch::Make(schema, 3, {arr0, arr1}); };
     TestWithBatchFactory(factory);
   }
   {
     // With schema and field metadata
-    auto factory = [&](std::shared_ptr<RecordBatch>* out) -> Status {
+    auto factory = [&]() {
       auto f0 = schema->field(0);
       auto f1 = schema->field(1);
       f1 = f1->WithMetadata(key_value_metadata(kMetadataKeys1, kMetadataValues1));
-      auto schema_with_md = ::arrow::schema({f0, f1},
-          key_value_metadata(kMetadataKeys2, kMetadataValues2));
-      *out = RecordBatch::Make(schema_with_md, 3, {arr0, arr1});
-      return Status::OK();
+      auto schema_with_md =
+          ::arrow::schema({f0, f1}, key_value_metadata(kMetadataKeys2, kMetadataValues2));
+      return RecordBatch::Make(schema_with_md, 3, {arr0, arr1});
     };
     TestWithBatchFactory(factory);
   }
 }
 
-// TODO C -> C++ -> C roundtripping tests?
+class TestDeviceArrayRoundtrip : public ::testing::Test {
+ public:
+  using ArrayFactory = std::function<Result<std::shared_ptr<Array>>()>;
+
+  void SetUp() override { pool_ = default_memory_pool(); }
+
+  static Result<std::shared_ptr<MemoryManager>> DeviceMapper(ArrowDeviceType type,
+                                                             int64_t id) {
+    if (type != kMyDeviceType) {
+      return Status::NotImplemented("should only be MyDevice");
+    }
+
+    std::shared_ptr<Device> device = std::make_shared<MyDevice>(id);
+    return device->default_memory_manager();
+  }
+
+  static Result<std::shared_ptr<ArrayData>> ToDeviceData(
+      const std::shared_ptr<MemoryManager>& mm, const ArrayData& data) {
+    arrow::BufferVector buffers;
+    for (const auto& buf : data.buffers) {
+      if (buf) {
+        ARROW_ASSIGN_OR_RAISE(auto dest, mm->CopyBuffer(buf, mm));
+        buffers.push_back(dest);
+      } else {
+        buffers.push_back(nullptr);
+      }
+    }
+
+    arrow::ArrayDataVector children;
+    for (const auto& child : data.child_data) {
+      ARROW_ASSIGN_OR_RAISE(auto dest, ToDeviceData(mm, *child));
+      children.push_back(dest);
+    }
+
+    return ArrayData::Make(data.type, data.length, buffers, children, data.null_count,
+                           data.offset);
+  }
+
+  static Result<std::shared_ptr<Array>> ToDevice(const std::shared_ptr<MemoryManager>& mm,
+                                                 const ArrayData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto result, ToDeviceData(mm, data));
+    return MakeArray(result);
+  }
+
+  static ArrayFactory ToDeviceFactory(const std::shared_ptr<MemoryManager>& mm,
+                                      ArrayFactory&& factory) {
+    return [&]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto arr, factory());
+      return ToDevice(mm, *arr->data());
+    };
+  }
+
+  static ArrayFactory JSONArrayFactory(const std::shared_ptr<MemoryManager>& mm,
+                                       std::shared_ptr<DataType> type, const char* json) {
+    return [=]() { return ToDevice(mm, *ArrayFromJSON(type, json)->data()); };
+  }
+
+  static ArrayFactory SlicedArrayFactory(ArrayFactory factory) {
+    return [=]() -> Result<std::shared_ptr<Array>> {
+      ARROW_ASSIGN_OR_RAISE(auto arr, factory());
+      DCHECK_GE(arr->length(), 2);
+      return arr->Slice(1, arr->length() - 2);
+    };
+  }
+
+  template <typename ArrayFactory>
+  void TestWithArrayFactory(ArrayFactory&& factory) {
+    TestWithArrayFactory(factory, factory);
+  }
+
+  template <typename ArrayFactory, typename ExpectedArrayFactory>
+  void TestWithArrayFactory(ArrayFactory&& factory,
+                            ExpectedArrayFactory&& factory_expected) {
+    std::shared_ptr<Array> array;
+    struct ArrowDeviceArray c_array {};
+    struct ArrowSchema c_schema {};
+    ArrayExportGuard array_guard(&c_array.array);
+    SchemaExportGuard schema_guard(&c_schema);
+
+    auto orig_bytes = pool_->bytes_allocated();
+
+    ASSERT_OK_AND_ASSIGN(array, ToResult(factory()));
+    ASSERT_OK(ExportType(*array->type(), &c_schema));
+    std::shared_ptr<Device::SyncEvent> sync{nullptr};
+    ASSERT_OK(ExportDeviceArray(*array, sync, &c_array));
+
+    auto new_bytes = pool_->bytes_allocated();
+    if (array->type_id() != Type::NA) {
+      ASSERT_GT(new_bytes, orig_bytes);
+    }
+
+    array.reset();
+    ASSERT_EQ(pool_->bytes_allocated(), new_bytes);
+    ASSERT_OK_AND_ASSIGN(array, ImportDeviceArray(&c_array, &c_schema, DeviceMapper));
+    ASSERT_OK(array->ValidateFull());
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Re-export and re-import, now both at once
+    ASSERT_OK(ExportDeviceArray(*array, sync, &c_array, &c_schema));
+    array.reset();
+    ASSERT_OK_AND_ASSIGN(array, ImportDeviceArray(&c_array, &c_schema, DeviceMapper));
+    ASSERT_OK(array->ValidateFull());
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Check value of imported array
+    {
+      std::shared_ptr<Array> expected;
+      ASSERT_OK_AND_ASSIGN(expected, ToResult(factory_expected()));
+      AssertTypeEqual(*expected->type(), *array->type(), /*check_metadata=*/true);
+      AssertArraysEqual(*expected, *array, true);
+    }
+    array.reset();
+    ASSERT_EQ(pool_->bytes_allocated(), orig_bytes);
+  }
+
+  template <typename BatchFactory>
+  void TestWithBatchFactory(BatchFactory&& factory) {
+    std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+    auto mm = device->default_memory_manager();
+
+    std::shared_ptr<RecordBatch> batch;
+    struct ArrowDeviceArray c_array {};
+    struct ArrowSchema c_schema {};
+    ArrayExportGuard array_guard(&c_array.array);
+    SchemaExportGuard schema_guard(&c_schema);
+
+    auto orig_bytes = pool_->bytes_allocated();
+    ASSERT_OK_AND_ASSIGN(batch, ToResult(factory()));
+    ASSERT_OK(ExportSchema(*batch->schema(), &c_schema));
+    ASSERT_OK_AND_ASSIGN(auto sync, mm->MakeDeviceSyncEvent());
+    ASSERT_OK(ExportDeviceRecordBatch(*batch, sync, &c_array));
+
+    auto new_bytes = pool_->bytes_allocated();
+    batch.reset();
+    ASSERT_EQ(pool_->bytes_allocated(), new_bytes);
+    ASSERT_OK_AND_ASSIGN(batch,
+                         ImportDeviceRecordBatch(&c_array, &c_schema, DeviceMapper));
+    ASSERT_OK(batch->ValidateFull());
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Re-export and re-import, now both at once
+    ASSERT_OK(ExportDeviceRecordBatch(*batch, sync, &c_array, &c_schema));
+    batch.reset();
+    ASSERT_OK_AND_ASSIGN(batch,
+                         ImportDeviceRecordBatch(&c_array, &c_schema, DeviceMapper));
+    ASSERT_OK(batch->ValidateFull());
+    ASSERT_TRUE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array.array));
+
+    // Check value of imported record batch
+    {
+      std::shared_ptr<RecordBatch> expected;
+      ASSERT_OK_AND_ASSIGN(expected, ToResult(factory()));
+      AssertSchemaEqual(*expected->schema(), *batch->schema(), /*check_metadata=*/true);
+      AssertBatchesEqual(*expected, *batch);
+    }
+    batch.reset();
+    ASSERT_EQ(pool_->bytes_allocated(), orig_bytes);
+  }
+
+  void TestWithJSON(const std::shared_ptr<MemoryManager>& mm,
+                    std::shared_ptr<DataType> type, const char* json) {
+    TestWithArrayFactory(JSONArrayFactory(mm, type, json));
+  }
+
+  void TestWithJSONSliced(const std::shared_ptr<MemoryManager>& mm,
+                          std::shared_ptr<DataType> type, const char* json) {
+    TestWithArrayFactory(SlicedArrayFactory(JSONArrayFactory(mm, type, json)));
+  }
+
+ protected:
+  MemoryPool* pool_;
+};
+
+TEST_F(TestDeviceArrayRoundtrip, Primitive) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  TestWithJSON(mm, int32(), "[4, 5, null]");
+}
+
+TEST_F(TestDeviceArrayRoundtrip, Struct) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+  auto type = struct_({field("ints", int16()), field("strs", utf8())});
+
+  TestWithJSON(mm, type, "[]");
+  TestWithJSON(mm, type, R"([[4, "foo"], [5, "bar"]])");
+  TestWithJSON(mm, type, R"([[4, null], null, [5, "foo"]])");
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Array stream export tests
+
+class FailingRecordBatchReader : public RecordBatchReader {
+ public:
+  explicit FailingRecordBatchReader(Status error) : error_(std::move(error)) {}
+
+  static std::shared_ptr<Schema> expected_schema() { return arrow::schema({}); }
+
+  std::shared_ptr<Schema> schema() const override { return expected_schema(); }
+
+  Status ReadNext(std::shared_ptr<RecordBatch>* batch) override { return error_; }
+
+ protected:
+  Status error_;
+};
+
+class BaseArrayStreamTest : public ::testing::Test {
+ public:
+  void SetUp() override {
+    pool_ = default_memory_pool();
+    orig_allocated_ = pool_->bytes_allocated();
+  }
+
+  void TearDown() override { ASSERT_EQ(pool_->bytes_allocated(), orig_allocated_); }
+
+  RecordBatchVector MakeBatches(std::shared_ptr<Schema> schema, ArrayVector arrays) {
+    DCHECK_EQ(schema->num_fields(), 1);
+    RecordBatchVector batches;
+    for (const auto& array : arrays) {
+      batches.push_back(RecordBatch::Make(schema, array->length(), {array}));
+    }
+    return batches;
+  }
+
+ protected:
+  MemoryPool* pool_;
+  int64_t orig_allocated_;
+};
+
+class TestArrayStreamExport : public BaseArrayStreamTest {
+ public:
+  void AssertStreamSchema(struct ArrowArrayStream* c_stream, const Schema& expected) {
+    struct ArrowSchema c_schema;
+    ASSERT_EQ(0, c_stream->get_schema(c_stream, &c_schema));
+
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_FALSE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_OK_AND_ASSIGN(auto schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(expected, *schema, /*check_metadata=*/true);
+  }
+
+  void AssertStreamEnd(struct ArrowArrayStream* c_stream) {
+    struct ArrowArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    ArrayExportGuard guard(&c_array);
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_array));
+  }
+
+  void AssertStreamNext(struct ArrowArrayStream* c_stream, const RecordBatch& expected) {
+    struct ArrowArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    ArrayExportGuard guard(&c_array);
+    ASSERT_FALSE(ArrowArrayIsReleased(&c_array));
+
+    ASSERT_OK_AND_ASSIGN(auto batch, ImportRecordBatch(&c_array, expected.schema()));
+    AssertBatchesEqual(expected, *batch);
+  }
+
+  void AssertStreamNext(struct ArrowArrayStream* c_stream, const Array& expected) {
+    struct ArrowArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    ArrayExportGuard guard(&c_array);
+    ASSERT_FALSE(ArrowArrayIsReleased(&c_array));
+
+    ASSERT_OK_AND_ASSIGN(auto array, ImportArray(&c_array, expected.type()));
+    AssertArraysEqual(expected, *array);
+  }
+};
+
+TEST_F(TestArrayStreamExport, Empty) {
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(schema, {});
+  ASSERT_OK_AND_ASSIGN(auto reader, RecordBatchReader::Make(batches, schema));
+
+  struct ArrowArrayStream c_stream;
+
+  ASSERT_OK(ExportRecordBatchReader(reader, &c_stream));
+  ArrayStreamExportGuard guard(&c_stream);
+
+  ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+  AssertStreamSchema(&c_stream, *schema);
+  AssertStreamEnd(&c_stream);
+  AssertStreamEnd(&c_stream);
+}
+
+TEST_F(TestArrayStreamExport, Simple) {
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(
+      schema, {ArrayFromJSON(int32(), "[1, 2]"), ArrayFromJSON(int32(), "[4, 5, null]")});
+  ASSERT_OK_AND_ASSIGN(auto reader, RecordBatchReader::Make(batches, schema));
+
+  struct ArrowArrayStream c_stream;
+
+  ASSERT_OK(ExportRecordBatchReader(reader, &c_stream));
+  ArrayStreamExportGuard guard(&c_stream);
+
+  ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+  AssertStreamSchema(&c_stream, *schema);
+  AssertStreamNext(&c_stream, *batches[0]);
+  AssertStreamNext(&c_stream, *batches[1]);
+  AssertStreamEnd(&c_stream);
+  AssertStreamEnd(&c_stream);
+}
+
+TEST_F(TestArrayStreamExport, ArrayLifetime) {
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(
+      schema, {ArrayFromJSON(int32(), "[1, 2]"), ArrayFromJSON(int32(), "[4, 5, null]")});
+  ASSERT_OK_AND_ASSIGN(auto reader, RecordBatchReader::Make(batches, schema));
+
+  struct ArrowArrayStream c_stream;
+  struct ArrowSchema c_schema;
+  struct ArrowArray c_array0, c_array1;
+
+  ASSERT_OK(ExportRecordBatchReader(reader, &c_stream));
+  {
+    ArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array0));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array1));
+    AssertStreamEnd(&c_stream);
+  }
+
+  ArrayExportGuard guard0(&c_array0), guard1(&c_array1);
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(*schema, *got_schema, /*check_metadata=*/true);
+  }
+
+  ASSERT_GT(pool_->bytes_allocated(), orig_allocated_);
+  ASSERT_OK_AND_ASSIGN(auto batch, ImportRecordBatch(&c_array1, schema));
+  AssertBatchesEqual(*batches[1], *batch);
+  ASSERT_OK_AND_ASSIGN(batch, ImportRecordBatch(&c_array0, schema));
+  AssertBatchesEqual(*batches[0], *batch);
+}
+
+TEST_F(TestArrayStreamExport, Errors) {
+  auto reader =
+      std::make_shared<FailingRecordBatchReader>(Status::Invalid("some example error"));
+
+  struct ArrowArrayStream c_stream;
+
+  ASSERT_OK(ExportRecordBatchReader(reader, &c_stream));
+  ArrayStreamExportGuard guard(&c_stream);
+
+  struct ArrowSchema c_schema;
+  ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+  ASSERT_FALSE(ArrowSchemaIsReleased(&c_schema));
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(schema, arrow::schema({}), /*check_metadata=*/true);
+  }
+
+  struct ArrowArray c_array;
+  ASSERT_EQ(EINVAL, c_stream.get_next(&c_stream, &c_array));
+}
+
+TEST_F(TestArrayStreamExport, ChunkedArrayExportEmpty) {
+  ASSERT_OK_AND_ASSIGN(auto chunked_array, ChunkedArray::Make({}, int32()));
+
+  struct ArrowArrayStream c_stream;
+  struct ArrowSchema c_schema;
+
+  ASSERT_OK(ExportChunkedArray(chunked_array, &c_stream));
+  ArrayStreamExportGuard guard(&c_stream);
+
+  {
+    ArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    AssertStreamEnd(&c_stream);
+  }
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_type, ImportType(&c_schema));
+    AssertTypeEqual(*chunked_array->type(), *got_type);
+  }
+}
+
+TEST_F(TestArrayStreamExport, ChunkedArrayExport) {
+  ASSERT_OK_AND_ASSIGN(auto chunked_array,
+                       ChunkedArray::Make({ArrayFromJSON(int32(), "[1, 2]"),
+                                           ArrayFromJSON(int32(), "[4, 5, null]")}));
+
+  struct ArrowArrayStream c_stream;
+  struct ArrowSchema c_schema;
+  struct ArrowArray c_array0, c_array1;
+
+  ASSERT_OK(ExportChunkedArray(chunked_array, &c_stream));
+  ArrayStreamExportGuard guard(&c_stream);
+
+  {
+    ArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array0));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array1));
+    AssertStreamEnd(&c_stream);
+  }
+
+  ArrayExportGuard guard0(&c_array0), guard1(&c_array1);
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_type, ImportType(&c_schema));
+    AssertTypeEqual(*chunked_array->type(), *got_type);
+  }
+
+  ASSERT_GT(pool_->bytes_allocated(), orig_allocated_);
+  ASSERT_OK_AND_ASSIGN(auto array, ImportArray(&c_array0, chunked_array->type()));
+  AssertArraysEqual(*chunked_array->chunk(0), *array);
+  ASSERT_OK_AND_ASSIGN(array, ImportArray(&c_array1, chunked_array->type()));
+  AssertArraysEqual(*chunked_array->chunk(1), *array);
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Array stream roundtrip tests
+
+class TestArrayStreamRoundtrip : public BaseArrayStreamTest {
+ public:
+  void Roundtrip(std::shared_ptr<RecordBatchReader>* reader,
+                 struct ArrowArrayStream* c_stream) {
+    ASSERT_OK(ExportRecordBatchReader(*reader, c_stream));
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(c_stream));
+
+    ASSERT_OK_AND_ASSIGN(auto got_reader, ImportRecordBatchReader(c_stream));
+    *reader = std::move(got_reader);
+  }
+
+  void Roundtrip(
+      std::shared_ptr<RecordBatchReader> reader,
+      std::function<void(const std::shared_ptr<RecordBatchReader>&)> check_func) {
+    ArrowArrayStream c_stream;
+
+    // NOTE: ReleaseCallback<> is not immediately usable with ArrowArrayStream,
+    // because get_next and get_schema need the original private_data.
+    std::weak_ptr<RecordBatchReader> weak_reader(reader);
+    ASSERT_EQ(weak_reader.use_count(), 1);  // Expiration check will fail otherwise
+
+    ASSERT_OK(ExportRecordBatchReader(std::move(reader), &c_stream));
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+
+    {
+      ASSERT_OK_AND_ASSIGN(auto new_reader, ImportRecordBatchReader(&c_stream));
+      // Stream was moved
+      ASSERT_TRUE(ArrowArrayStreamIsReleased(&c_stream));
+      ASSERT_FALSE(weak_reader.expired());
+
+      check_func(new_reader);
+    }
+    // Stream was released when `new_reader` was destroyed
+    ASSERT_TRUE(weak_reader.expired());
+  }
+
+  void Roundtrip(std::shared_ptr<ChunkedArray> src,
+                 std::function<void(const std::shared_ptr<ChunkedArray>&)> check_func) {
+    ArrowArrayStream c_stream;
+
+    // One original copy which to compare the result, one copy held by the stream
+    std::weak_ptr<ChunkedArray> weak_src(src);
+    int64_t initial_use_count = weak_src.use_count();
+
+    ASSERT_OK(ExportChunkedArray(std::move(src), &c_stream));
+    ASSERT_FALSE(ArrowArrayStreamIsReleased(&c_stream));
+
+    {
+      ASSERT_OK_AND_ASSIGN(auto dst, ImportChunkedArray(&c_stream));
+      // Stream was moved, consumed, and released
+      ASSERT_TRUE(ArrowArrayStreamIsReleased(&c_stream));
+
+      // Stream was released by ImportChunkedArray but original copy remains
+      ASSERT_EQ(weak_src.use_count(), initial_use_count - 1);
+
+      check_func(dst);
+    }
+  }
+
+  void AssertReaderNext(const std::shared_ptr<RecordBatchReader>& reader,
+                        const RecordBatch& expected) {
+    ASSERT_OK_AND_ASSIGN(auto batch, reader->Next());
+    ASSERT_NE(batch, nullptr);
+    AssertBatchesEqual(expected, *batch);
+  }
+
+  void AssertReaderEnd(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_OK_AND_ASSIGN(auto batch, reader->Next());
+    ASSERT_EQ(batch, nullptr);
+  }
+
+  void AssertReaderClosed(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_THAT(reader->Next(),
+                Raises(StatusCode::Invalid, ::testing::HasSubstr("already been closed")));
+  }
+
+  void AssertReaderClose(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_OK(reader->Close());
+    AssertReaderClosed(reader);
+  }
+};
+
+TEST_F(TestArrayStreamRoundtrip, Simple) {
+  auto orig_schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(orig_schema, {ArrayFromJSON(int32(), "[1, 2]"),
+                                           ArrayFromJSON(int32(), "[4, 5, null]")});
+
+  ASSERT_OK_AND_ASSIGN(auto reader, RecordBatchReader::Make(batches, orig_schema));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    AssertSchemaEqual(*orig_schema, *reader->schema(), /*check_metadata=*/true);
+    AssertReaderNext(reader, *batches[0]);
+    AssertReaderNext(reader, *batches[1]);
+    AssertReaderEnd(reader);
+    AssertReaderEnd(reader);
+    AssertReaderClose(reader);
+  });
+}
+
+TEST_F(TestArrayStreamRoundtrip, CloseEarly) {
+  auto orig_schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(orig_schema, {ArrayFromJSON(int32(), "[1, 2]"),
+                                           ArrayFromJSON(int32(), "[4, 5, null]")});
+
+  ASSERT_OK_AND_ASSIGN(auto reader, RecordBatchReader::Make(batches, orig_schema));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    AssertReaderNext(reader, *batches[0]);
+    AssertReaderClose(reader);
+  });
+}
+
+TEST_F(TestArrayStreamRoundtrip, Errors) {
+  auto reader = std::make_shared<FailingRecordBatchReader>(
+      Status::Invalid("roundtrip error example"));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    auto status = reader->Next().status();
+    ASSERT_RAISES(Invalid, status);
+    ASSERT_THAT(status.message(), ::testing::HasSubstr("roundtrip error example"));
+  });
+}
+
+TEST_F(TestArrayStreamRoundtrip, SchemaError) {
+  struct StreamState {
+    bool released = false;
+
+    static const char* GetLastError(struct ArrowArrayStream* stream) {
+      return "Expected error";
+    }
+
+    static int GetSchema(struct ArrowArrayStream* stream, struct ArrowSchema* schema) {
+      return EIO;
+    }
+
+    static int GetNext(struct ArrowArrayStream* stream, struct ArrowArray* array) {
+      return EINVAL;
+    }
+
+    static void Release(struct ArrowArrayStream* stream) {
+      reinterpret_cast<StreamState*>(stream->private_data)->released = true;
+      std::memset(stream, 0, sizeof(*stream));
+    }
+  } state;
+  struct ArrowArrayStream stream = {};
+  stream.get_last_error = &StreamState::GetLastError;
+  stream.get_schema = &StreamState::GetSchema;
+  stream.get_next = &StreamState::GetNext;
+  stream.release = &StreamState::Release;
+  stream.private_data = &state;
+
+  EXPECT_RAISES_WITH_MESSAGE_THAT(IOError, ::testing::HasSubstr("Expected error"),
+                                  ImportRecordBatchReader(&stream));
+  ASSERT_TRUE(state.released);
+}
+
+TEST_F(TestArrayStreamRoundtrip, ChunkedArrayRoundtrip) {
+  ASSERT_OK_AND_ASSIGN(auto src,
+                       ChunkedArray::Make({ArrayFromJSON(int32(), "[1, 2]"),
+                                           ArrayFromJSON(int32(), "[4, 5, null]")}));
+
+  Roundtrip(src, [&](const std::shared_ptr<ChunkedArray>& dst) {
+    AssertTypeEqual(*dst->type(), *src->type());
+    AssertChunkedEqual(*dst, *src);
+  });
+}
+
+TEST_F(TestArrayStreamRoundtrip, ChunkedArrayRoundtripEmpty) {
+  ASSERT_OK_AND_ASSIGN(auto src, ChunkedArray::Make({}, int32()));
+
+  Roundtrip(src, [&](const std::shared_ptr<ChunkedArray>& dst) {
+    AssertTypeEqual(*dst->type(), *src->type());
+    AssertChunkedEqual(*dst, *src);
+  });
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Array device stream export tests
+
+class TestArrayDeviceStreamExport : public BaseArrayStreamTest {
+ public:
+  void AssertStreamSchema(struct ArrowDeviceArrayStream* c_stream,
+                          const Schema& expected) {
+    struct ArrowSchema c_schema;
+    ASSERT_EQ(0, c_stream->get_schema(c_stream, &c_schema));
+
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_FALSE(ArrowSchemaIsReleased(&c_schema));
+    ASSERT_OK_AND_ASSIGN(auto schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(expected, *schema, /*check_metadata=*/true);
+  }
+
+  void AssertStreamEnd(struct ArrowDeviceArrayStream* c_stream) {
+    struct ArrowDeviceArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    DeviceArrayExportGuard guard(&c_array);
+    ASSERT_TRUE(ArrowDeviceArrayIsReleased(&c_array));
+  }
+
+  void AssertStreamNext(struct ArrowDeviceArrayStream* c_stream,
+                        const RecordBatch& expected) {
+    struct ArrowDeviceArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    DeviceArrayExportGuard guard(&c_array);
+    ASSERT_FALSE(ArrowDeviceArrayIsReleased(&c_array));
+
+    ASSERT_OK_AND_ASSIGN(auto batch,
+                         ImportDeviceRecordBatch(&c_array, expected.schema(),
+                                                 TestDeviceArrayRoundtrip::DeviceMapper));
+    AssertBatchesEqual(expected, *batch);
+  }
+
+  void AssertStreamNext(struct ArrowDeviceArrayStream* c_stream, const Array& expected) {
+    struct ArrowDeviceArray c_array;
+    ASSERT_EQ(0, c_stream->get_next(c_stream, &c_array));
+
+    DeviceArrayExportGuard guard(&c_array);
+    ASSERT_FALSE(ArrowDeviceArrayIsReleased(&c_array));
+
+    ASSERT_OK_AND_ASSIGN(auto array,
+                         ImportDeviceArray(&c_array, expected.type(),
+                                           TestDeviceArrayRoundtrip::DeviceMapper));
+    AssertArraysEqual(expected, *array);
+  }
+
+  static Result<std::shared_ptr<ArrayData>> ToDeviceData(
+      const std::shared_ptr<MemoryManager>& mm, const ArrayData& data) {
+    arrow::BufferVector buffers;
+    for (const auto& buf : data.buffers) {
+      if (buf) {
+        ARROW_ASSIGN_OR_RAISE(auto dest, mm->CopyBuffer(buf, mm));
+        buffers.push_back(dest);
+      } else {
+        buffers.push_back(nullptr);
+      }
+    }
+
+    arrow::ArrayDataVector children;
+    for (const auto& child : data.child_data) {
+      ARROW_ASSIGN_OR_RAISE(auto dest, ToDeviceData(mm, *child));
+      children.push_back(dest);
+    }
+
+    return ArrayData::Make(data.type, data.length, buffers, children, data.null_count,
+                           data.offset);
+  }
+
+  static Result<std::shared_ptr<Array>> ToDevice(const std::shared_ptr<MemoryManager>& mm,
+                                                 const ArrayData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto result, ToDeviceData(mm, data));
+    return MakeArray(result);
+  }
+};
+
+TEST_F(TestArrayDeviceStreamExport, Empty) {
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(schema, {});
+  ASSERT_OK_AND_ASSIGN(
+      auto reader,
+      RecordBatchReader::Make(batches, schema,
+                              static_cast<DeviceAllocationType>(kMyDeviceType)));
+
+  struct ArrowDeviceArrayStream c_stream;
+  ASSERT_OK(ExportDeviceRecordBatchReader(reader, &c_stream));
+  DeviceArrayStreamExportGuard guard(&c_stream);
+
+  ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+  ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+  AssertStreamSchema(&c_stream, *schema);
+  AssertStreamEnd(&c_stream);
+  AssertStreamEnd(&c_stream);
+}
+
+TEST_F(TestArrayDeviceStreamExport, Simple) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(schema, {arr1, arr2});
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       RecordBatchReader::Make(batches, schema, device->device_type()));
+
+  struct ArrowDeviceArrayStream c_stream;
+
+  ASSERT_OK(ExportDeviceRecordBatchReader(reader, &c_stream));
+  DeviceArrayStreamExportGuard guard(&c_stream);
+
+  ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+  AssertStreamSchema(&c_stream, *schema);
+  ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+  AssertStreamNext(&c_stream, *batches[0]);
+  AssertStreamNext(&c_stream, *batches[1]);
+  AssertStreamEnd(&c_stream);
+  AssertStreamEnd(&c_stream);
+}
+
+TEST_F(TestArrayDeviceStreamExport, ArrayLifetime) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+  auto schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(schema, {arr1, arr2});
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       RecordBatchReader::Make(batches, schema, device->device_type()));
+
+  struct ArrowDeviceArrayStream c_stream;
+  struct ArrowSchema c_schema;
+  struct ArrowDeviceArray c_array0, c_array1;
+
+  ASSERT_OK(ExportDeviceRecordBatchReader(reader, &c_stream));
+  {
+    DeviceArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+    ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array0));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array1));
+    AssertStreamEnd(&c_stream);
+  }
+
+  DeviceArrayExportGuard guard0(&c_array0), guard1(&c_array1);
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(*schema, *got_schema, /*check_metadata=*/true);
+  }
+
+  ASSERT_EQ(kMyDeviceType, c_array0.device_type);
+  ASSERT_EQ(kMyDeviceType, c_array1.device_type);
+
+  ASSERT_GT(pool_->bytes_allocated(), orig_allocated_);
+  ASSERT_OK_AND_ASSIGN(
+      auto batch,
+      ImportDeviceRecordBatch(&c_array1, schema, TestDeviceArrayRoundtrip::DeviceMapper));
+  AssertBatchesEqual(*batches[1], *batch);
+  ASSERT_EQ(device->device_type(), batch->device_type());
+  ASSERT_OK_AND_ASSIGN(
+      batch,
+      ImportDeviceRecordBatch(&c_array0, schema, TestDeviceArrayRoundtrip::DeviceMapper));
+  AssertBatchesEqual(*batches[0], *batch);
+  ASSERT_EQ(device->device_type(), batch->device_type());
+}
+
+TEST_F(TestArrayDeviceStreamExport, Errors) {
+  auto reader =
+      std::make_shared<FailingRecordBatchReader>(Status::Invalid("some example error"));
+
+  struct ArrowDeviceArrayStream c_stream;
+
+  ASSERT_OK(ExportDeviceRecordBatchReader(reader, &c_stream));
+  DeviceArrayStreamExportGuard guard(&c_stream);
+
+  struct ArrowSchema c_schema;
+  ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+  ASSERT_FALSE(ArrowSchemaIsReleased(&c_schema));
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto schema, ImportSchema(&c_schema));
+    AssertSchemaEqual(schema, arrow::schema({}), /*check_metadata=*/true);
+  }
+
+  struct ArrowDeviceArray c_array;
+  ASSERT_EQ(EINVAL, c_stream.get_next(&c_stream, &c_array));
+}
+
+TEST_F(TestArrayDeviceStreamExport, ChunkedArrayExportEmpty) {
+  ASSERT_OK_AND_ASSIGN(auto chunked_array, ChunkedArray::Make({}, int32()));
+
+  struct ArrowDeviceArrayStream c_stream;
+  struct ArrowSchema c_schema;
+
+  ASSERT_OK(ExportDeviceChunkedArray(
+      chunked_array, static_cast<DeviceAllocationType>(kMyDeviceType), &c_stream));
+  DeviceArrayStreamExportGuard guard(&c_stream);
+
+  {
+    DeviceArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+
+    ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    AssertStreamEnd(&c_stream);
+  }
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_type, ImportType(&c_schema));
+    AssertTypeEqual(*chunked_array->type(), *got_type);
+  }
+}
+
+TEST_F(TestArrayDeviceStreamExport, ChunkedArrayExport) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+
+  ASSERT_OK_AND_ASSIGN(auto chunked_array, ChunkedArray::Make({arr1, arr2}));
+
+  struct ArrowDeviceArrayStream c_stream;
+  struct ArrowSchema c_schema;
+  struct ArrowDeviceArray c_array0, c_array1;
+
+  ASSERT_OK(ExportDeviceChunkedArray(chunked_array, device->device_type(), &c_stream));
+  DeviceArrayStreamExportGuard guard(&c_stream);
+
+  {
+    DeviceArrayStreamExportGuard guard(&c_stream);
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+    ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+
+    ASSERT_EQ(0, c_stream.get_schema(&c_stream, &c_schema));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array0));
+    ASSERT_EQ(0, c_stream.get_next(&c_stream, &c_array1));
+    AssertStreamEnd(&c_stream);
+  }
+
+  DeviceArrayExportGuard guard0(&c_array0), guard1(&c_array1);
+
+  {
+    SchemaExportGuard schema_guard(&c_schema);
+    ASSERT_OK_AND_ASSIGN(auto got_type, ImportType(&c_schema));
+    AssertTypeEqual(*chunked_array->type(), *got_type);
+  }
+
+  ASSERT_EQ(kMyDeviceType, c_array0.device_type);
+  ASSERT_EQ(kMyDeviceType, c_array1.device_type);
+
+  ASSERT_GT(pool_->bytes_allocated(), orig_allocated_);
+  ASSERT_OK_AND_ASSIGN(auto array,
+                       ImportDeviceArray(&c_array0, chunked_array->type(),
+                                         TestDeviceArrayRoundtrip::DeviceMapper));
+  ASSERT_EQ(device->device_type(), array->device_type());
+  AssertArraysEqual(*chunked_array->chunk(0), *array);
+  ASSERT_OK_AND_ASSIGN(array, ImportDeviceArray(&c_array1, chunked_array->type(),
+                                                TestDeviceArrayRoundtrip::DeviceMapper));
+  ASSERT_EQ(device->device_type(), array->device_type());
+  AssertArraysEqual(*chunked_array->chunk(1), *array);
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Array device stream roundtrip tests
+
+class TestArrayDeviceStreamRoundtrip : public BaseArrayStreamTest {
+ public:
+  static Result<std::shared_ptr<ArrayData>> ToDeviceData(
+      const std::shared_ptr<MemoryManager>& mm, const ArrayData& data) {
+    arrow::BufferVector buffers;
+    for (const auto& buf : data.buffers) {
+      if (buf) {
+        ARROW_ASSIGN_OR_RAISE(auto dest, mm->CopyBuffer(buf, mm));
+        buffers.push_back(dest);
+      } else {
+        buffers.push_back(nullptr);
+      }
+    }
+
+    arrow::ArrayDataVector children;
+    for (const auto& child : data.child_data) {
+      ARROW_ASSIGN_OR_RAISE(auto dest, ToDeviceData(mm, *child));
+      children.push_back(dest);
+    }
+
+    return ArrayData::Make(data.type, data.length, buffers, children, data.null_count,
+                           data.offset);
+  }
+
+  static Result<std::shared_ptr<Array>> ToDevice(const std::shared_ptr<MemoryManager>& mm,
+                                                 const ArrayData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto result, ToDeviceData(mm, data));
+    return MakeArray(result);
+  }
+
+  void Roundtrip(std::shared_ptr<RecordBatchReader>* reader,
+                 struct ArrowDeviceArrayStream* c_stream) {
+    ASSERT_OK(ExportDeviceRecordBatchReader(*reader, c_stream));
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(c_stream));
+
+    ASSERT_OK_AND_ASSIGN(
+        auto got_reader,
+        ImportDeviceRecordBatchReader(c_stream, TestDeviceArrayRoundtrip::DeviceMapper));
+    *reader = std::move(got_reader);
+  }
+
+  void Roundtrip(
+      std::shared_ptr<RecordBatchReader> reader,
+      std::function<void(const std::shared_ptr<RecordBatchReader>&)> check_func) {
+    ArrowDeviceArrayStream c_stream;
+
+    // NOTE: ReleaseCallback<> is not immediately usable with ArrowDeviceArayStream
+    // because get_next and get_schema need the original private_data.
+    std::weak_ptr<RecordBatchReader> weak_reader(reader);
+    ASSERT_EQ(weak_reader.use_count(), 1);  // Expiration check will fail otherwise
+
+    ASSERT_OK(ExportDeviceRecordBatchReader(std::move(reader), &c_stream));
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+
+    {
+      ASSERT_OK_AND_ASSIGN(auto new_reader,
+                           ImportDeviceRecordBatchReader(
+                               &c_stream, TestDeviceArrayRoundtrip::DeviceMapper));
+      // stream was moved
+      ASSERT_TRUE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+      ASSERT_FALSE(weak_reader.expired());
+
+      check_func(new_reader);
+    }
+    // Stream was released when `new_reader` was destroyed
+    ASSERT_TRUE(weak_reader.expired());
+  }
+
+  void Roundtrip(std::shared_ptr<ChunkedArray> src,
+                 std::function<void(const std::shared_ptr<ChunkedArray>&)> check_func) {
+    ArrowDeviceArrayStream c_stream;
+
+    // One original copy to compare the result, one copy held by the stream
+    std::weak_ptr<ChunkedArray> weak_src(src);
+    int64_t initial_use_count = weak_src.use_count();
+
+    ASSERT_OK(ExportDeviceChunkedArray(
+        std::move(src), static_cast<DeviceAllocationType>(kMyDeviceType), &c_stream));
+    ASSERT_FALSE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+    ASSERT_EQ(kMyDeviceType, c_stream.device_type);
+
+    {
+      ASSERT_OK_AND_ASSIGN(
+          auto dst,
+          ImportDeviceChunkedArray(&c_stream, TestDeviceArrayRoundtrip::DeviceMapper));
+      // Stream was moved, consumed, and released
+      ASSERT_TRUE(ArrowDeviceArrayStreamIsReleased(&c_stream));
+
+      // Stream was released by ImportDeviceChunkedArray but original copy remains
+      ASSERT_EQ(weak_src.use_count(), initial_use_count - 1);
+
+      check_func(dst);
+    }
+  }
+
+  void AssertReaderNext(const std::shared_ptr<RecordBatchReader>& reader,
+                        const RecordBatch& expected) {
+    ASSERT_OK_AND_ASSIGN(auto batch, reader->Next());
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(static_cast<DeviceAllocationType>(kMyDeviceType), batch->device_type());
+    AssertBatchesEqual(expected, *batch);
+  }
+
+  void AssertReaderEnd(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_OK_AND_ASSIGN(auto batch, reader->Next());
+    ASSERT_EQ(batch, nullptr);
+  }
+
+  void AssertReaderClosed(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_THAT(reader->Next(),
+                Raises(StatusCode::Invalid, ::testing::HasSubstr("already been closed")));
+  }
+
+  void AssertReaderClose(const std::shared_ptr<RecordBatchReader>& reader) {
+    ASSERT_OK(reader->Close());
+    AssertReaderClosed(reader);
+  }
+};
+
+TEST_F(TestArrayDeviceStreamRoundtrip, Simple) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+  auto orig_schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(orig_schema, {arr1, arr2});
+  ASSERT_OK_AND_ASSIGN(
+      auto reader, RecordBatchReader::Make(batches, orig_schema, device->device_type()));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    AssertSchemaEqual(*orig_schema, *reader->schema(), /*check_metadata=*/true);
+    AssertReaderNext(reader, *batches[0]);
+    AssertReaderNext(reader, *batches[1]);
+    AssertReaderEnd(reader);
+    AssertReaderEnd(reader);
+    AssertReaderClose(reader);
+  });
+}
+
+TEST_F(TestArrayDeviceStreamRoundtrip, CloseEarly) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+  auto orig_schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(orig_schema, {arr1, arr2});
+  ASSERT_OK_AND_ASSIGN(
+      auto reader, RecordBatchReader::Make(batches, orig_schema, device->device_type()));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    AssertReaderNext(reader, *batches[0]);
+    AssertReaderClose(reader);
+  });
+}
+
+TEST_F(TestArrayDeviceStreamRoundtrip, Errors) {
+  auto reader = std::make_shared<FailingRecordBatchReader>(
+      Status::Invalid("roundtrip error example"));
+
+  Roundtrip(std::move(reader), [&](const std::shared_ptr<RecordBatchReader>& reader) {
+    EXPECT_THAT(reader->Next(), Raises(StatusCode::Invalid,
+                                       ::testing::HasSubstr("roundtrip error example")));
+  });
+}
+
+TEST_F(TestArrayDeviceStreamRoundtrip, SchemaError) {
+  struct ArrowDeviceArrayStream stream = {};
+  stream.get_last_error = [](struct ArrowDeviceArrayStream* stream) {
+    return "Expected error";
+  };
+  stream.get_schema = [](struct ArrowDeviceArrayStream* stream,
+                         struct ArrowSchema* schema) { return EIO; };
+  stream.get_next = [](struct ArrowDeviceArrayStream* stream,
+                       struct ArrowDeviceArray* array) { return EINVAL; };
+  stream.release = [](struct ArrowDeviceArrayStream* stream) {
+    *static_cast<bool*>(stream->private_data) = true;
+    std::memset(stream, 0, sizeof(*stream));
+  };
+  bool released = false;
+  stream.private_data = &released;
+
+  EXPECT_RAISES_WITH_MESSAGE_THAT(IOError, ::testing::HasSubstr("Expected error"),
+                                  ImportDeviceRecordBatchReader(&stream));
+  ASSERT_TRUE(released);
+}
+
+TEST_F(TestArrayDeviceStreamRoundtrip, ChunkedArrayRoundtrip) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+
+  ASSERT_OK_AND_ASSIGN(auto src, ChunkedArray::Make({arr1, arr2}));
+
+  Roundtrip(src, [&](const std::shared_ptr<ChunkedArray>& dst) {
+    AssertTypeEqual(*dst->type(), *src->type());
+    AssertChunkedEqual(*dst, *src);
+  });
+}
+
+TEST_F(TestArrayDeviceStreamRoundtrip, ChunkedArrayRoundtripEmpty) {
+  ASSERT_OK_AND_ASSIGN(auto src, ChunkedArray::Make({}, int32()));
+
+  Roundtrip(src, [&](const std::shared_ptr<ChunkedArray>& dst) {
+    AssertTypeEqual(*dst->type(), *src->type());
+    AssertChunkedEqual(*dst, *src);
+  });
+}
+
+class TestAsyncDeviceArrayStreamRoundTrip : public BaseArrayStreamTest {
+ public:
+  void SetUp() override {
+    BaseArrayStreamTest::SetUp();
+#ifndef ARROW_ENABLE_THREADING
+    GTEST_SKIP() << "Test requires ARROW_ENABLE_THREADING=ON";
+#endif
+  }
+
+  static Result<std::shared_ptr<ArrayData>> ToDeviceData(
+      const std::shared_ptr<MemoryManager>& mm, const ArrayData& data) {
+    arrow::BufferVector buffers;
+    for (const auto& buf : data.buffers) {
+      if (buf) {
+        ARROW_ASSIGN_OR_RAISE(auto dest, mm->CopyBuffer(buf, mm));
+        buffers.push_back(dest);
+      } else {
+        buffers.push_back(nullptr);
+      }
+    }
+
+    arrow::ArrayDataVector children;
+    for (const auto& child : data.child_data) {
+      ARROW_ASSIGN_OR_RAISE(auto dest, ToDeviceData(mm, *child));
+      children.push_back(dest);
+    }
+
+    return ArrayData::Make(data.type, data.length, buffers, children, data.null_count,
+                           data.offset);
+  }
+
+  static Result<std::shared_ptr<Array>> ToDevice(const std::shared_ptr<MemoryManager>& mm,
+                                                 const ArrayData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto result, ToDeviceData(mm, data));
+    return MakeArray(result);
+  }
+};
+
+TEST_F(TestAsyncDeviceArrayStreamRoundTrip, Simple) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto mm = device->default_memory_manager();
+
+  ASSERT_OK_AND_ASSIGN(auto arr1,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[1, 2]")->data()));
+  ASSERT_EQ(device->device_type(), arr1->device_type());
+  ASSERT_OK_AND_ASSIGN(auto arr2,
+                       ToDevice(mm, *ArrayFromJSON(int32(), "[4, 5, null]")->data()));
+  ASSERT_EQ(device->device_type(), arr2->device_type());
+  auto orig_schema = arrow::schema({field("ints", int32())});
+  auto batches = MakeBatches(orig_schema, {arr1, arr2});
+
+  struct ArrowAsyncDeviceStreamHandler handler;
+  auto fut_gen = CreateAsyncDeviceStreamHandler(&handler, internal::GetCpuThreadPool(), 1,
+                                                TestDeviceArrayRoundtrip::DeviceMapper);
+  ASSERT_FALSE(fut_gen.is_finished());
+
+  ASSERT_OK_AND_ASSIGN(auto fut, internal::GetCpuThreadPool()->Submit([&]() {
+    return ExportAsyncRecordBatchReader(orig_schema, MakeVectorGenerator(batches),
+                                        device->device_type(), &handler);
+  }));
+
+  ASSERT_FINISHES_OK_AND_ASSIGN(auto generator, fut_gen);
+  ASSERT_NO_FATAL_FAILURE(AssertSchemaEqual(*orig_schema, *generator.schema));
+
+  auto collect_fut = CollectAsyncGenerator(generator.generator);
+  ASSERT_FINISHES_OK_AND_ASSIGN(auto results, collect_fut);
+  ASSERT_FINISHES_OK(fut);
+  ASSERT_FINISHES_OK(fut_gen);
+
+  ASSERT_EQ(results.size(), 2);
+  AssertBatchesEqual(*results[0].batch, *batches[0]);
+  AssertBatchesEqual(*results[1].batch, *batches[1]);
+
+  internal::GetCpuThreadPool()->WaitForIdle();
+}
+
+TEST_F(TestAsyncDeviceArrayStreamRoundTrip, NullSchema) {
+  struct ArrowAsyncDeviceStreamHandler handler;
+  auto fut_gen = CreateAsyncDeviceStreamHandler(&handler, internal::GetCpuThreadPool(), 1,
+                                                TestDeviceArrayRoundtrip::DeviceMapper);
+  ASSERT_FALSE(fut_gen.is_finished());
+
+  auto fut = ExportAsyncRecordBatchReader(nullptr, nullptr, DeviceAllocationType::kCPU,
+                                          &handler);
+  ASSERT_FINISHES_AND_RAISES(Invalid, fut);
+  ASSERT_FINISHES_AND_RAISES(UnknownError, fut_gen);
+}
+
+TEST_F(TestAsyncDeviceArrayStreamRoundTrip, PropagateError) {
+  std::shared_ptr<Device> device = std::make_shared<MyDevice>(1);
+  auto orig_schema = arrow::schema({field("ints", int32())});
+
+  struct ArrowAsyncDeviceStreamHandler handler;
+  auto fut_gen = CreateAsyncDeviceStreamHandler(&handler, internal::GetCpuThreadPool(), 1,
+                                                TestDeviceArrayRoundtrip::DeviceMapper);
+  ASSERT_FALSE(fut_gen.is_finished());
+
+  ASSERT_OK_AND_ASSIGN(auto fut, internal::GetCpuThreadPool()->Submit([&]() {
+    return ExportAsyncRecordBatchReader(
+        orig_schema,
+        MakeFailingGenerator<std::shared_ptr<RecordBatch>>(
+            Status::UnknownError("expected failure")),
+        device->device_type(), &handler);
+  }));
+
+  ASSERT_FINISHES_OK_AND_ASSIGN(auto generator, fut_gen);
+  ASSERT_NO_FATAL_FAILURE(AssertSchemaEqual(*orig_schema, *generator.schema));
+
+  auto collect_fut = CollectAsyncGenerator(generator.generator);
+  ASSERT_FINISHES_AND_RAISES(UnknownError, collect_fut);
+  ASSERT_FINISHES_AND_RAISES(UnknownError, fut);
+
+  internal::GetCpuThreadPool()->WaitForIdle();
+}
 
 }  // namespace arrow

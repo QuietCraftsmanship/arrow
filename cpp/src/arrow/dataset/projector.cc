@@ -17,126 +17,47 @@
 
 #include "arrow/dataset/projector.h"
 
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
-
-#include "arrow/array.h"
-#include "arrow/dataset/type_fwd.h"
-#include "arrow/record_batch.h"
-#include "arrow/result.h"
-#include "arrow/scalar.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/util/logging.h"
 
 namespace arrow {
 namespace dataset {
 
-RecordBatchProjector::RecordBatchProjector(std::shared_ptr<Schema> to)
-    : to_(std::move(to)),
-      missing_columns_(to_->num_fields(), nullptr),
-      column_indices_(to_->num_fields(), kNoMatch),
-      scalars_(to_->num_fields(), nullptr) {}
+Status CheckProjectable(const Schema& from, const Schema& to) {
+  for (const auto& to_field : to.fields()) {
+    ARROW_ASSIGN_OR_RAISE(auto from_field, FieldRef(to_field->name()).GetOneOrNone(from));
 
-Status RecordBatchProjector::SetDefaultValue(FieldRef ref,
-                                             std::shared_ptr<Scalar> scalar) {
-  DCHECK_NE(scalar, nullptr);
-  if (ref.IsNested()) {
-    return Status::NotImplemented("setting default values for nested columns");
+    if (from_field == nullptr) {
+      if (to_field->nullable()) continue;
+
+      return Status::TypeError("field ", to_field->ToString(),
+                               " is not nullable and does not exist in origin schema ",
+                               from);
+    }
+
+    if (from_field->type()->id() == Type::NA) {
+      // promotion from null to any type is supported
+      if (to_field->nullable()) continue;
+
+      return Status::TypeError("field ", to_field->ToString(),
+                               " is not nullable but has type ", NullType(),
+                               " in origin schema ", from);
+    }
+
+    if (!from_field->type()->Equals(to_field->type())) {
+      return Status::TypeError("fields had matching names but differing types. From: ",
+                               from_field->ToString(), " To: ", to_field->ToString());
+    }
+
+    if (from_field->nullable() && !to_field->nullable()) {
+      return Status::TypeError("field ", to_field->ToString(),
+                               " is not nullable but is not required in origin schema ",
+                               from);
+    }
   }
 
-  ARROW_ASSIGN_OR_RAISE(auto match, ref.FindOne(*to_));
-  auto index = match.indices()[0];
-
-  auto field_type = to_->field(index)->type();
-  if (!field_type->Equals(scalar->type)) {
-    return Status::TypeError("field ", to_->field(index)->ToString(),
-                             " cannot be materialized from scalar of type ",
-                             *scalar->type);
-  }
-
-  scalars_[index] = std::move(scalar);
   return Status::OK();
 }
-
-Result<std::shared_ptr<RecordBatch>> RecordBatchProjector::Project(
-    const RecordBatch& batch, MemoryPool* pool) {
-  if (from_ == nullptr || !batch.schema()->Equals(*from_, /*check_metadata=*/false)) {
-    RETURN_NOT_OK(SetInputSchema(batch.schema(), pool));
-  }
-
-  if (missing_columns_length_ < batch.num_rows()) {
-    RETURN_NOT_OK(ResizeMissingColumns(batch.num_rows(), pool));
-  }
-
-  std::vector<std::shared_ptr<Array>> columns(to_->num_fields());
-
-  for (int i = 0; i < to_->num_fields(); ++i) {
-    if (column_indices_[i] != kNoMatch) {
-      columns[i] = batch.column(column_indices_[i]);
-    } else {
-      columns[i] = missing_columns_[i]->Slice(0, batch.num_rows());
-    }
-  }
-
-  return RecordBatch::Make(to_, batch.num_rows(), std::move(columns));
-}
-
-Status RecordBatchProjector::SetInputSchema(std::shared_ptr<Schema> from,
-                                            MemoryPool* pool) {
-  from_ = std::move(from);
-
-  for (int i = 0; i < to_->num_fields(); ++i) {
-    const auto& field = to_->field(i);
-    FieldRef ref(field->name());
-    auto matches = ref.FindAll(*from_);
-
-    if (matches.empty()) {
-      // Mark column i as missing by setting missing_columns_[i]
-      // to a non-null placeholder.
-      RETURN_NOT_OK(
-          MakeArrayOfNull(pool, to_->field(i)->type(), 0, &missing_columns_[i]));
-      column_indices_[i] = kNoMatch;
-    } else {
-      RETURN_NOT_OK(ref.CheckNonMultiple(matches, *from_));
-      int matching_index = matches[0].indices()[0];
-
-      if (!from_->field(matching_index)->Equals(field, /*check_metadata=*/false)) {
-        return Status::TypeError("fields had matching names but were not equivalent ",
-                                 from_->field(matching_index)->ToString(), " vs ",
-                                 field->ToString());
-      }
-
-      // Mark column i as not missing by setting missing_columns_[i] to nullptr
-      missing_columns_[i] = nullptr;
-      column_indices_[i] = matching_index;
-    }
-  }
-  return Status::OK();
-}
-
-Status RecordBatchProjector::ResizeMissingColumns(int64_t new_length, MemoryPool* pool) {
-  // TODO(bkietz) MakeArrayOfNull could use fewer buffers by reusing a single zeroed
-  // buffer for every buffer in every column which is null
-  for (int i = 0; i < to_->num_fields(); ++i) {
-    if (missing_columns_[i] == nullptr) {
-      continue;
-    }
-    if (scalars_[i] == nullptr) {
-      RETURN_NOT_OK(MakeArrayOfNull(pool, missing_columns_[i]->type(), new_length,
-                                    &missing_columns_[i]));
-      continue;
-    }
-    RETURN_NOT_OK(
-        MakeArrayFromScalar(pool, *scalars_[i], new_length, &missing_columns_[i]));
-  }
-  missing_columns_length_ = new_length;
-  return Status::OK();
-}
-
-constexpr int RecordBatchProjector::kNoMatch;
 
 }  // namespace dataset
 }  // namespace arrow

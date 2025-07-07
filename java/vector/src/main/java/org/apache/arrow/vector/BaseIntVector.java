@@ -20,24 +20,10 @@ package org.apache.arrow.vector;
 /**
  * Interface for all int type vectors.
  */
-public interface BaseIntVector extends FieldVector {
+public interface BaseIntVector extends ValueVector {
 
   /**
-   * Sets the value at index, note this value may need to be need truncated.
-   * Note this is safe version (i.e. call setSafe method in vector)
+   * set the encoded value from a {@link org.apache.arrow.vector.dictionary.Dictionary}.
    */
-  void setWithPossibleTruncate(int index, long value);
-
-  /**
-   * Sets the value at index, note this value may need to be need truncated.
-   * Note this is unsafe version (i.e. call set method in vector)
-   */
-  void setUnsafeWithPossibleTruncate(int index, long value);
-
-  /**
-   * Gets the value at index.
-   * This value may have been extended to long and will throw {@link NullPointerException}
-   * if the value is null. Note null check could be turned off via {@link NullCheckingForGet}.
-   */
-  long getValueAsLong(int index);
+  void setEncodedValue(int index, int value);
 }

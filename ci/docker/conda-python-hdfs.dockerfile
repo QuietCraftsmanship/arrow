@@ -17,33 +17,41 @@
 
 ARG repo
 ARG arch=amd64
-ARG python=3.6
+ARG python=3.9
 FROM ${repo}:${arch}-conda-python-${python}
 
-ARG jdk=8
-ARG maven=3.5
-RUN conda install -q \
+ARG jdk=11
+ARG maven=3.8.7
+RUN mamba install -q -y \
         maven=${maven} \
         openjdk=${jdk} \
         pandas && \
-    conda clean --all
+    mamba clean --all
 
 # installing libhdfs (JNI)
-ARG hdfs=2.9.2
+ARG hdfs=3.2.1
 ENV HADOOP_HOME=/opt/hadoop-${hdfs} \
     HADOOP_OPTS=-Djava.library.path=/opt/hadoop-${hdfs}/lib/native \
     PATH=$PATH:/opt/hadoop-${hdfs}/bin:/opt/hadoop-${hdfs}/sbin
-RUN wget -q -O - "https://www.apache.org/dyn/mirrors/mirrors.cgi?action=download&filename=hadoop/common/hadoop-${hdfs}/hadoop-${hdfs}.tar.gz" | tar -xzf - -C /opt
+COPY ci/scripts/util_download_apache.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/util_download_apache.sh \
+    "hadoop/common/hadoop-${hdfs}/hadoop-${hdfs}.tar.gz" /opt
+
 COPY ci/etc/hdfs-site.xml $HADOOP_HOME/etc/hadoop/
 
 # build cpp with tests
 ENV CC=gcc \
     CXX=g++ \
+    ARROW_ACERO=ON \
+    ARROW_BUILD_TESTS=ON \
+    ARROW_COMPUTE=ON \
+    ARROW_CSV=ON \
+    ARROW_DATASET=ON \
+    ARROW_FILESYSTEM=ON \
     ARROW_FLIGHT=OFF \
     ARROW_GANDIVA=OFF \
-    ARROW_PLASMA=OFF \
-    ARROW_PARQUET=ON \
-    ARROW_ORC=OFF \
     ARROW_HDFS=ON \
-    ARROW_PYTHON=ON \
-    ARROW_BUILD_TESTS=ON
+    ARROW_JSON=ON \
+    ARROW_ORC=OFF \
+    ARROW_PARQUET=ON \
+    PARQUET_REQUIRE_ENCRYPTION=ON

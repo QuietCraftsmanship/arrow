@@ -18,10 +18,12 @@
 #include "arrow/util/formatting.h"
 #include "arrow/util/config.h"
 #include "arrow/util/double_conversion.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/float16.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
+using util::Float16;
 using util::double_conversion::DoubleToStringConverter;
 
 static constexpr int kMinBufferSize = DoubleToStringConverter::kBase10MaximalLength + 1;
@@ -43,10 +45,28 @@ struct FloatToStringFormatter::Impl {
       : converter_(DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN, "inf", "nan",
                    'e', -6, 10, 6, 0) {}
 
+  Impl(int flags, const char* inf_symbol, const char* nan_symbol, char exp_character,
+       int decimal_in_shortest_low, int decimal_in_shortest_high,
+       int max_leading_padding_zeroes_in_precision_mode,
+       int max_trailing_padding_zeroes_in_precision_mode)
+      : converter_(flags, inf_symbol, nan_symbol, exp_character, decimal_in_shortest_low,
+                   decimal_in_shortest_high, max_leading_padding_zeroes_in_precision_mode,
+                   max_trailing_padding_zeroes_in_precision_mode) {}
+
   DoubleToStringConverter converter_;
 };
 
 FloatToStringFormatter::FloatToStringFormatter() : impl_(new Impl()) {}
+
+FloatToStringFormatter::FloatToStringFormatter(
+    int flags, const char* inf_symbol, const char* nan_symbol, char exp_character,
+    int decimal_in_shortest_low, int decimal_in_shortest_high,
+    int max_leading_padding_zeroes_in_precision_mode,
+    int max_trailing_padding_zeroes_in_precision_mode)
+    : impl_(new Impl(flags, inf_symbol, nan_symbol, exp_character,
+                     decimal_in_shortest_low, decimal_in_shortest_high,
+                     max_leading_padding_zeroes_in_precision_mode,
+                     max_trailing_padding_zeroes_in_precision_mode)) {}
 
 FloatToStringFormatter::~FloatToStringFormatter() {}
 
@@ -64,6 +84,15 @@ int FloatToStringFormatter::FormatFloat(double v, char* out_buffer, int out_size
   DCHECK_GE(out_size, kMinBufferSize);
   util::double_conversion::StringBuilder builder(out_buffer, out_size);
   bool result = impl_->converter_.ToShortest(v, &builder);
+  DCHECK(result);
+  ARROW_UNUSED(result);
+  return builder.position();
+}
+
+int FloatToStringFormatter::FormatFloat(uint16_t v, char* out_buffer, int out_size) {
+  DCHECK_GE(out_size, kMinBufferSize);
+  util::double_conversion::StringBuilder builder(out_buffer, out_size);
+  bool result = impl_->converter_.ToShortest(Float16::FromBits(v).ToFloat(), &builder);
   DCHECK(result);
   ARROW_UNUSED(result);
   return builder.position();

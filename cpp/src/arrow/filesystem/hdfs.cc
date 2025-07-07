@@ -22,16 +22,20 @@
 
 #include "arrow/filesystem/hdfs.h"
 #include "arrow/filesystem/path_util.h"
+#include "arrow/filesystem/util_internal.h"
 #include "arrow/io/hdfs.h"
 #include "arrow/io/hdfs_internal.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"
-#include "arrow/util/parsing.h"
+#include "arrow/util/value_parsing.h"
 #include "arrow/util/windows_fixup.h"
 
 namespace arrow {
 
-using internal::Uri;
+using internal::ErrnoFromStatus;
+using internal::ParseValue;
+using util::Uri;
 
 namespace fs {
 
@@ -41,14 +45,10 @@ using internal::RemoveLeadingSlash;
 
 class HadoopFileSystem::Impl {
  public:
-  explicit Impl(HdfsOptions options) : options_(std::move(options)) {}
+  Impl(HdfsOptions options, const io::IOContext& io_context)
+      : options_(std::move(options)), io_context_(io_context) {}
 
-  ~Impl() {
-    Status st = Close();
-    if (!st.ok()) {
-      ARROW_LOG(WARNING) << "Failed to disconnect hdfs client: " << st.ToString();
-    }
-  }
+  ~Impl() { ARROW_WARN_NOT_OK(Close(), "Failed to disconnect hdfs client"); }
 
   Status Init() {
     io::internal::LibHdfsShim* driver_shim;
@@ -67,6 +67,14 @@ class HadoopFileSystem::Impl {
   HdfsOptions options() const { return options_; }
 
   Result<FileInfo> GetFileInfo(const std::string& path) {
+    // It has unfortunately been a frequent logic error to pass URIs down
+    // to GetFileInfo (e.g. ARROW-10264).  Unlike other filesystems, HDFS
+    // silently accepts URIs but returns different results than if given the
+    // equivalent in-filesystem paths.  Instead of raising cryptic errors
+    // later, notify the underlying problem immediately.
+    if (path.substr(0, 5) == "hdfs:") {
+      return Status::Invalid("GetFileInfo must not be passed a URI, got: ", path);
+    }
     FileInfo info;
     io::HdfsPathInfo path_info;
     auto status = client_->GetPathInfo(path, &path_info);
@@ -95,12 +103,18 @@ class HadoopFileSystem::Impl {
       return st;
     }
     for (const auto& child_path_info : children) {
-      // HDFS returns an absolute URI here, need to extract path relative to wd
-      Uri uri;
-      RETURN_NOT_OK(uri.Parse(child_path_info.name));
-      std::string child_path = uri.path();
+      // HDFS returns an absolute "URI" here, need to extract path relative to wd
+      // XXX: unfortunately, this is not a real URI as special characters
+      // are not %-escaped... hence parsing it as URI would fail.
+      std::string child_path;
       if (!wd.empty()) {
-        ARROW_ASSIGN_OR_RAISE(child_path, MakeAbstractPathRelative(wd, child_path));
+        if (child_path_info.name.substr(0, wd.length()) != wd) {
+          return Status::IOError("HDFS returned path '", child_path_info.name,
+                                 "' that is not a child of '", wd, "'");
+        }
+        child_path = child_path_info.name.substr(wd.length());
+      } else {
+        child_path = child_path_info.name;
       }
 
       FileInfo info;
@@ -116,23 +130,46 @@ class HadoopFileSystem::Impl {
   }
 
   Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) {
+    // See GetFileInfo(const std::string&) above.
+    if (select.base_dir.substr(0, 5) == "hdfs:") {
+      return Status::Invalid("FileSelector.base_dir must not be a URI, got: ",
+                             select.base_dir);
+    }
     std::vector<FileInfo> results;
 
+    // Fetch working directory.
+    // If select.base_dir is relative, we need to trim it from the start
+    // of paths returned by ListDirectory.
+    // If select.base_dir is absolute, we need to trim the "URI authority"
+    // portion of the working directory.
     std::string wd;
-    if (select.base_dir.empty() || select.base_dir.front() != '/') {
-      // Fetch working directory, because we need to trim it from the start
-      // of paths returned by ListDirectory as select.base_dir is relative.
-      RETURN_NOT_OK(client_->GetWorkingDirectory(&wd));
-      Uri wd_uri;
-      RETURN_NOT_OK(wd_uri.Parse(wd));
-      wd = wd_uri.path();
+    RETURN_NOT_OK(client_->GetWorkingDirectory(&wd));
+
+    if (!select.base_dir.empty() && select.base_dir.front() == '/') {
+      // base_dir is absolute, only keep the URI authority portion.
+      // As mentioned in StatSelector() above, the URI may contain unescaped
+      // special chars and therefore may not be a valid URI, so we parse by hand.
+      auto pos = wd.find("://");  // start of host:port portion
+      if (pos == std::string::npos) {
+        return Status::IOError("Unexpected HDFS working directory URI: ", wd);
+      }
+      pos = wd.find("/", pos + 3);  // end of host:port portion
+      if (pos == std::string::npos) {
+        return Status::IOError("Unexpected HDFS working directory URI: ", wd);
+      }
+      wd = wd.substr(0, pos);  // keep up until host:port (included)
+    } else if (!wd.empty() && wd.back() != '/') {
+      // For a relative lookup, trim leading slashes
+      wd += '/';
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto info, GetFileInfo(select.base_dir));
-    if (info.type() == FileType::File) {
-      return Status::Invalid(
-          "GetFileInfo expects base_dir of selector to be a directory, while '",
-          select.base_dir, "' is a file");
+    if (!select.base_dir.empty()) {
+      ARROW_ASSIGN_OR_RAISE(auto info, GetFileInfo(select.base_dir));
+      if (info.type() == FileType::File) {
+        return Status::IOError(
+            "GetFileInfo expects base_dir of selector to be a directory, but '",
+            select.base_dir, "' is a file");
+      }
     }
     RETURN_NOT_OK(StatSelector(wd, select.base_dir, select, 0, &results));
     return results;
@@ -153,18 +190,34 @@ class HadoopFileSystem::Impl {
     return Status::OK();
   }
 
-  Status DeleteDir(const std::string& path) {
-    if (!IsDirectory(path)) {
-      return Status::IOError("Cannot delete directory '", path, "': not a directory");
+  Status CheckForDirectory(const std::string& path, const char* action) {
+    // Check existence of path, and that it's a directory
+    io::HdfsPathInfo info;
+    RETURN_NOT_OK(client_->GetPathInfo(path, &info));
+    if (info.kind != io::ObjectType::DIRECTORY) {
+      return Status::IOError("Cannot ", action, " directory '", path,
+                             "': not a directory");
     }
-    RETURN_NOT_OK(client_->DeleteDirectory(path));
     return Status::OK();
   }
 
-  Status DeleteDirContents(const std::string& path) {
+  Status DeleteDir(const std::string& path) {
+    RETURN_NOT_OK(CheckForDirectory(path, "delete"));
+    return client_->DeleteDirectory(path);
+  }
+
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) {
+    auto st = CheckForDirectory(path, "delete contents of");
+    if (!st.ok()) {
+      if (missing_dir_ok && ErrnoFromStatus(st) == ENOENT) {
+        return Status::OK();
+      }
+      return st;
+    }
+
     std::vector<std::string> file_list;
     RETURN_NOT_OK(client_->GetChildren(path, &file_list));
-    for (auto file : file_list) {
+    for (const auto& file : file_list) {
       RETURN_NOT_OK(client_->Delete(file, /*recursive=*/true));
     }
     return Status::OK();
@@ -179,24 +232,30 @@ class HadoopFileSystem::Impl {
   }
 
   Status Move(const std::string& src, const std::string& dest) {
-    RETURN_NOT_OK(client_->Rename(src, dest));
-    return Status::OK();
+    auto st = client_->Rename(src, dest);
+    if (st.IsIOError() && IsFile(src) && IsFile(dest)) {
+      // Allow file -> file clobber
+      RETURN_NOT_OK(client_->Delete(dest));
+      st = client_->Rename(src, dest);
+    }
+    return st;
   }
 
   Status CopyFile(const std::string& src, const std::string& dest) {
-    // TODO implement this (but only if HDFS supports on-server copy)
-    return Status::NotImplemented("HadoopFileSystem::CopyFile is not supported yet");
+    return client_->Copy(src, dest);
   }
 
   Result<std::shared_ptr<io::InputStream>> OpenInputStream(const std::string& path) {
+    ARROW_RETURN_NOT_OK(internal::AssertNoTrailingSlash(path));
     std::shared_ptr<io::HdfsReadableFile> file;
-    RETURN_NOT_OK(client_->OpenReadable(path, &file));
+    RETURN_NOT_OK(client_->OpenReadable(path, io_context_, &file));
     return file;
   }
 
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(const std::string& path) {
+    ARROW_RETURN_NOT_OK(internal::AssertNoTrailingSlash(path));
     std::shared_ptr<io::HdfsReadableFile> file;
-    RETURN_NOT_OK(client_->OpenReadable(path, &file));
+    RETURN_NOT_OK(client_->OpenReadable(path, io_context_, &file));
     return file;
   }
 
@@ -211,7 +270,8 @@ class HadoopFileSystem::Impl {
   }
 
  protected:
-  HdfsOptions options_;
+  const HdfsOptions options_;
+  const io::IOContext io_context_;
   std::shared_ptr<::arrow::io::HadoopFileSystem> client_;
 
   void PathInfoToFileInfo(const io::HdfsPathInfo& info, FileInfo* out) {
@@ -227,6 +287,7 @@ class HadoopFileSystem::Impl {
 
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStreamGeneric(
       const std::string& path, bool append) {
+    ARROW_RETURN_NOT_OK(internal::AssertNoTrailingSlash(path));
     std::shared_ptr<io::HdfsOutputStream> stream;
     RETURN_NOT_OK(client_->OpenWritable(path, append, options_.buffer_size,
                                         options_.replication, options_.default_block_size,
@@ -236,14 +297,16 @@ class HadoopFileSystem::Impl {
 
   bool IsDirectory(const std::string& path) {
     io::HdfsPathInfo info;
-    Status status = client_->GetPathInfo(path, &info);
-    if (!status.ok()) {
-      return false;
-    }
-    if (info.kind == io::ObjectType::DIRECTORY) {
-      return true;
-    }
-    return false;
+    return GetPathInfo(path, &info) && info.kind == io::ObjectType::DIRECTORY;
+  }
+
+  bool IsFile(const std::string& path) {
+    io::HdfsPathInfo info;
+    return GetPathInfo(path, &info) && info.kind == io::ObjectType::FILE;
+  }
+
+  bool GetPathInfo(const std::string& path, io::HdfsPathInfo* info) {
+    return client_->GetPathInfo(path, info).ok();
   }
 
   TimePoint ToTimePoint(int secs) {
@@ -252,25 +315,33 @@ class HadoopFileSystem::Impl {
   }
 };
 
-void HdfsOptions::ConfigureEndPoint(const std::string& host, int port) {
-  connection_config.host = host;
+void HdfsOptions::ConfigureEndPoint(std::string host, int port) {
+  connection_config.host = std::move(host);
   connection_config.port = port;
 }
 
-void HdfsOptions::ConfigureHdfsUser(const std::string& user_name) {
-  connection_config.user = user_name;
+void HdfsOptions::ConfigureUser(std::string user_name) {
+  connection_config.user = std::move(user_name);
 }
 
-void HdfsOptions::ConfigureHdfsReplication(int16_t replication) {
+void HdfsOptions::ConfigureKerberosTicketCachePath(std::string path) {
+  connection_config.kerb_ticket = std::move(path);
+}
+
+void HdfsOptions::ConfigureReplication(int16_t replication) {
   this->replication = replication;
 }
 
-void HdfsOptions::ConfigureHdfsBufferSize(int32_t buffer_size) {
+void HdfsOptions::ConfigureBufferSize(int32_t buffer_size) {
   this->buffer_size = buffer_size;
 }
 
-void HdfsOptions::ConfigureHdfsBlockSize(int64_t default_block_size) {
+void HdfsOptions::ConfigureBlockSize(int64_t default_block_size) {
   this->default_block_size = default_block_size;
+}
+
+void HdfsOptions::ConfigureExtraConf(std::string key, std::string val) {
+  connection_config.extra_conf.emplace(std::move(key), std::move(val));
 }
 
 bool HdfsOptions::Equals(const HdfsOptions& other) const {
@@ -308,43 +379,57 @@ Result<HdfsOptions> HdfsOptions::FromUri(const Uri& uri) {
   auto it = options_map.find("replication");
   if (it != options_map.end()) {
     const auto& v = it->second;
-    ::arrow::internal::StringConverter<Int16Type> converter;
     int16_t replication;
-    if (!converter(v.data(), v.size(), &replication)) {
+    if (!ParseValue<Int16Type>(v.data(), v.size(), &replication)) {
       return Status::Invalid("Invalid value for option 'replication': '", v, "'");
     }
-    options.ConfigureHdfsReplication(replication);
+    options.ConfigureReplication(replication);
+    options_map.erase(it);
   }
 
   // configure buffer_size
   it = options_map.find("buffer_size");
   if (it != options_map.end()) {
     const auto& v = it->second;
-    ::arrow::internal::StringConverter<Int32Type> converter;
     int32_t buffer_size;
-    if (!converter(v.data(), v.size(), &buffer_size)) {
+    if (!ParseValue<Int32Type>(v.data(), v.size(), &buffer_size)) {
       return Status::Invalid("Invalid value for option 'buffer_size': '", v, "'");
     }
-    options.ConfigureHdfsBufferSize(buffer_size);
+    options.ConfigureBufferSize(buffer_size);
+    options_map.erase(it);
   }
 
   // configure default_block_size
   it = options_map.find("default_block_size");
   if (it != options_map.end()) {
     const auto& v = it->second;
-    ::arrow::internal::StringConverter<Int64Type> converter;
     int64_t default_block_size;
-    if (!converter(v.data(), v.size(), &default_block_size)) {
+    if (!ParseValue<Int64Type>(v.data(), v.size(), &default_block_size)) {
       return Status::Invalid("Invalid value for option 'default_block_size': '", v, "'");
     }
-    options.ConfigureHdfsBlockSize(default_block_size);
+    options.ConfigureBlockSize(default_block_size);
+    options_map.erase(it);
   }
 
   // configure user
   it = options_map.find("user");
   if (it != options_map.end()) {
     const auto& user = it->second;
-    options.ConfigureHdfsUser(user);
+    options.ConfigureUser(user);
+    options_map.erase(it);
+  }
+
+  // configure kerberos
+  it = options_map.find("kerb_ticket");
+  if (it != options_map.end()) {
+    const auto& ticket = it->second;
+    options.ConfigureKerberosTicketCachePath(ticket);
+    options_map.erase(it);
+  }
+
+  // configure other options
+  for (const auto& it : options_map) {
+    options.ConfigureExtraConf(it.first, it.second);
   }
 
   return options;
@@ -356,14 +441,17 @@ Result<HdfsOptions> HdfsOptions::FromUri(const std::string& uri_string) {
   return FromUri(uri);
 }
 
-HadoopFileSystem::HadoopFileSystem(const HdfsOptions& options)
-    : impl_(new Impl{options}) {}
+HadoopFileSystem::HadoopFileSystem(const HdfsOptions& options,
+                                   const io::IOContext& io_context)
+    : FileSystem(io_context), impl_(new Impl{options, io_context_}) {
+  default_async_is_sync_ = false;
+}
 
 HadoopFileSystem::~HadoopFileSystem() {}
 
 Result<std::shared_ptr<HadoopFileSystem>> HadoopFileSystem::Make(
-    const HdfsOptions& options) {
-  std::shared_ptr<HadoopFileSystem> ptr(new HadoopFileSystem(options));
+    const HdfsOptions& options, const io::IOContext& io_context) {
+  std::shared_ptr<HadoopFileSystem> ptr(new HadoopFileSystem(options, io_context));
   RETURN_NOT_OK(ptr->impl_->Init());
   return ptr;
 }
@@ -385,6 +473,12 @@ bool HadoopFileSystem::Equals(const FileSystem& other) const {
   return options().Equals(hdfs.options());
 }
 
+Result<std::string> HadoopFileSystem::PathFromUri(const std::string& uri_string) const {
+  return internal::PathFromUriHelper(uri_string, {"hdfs", "viewfs"},
+                                     /*accept_local_paths=*/false,
+                                     internal::AuthorityHandlingBehavior::kIgnore);
+}
+
 Result<std::vector<FileInfo>> HadoopFileSystem::GetFileInfo(const FileSelector& select) {
   return impl_->GetFileInfo(select);
 }
@@ -397,8 +491,15 @@ Status HadoopFileSystem::DeleteDir(const std::string& path) {
   return impl_->DeleteDir(path);
 }
 
-Status HadoopFileSystem::DeleteDirContents(const std::string& path) {
-  return impl_->DeleteDirContents(path);
+Status HadoopFileSystem::DeleteDirContents(const std::string& path, bool missing_dir_ok) {
+  if (internal::IsEmptyPath(path)) {
+    return internal::InvalidDeleteDirContents(path);
+  }
+  return impl_->DeleteDirContents(path, missing_dir_ok);
+}
+
+Status HadoopFileSystem::DeleteRootDirContents() {
+  return impl_->DeleteDirContents("", /*missing_dir_ok=*/false);
 }
 
 Status HadoopFileSystem::DeleteFile(const std::string& path) {
@@ -424,12 +525,12 @@ Result<std::shared_ptr<io::RandomAccessFile>> HadoopFileSystem::OpenInputFile(
 }
 
 Result<std::shared_ptr<io::OutputStream>> HadoopFileSystem::OpenOutputStream(
-    const std::string& path) {
+    const std::string& path, const std::shared_ptr<const KeyValueMetadata>& metadata) {
   return impl_->OpenOutputStream(path);
 }
 
 Result<std::shared_ptr<io::OutputStream>> HadoopFileSystem::OpenAppendStream(
-    const std::string& path) {
+    const std::string& path, const std::shared_ptr<const KeyValueMetadata>& metadata) {
   return impl_->OpenAppendStream(path);
 }
 

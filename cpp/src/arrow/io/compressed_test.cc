@@ -33,6 +33,7 @@
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
 #include "arrow/util/compression.h"
+#include "arrow/util/config.h"
 
 namespace arrow {
 namespace io {
@@ -72,12 +73,11 @@ std::shared_ptr<Buffer> CompressDataOneShot(Codec* codec,
                                             const std::vector<uint8_t>& data) {
   int64_t max_compressed_len, compressed_len;
   max_compressed_len = codec->MaxCompressedLen(data.size(), data.data());
-  std::shared_ptr<ResizableBuffer> compressed;
-  ABORT_NOT_OK(AllocateResizableBuffer(max_compressed_len, &compressed));
+  auto compressed = *AllocateResizableBuffer(max_compressed_len);
   compressed_len = *codec->Compress(data.size(), data.data(), max_compressed_len,
                                     compressed->mutable_data());
   ABORT_NOT_OK(compressed->Resize(compressed_len));
-  return std::move(compressed);
+  return compressed;
 }
 
 Status RunCompressedInputStream(Codec* codec, std::shared_ptr<Buffer> compressed,
@@ -211,15 +211,28 @@ TEST_P(CompressedInputStreamTest, ConcatenatedStreams) {
   auto data2 = MakeCompressibleData(200);
   auto compressed1 = CompressDataOneShot(codec.get(), data1);
   auto compressed2 = CompressDataOneShot(codec.get(), data2);
-
-  std::shared_ptr<Buffer> concatenated;
-  ASSERT_OK(ConcatenateBuffers({compressed1, compressed2}, default_memory_pool(),
-                               &concatenated));
-  std::vector<uint8_t> decompressed, expected;
-  ASSERT_OK(RunCompressedInputStream(codec.get(), concatenated, &decompressed));
+  std::vector<uint8_t> expected;
   std::copy(data1.begin(), data1.end(), std::back_inserter(expected));
   std::copy(data2.begin(), data2.end(), std::back_inserter(expected));
 
+  ASSERT_OK_AND_ASSIGN(auto concatenated, ConcatenateBuffers({compressed1, compressed2}));
+  std::vector<uint8_t> decompressed;
+  ASSERT_OK(RunCompressedInputStream(codec.get(), concatenated, &decompressed));
+  ASSERT_EQ(decompressed.size(), expected.size());
+  ASSERT_EQ(decompressed, expected);
+
+  // Same, but with an empty decompressed stream in the middle
+  auto compressed_empty = CompressDataOneShot(codec.get(), {});
+  ASSERT_OK_AND_ASSIGN(concatenated,
+                       ConcatenateBuffers({compressed1, compressed_empty, compressed2}));
+  ASSERT_OK(RunCompressedInputStream(codec.get(), concatenated, &decompressed));
+  ASSERT_EQ(decompressed.size(), expected.size());
+  ASSERT_EQ(decompressed, expected);
+
+  // Same, but with an empty decompressed stream at the end
+  ASSERT_OK_AND_ASSIGN(concatenated,
+                       ConcatenateBuffers({compressed1, compressed2, compressed_empty}));
+  ASSERT_OK(RunCompressedInputStream(codec.get(), concatenated, &decompressed));
   ASSERT_EQ(decompressed.size(), expected.size());
   ASSERT_EQ(decompressed, expected);
 }
@@ -249,7 +262,7 @@ TEST_P(CompressedOutputStreamTest, RandomData) {
 TEST(TestSnappyInputStream, NotImplemented) {
   std::unique_ptr<Codec> codec;
   ASSERT_OK_AND_ASSIGN(codec, Codec::Create(Compression::SNAPPY));
-  std::shared_ptr<InputStream> stream = std::make_shared<BufferReader>("");
+  std::shared_ptr<InputStream> stream = BufferReader::FromString("");
   ASSERT_RAISES(NotImplemented, CompressedInputStream::Make(codec.get(), stream));
 }
 
@@ -259,6 +272,12 @@ TEST(TestSnappyOutputStream, NotImplemented) {
   std::shared_ptr<OutputStream> stream = std::make_shared<MockOutputStream>();
   ASSERT_RAISES(NotImplemented, CompressedOutputStream::Make(codec.get(), stream));
 }
+#endif
+
+#if !defined ARROW_WITH_ZLIB && !defined ARROW_WITH_BROTLI && !defined ARROW_WITH_LZ4 && \
+    !defined ARROW_WITH_ZSTD
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(CompressedInputStreamTest);
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(CompressedOutputStreamTest);
 #endif
 
 #ifdef ARROW_WITH_ZLIB

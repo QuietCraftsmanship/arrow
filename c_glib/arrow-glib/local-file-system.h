@@ -25,7 +25,9 @@ G_BEGIN_DECLS
 
 /* arrow::fs::LocalFileSystemOptions */
 
-#define GARROW_TYPE_LOCAL_FILE_SYSTEM_OPTIONS (garrow_local_file_system_options_get_type())
+#define GARROW_TYPE_LOCAL_FILE_SYSTEM_OPTIONS                                            \
+  (garrow_local_file_system_options_get_type())
+GARROW_AVAILABLE_IN_0_17
 G_DECLARE_DERIVABLE_TYPE(GArrowLocalFileSystemOptions,
                          garrow_local_file_system_options,
                          GARROW,
@@ -36,13 +38,14 @@ struct _GArrowLocalFileSystemOptionsClass
   GObjectClass parent_class;
 };
 
-GARROW_AVAILABLE_IN_1_0
+GARROW_AVAILABLE_IN_0_17
 GArrowLocalFileSystemOptions *
 garrow_local_file_system_options_new(void);
 
 /* arrow::fs::LocalFileSystem */
 
 #define GARROW_TYPE_LOCAL_FILE_SYSTEM (garrow_local_file_system_get_type())
+GARROW_AVAILABLE_IN_0_17
 G_DECLARE_DERIVABLE_TYPE(GArrowLocalFileSystem,
                          garrow_local_file_system,
                          GARROW,
@@ -53,7 +56,7 @@ struct _GArrowLocalFileSystemClass
   GArrowFileSystemClass parent_class;
 };
 
-GARROW_AVAILABLE_IN_1_0
+GARROW_AVAILABLE_IN_0_17
 GArrowLocalFileSystem *
 garrow_local_file_system_new(GArrowLocalFileSystemOptions *options);
 

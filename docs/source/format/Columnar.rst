@@ -21,7 +21,12 @@
 Arrow Columnar Format
 *********************
 
-The "Arrow Columnar Format" includes a language-agnostic in-memory
+*Version: 1.5*
+
+.. seealso:: :ref:`Additions to the Arrow columnar format since version 1.0.0
+   <post-1-0-0-format-versions>`
+
+The **Arrow columnar format** includes a language-agnostic in-memory
 data structure specification, metadata serialization, and a protocol
 for serialization and generic data transport.
 
@@ -65,28 +70,142 @@ concepts, here is a small glossary to help disambiguate.
   without taking into account any value semantics. For example, a
   32-bit signed integer array and 32-bit floating point array have the
   same layout.
-* **Parent** and **child arrays**: names to express relationships
-  between physical value arrays in a nested type structure. For
-  example, a ``List<T>``-type parent array has a T-type array as its
-  child (see more on lists below).
+* **Data type**: An application-facing semantic value type that is
+  implemented using some physical layout. For example, Decimal128
+  values are stored as 16 bytes in a fixed-size binary
+  layout. A timestamp may be stored as 64-bit fixed-size layout.
 * **Primitive type**: a data type having no child types. This includes
   such types as fixed bit-width, variable-size binary, and null types.
 * **Nested type**: a data type whose full structure depends on one or
   more other child types. Two fully-specified nested types are equal
   if and only if their child types are equal. For example, ``List<U>``
   is distinct from ``List<V>`` iff U and V are different types.
-* **Logical type**: An application-facing semantic value type that is
-  implemented using some physical layout. For example, Decimal
-  values are stored as 16 bytes in a fixed-size binary
-  layout. Similarly, strings can be stored as ``List<1-byte>``. A
-  timestamp may be stored as 64-bit fixed-size layout.
+* **Parent** and **child arrays**: names to express relationships
+  between physical value arrays in a nested type structure. For
+  example, a ``List<T>``-type parent array has a T-type array as its
+  child (see more on lists below).
+* **Parametric type**: a type which requires additional parameters
+  for full determination of its semantics. For example, all nested types
+  are parametric by construction. A timestamp is also parametric as it needs
+  a unit (such as microseconds) and a timezone.
+
+.. _data_types:
+
+Data Types
+==========
+
+The file `Schema.fbs`_ defines built-in data types supported by the
+Arrow columnar format. Each data type uses a well-defined physical layout.
+
+`Schema.fbs`_ is the authoritative source for the description of the
+standard Arrow data types. However, we also provide the below table for
+convenience:
+
++--------------------+------------------------------+------------------------------------------------------------+
+| Type               | Type Parameters *(1)*        | Physical Memory Layout                                     |
++====================+==============================+============================================================+
+| Null               |                              | Null                                                       |
++--------------------+------------------------------+------------------------------------------------------------+
+| Boolean            |                              | Fixed-size Primitive                                       |
++--------------------+------------------------------+------------------------------------------------------------+
+| Int                | * bit width                  | *" (same as above)*                                        |
+|                    | * signedness                 |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Floating Point     | * precision                  | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Decimal            | * bit width                  | *"*                                                        |
+|                    | * scale                      |                                                            |
+|                    | * precision                  |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Date               | * unit                       | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Time               | * bit width *(2)*            | *"*                                                        |
+|                    | * unit                       |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Timestamp          | * unit                       | *"*                                                        |
+|                    | * timezone                   |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Interval           | * unit                       | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Duration           | * unit                       | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Fixed-Size Binary  | * byte width                 | Fixed-size Binary                                          |
++--------------------+------------------------------+------------------------------------------------------------+
+| Binary             |                              | Variable-size Binary with 32-bit offsets                   |
++--------------------+------------------------------+------------------------------------------------------------+
+| Utf8               |                              | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Large Binary       |                              | Variable-size Binary with 64-bit offsets                   |
++--------------------+------------------------------+------------------------------------------------------------+
+| Large Utf8         |                              | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Binary View        |                              | Variable-size Binary View                                  |
++--------------------+------------------------------+------------------------------------------------------------+
+| Utf8 View          |                              | *"*                                                        |
++--------------------+------------------------------+------------------------------------------------------------+
+| Fixed-Size List    | * *value type*               | Fixed-size List                                            |
+|                    | * list size                  |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| List               | * *value type*               | Variable-size List with 32-bit offsets                     |
++--------------------+------------------------------+------------------------------------------------------------+
+| Large List         | * *value type*               | Variable-size List with 64-bit offsets                     |
++--------------------+------------------------------+------------------------------------------------------------+
+| List View          | * *value type*               | Variable-size List View with 32-bit offsets and sizes      |
++--------------------+------------------------------+------------------------------------------------------------+
+| Large List View    | * *value type*               | Variable-size List View with 64-bit offsets and sizes      |
++--------------------+------------------------------+------------------------------------------------------------+
+| Struct             | * *children*                 | Struct                                                     |
++--------------------+------------------------------+------------------------------------------------------------+
+| Map                | * *children*                 | Variable-size List of Structs                              |
+|                    | * keys sortedness            |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Union              | * *children*                 | Dense or Sparse Union *(3)*                                |
+|                    | * mode                       |                                                            |
+|                    | * type ids                   |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Dictionary         | * *index type* *(4)*         | Dictionary Encoded                                         |
+|                    | * *value type*               |                                                            |
+|                    | * orderedness                |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+| Run-End Encoded    | * *run end type* *(5)*       | Run-End Encoded                                            |
+|                    | * *value type*               |                                                            |
++--------------------+------------------------------+------------------------------------------------------------+
+
+* \(1) Type parameters listed in *italics* denote a data type's child types.
+
+* \(2) The *bit width* parameter of a Time type is technically redundant as
+  each *unit* mandates a single bit width.
+
+* \(3) Whether a Union type uses the Sparse or Dense layout is denoted by its
+  *mode* parameter.
+
+* \(4) The *index type* of a Dictionary type can only be an integer type,
+  preferably signed, with width 8 to 64 bits.
+
+* \(5) The *run end type* of a Run-End Encoded type can only be a signed integer type
+  with width 16 to 64 bits.
+
+.. note::
+   Sometimes the term "logical type" is used to denote the Arrow data types
+   and distinguish them from their respective physical layouts. However,
+   unlike other type systems such as `Apache Parquet <https://parquet.apache.org/>`__'s,
+   the Arrow type system doesn't have separate notions of physical types and
+   logical types.
+
+   The Arrow type system separately provides
+   :ref:`extension types <format_metadata_extension_types>`, which allow
+   annotating standard Arrow data types with richer application-facing semantics
+   (for example defining a "JSON" type laid upon the standard String data type).
+
+
+.. _format_layout:
 
 Physical Memory Layout
 ======================
 
 Arrays are defined by a few pieces of metadata and data:
 
-* A logical data type.
+* A data type.
 * A sequence of buffers.
 * A length as a 64-bit signed integer. Implementations are permitted
   to be limited to 32-bit lengths, see more on this below.
@@ -96,27 +215,42 @@ Arrays are defined by a few pieces of metadata and data:
 Nested arrays additionally have a sequence of one or more sets of
 these items, called the **child arrays**.
 
-Each logical data type has a well-defined physical layout. Here are
-the different physical layouts defined by Arrow:
+Each data type has a well-defined physical layout. Here are the different
+physical layouts defined by Arrow:
 
 * **Primitive (fixed-size)**: a sequence of values each having the
   same byte or bit width
 * **Variable-size Binary**: a sequence of values each having a variable
   byte length. Two variants of this layout are supported using 32-bit
   and 64-bit length encoding.
+* **View of Variable-size Binary**: a sequence of values each having a
+  variable byte length. In contrast to Variable-size Binary, the values
+  of this layout are distributed across potentially multiple buffers
+  instead of densely and sequentially packed in a single buffer.
 * **Fixed-size List**: a nested layout where each value has the same
   number of elements taken from a child data type.
 * **Variable-size List**: a nested layout where each value is a
   variable-length sequence of values taken from a child data type. Two
   variants of this layout are supported using 32-bit and 64-bit length
   encoding.
+* **View of Variable-size List**: a nested layout where each value is a
+  variable-length sequence of values taken from a child data type. This
+  layout differs from **Variable-size List** by having an additional
+  buffer containing the sizes of each list value. This removes a constraint
+  on the offsets buffer — it does not need to be in order.
 * **Struct**: a nested layout consisting of a collection of named
   child **fields** each having the same length but possibly different
   types.
 * **Sparse** and **Dense Union**: a nested layout representing a
   sequence of values, each of which can have type chosen from a
   collection of child array types.
-* **Null**: a sequence of all null values, having null logical type
+* **Dictionary-Encoded**: a layout consisting of a sequence of
+  integers (any bit-width) which represent indexes into a dictionary
+  which could be of any type.
+* **Run-End Encoded (REE)**: a nested layout consisting of two child arrays,
+  one representing values, and one representing the logical index where
+  the run of a corresponding value ends.
+* **Null**: a sequence of all null values.
 
 The Arrow columnar memory layout only applies to *data* and not
 *metadata*. Implementations are free to represent metadata in-memory
@@ -178,11 +312,13 @@ large as the array length.
 Validity bitmaps
 ----------------
 
-Any type can have null value slots, whether primitive or nested type.
+Any value in an array may be semantically null, whether primitive or nested
+type.
 
-An array with nulls must have a contiguous memory buffer, known as the
-validity (or "null") bitmap, large enough to have at least 1 bit for
-each array slot.
+All array types, with the exception of union types (more on these later),
+utilize a dedicated memory buffer, known as the validity (or "null") bitmap, to
+encode the nullness or non-nullness of each value slot. The validity bitmap
+must be large enough to have at least 1 bit for each array slot.
 
 Whether any array slot is valid (non-null) is encoded in the respective bits of
 this bitmap. A 1 (set bit) for index ``j`` indicates that the value is not null,
@@ -202,17 +338,19 @@ right-to-left: ::
               0  0  1  0  1  0  1  1
 
 Arrays having a 0 null count may choose to not allocate the validity
-bitmap. Implementations may choose to always allocate one anyway as a
-matter of convenience, but this should be noted when memory is being
-shared.
+bitmap; how this is represented depends on the implementation (for
+example, a C++ implementation may represent such an "absent" validity
+bitmap using a NULL pointer). Implementations may choose to always allocate
+a validity bitmap anyway as a matter of convenience. Consumers of Arrow
+arrays should be ready to handle those two possibilities.
 
-Nested type arrays have their own validity bitmap and null count
-regardless of the null count and valid bits of their child arrays.
+Nested type arrays (except for union types as noted above) have their own
+top-level validity bitmap and null count, regardless of the null count and
+valid bits of their child arrays.
 
-Array slots which are null are not required to have a particular
-value; any "masked" memory can have any value and need not be zeroed,
-though implementations frequently choose to zero memory for null
-values.
+Array slots which are null are not required to have a particular value;
+any "masked" memory can have any value and need not be zeroed, though
+implementations frequently choose to zero memory for null values.
 
 Fixed-size Primitive Layout
 ---------------------------
@@ -242,15 +380,15 @@ Would look like: ::
     * Length: 5, Null count: 1
     * Validity bitmap buffer:
 
-      |Byte 0 (validity bitmap) | Bytes 1-63            |
-      |-------------------------|-----------------------|
-      | 00011101                | 0 (padding)           |
+      | Byte 0 (validity bitmap) | Bytes 1-63            |
+      |--------------------------|-----------------------|
+      | 00011101                 | 0 (padding)           |
 
     * Value Buffer:
 
-      |Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63 |
-      |------------|-------------|-------------|-------------|-------------|-------------|
-      | 1          | unspecified | 2           | 4           | 8           | unspecified |
+      | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63           |
+      |-------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 1           | unspecified | 2           | 4           | 8           | unspecified (padding) |
 
 **Example Layout: Non-null int32 Array**
 
@@ -265,9 +403,9 @@ Would look like: ::
 
     * Value Buffer:
 
-      |Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | bytes 12-15 | bytes 16-19 | Bytes 20-63 |
-      |------------|-------------|-------------|-------------|-------------|-------------|
-      | 1          | 2           | 3           | 4           | 8           | unspecified |
+      | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63           |
+      |-------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 1           | 2           | 3           | 4           | 8           | unspecified (padding) |
 
 or with the bitmap elided: ::
 
@@ -275,9 +413,9 @@ or with the bitmap elided: ::
     * Validity bitmap buffer: Not required
     * Value Buffer:
 
-      |Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | bytes 12-15 | bytes 16-19 | Bytes 20-63 |
-      |------------|-------------|-------------|-------------|-------------|-------------|
-      | 1          | 2           | 3           | 4           | 8           | unspecified |
+      | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | bytes 12-15 | bytes 16-19 | Bytes 20-63           |
+      |-------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 1           | 2           | 3           | 4           | 8           | unspecified (padding) |
 
 Variable-size Binary Layout
 ---------------------------
@@ -286,8 +424,8 @@ Each value in this layout consists of 0 or more bytes. While primitive
 arrays have a single values buffer, variable-size binary have an
 **offsets** buffer and **data** buffer.
 
-The offsets buffer contains `length + 1` signed integers (either
-32-bit or 64-bit, depending on the logical type), which encode the
+The offsets buffer contains ``length + 1`` signed integers (either
+32-bit or 64-bit, depending on the data type), which encode the
 start position of each slot in the data buffer. The length of the
 value in each slot is computed using the difference between the offset
 at that slot's index and the subsequent offset. For example, the
@@ -303,15 +441,104 @@ That is, a null value may occupy a **non-empty** memory space in the data
 buffer. When this is true, the content of the corresponding memory space
 is undefined.
 
-Generally the first value in the offsets array is 0, and the last slot
+Offsets must be monotonically increasing, that is ``offsets[j+1] >= offsets[j]``
+for ``0 <= j < length``, even for null slots. This property ensures the
+location for all values is valid and well defined.
+
+Generally the first slot in the offsets array is 0, and the last slot
 is the length of the values array. When serializing this layout, we
 recommend normalizing the offsets to start at 0.
+
+**Example Layout: ``VarBinary``**
+
+``['joe', null, null, 'mark']``
+
+will be represented as follows: ::
+
+  * Length: 4, Null count: 2
+  * Validity bitmap buffer:
+
+    | Byte 0 (validity bitmap) | Bytes 1-63            |
+    |--------------------------|-----------------------|
+    | 00001001                 | 0 (padding)           |
+
+  * Offsets buffer:
+
+    | Bytes 0-19     | Bytes 20-63           |
+    |----------------|-----------------------|
+    | 0, 3, 3, 3, 7  | unspecified (padding) |
+
+   * Value buffer:
+
+    | Bytes 0-6      | Bytes 7-63            |
+    |----------------|-----------------------|
+    | joemark        | unspecified (padding) |
+
+.. _variable-size-binary-view-layout:
+
+Variable-size Binary View Layout
+--------------------------------
+
+.. versionadded:: Arrow Columnar Format 1.4
+
+Each value in this layout consists of 0 or more bytes. These bytes'
+locations are indicated using a **views** buffer, which may point to one
+of potentially several **data** buffers or may contain the characters
+inline.
+
+The views buffer contains ``length`` view structures with the following layout:
+
+::
+
+    * Short strings, length <= 12
+      | Bytes 0-3  | Bytes 4-15                            |
+      |------------|---------------------------------------|
+      | length     | data (padded with 0)                  |
+
+    * Long strings, length > 12
+      | Bytes 0-3  | Bytes 4-7  | Bytes 8-11 | Bytes 12-15 |
+      |------------|------------|------------|-------------|
+      | length     | prefix     | buf. index | offset      |
+
+In both the long and short string cases, the first four bytes encode the
+length of the string and can be used to determine how the rest of the view
+should be interpreted.
+
+In the short string case the string's bytes are inlined — stored inside the
+view itself, in the twelve bytes which follow the length. Any remaining bytes
+after the string itself are padded with ``0``.
+
+In the long string case, a buffer index indicates which data buffer
+stores the data bytes and an offset indicates where in that buffer the
+data bytes begin. Buffer index 0 refers to the first data buffer, IE
+the first buffer **after** the validity buffer and the views buffer.
+The half-open range ``[offset, offset + length)`` must be entirely contained
+within the indicated buffer. A copy of the first four bytes of the string is
+stored inline in the prefix, after the length. This prefix enables a
+profitable fast path for string comparisons, which are frequently determined
+within the first four bytes.
+
+All integers (length, buffer index, and offset) are signed.
+
+This layout is adapted from TU Munich's `UmbraDB`_.
+
+Note that this layout uses one additional buffer to store the variadic buffer
+lengths in the :ref:`Arrow C data interface <c-data-interface-binary-view-arrays>`.
+
+.. _variable-size-list-layout:
 
 Variable-size List Layout
 -------------------------
 
 List is a nested type which is semantically similar to variable-size
-binary. It is defined by two buffers, a validity bitmap and an offsets
+binary. There are two list layout variations — "list" and "list-view" —
+and each variation can be delimited by either 32-bit or 64-bit offsets
+integers.
+
+List Layout
+~~~~~~~~~~~
+
+The List layout is defined by two buffers, a validity bitmap and an offsets
 buffer, and a child array. The offsets are the same as in the
 variable-size binary case, and both 32-bit and 64-bit signed integer
 offsets are supported options for the offsets. Rather than referencing
@@ -343,18 +570,18 @@ will have the following representation: ::
 
     * Offsets buffer (int32)
 
-      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63 |
-      |------------|-------------|-------------|-------------|-------------|-------------|
-      | 0          | 3           | 3           | 7           | 7           | unspecified |
+      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63           |
+      |------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 0          | 3           | 3           | 7           | 7           | unspecified (padding) |
 
-    * Values array (Int8array):
+    * Values array (Int8Array):
       * Length: 7,  Null count: 0
       * Validity bitmap buffer: Not required
       * Values buffer (int8)
 
-        | Bytes 0-6                    | Bytes 7-63  |
-        |------------------------------|-------------|
-        | 12, -7, 25, 0, -127, 127, 50 | unspecified |
+        | Bytes 0-6                    | Bytes 7-63            |
+        |------------------------------|-----------------------|
+        | 12, -7, 25, 0, -127, 127, 50 | unspecified (padding) |
 
 **Example Layout: ``List<List<Int8>>``**
 
@@ -367,9 +594,9 @@ will be represented as follows: ::
     * Validity bitmap buffer: Not required
     * Offsets buffer (int32)
 
-      | Bytes 0-3  | Bytes 4-7  | Bytes 8-11 | Bytes 12-15 | Bytes 16-63 |
-      |------------|------------|------------|-------------|-------------|
-      | 0          |  2         |  5         |  6          | unspecified |
+      | Bytes 0-3  | Bytes 4-7  | Bytes 8-11 | Bytes 12-15 | Bytes 16-63           |
+      |------------|------------|------------|-------------|-----------------------|
+      | 0          |  2         |  5         |  6          | unspecified (padding) |
 
     * Values array (`List<Int8>`)
       * Length: 6, Null count: 1
@@ -381,17 +608,118 @@ will be represented as follows: ::
 
       * Offsets buffer (int32)
 
-        | Bytes 0-27           | Bytes 28-63 |
-        |----------------------|-------------|
-        | 0, 2, 4, 7, 7, 8, 10 | unspecified |
+        | Bytes 0-27           | Bytes 28-63           |
+        |----------------------|-----------------------|
+        | 0, 2, 4, 7, 7, 8, 10 | unspecified (padding) |
 
       * Values array (Int8):
         * Length: 10, Null count: 0
         * Validity bitmap buffer: Not required
 
-          | Bytes 0-9                     | Bytes 10-63 |
-          |-------------------------------|-------------|
-          | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 | unspecified |
+          | Bytes 0-9                     | Bytes 10-63           |
+          |-------------------------------|-----------------------|
+          | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 | unspecified (padding) |
+
+.. _listview-layout:
+
+ListView Layout
+~~~~~~~~~~~~~~~
+
+.. versionadded:: Arrow Columnar Format 1.4
+
+The ListView layout is defined by three buffers: a validity bitmap, an offsets
+buffer, and an additional sizes buffer. Sizes and offsets have the identical bit
+width and both 32-bit and 64-bit signed integer options are supported.
+
+As in the List layout, the offsets encode the start position of each slot in the
+child array. In contrast to the List layout, list lengths are stored explicitly
+in the sizes buffer instead of inferred. This allows offsets to be out of order.
+Elements of the child array do not have to be stored in the same order they
+logically appear in the list elements of the parent array.
+
+Every list-view value, including null values, has to guarantee the following
+invariants: ::
+
+    0 <= offsets[i] <= length of the child array
+    0 <= offsets[i] + size[i] <= length of the child array
+
+A list-view type is specified like ``ListView<T>``, where ``T`` is any type
+(primitive or nested). In these examples we use 32-bit offsets and sizes where
+the 64-bit version would be denoted by ``LargeListView<T>``.
+
+**Example Layout: ``ListView<Int8>`` Array**
+
+We illustrate an example of ``ListView<Int8>`` with length 4 having values::
+
+    [[12, -7, 25], null, [0, -127, 127, 50], []]
+
+It may have the following representation: ::
+
+    * Length: 4, Null count: 1
+    * Validity bitmap buffer:
+
+      | Byte 0 (validity bitmap) | Bytes 1-63            |
+      |--------------------------|-----------------------|
+      | 00001101                 | 0 (padding)           |
+
+    * Offsets buffer (int32)
+
+      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-63           |
+      |------------|-------------|-------------|-------------|-----------------------|
+      | 0          | 7           | 3           | 0           | unspecified (padding) |
+
+    * Sizes buffer (int32)
+
+      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-63           |
+      |------------|-------------|-------------|-------------|-----------------------|
+      | 3          | 0           | 4           | 0           | unspecified (padding) |
+
+    * Values array (Int8Array):
+      * Length: 7,  Null count: 0
+      * Validity bitmap buffer: Not required
+      * Values buffer (int8)
+
+        | Bytes 0-6                    | Bytes 7-63            |
+        |------------------------------|-----------------------|
+        | 12, -7, 25, 0, -127, 127, 50 | unspecified (padding) |
+
+**Example Layout: ``ListView<Int8>`` Array**
+
+We continue with the ``ListView<Int8>`` type, but this instance illustrates out
+of order offsets and sharing of child array values. It is an array with length 5
+having logical values::
+
+    [[12, -7, 25], null, [0, -127, 127, 50], [], [50, 12]]
+
+It may have the following representation: ::
+
+    * Length: 5, Null count: 1
+    * Validity bitmap buffer:
+
+      | Byte 0 (validity bitmap) | Bytes 1-63            |
+      |--------------------------|-----------------------|
+      | 00011101                 | 0 (padding)           |
+
+    * Offsets buffer (int32)
+
+      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63           |
+      |------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 4          | 7           | 0           | 0           | 3           | unspecified (padding) |
+
+    * Sizes buffer (int32)
+
+      | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-63           |
+      |------------|-------------|-------------|-------------|-------------|-----------------------|
+      | 3          | 0           | 4           | 0           | 2           | unspecified (padding) |
+
+    * Values array (Int8Array):
+      * Length: 7,  Null count: 0
+      * Validity bitmap buffer: Not required
+      * Values buffer (int8)
+
+        | Bytes 0-6                    | Bytes 7-63            |
+        |------------------------------|-----------------------|
+        | 0, -127, 127, 50, 12, -7, 25 | unspecified (padding) |
 
 Fixed-Size List Layout
 ----------------------
@@ -442,13 +770,10 @@ types (which can all be distinct), called its fields. Each field must
 have a UTF8-encoded name, and these field names are part of the type
 metadata.
 
-A struct array does not have any additional allocated physical storage
-for its values.  A struct array must still have an allocated validity
-bitmap, if it has one or more null values.
-
 Physically, a struct array has one child array for each field. The
 child arrays are independent and need not be adjacent to each other in
-memory.
+memory. A struct array also has a validity bitmap to encode top-level
+validity information.
 
 For example, the struct (field names shown here as strings for illustration
 purposes)::
@@ -464,39 +789,37 @@ type.
 
 **Example Layout: ``Struct<VarBinary, Int32>``**
 
-The layout for ``[{'joe', 1}, {null, 2}, null, {'mark', 4}]`` would be: ::
+The layout for ``[{'joe', 1}, {null, 2}, null, {'mark', 4}]``, having
+child arrays ``['joe', null, 'alice', 'mark']`` and ``[1, 2, null, 4]``
+would be: ::
 
     * Length: 4, Null count: 1
     * Validity bitmap buffer:
 
-      |Byte 0 (validity bitmap) | Bytes 1-63            |
-      |-------------------------|-----------------------|
-      | 00001011                | 0 (padding)           |
+      | Byte 0 (validity bitmap) | Bytes 1-63            |
+      |--------------------------|-----------------------|
+      | 00001011                 | 0 (padding)           |
 
     * Children arrays:
       * field-0 array (`VarBinary`):
-        * Length: 4, Null count: 2
+        * Length: 4, Null count: 1
         * Validity bitmap buffer:
 
           | Byte 0 (validity bitmap) | Bytes 1-63            |
           |--------------------------|-----------------------|
-          | 00001001                 | 0 (padding)           |
+          | 00001101                 | 0 (padding)           |
 
         * Offsets buffer:
 
-          | Bytes 0-19     |
-          |----------------|
-          | 0, 3, 3, 3, 7  |
+          | Bytes 0-19     | Bytes 20-63           |
+          |----------------|-----------------------|
+          | 0, 3, 3, 8, 12 | unspecified (padding) |
 
-         * Values array:
-            * Length: 7, Null count: 0
-            * Validity bitmap buffer: Not required
+         * Value buffer:
 
-            * Value buffer:
-
-              | Bytes 0-6      |
-              |----------------|
-              | joemark        |
+          | Bytes 0-11     | Bytes 12-63           |
+          |----------------|-----------------------|
+          | joealicemark   | unspecified (padding) |
 
       * field-1 array (int32 array):
         * Length: 4, Null count: 1
@@ -508,23 +831,28 @@ The layout for ``[{'joe', 1}, {null, 2}, null, {'mark', 4}]`` would be: ::
 
         * Value Buffer:
 
-          |Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-63 |
-          |------------|-------------|-------------|-------------|-------------|
-          | 1          | 2           | unspecified | 4           | unspecified |
+          | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-63           |
+          |-------------|-------------|-------------|-------------|-----------------------|
+          | 1           | 2           | unspecified | 4           | unspecified (padding) |
 
-While a struct does not have physical storage for each of its semantic
-slots (i.e. each scalar C-like struct), an entire struct slot can be
-set to null via the validity bitmap. Any of the child field arrays can
-have null values according to their respective independent validity
-bitmaps. This implies that for a particular struct slot the validity
-bitmap for the struct array might indicate a null slot when one or
-more of its child arrays has a non-null value in their corresponding
-slot.  When reading the struct array the parent validity bitmap takes
-priority.  This is illustrated in the example above, the child arrays
-have valid entries for the null struct but are 'hidden' from the
-consumer by the parent array's validity bitmap.  However, when treated
-independently corresponding values of the children array will be
-non-null.
+Struct Validity
+~~~~~~~~~~~~~~~
+
+A struct array has its own validity bitmap that is independent of its
+child arrays' validity bitmaps. The validity bitmap for the struct
+array might indicate a null when one or more of its child arrays has
+a non-null value in its corresponding slot; or conversely, a child
+array might indicate a null in its validity bitmap while the struct array's
+validity bitmap shows a non-null value.
+
+Therefore, to know whether a particular child entry is valid, one must
+take the logical AND of the corresponding bits in the two validity bitmaps
+(the struct array's and the child array's).
+
+This is illustrated in the example above, one of the child arrays has a
+valid entry ``'alice'`` for the null struct but it is "hidden" by the
+struct array's validity bitmap. However, when treated independently,
+corresponding entries of the children array will be non-null.
 
 Union Layout
 ------------
@@ -532,6 +860,10 @@ Union Layout
 A union is defined by an ordered sequence of types; each slot in the
 union can have a value chosen from these types. The types are named
 like a struct's fields, and the names are part of the type metadata.
+
+Unlike other data types, unions do not have their own validity bitmap. Instead,
+the nullness of each slot is determined exclusively by the child arrays which
+are composed to create the union.
 
 We define two distinct union types, "dense" and "sparse", that are
 optimized for different use cases.
@@ -547,61 +879,53 @@ each value. Its physical layout is as follows:
   union has a corresponding type id whose values are found in this
   buffer. A union with more than 127 possible types can be modeled as
   a union of unions.
-* Offsets buffer: A buffer of signed int32 values indicating the
+* Offsets buffer: A buffer of signed Int32 values indicating the
   relative offset into the respective child array for the type in a
   given slot. The respective offsets for each child value array must
   be in order / increasing.
 
-Critically, the dense union allows for minimal overhead in the ubiquitous
-union-of-structs with non-overlapping-fields use case (``Union<s1: Struct1, s2:
-Struct2, s3: Struct3, ...>``)
+**Example Layout: ``DenseUnion<f: Float32, i: Int32>``**
 
-**Example Layout: Dense union**
+For the union array: ::
 
-An example layout for logical union of: ``Union<f: float, i: int32>``
-having the values: ``[{f=1.2}, null, {f=3.4}, {i=5}]``
+    [{f=1.2}, null, {f=3.4}, {i=5}]
 
-::
+will have the following layout: ::
 
-    * Length: 4, Null count: 1
-    * Validity bitmap buffer:
-      |Byte 0 (validity bitmap) | Bytes 1-63            |
-      |-------------------------|-----------------------|
-      |00001101                 | 0 (padding)           |
-
+    * Length: 4, Null count: 0
     * Types buffer:
 
-      |Byte 0   | Byte 1      | Byte 2   | Byte 3   | Bytes 4-63  |
-      |---------|-------------|----------|----------|-------------|
-      | 0       | unspecified | 0        | 1        | unspecified |
+      | Byte 0   | Byte 1      | Byte 2   | Byte 3   | Bytes 4-63            |
+      |----------|-------------|----------|----------|-----------------------|
+      | 0        | 0           | 0        | 1        | unspecified (padding) |
 
     * Offset buffer:
 
-      |Bytes 0-3 | Bytes 4-7   | Bytes 8-11 | Bytes 12-15 | Bytes 16-63 |
-      |----------|-------------|------------|-------------|-------------|
-      | 0        | unspecified | 1          | 0           | unspecified |
+      | Bytes 0-3 | Bytes 4-7   | Bytes 8-11 | Bytes 12-15 | Bytes 16-63           |
+      |-----------|-------------|------------|-------------|-----------------------|
+      | 0         | 1           | 2          | 0           | unspecified (padding) |
 
     * Children arrays:
-      * Field-0 array (f: float):
-        * Length: 2, nulls: 0
+      * Field-0 array (f: Float32):
+        * Length: 3, Null count: 1
+        * Validity bitmap buffer: 00000101
+
+        * Value Buffer:
+
+          | Bytes 0-11     | Bytes 12-63           |
+          |----------------|-----------------------|
+          | 1.2, null, 3.4 | unspecified (padding) |
+
+
+      * Field-1 array (i: Int32):
+        * Length: 1, Null count: 0
         * Validity bitmap buffer: Not required
 
         * Value Buffer:
 
-          | Bytes 0-7 | Bytes 8-63  |
-          |-----------|-------------|
-          | 1.2, 3.4  | unspecified |
-
-
-      * Field-1 array (i: int32):
-        * Length: 1, nulls: 0
-        * Validity bitmap buffer: Not required
-
-        * Value Buffer:
-
-          | Bytes 0-3 | Bytes 4-63  |
-          |-----------|-------------|
-          | 5         | unspecified |
+          | Bytes 0-3 | Bytes 4-63            |
+          |-----------|-----------------------|
+          | 5         | unspecified (padding) |
 
 Sparse Union
 ~~~~~~~~~~~~
@@ -617,17 +941,15 @@ use cases:
 * A sparse union is more amenable to vectorized expression evaluation in some use cases.
 * Equal-length arrays can be interpreted as a union by only defining the types array.
 
-**Example layout: ``SparseUnion<u0: Int32, u1: Float, u2: VarBinary>``**
+**Example layout: ``SparseUnion<i: Int32, f: Float32, s: VarBinary>``**
 
 For the union array: ::
 
-    [{u0=5}, {u1=1.2}, {u2='joe'}, {u1=3.4}, {u0=4}, {u2='mark'}]
+    [{i=5}, {f=1.2}, {s='joe'}, {f=3.4}, {i=4}, {s='mark'}]
 
 will have the following layout: ::
 
     * Length: 6, Null count: 0
-    * Validity bitmap buffer: Not required
-
     * Types buffer:
 
      | Byte 0     | Byte 1      | Byte 2      | Byte 3      | Byte 4      | Byte 5       | Bytes  6-63           |
@@ -636,35 +958,35 @@ will have the following layout: ::
 
     * Children arrays:
 
-      * u0 (Int32):
+      * i (Int32):
         * Length: 6, Null count: 4
         * Validity bitmap buffer:
 
-          |Byte 0 (validity bitmap) | Bytes 1-63            |
-          |-------------------------|-----------------------|
-          |00010001                 | 0 (padding)           |
+          | Byte 0 (validity bitmap) | Bytes 1-63            |
+          |--------------------------|-----------------------|
+          | 00010001                 | 0 (padding)           |
 
         * Value buffer:
 
-          |Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23  | Bytes 24-63           |
-          |------------|-------------|-------------|-------------|-------------|--------------|-----------------------|
-          | 5          | unspecified | unspecified | unspecified | 4           |  unspecified | unspecified (padding) |
-
-      * u1 (float):
-        * Length: 6, Null count: 4
-        * Validity bitmap buffer:
-
-          |Byte 0 (validity bitmap) | Bytes 1-63            |
-          |-------------------------|-----------------------|
-          | 00001010                | 0 (padding)           |
-
-        * Value buffer:
-
-          |Bytes 0-3    | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23  | Bytes 24-63           |
+          | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23  | Bytes 24-63           |
           |-------------|-------------|-------------|-------------|-------------|--------------|-----------------------|
-          | unspecified |  1.2        | unspecified | 3.4         | unspecified |  unspecified | unspecified (padding) |
+          | 5           | unspecified | unspecified | unspecified | 4           |  unspecified | unspecified (padding) |
 
-      * u2 (`VarBinary`)
+      * f (Float32):
+        * Length: 6, Null count: 4
+        * Validity bitmap buffer:
+
+          | Byte 0 (validity bitmap) | Bytes 1-63            |
+          |--------------------------|-----------------------|
+          | 00001010                 | 0 (padding)           |
+
+        * Value buffer:
+
+          | Bytes 0-3    | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23 | Bytes 24-63           |
+          |--------------|-------------|-------------|-------------|-------------|-------------|-----------------------|
+          | unspecified  | 1.2         | unspecified | 3.4         | unspecified | unspecified | unspecified (padding) |
+
+      * s (`VarBinary`)
         * Length: 6, Null count: 4
         * Validity bitmap buffer:
 
@@ -672,25 +994,21 @@ will have the following layout: ::
           |--------------------------|-----------------------|
           | 00100100                 | 0 (padding)           |
 
-        * Offsets buffer (int32)
+        * Offsets buffer (Int32)
 
-          | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23 | Bytes 24-27 | Bytes 28-63 |
-          |------------|-------------|-------------|-------------|-------------|-------------|-------------|-------------|
-          | 0          | 0           | 0           | 3           | 3           | 3           | 7           | unspecified |
+          | Bytes 0-3  | Bytes 4-7   | Bytes 8-11  | Bytes 12-15 | Bytes 16-19 | Bytes 20-23 | Bytes 24-27 | Bytes 28-63            |
+          |------------|-------------|-------------|-------------|-------------|-------------|-------------|------------------------|
+          | 0          | 0           | 0           | 3           | 3           | 3           | 7           | unspecified (padding)  |
 
-        * Values array (VarBinary):
-          * Length: 7,  Null count: 0
-          * Validity bitmap buffer: Not required
+        * Values buffer:
 
-            | Bytes 0-6  | Bytes 7-63            |
-            |------------|-----------------------|
-            | joemark    | unspecified (padding) |
+          | Bytes 0-6  | Bytes 7-63            |
+          |------------|-----------------------|
+          | joemark    | unspecified (padding) |
 
-Similar to structs, a particular child array may have a non-null slot
-even if the validity bitmap of the parent union array indicates the
-slot is null.  Additionally, a child array may have a non-null slot
-even if the types array indicates that a slot contains a different
-type at the index.
+Only the slot in the array corresponding to the type index is considered. All
+"unselected" values are ignored and could be any semantically correct array
+value.
 
 Null Layout
 -----------
@@ -698,6 +1016,8 @@ Null Layout
 We provide a simplified memory-efficient layout for the Null data type
 where all values are null. In this case no memory buffers are
 allocated.
+
+.. _dictionary-encoded-layout:
 
 Dictionary-encoded Layout
 -------------------------
@@ -707,13 +1027,12 @@ values by integers referencing a **dictionary** usually consisting of
 unique values. It can be effective when you have data with many
 repeated values.
 
-Any array can be dictionary-encoded. The dictionary is stored as an
-optional property of an array. When a field is dictionary encoded, the
-values are represented by an array of signed integers representing the
-index of the value in the dictionary. The memory layout for a
-dictionary-encoded array is the same as that of a primitive signed
-integer layout. The dictionary is handled as a separate columnar array
-with its own respective layout.
+Any array can be dictionary-encoded. The dictionary is stored as an optional
+property of an array. When a field is dictionary encoded, the values are
+represented by an array of non-negative integers representing the index of the
+value in the dictionary. The memory layout for a dictionary-encoded array is
+the same as that of a primitive integer layout. The dictionary is handled as a
+separate columnar array with its own respective layout.
 
 As an example, you could have the following data: ::
 
@@ -749,8 +1068,97 @@ nulls:
 The null count of such arrays is dictated only by the validity bitmap
 of its indices, irrespective of any null values in the dictionary.
 
+Since unsigned integers can be more difficult to work with in some cases
+(e.g. in the JVM), we recommend preferring signed integers over unsigned
+integers for representing dictionary indices. Additionally, we recommend
+avoiding using 64-bit unsigned integer indices unless they are required by an
+application.
+
 We discuss dictionary encoding as it relates to serialization further
 below.
+
+.. _run-end-encoded-layout:
+
+Run-End Encoded Layout
+----------------------
+
+.. versionadded:: Arrow Columnar Format 1.3
+
+Run-end encoding (REE) is a variation of run-length encoding (RLE). These
+encodings are well-suited for representing data containing sequences of the
+same value, called runs. In run-end encoding, each run is represented as a
+value and an integer giving the index in the array where the run ends.
+
+Any array can be run-end encoded. A run-end encoded array has no buffers
+by itself, but has two child arrays. The first child array, called the run ends array,
+holds either 16, 32, or 64-bit signed integers. The actual values of each run
+are held in the second child array.
+For the purposes of determining field names and schemas, these child arrays
+are prescribed the standard names of **run_ends** and **values** respectively.
+
+The values in the first child array represent the accumulated length of all runs
+from the first to the current one, i.e. the logical index where the
+current run ends. This allows relatively efficient random access from a logical
+index using binary search. The length of an individual run can be determined by
+subtracting two adjacent values. (Contrast this with run-length encoding, in
+which the lengths of the runs are represented directly, and in which random
+access is less efficient.)
+
+.. note::
+   Because the ``run_ends`` child array cannot have nulls, it's reasonable
+   to consider why the ``run_ends`` are a child array instead of just a
+   buffer, like the offsets for a :ref:`variable-size-list-layout`. This
+   layout was considered, but it was decided to use the child arrays.
+
+   Child arrays allow us to keep the "logical length" (the decoded length)
+   associated with the parent array and the "physical length" (the number
+   of run ends) associated with the child arrays.  If ``run_ends`` was a
+   buffer in the parent array then the size of the buffer would be unrelated
+   to the length of the array and this would be confusing.
+
+
+A run must have a length of at least 1. This means the values in the
+run ends array all are positive and in strictly ascending order. A run end cannot be
+null.
+
+The REE parent has no validity bitmap, and it's null count field should always be 0.
+Null values are encoded as runs with the value null.
+
+As an example, you could have the following data: ::
+
+    type: Float32
+    [1.0, 1.0, 1.0, 1.0, null, null, 2.0]
+
+In Run-end-encoded form, this could appear as:
+
+::
+
+    * Length: 7, Null count: 0
+    * Child Arrays:
+
+      * run_ends (Int32):
+        * Length: 3, Null count: 0 (Run Ends cannot be null)
+        * Validity bitmap buffer: Not required (if it exists, it should be all 1s)
+        * Values buffer
+
+          | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-63           |
+          |-------------|-------------|-------------|-----------------------|
+          | 4           | 6           | 7           | unspecified (padding) |
+
+      * values (Float32):
+        * Length: 3, Null count: 1
+        * Validity bitmap buffer:
+
+          | Byte 0 (validity bitmap) | Bytes 1-63            |
+          |--------------------------|-----------------------|
+          | 00000101                 | 0 (padding)           |
+
+        * Values buffer
+
+          | Bytes 0-3   | Bytes 4-7   | Bytes 8-11  | Bytes 12-63           |
+          |-------------|-------------|-------------|-----------------------|
+          | 1.0         | unspecified | 2.0         | unspecified (padding) |
+
 
 Buffer Listing for Each Layout
 ------------------------------
@@ -759,29 +1167,23 @@ For the avoidance of ambiguity, we provide listing the order and type
 of memory buffers for each layout.
 
 .. csv-table:: Buffer Layouts
-   :header: "Layout Type", "Buffer 0", "Buffer 1", "Buffer 2"
-   :widths: 30, 20, 20, 20
+   :header: "Layout Type", "Buffer 0", "Buffer 1", "Buffer 2", "Variadic Buffers"
+   :widths: 30, 20, 20, 20, 20
 
-   "Primitive",validity,data,
-   "Variable Binary",validity,offsets,data
-   "List",validity,offsets,
-   "Fixed-size List",validity,,
-   "Struct",validity,,
-   "Sparse Union",validity,type ids,
-   "Dense Union",validity,type ids,offsets
-   "Null",,,
-   "Dictionary-encoded",validity,data (indices),
+   "Primitive",validity,data,,
+   "Variable Binary",validity,offsets,data,
+   "Variable Binary View",validity,views,,data
+   "List",validity,offsets,,
+   "List View",validity,offsets,sizes,
+   "Fixed-size List",validity,,,
+   "Struct",validity,,,
+   "Sparse Union",type ids,,,
+   "Dense Union",type ids,offsets,,
+   "Null",,,,
+   "Dictionary-encoded",validity,data (indices),,
+   "Run-end encoded",,,,
 
-Logical Types
-=============
-
-The `Schema.fbs`_ defines built-in logical types supported by the
-Arrow columnar format. Each logical type uses one of the above
-physical layouts. Nested logical types may have different physical
-layouts depending on the particular realization of the type.
-
-We do not go into detail about the logical types definitions in this
-document as we consider `Schema.fbs`_ to be authoritative.
+.. _format-ipc:
 
 Serialization and Interprocess Communication (IPC)
 ==================================================
@@ -803,10 +1205,12 @@ of these types:
 * RecordBatch
 * DictionaryBatch
 
-We specify a so-called *encapsulated IPC message** format which
+We specify a so-called *encapsulated IPC message* format which
 includes a serialized Flatbuffer type along with an optional message
 body. We define this message format before describing how to serialize
 each constituent IPC message type.
+
+.. _ipc-message-format:
 
 Encapsulated message format
 ---------------------------
@@ -858,17 +1262,16 @@ Schema message
 --------------
 
 The Flatbuffers files `Schema.fbs`_ contains the definitions for all
-built-in logical data types and the ``Schema`` metadata type which
-represents the schema of a given record batch. A schema consists of of
-an ordered sequence of fields, each having a name and type. A
-serialized ``Schema`` does not contain any data buffers, only type
-metadata.
+built-in data types and the ``Schema`` metadata type which represents
+the schema of a given record batch. A schema consists of an ordered
+sequence of fields, each having a name and type. A serialized ``Schema``
+does not contain any data buffers, only type metadata.
 
 The ``Field`` Flatbuffers type contains the metadata for a single
 array. This includes:
 
 * The field's name
-* The field's logical type
+* The field's data type
 * Whether the field is semantically nullable. While this has no
   bearing on the array's physical layout, many systems distinguish
   nullable and non-nullable fields and we want to allow them to
@@ -879,9 +1282,11 @@ array. This includes:
   to allow matching a subsequent dictionary IPC message with the
   appropriate field.
 
-We additionally provide provide both schema-level and field-level
+We additionally provide both schema-level and field-level
 ``custom_metadata`` attributes allowing for systems to insert their
 own application defined metadata to customize behavior.
+
+.. _ipc-recordbatch-message:
 
 RecordBatch message
 -------------------
@@ -947,6 +1352,102 @@ bytes. Since this metadata can be used to communicate in-memory pointer
 addresses between libraries, it is recommended to set ``size`` to the actual
 memory size rather than the padded size.
 
+.. _variadic-buffers:
+
+Variadic buffers
+----------------
+
+.. versionadded:: Arrow Columnar Format 1.4
+
+Some types such as Utf8View are represented using a variable number of buffers.
+For each such Field in the pre-ordered flattened logical schema, there will be
+an entry in ``variadicBufferCounts`` to indicate the number of variadic buffers
+which belong to that Field in the current RecordBatch.
+
+For example, consider the schema ::
+
+    col1: Struct<a: Int32, b: BinaryView, c: Float64>
+    col2: Utf8View
+
+This has two fields with variadic buffers, so ``variadicBufferCounts`` will
+have two entries in each RecordBatch. For a RecordBatch of this schema with
+``variadicBufferCounts = [3, 2]``, the flattened buffers would be::
+
+    buffer 0:  col1    validity
+    buffer 1:  col1.a  validity
+    buffer 2:  col1.a  values
+    buffer 3:  col1.b  validity
+    buffer 4:  col1.b  views
+    buffer 5:  col1.b  data
+    buffer 6:  col1.b  data
+    buffer 7:  col1.b  data
+    buffer 8:  col1.c  validity
+    buffer 9:  col1.c  values
+    buffer 10: col2    validity
+    buffer 11: col2    views
+    buffer 12: col2    data
+    buffer 13: col2    data
+
+
+Compression
+-----------
+
+There are three different options for compression of record batch
+body buffers: Buffers can be uncompressed, buffers can be
+compressed with the ``lz4`` compression codec, or buffers can be
+compressed with the ``zstd`` compression codec. Buffers in the
+flat sequence of a message body must be compressed separately using
+the same codec. Specific buffers in the sequence of compressed
+buffers may be left uncompressed (for example if compressing those
+specific buffers would not appreciably reduce their size).
+
+The compression type used is defined in the ``data header``
+of the :ref:`ipc-recordbatch-message` in the optional ``compression``
+field with the default being uncompressed.
+
+.. note::
+
+   ``lz4`` compression codec means the
+   `LZ4 frame format <https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md>`_
+   and should not to be confused with
+   `"raw" (also called "block") format <https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md>`_.
+
+The difference between compressed and uncompressed buffers in the
+serialized form is as follows:
+
+* If the buffers in the :ref:`ipc-recordbatch-message` are **compressed**
+
+  - the ``data header`` includes the length and memory offset
+    of each **compressed buffer** in the record batch's body together
+    with the compression type
+
+  - the ``body`` includes a flat sequence of **compressed buffers**
+    together with the **length of the uncompressed buffer** as a 64-bit
+    little-endian signed integer stored in the first 8 bytes of each
+    buffer in the sequence. This uncompressed length can be set to ``-1`` to indicate
+    that that specific buffer is left uncompressed.
+
+* If the buffers in the :ref:`ipc-recordbatch-message` are **uncompressed**
+
+  - the ``data header`` includes the length and memory offset
+    of each **uncompressed buffer** in the record batch's body
+
+  - the ``body`` includes a flat sequence of **uncompressed buffers**.
+
+.. note::
+
+   Some Arrow implementations lack support for producing and consuming
+   IPC data with compressed buffers using one or either of the codecs
+   listed above. See :doc:`../status` for details.
+
+   Some applications might apply compression in the protocol they use
+   to store or transport Arrow IPC data. (For example, an HTTP server
+   might serve gzip-compressed Arrow IPC streams.) Applications that
+   already use compression in their storage or transport protocols
+   should avoid using buffer compression. Double compression typically
+   worsens performance and does not substantially improve compression
+   ratios.
+
 Byte Order (`Endianness`_)
 ---------------------------
 
@@ -998,19 +1499,21 @@ message flatbuffer is read, you can then read the message body.
 
 The stream writer can signal end-of-stream (EOS) either by writing 8 bytes
 containing the 4-byte continuation indicator (``0xFFFFFFFF``) followed by 0
-metadata length (``0x00000000``) or closing the stream interface.
+metadata length (``0x00000000``) or closing the stream interface. We
+recommend the ".arrows" file extension for the streaming format although
+in many cases these streams will not ever be stored as files.
 
 IPC File Format
 ---------------
 
-We define a "file format" supporting random access that is build with
-the stream format. The file starts and ends with a magic string
-``ARROW1`` (plus padding). What follows in the file is identical to
-the stream format. At the end of the file, we write a *footer*
-containing a redundant copy of the schema (which is a part of the
-streaming format) plus memory offsets and sizes for each of the data
-blocks in the file. This enables random access any record batch in the
-file. See ``File.fbs`` for the precise details of the file footer.
+We define a "file format" supporting random access that is an extension of
+the stream format. The file starts and ends with a magic string ``ARROW1``
+(plus padding). What follows in the file is identical to the stream format.
+At the end of the file, we write a *footer* containing a redundant copy of
+the schema (which is a part of the streaming format) plus memory offsets and
+sizes for each of the data blocks in the file. This enables random access to
+any record batch in the file. See `File.fbs`_ for the precise details of the
+file footer.
 
 Schematically we have: ::
 
@@ -1024,10 +1527,15 @@ Schematically we have: ::
 In the file format, there is no requirement that dictionary keys
 should be defined in a ``DictionaryBatch`` before they are used in a
 ``RecordBatch``, as long as the keys are defined somewhere in the
-file. Further more, it is invalid to have more then one **non-delta**
+file. Further more, it is invalid to have more than one **non-delta**
 dictionary batch per dictionary ID (i.e. dictionary replacement is not
-supported).  Delta dictionaries are applied in the order they appear in 
-the file footer.
+supported). Delta dictionaries are applied in the order they appear in
+the file footer. We recommend the ".arrow" extension for files created with
+this format. Note that files created with this format are sometimes called
+"Feather V2" or with the ".feather" extension, the name and the extension
+derived from "Feather (V1)", which was a proof of concept early in
+the Arrow project for language-agnostic fast data frame storage for
+Python (pandas) and R.
 
 Dictionary Messages
 -------------------
@@ -1047,7 +1555,7 @@ the dictionaries can be properly interpreted: ::
 
 The dictionary ``id`` in the message metadata can be referenced one or more times
 in the schema, so that dictionaries can even be used for multiple fields. See
-the :doc:`Layout` document for more about the semantics of
+the :ref:`dictionary-encoded-layout` section for more about the semantics of
 dictionary-encoded data.
 
 The dictionary ``isDelta`` flag allows existing dictionaries to be
@@ -1111,6 +1619,7 @@ example as above, an alternate encoding could be: ::
     0
     EOS
 
+.. _format_metadata:
 
 Custom Application Metadata
 ---------------------------
@@ -1145,13 +1654,18 @@ structure. These extension keys are:
 * ``'ARROW:extension:metadata'`` for a serialized representation
   of the ``ExtensionType`` necessary to reconstruct the custom type
 
+.. note::
+   Extension names beginning with ``arrow.`` are reserved for
+   :ref:`canonical extension types <format_canonical_extensions>`,
+   they should not be used for third-party extension types.
+
 This extension metadata can annotate any of the built-in Arrow logical
-types. The intent is that an implementation that does not support an
-extension type can still handle the underlying data. For example a
-16-byte UUID value could be embedded in ``FixedSizeBinary(16)``, and
-implementations that do not have this extension type can still work
-with the underlying binary values and pass along the
-``custom_metadata`` in subsequent Arrow protocol messages.
+types. For example, Arrow specifies a canonical extension type that
+represents a UUID as a ``FixedSizeBinary(16)``. Arrow implementations are
+not required to support canonical extensions, so an implementation that
+does not support this UUID type will simply interpret it as a
+``FixedSizeBinary(16)`` and pass along the ``custom_metadata`` in
+subsequent Arrow protocol messages.
 
 Extension types may or may not use the
 ``'ARROW:extension:metadata'`` field. Let's consider some example
@@ -1168,6 +1682,10 @@ extension types:
   metadata indicating the market trading calendar the data corresponds
   to
 
+.. seealso::
+   :ref:`format_canonical_extensions`
+
+
 Implementation guidelines
 =========================
 
@@ -1175,8 +1693,8 @@ An execution engine (or framework, or UDF executor, or storage engine,
 etc) can implement only a subset of the Arrow spec and/or extend it
 given the following constraints:
 
-Implementing a subset the spec
-------------------------------
+Implementing a subset of the spec
+---------------------------------
 
 * **If only producing (and not consuming) arrow vectors**: Any subset
   of the vector spec and the corresponding metadata can be implemented.
@@ -1196,17 +1714,14 @@ never exposed. Before sending data to another system expecting Arrow
 data, these custom vectors should be converted to a type that exist in
 the Arrow spec.
 
-References
-----------
-* Apache Drill Documentation - `Value Vectors`_
-
 .. _Flatbuffers: http://github.com/google/flatbuffers
-.. _Flatbuffers protocol definition files: https://github.com/apache/arrow/tree/master/format
-.. _Schema.fbs: https://github.com/apache/arrow/blob/master/format/Schema.fbs
-.. _Message.fbs: https://github.com/apache/arrow/blob/master/format/Message.fbs
+.. _Flatbuffers protocol definition files: https://github.com/apache/arrow/tree/main/format
+.. _Schema.fbs: https://github.com/apache/arrow/blob/main/format/Schema.fbs
+.. _Message.fbs: https://github.com/apache/arrow/blob/main/format/Message.fbs
+.. _File.fbs: https://github.com/apache/arrow/blob/main/format/File.fbs
 .. _least-significant bit (LSB) numbering: https://en.wikipedia.org/wiki/Bit_numbering
-.. _Intel performance guide: https://software.intel.com/en-us/articles/practical-intel-avx-optimization-on-2nd-generation-intel-core-processors
+.. _Intel performance guide: https://web.archive.org/web/20151101074635/https://software.intel.com/en-us/articles/practical-intel-avx-optimization-on-2nd-generation-intel-core-processors
 .. _Endianness: https://en.wikipedia.org/wiki/Endianness
-.. _SIMD: https://software.intel.com/en-us/cpp-compiler-developer-guide-and-reference-introduction-to-the-simd-data-layout-templates
-.. _Parquet: https://parquet.apache.org/documentation/latest/
-.. _Value Vectors: https://drill.apache.org/docs/value-vectors/
+.. _SIMD: https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/simd-data-layout-templates.html
+.. _Parquet: https://parquet.apache.org/docs/
+.. _UmbraDB: https://db.in.tum.de/~freitag/papers/p29-neumann-cidr20.pdf

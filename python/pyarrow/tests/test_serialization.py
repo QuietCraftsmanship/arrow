@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import division
 
 import pytest
 
@@ -38,18 +39,6 @@ except ImportError:
     # Blacklist the module in case `import torch` is costly before
     # failing (ARROW-2071)
     sys.modules['torch'] = None
-
-try:
-    from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
-except ImportError:
-    coo_matrix = None
-    csr_matrix = None
-    csc_matrix = None
-
-try:
-    import sparse
-except ImportError:
-    sparse = None
 
 
 def assert_equal(obj1, obj2):
@@ -82,6 +71,12 @@ def assert_equal(obj1, obj2):
                                                                   .format(
                                                                       obj1,
                                                                       obj2))
+        try:
+            # Workaround to make comparison of OrderedDicts work on Python 2.7
+            if obj1 == obj2:
+                return
+        except Exception:
+            pass
         if obj1.__dict__ == {}:
             print("WARNING: Empty dict in ", obj1)
         for key in obj1.__dict__.keys():
@@ -116,15 +111,6 @@ def assert_equal(obj1, obj2):
         assert obj1.equals(obj2)
     elif isinstance(obj1, pa.Tensor) and isinstance(obj2, pa.Tensor):
         assert obj1.equals(obj2)
-    elif isinstance(obj1, pa.SparseCOOTensor) and \
-            isinstance(obj2, pa.SparseCOOTensor):
-        assert obj1.equals(obj2)
-    elif isinstance(obj1, pa.SparseCSRMatrix) and \
-            isinstance(obj2, pa.SparseCSRMatrix):
-        assert obj1.equals(obj2)
-    elif isinstance(obj1, pa.SparseCSCMatrix) and \
-            isinstance(obj2, pa.SparseCSCMatrix):
-        assert obj1.equals(obj2)
     elif isinstance(obj1, pa.RecordBatch) and isinstance(obj2, pa.RecordBatch):
         assert obj1.equals(obj2)
     elif isinstance(obj1, pa.Table) and isinstance(obj2, pa.Table):
@@ -137,13 +123,13 @@ def assert_equal(obj1, obj2):
 PRIMITIVE_OBJECTS = [
     0, 0.0, 0.9, 1 << 62, 1 << 999,
     [1 << 100, [1 << 100]], "a", string.printable, "\u262F",
-    "hello world", "hello world", "\xff\xfe\x9c\x001\x000\x00",
+    "hello world", u"hello world", u"\xff\xfe\x9c\x001\x000\x00",
     None, True, False, [], (), {}, {(1, 2): 1}, {(): 2},
-    [1, "hello", 3.0], "\u262F", 42.0, (1.0, "hi"),
+    [1, "hello", 3.0], u"\u262F", 42.0, (1.0, "hi"),
     [1, 2, 3, None], [(None,), 3, 1.0], ["h", "e", "l", "l", "o", None],
     (None, None), ("hello", None), (True, False),
     {True: "hello", False: "world"}, {"hello": "world", 1: 42, 2.5: 45},
-    {"hello": {2, 3}, "world": {42.0}, "this": None},
+    {"hello": set([2, 3]), "world": set([42.0]), "this": None},
     np.int8(3), np.int32(4), np.int64(5),
     np.uint8(3), np.uint32(4), np.uint64(5),
     np.float16(1.9), np.float32(1.9),
@@ -154,12 +140,12 @@ PRIMITIVE_OBJECTS = [
 ]
 
 
-index_types = ('i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8')
-tensor_types = ('i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8',
-                'f2', 'f4', 'f8')
-
-
-PRIMITIVE_OBJECTS += [0, np.array([["hi", "hi"], [1.3, 1]])]
+if sys.version_info >= (3, 0):
+    PRIMITIVE_OBJECTS += [0, np.array([["hi", u"hi"], [1.3, 1]])]
+else:
+    PRIMITIVE_OBJECTS += [long(42), long(1 << 62), long(0),  # noqa
+                          np.array([["hi", u"hi"],
+                          [1.3, long(1)]])]  # noqa
 
 
 COMPLEX_OBJECTS = [
@@ -172,7 +158,7 @@ COMPLEX_OBJECTS = [
 ]
 
 
-class Foo:
+class Foo(object):
     def __init__(self, value=0):
         self.value = value
 
@@ -183,13 +169,13 @@ class Foo:
         return other.value == self.value
 
 
-class Bar:
+class Bar(object):
     def __init__(self):
         for i, val in enumerate(COMPLEX_OBJECTS):
             setattr(self, "field{}".format(i), val)
 
 
-class Baz:
+class Baz(object):
     def __init__(self):
         self.foo = Foo()
         self.bar = Bar()
@@ -198,7 +184,7 @@ class Baz:
         pass
 
 
-class Qux:
+class Qux(object):
     def __init__(self):
         self.objs = [Foo(1), Foo(42)]
 
@@ -292,7 +278,7 @@ def large_memory_map(tmpdir_factory, size=100*1024*1024):
 def test_clone():
     context = pa.SerializationContext()
 
-    class Foo:
+    class Foo(object):
         pass
 
     def custom_serializer(obj):
@@ -376,9 +362,7 @@ def test_default_dict_serialization(large_buffer):
 def test_numpy_serialization(large_buffer):
     for t in ["bool", "int8", "uint8", "int16", "uint16", "int32",
               "uint32", "float16", "float32", "float64", "<U1", "<U2", "<U3",
-              "<U4", "|S1", "|S2", "|S3", "|S4", "|O",
-              np.dtype([('a', 'int64'), ('b', 'float')]),
-              np.dtype([('x', 'uint32'), ('y', '<U8')])]:
+              "<U4", "|S1", "|S2", "|S3", "|S4", "|O"]:
         obj = np.random.randint(0, 10, size=(100, 100)).astype(t)
         serialization_roundtrip(obj, large_buffer)
         obj = obj[1:99, 10:90]
@@ -489,7 +473,7 @@ def test_numpy_base_object(tmpdir):
 # see https://issues.apache.org/jira/browse/ARROW-1695
 def test_serialization_callback_numpy():
 
-    class DummyClass:
+    class DummyClass(object):
         pass
 
     def serialize_dummy_class(obj):
@@ -534,212 +518,15 @@ def test_numpy_subclass_serialization():
     assert np.alltrue(new_x.view(np.ndarray) == np.zeros(3))
 
 
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_coo_tensor_serialization(index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([[1, 2, 3, 4, 5, 6]]).T.astype(tensor_dtype)
-    coords = np.array([
-        [0, 0, 2, 3, 1, 3],
-        [0, 2, 0, 4, 5, 5],
-    ]).T.astype(index_dtype)
-    shape = (4, 6)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCOOTensor.from_numpy(data, coords,
-                                                  shape, dim_names)
-
-    context = pa.default_serialization_context()
-    serialized = pa.serialize(sparse_tensor, context=context).to_buffer()
-    result = pa.deserialize(serialized)
-    assert_equal(result, sparse_tensor)
-    assert isinstance(result, pa.SparseCOOTensor)
-
-    data_result, coords_result = result.to_numpy()
-    assert np.array_equal(data_result, data)
-    assert np.array_equal(coords_result, coords)
-    assert result.dim_names == dim_names
-
-
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_coo_tensor_components_serialization(large_buffer,
-                                                    index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([[1, 2, 3, 4, 5, 6]]).T.astype(tensor_dtype)
-    coords = np.array([
-        [0, 0, 2, 3, 1, 3],
-        [0, 2, 0, 4, 5, 5],
-    ]).T.astype(index_dtype)
-    shape = (4, 6)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCOOTensor.from_numpy(data, coords,
-                                                  shape, dim_names)
-    serialization_roundtrip(sparse_tensor, large_buffer)
-
-
-@pytest.mark.skipif(not coo_matrix, reason="requires scipy")
-def test_scipy_sparse_coo_tensor_serialization():
-    data = np.array([1, 2, 3, 4, 5, 6])
-    row = np.array([0, 0, 2, 3, 1, 3])
-    col = np.array([0, 2, 0, 4, 5, 5])
-    shape = (4, 6)
-
-    sparse_array = coo_matrix((data, (row, col)), shape=shape)
-    serialized = pa.serialize(sparse_array)
-    result = serialized.deserialize()
-
-    assert np.array_equal(sparse_array.toarray(), result.toarray())
-
-
-@pytest.mark.skipif(not sparse, reason="requires pydata/sparse")
-def test_pydata_sparse_sparse_coo_tensor_serialization():
-    data = np.array([1, 2, 3, 4, 5, 6])
-    coords = np.array([
-        [0, 0, 2, 3, 1, 3],
-        [0, 2, 0, 4, 5, 5],
-    ])
-    shape = (4, 6)
-
-    sparse_array = sparse.COO(data=data, coords=coords, shape=shape)
-    serialized = pa.serialize(sparse_array)
-    result = serialized.deserialize()
-
-    assert np.array_equal(sparse_array.todense(), result.todense())
-
-
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_csr_matrix_serialization(index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([[8, 2, 5, 3, 4, 6]]).T.astype(tensor_dtype)
-    indptr = np.array([0, 2, 3, 4, 6]).astype(index_dtype)
-    indices = np.array([0, 2, 5, 0, 4, 5]).astype(index_dtype)
-    shape = (4, 6)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCSRMatrix.from_numpy(data, indptr, indices,
-                                                  shape, dim_names)
-
-    context = pa.default_serialization_context()
-    serialized = pa.serialize(sparse_tensor, context=context).to_buffer()
-    result = pa.deserialize(serialized)
-    assert_equal(result, sparse_tensor)
-    assert isinstance(result, pa.SparseCSRMatrix)
-
-    data_result, indptr_result, indices_result = result.to_numpy()
-    assert np.array_equal(data_result, data)
-    assert np.array_equal(indptr_result, indptr)
-    assert np.array_equal(indices_result, indices)
-    assert result.dim_names == dim_names
-
-
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_csr_matrix_components_serialization(large_buffer,
-                                                    index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([8, 2, 5, 3, 4, 6]).astype(tensor_dtype)
-    indptr = np.array([0, 2, 3, 4, 6]).astype(index_dtype)
-    indices = np.array([0, 2, 5, 0, 4, 5]).astype(index_dtype)
-    shape = (4, 6)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCSRMatrix.from_numpy(data, indptr, indices,
-                                                  shape, dim_names)
-    serialization_roundtrip(sparse_tensor, large_buffer)
-
-
-@pytest.mark.skipif(not csr_matrix, reason="requires scipy")
-def test_scipy_sparse_csr_matrix_serialization():
-    data = np.array([8, 2, 5, 3, 4, 6])
-    indptr = np.array([0, 2, 3, 4, 6])
-    indices = np.array([0, 2, 5, 0, 4, 5])
-    shape = (4, 6)
-
-    sparse_array = csr_matrix((data, indices, indptr), shape=shape)
-    serialized = pa.serialize(sparse_array)
-    result = serialized.deserialize()
-
-    assert np.array_equal(sparse_array.toarray(), result.toarray())
-
-
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_csc_matrix_serialization(index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([[8, 2, 5, 3, 4, 6]]).T.astype(tensor_dtype)
-    indptr = np.array([0, 2, 3, 4, 6]).astype(index_dtype)
-    indices = np.array([0, 2, 5, 0, 4, 5]).astype(index_dtype)
-    shape = (6, 4)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCSCMatrix.from_numpy(data, indptr, indices,
-                                                  shape, dim_names)
-
-    context = pa.default_serialization_context()
-    serialized = pa.serialize(sparse_tensor, context=context).to_buffer()
-    result = pa.deserialize(serialized)
-    assert_equal(result, sparse_tensor)
-    assert isinstance(result, pa.SparseCSCMatrix)
-
-    data_result, indptr_result, indices_result = result.to_numpy()
-    assert np.array_equal(data_result, data)
-    assert np.array_equal(indptr_result, indptr)
-    assert np.array_equal(indices_result, indices)
-    assert result.dim_names == dim_names
-
-
-@pytest.mark.parametrize('tensor_type', tensor_types)
-@pytest.mark.parametrize('index_type', index_types)
-def test_sparse_csc_matrix_components_serialization(large_buffer,
-                                                    index_type, tensor_type):
-    tensor_dtype = np.dtype(tensor_type)
-    index_dtype = np.dtype(index_type)
-    data = np.array([8, 2, 5, 3, 4, 6]).astype(tensor_dtype)
-    indptr = np.array([0, 2, 3, 6]).astype(index_dtype)
-    indices = np.array([0, 2, 2, 0, 1, 2]).astype(index_dtype)
-    shape = (3, 3)
-    dim_names = ('x', 'y')
-
-    sparse_tensor = pa.SparseCSCMatrix.from_numpy(data, indptr, indices,
-                                                  shape, dim_names)
-    serialization_roundtrip(sparse_tensor, large_buffer)
-
-
-@pytest.mark.skipif(not csc_matrix, reason="requires scipy")
-def test_scipy_sparse_csc_matrix_serialization():
-    data = np.array([8, 2, 5, 3, 4, 6])
-    indptr = np.array([0, 2, 3, 4, 6])
-    indices = np.array([0, 2, 5, 0, 4, 5])
-    shape = (6, 4)
-
-    sparse_array = csc_matrix((data, indices, indptr), shape=shape)
-    serialized = pa.serialize(sparse_array)
-    result = serialized.deserialize()
-
-    assert np.array_equal(sparse_array.toarray(), result.toarray())
-
-
-@pytest.mark.filterwarnings(
-    "ignore:the matrix subclass:PendingDeprecationWarning")
 def test_numpy_matrix_serialization(tmpdir):
-    class CustomType:
+    class CustomType(object):
         def __init__(self, val):
             self.val = val
-
-    rec_type = np.dtype([('x', 'int64'), ('y', 'double'), ('z', '<U4')])
 
     path = os.path.join(str(tmpdir), 'pyarrow_npmatrix_serialization_test.bin')
     array = np.random.randint(low=-1, high=1, size=(2, 2))
 
-    for data_type in [str, int, float, rec_type, CustomType]:
+    for data_type in [str, int, float, CustomType]:
         matrix = np.matrix(array.astype(data_type))
 
         with open(path, 'wb') as f:
@@ -758,17 +545,17 @@ def test_pyarrow_objects_serialization(large_buffer):
     # NOTE: We have to put these objects inside,
     # or it will affect 'test_total_bytes_allocated'.
     pyarrow_objects = [
-        pa.array([1, 2, 3, 4]), pa.array(['1', 'never U+1F631', '',
-                                         "233 * U+1F600"]),
+        pa.array([1, 2, 3, 4]), pa.array(['1', u'never U+1F631', '',
+                                         u"233 * U+1F600"]),
         pa.array([1, None, 2, 3]),
         pa.Tensor.from_numpy(np.random.rand(2, 3, 4)),
         pa.RecordBatch.from_arrays(
             [pa.array([1, None, 2, 3]),
-             pa.array(['1', 'never U+1F631', '', "233 * u1F600"])],
+             pa.array(['1', u'never U+1F631', '', u"233 * u1F600"])],
             ['a', 'b']),
         pa.Table.from_arrays([pa.array([1, None, 2, 3]),
-                              pa.array(['1', 'never U+1F631', '',
-                                       "233 * u1F600"])],
+                              pa.array(['1', u'never U+1F631', '',
+                                       u"233 * u1F600"])],
                              ['a', 'b'])
     ]
     for obj in pyarrow_objects:
@@ -777,7 +564,7 @@ def test_pyarrow_objects_serialization(large_buffer):
 
 def test_buffer_serialization():
 
-    class BufferClass:
+    class BufferClass(object):
         pass
 
     def serialize_buffer_class(obj):
@@ -827,7 +614,7 @@ def test_arrow_limits(self):
 
 def test_serialization_callback_error():
 
-    class TempClass:
+    class TempClass(object):
         pass
 
     # Pass a SerializationContext into serialize, but TempClass
@@ -848,7 +635,7 @@ def test_serialization_callback_error():
         serialized_object.deserialize(deserialization_context)
     assert err.value.type_id == "TempClass"
 
-    class TempClass2:
+    class TempClass2(object):
         pass
 
     # Make sure that we receive an error when we use an inappropriate value for
@@ -878,7 +665,7 @@ def test_fallback_to_subclasses():
     assert type(reconstructed_object) == Foo
 
 
-class Serializable:
+class Serializable(object):
     pass
 
 
@@ -929,7 +716,6 @@ def test_serialize_to_components_invalid_cases():
 
     components = {
         'num_tensors': 0,
-        'num_sparse_tensors': {'coo': 0, 'csr': 0, 'csc': 0},
         'num_ndarrays': 0,
         'num_buffers': 1,
         'data': [buf]
@@ -940,7 +726,6 @@ def test_serialize_to_components_invalid_cases():
 
     components = {
         'num_tensors': 0,
-        'num_sparse_tensors': {'coo': 0, 'csr': 0, 'csc': 0},
         'num_ndarrays': 1,
         'num_buffers': 0,
         'data': [buf, buf]
@@ -960,7 +745,7 @@ def test_deserialize_components_in_different_process():
 
         import pyarrow as pa
 
-        data = {!r}
+        data = {0!r}
         components = pickle.loads(data)
         arr = pa.deserialize_components(components)
 
@@ -970,7 +755,7 @@ def test_deserialize_components_in_different_process():
     subprocess_env = test_util.get_modified_env_with_pythonpath()
     print("** sys.path =", sys.path)
     print("** setting PYTHONPATH to:", subprocess_env['PYTHONPATH'])
-    subprocess.check_call([sys.executable, "-c", code], env=subprocess_env)
+    subprocess.check_call(["python", "-c", code], env=subprocess_env)
 
 
 def test_serialize_read_concatenated_records():
@@ -985,11 +770,7 @@ def test_serialize_read_concatenated_records():
     pa.read_serialized(f).deserialize()
 
 
-def deserialize_regex(serialized, q):
-    import pyarrow as pa
-    q.put(pa.deserialize(serialized))
-
-
+@pytest.mark.skipif(os.name == 'nt', reason="deserialize_regex not pickleable")
 def test_deserialize_in_different_process():
     from multiprocessing import Process, Queue
     import re
@@ -1001,6 +782,10 @@ def test_deserialize_in_different_process():
 
     serialized = pa.serialize(regex, serialization_context)
     serialized_bytes = serialized.to_buffer().to_pybytes()
+
+    def deserialize_regex(serialized, q):
+        import pyarrow as pa
+        q.put(pa.deserialize(serialized))
 
     q = Queue()
     p = Process(target=deserialize_regex, args=(serialized_bytes, q))
@@ -1017,12 +802,17 @@ def test_deserialize_buffer_in_different_process():
     f.write(b.to_pybytes())
     f.close()
 
-    test_util.invoke_script('deserialize_buffer.py', f.name)
+    subprocess_env = test_util.get_modified_env_with_pythonpath()
+
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    python_file = os.path.join(dir_path, 'deserialize_buffer.py')
+    subprocess.check_call([sys.executable, python_file, f.name],
+                          env=subprocess_env)
 
 
 def test_set_pickle():
     # Use a custom type to trigger pickling.
-    class Foo:
+    class Foo(object):
         pass
 
     context = pa.SerializationContext()
@@ -1093,21 +883,6 @@ def test_tensor_alignment():
         assert y.ctypes.data % 64 == 0
 
 
-def test_empty_tensor():
-    # ARROW-8122, serialize and deserialize empty tensors
-    x = np.array([], dtype=np.float64)
-    y = pa.deserialize(pa.serialize(x).to_buffer())
-    np.testing.assert_array_equal(x, y)
-
-    x = np.array([[], [], []], dtype=np.float64)
-    y = pa.deserialize(pa.serialize(x).to_buffer())
-    np.testing.assert_array_equal(x, y)
-
-    x = np.array([[], [], []], dtype=np.float64).T
-    y = pa.deserialize(pa.serialize(x).to_buffer())
-    np.testing.assert_array_equal(x, y)
-
-
 def test_serialization_determinism():
     for obj in COMPLEX_OBJECTS:
         buf1 = pa.serialize(obj).to_buffer()
@@ -1116,7 +891,7 @@ def test_serialization_determinism():
 
 
 def test_serialize_recursive_objects():
-    class ClassA:
+    class ClassA(object):
         pass
 
     # Make a list that contains itself.

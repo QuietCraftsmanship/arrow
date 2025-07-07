@@ -15,27 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "arrow/filesystem/hdfs.h"
+
+#include <gtest/gtest.h>
+
+#include <cerrno>
+#include <chrono>
 #include <memory>
 #include <sstream>
 #include <string>
 
-#include <gtest/gtest.h>
-
-#include "arrow/filesystem/hdfs.h"
 #include "arrow/filesystem/test_util.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/util/io_util.h"
+#include "arrow/util/logging.h"
 #include "arrow/util/uri.h"
 
 namespace arrow {
 
-using internal::Uri;
+using internal::ErrnoFromStatus;
+using util::Uri;
 
 namespace fs {
 
 TEST(TestHdfsOptions, FromUri) {
   HdfsOptions options;
-  internal::Uri uri;
+  Uri uri;
 
   ASSERT_OK(uri.Parse("hdfs://localhost"));
   ASSERT_OK_AND_ASSIGN(options, HdfsOptions::FromUri(uri));
@@ -44,12 +49,19 @@ TEST(TestHdfsOptions, FromUri) {
   ASSERT_EQ(options.connection_config.port, 0);
   ASSERT_EQ(options.connection_config.user, "");
 
-  ASSERT_OK(uri.Parse("hdfs://otherhost:9999/?replication=2"));
+  ASSERT_OK(uri.Parse("hdfs://otherhost:9999/?replication=2&kerb_ticket=kerb.ticket"));
   ASSERT_OK_AND_ASSIGN(options, HdfsOptions::FromUri(uri));
   ASSERT_EQ(options.replication, 2);
+  ASSERT_EQ(options.connection_config.kerb_ticket, "kerb.ticket");
   ASSERT_EQ(options.connection_config.host, "hdfs://otherhost");
   ASSERT_EQ(options.connection_config.port, 9999);
   ASSERT_EQ(options.connection_config.user, "");
+
+  ASSERT_OK(uri.Parse("hdfs://otherhost:9999/?hdfs_token=hdfs_token_ticket"));
+  ASSERT_OK_AND_ASSIGN(options, HdfsOptions::FromUri(uri));
+  ASSERT_EQ(options.connection_config.host, "hdfs://otherhost");
+  ASSERT_EQ(options.connection_config.port, 9999);
+  ASSERT_EQ(options.connection_config.extra_conf["hdfs_token"], "hdfs_token_ticket");
 
   ASSERT_OK(uri.Parse("viewfs://other-nn/mypath/myfile"));
   ASSERT_OK_AND_ASSIGN(options, HdfsOptions::FromUri(uri));
@@ -58,9 +70,9 @@ TEST(TestHdfsOptions, FromUri) {
   ASSERT_EQ(options.connection_config.user, "");
 }
 
-class TestHadoopFileSystem : public ::testing::Test {
+class HadoopFileSystemTestMixin {
  public:
-  void SetUp() override {
+  void MakeFileSystem() {
     const char* host = std::getenv("ARROW_HDFS_TEST_HOST");
     const char* port = std::getenv("ARROW_HDFS_TEST_PORT");
     const char* user = std::getenv("ARROW_HDFS_TEST_USER");
@@ -70,8 +82,8 @@ class TestHadoopFileSystem : public ::testing::Test {
     std::string hdfs_user = user == nullptr ? "root" : std::string(user);
 
     options_.ConfigureEndPoint(hdfs_host, hdfs_port);
-    options_.ConfigureHdfsUser(hdfs_user);
-    options_.ConfigureHdfsReplication(0);
+    options_.ConfigureUser(hdfs_user);
+    options_.ConfigureReplication(0);
 
     auto result = HadoopFileSystem::Make(options_);
     if (!result.ok()) {
@@ -83,8 +95,18 @@ class TestHadoopFileSystem : public ::testing::Test {
       return;
     }
     loaded_driver_ = true;
-    fs_ = std::make_shared<SubTreeFileSystem>("", *result);
+    fs_ = *result;
   }
+
+ protected:
+  HdfsOptions options_;
+  bool loaded_driver_ = false;
+  std::shared_ptr<FileSystem> fs_;
+};
+
+class TestHadoopFileSystem : public ::testing::Test, public HadoopFileSystemTestMixin {
+ public:
+  void SetUp() override { MakeFileSystem(); }
 
   void TestFileSystemFromUri() {
     std::stringstream ss;
@@ -96,6 +118,8 @@ class TestHadoopFileSystem : public ::testing::Test {
     std::string path;
     ARROW_LOG(INFO) << "!!! uri = " << ss.str();
     ASSERT_OK_AND_ASSIGN(uri_fs, FileSystemFromUri(ss.str(), &path));
+    ASSERT_EQ(path, "/");
+    ASSERT_OK_AND_ASSIGN(path, uri_fs->PathFromUri(ss.str()));
     ASSERT_EQ(path, "/");
 
     // Sanity check
@@ -163,22 +187,18 @@ class TestHadoopFileSystem : public ::testing::Test {
     ASSERT_EQ(infos.size(), 0);
 
     selector.allow_not_found = false;
-    ASSERT_RAISES(IOError, fs_->GetFileInfo(selector));
+    auto st = fs_->GetFileInfo(selector).status();
+    ASSERT_RAISES(IOError, st);
+    ASSERT_EQ(ErrnoFromStatus(st), ENOENT);
 
     ASSERT_OK(fs_->DeleteDir(base_dir + "AB"));
     AssertFileInfo(fs_.get(), base_dir + "AB", FileType::NotFound);
   }
-
- protected:
-  std::shared_ptr<FileSystem> fs_;
-  HdfsOptions options_;
-  bool loaded_driver_ = false;
 };
 
-#define SKIP_IF_NO_DRIVER()                           \
-  if (!this->loaded_driver_) {                        \
-    ARROW_LOG(INFO) << "Driver not loaded, skipping"; \
-    return;                                           \
+#define SKIP_IF_NO_DRIVER()                        \
+  if (!this->loaded_driver_) {                     \
+    GTEST_SKIP() << "Driver not loaded, skipping"; \
   }
 
 TEST_F(TestHadoopFileSystem, CreateDirDeleteDir) {
@@ -201,7 +221,10 @@ TEST_F(TestHadoopFileSystem, CreateDirDeleteDir) {
 
   ASSERT_OK(this->fs_->DeleteDir("AB"));
   AssertFileInfo(this->fs_.get(), "AB", FileType::NotFound);
-  ASSERT_RAISES(IOError, this->fs_->DeleteDir("AB"));
+
+  auto st = this->fs_->DeleteDir("AB");
+  ASSERT_RAISES(IOError, st);
+  ASSERT_EQ(ErrnoFromStatus(st), ENOENT);
 }
 
 TEST_F(TestHadoopFileSystem, DeleteDirContents) {
@@ -221,6 +244,11 @@ TEST_F(TestHadoopFileSystem, DeleteDirContents) {
   ASSERT_OK(this->fs_->DeleteDirContents("AB"));
   AssertFileInfo(this->fs_.get(), "AB", FileType::Directory);
   ASSERT_OK(this->fs_->DeleteDir("AB"));
+
+  ASSERT_OK(this->fs_->DeleteDirContents("DoesNotExist", /*missing_dir_ok=*/true));
+  auto st = this->fs_->DeleteDirContents("DoesNotExist");
+  ASSERT_RAISES(IOError, st);
+  ASSERT_EQ(ErrnoFromStatus(st), ENOENT);
 }
 
 TEST_F(TestHadoopFileSystem, WriteReadFile) {
@@ -299,6 +327,44 @@ TEST_F(TestHadoopFileSystem, FileSystemFromUri) {
 
   this->TestFileSystemFromUri();
 }
+
+class TestHadoopFileSystemGeneric : public ::testing::Test,
+                                    public HadoopFileSystemTestMixin,
+                                    public GenericFileSystemTest {
+ public:
+  void SetUp() override {
+    MakeFileSystem();
+    SKIP_IF_NO_DRIVER();
+    timestamp_ =
+        static_cast<int64_t>(std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now())
+                                 .time_since_epoch()
+                                 .count());
+  }
+
+ protected:
+  bool allow_write_file_over_dir() const override { return true; }
+  bool allow_move_dir_over_non_empty_dir() const override { return true; }
+  bool have_implicit_directories() const override { return true; }
+  bool allow_append_to_new_file() const override { return false; }
+
+  std::shared_ptr<FileSystem> GetEmptyFileSystem() override {
+    // Since the HDFS contents are kept persistently between test runs,
+    // make sure each test gets a pristine fresh directory.
+    std::stringstream ss;
+    ss << "GenericTest" << timestamp_ << "-" << test_num_++;
+    const auto subdir = ss.str();
+    ARROW_EXPECT_OK(fs_->CreateDir(subdir));
+    return std::make_shared<SubTreeFileSystem>(subdir, fs_);
+  }
+
+  static int test_num_;
+  int64_t timestamp_;
+};
+
+int TestHadoopFileSystemGeneric::test_num_ = 1;
+
+GENERIC_FS_TEST_FUNCTIONS(TestHadoopFileSystemGeneric);
 
 }  // namespace fs
 }  // namespace arrow

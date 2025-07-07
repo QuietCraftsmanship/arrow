@@ -17,22 +17,43 @@
 
 #pragma once
 
-#include <memory>
-
-#include "arrow/type_fwd.h"
+#include "arrow/util/visibility.h"
 
 namespace arrow {
+
+struct Datum;
+struct TypeHolder;
+
 namespace compute {
 
-class Expr;
-class LogicalType;
-class Operation;
+class Function;
+class ScalarAggregateFunction;
+class FunctionExecutor;
+class FunctionOptions;
+class FunctionRegistry;
 
-using ArrowTypePtr = std::shared_ptr<::arrow::DataType>;
-using ExprPtr = std::shared_ptr<Expr>;
-using ConstOpPtr = std::shared_ptr<const Operation>;
-using OpPtr = std::shared_ptr<Operation>;
-using LogicalTypePtr = std::shared_ptr<LogicalType>;
+/// \brief Return the process-global function registry.
+// Defined in registry.cc
+ARROW_EXPORT FunctionRegistry* GetFunctionRegistry();
+
+class CastOptions;
+
+struct ExecBatch;
+class ExecContext;
+struct ExecValue;
+class KernelContext;
+
+struct Kernel;
+struct ScalarKernel;
+struct ScalarAggregateKernel;
+struct VectorKernel;
+
+struct KernelState;
+
+class Expression;
+
+ARROW_EXPORT ExecContext* default_exec_context();
+ARROW_EXPORT ExecContext* threaded_exec_context();
 
 }  // namespace compute
 }  // namespace arrow

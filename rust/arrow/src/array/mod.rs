@@ -70,12 +70,8 @@ pub use self::data::ArrayDataBuilder;
 pub use self::data::ArrayDataRef;
 
 pub use self::array::BinaryArray;
-pub use self::array::DictionaryArray;
-pub use self::array::FixedSizeBinaryArray;
-pub use self::array::FixedSizeListArray;
 pub use self::array::ListArray;
 pub use self::array::PrimitiveArray;
-pub use self::array::StringArray;
 pub use self::array::StructArray;
 
 pub(crate) use self::array::make_array;
@@ -92,15 +88,6 @@ pub type UInt64Array = PrimitiveArray<UInt64Type>;
 pub type Float32Array = PrimitiveArray<Float32Type>;
 pub type Float64Array = PrimitiveArray<Float64Type>;
 
-pub type Int8DictionaryArray = DictionaryArray<Int8Type>;
-pub type Int16DictionaryArray = DictionaryArray<Int16Type>;
-pub type Int32DictionaryArray = DictionaryArray<Int32Type>;
-pub type Int64DictionaryArray = DictionaryArray<Int64Type>;
-pub type UInt8DictionaryArray = DictionaryArray<UInt8Type>;
-pub type UInt16DictionaryArray = DictionaryArray<UInt16Type>;
-pub type UInt32DictionaryArray = DictionaryArray<UInt32Type>;
-pub type UInt64DictionaryArray = DictionaryArray<UInt64Type>;
-
 pub type TimestampSecondArray = PrimitiveArray<TimestampSecondType>;
 pub type TimestampMillisecondArray = PrimitiveArray<TimestampMillisecondType>;
 pub type TimestampMicrosecondArray = PrimitiveArray<TimestampMicrosecondType>;
@@ -111,12 +98,7 @@ pub type Time32SecondArray = PrimitiveArray<Time32SecondType>;
 pub type Time32MillisecondArray = PrimitiveArray<Time32MillisecondType>;
 pub type Time64MicrosecondArray = PrimitiveArray<Time64MicrosecondType>;
 pub type Time64NanosecondArray = PrimitiveArray<Time64NanosecondType>;
-pub type IntervalYearMonthArray = PrimitiveArray<IntervalYearMonthType>;
-pub type IntervalDayTimeArray = PrimitiveArray<IntervalDayTimeType>;
-pub type DurationSecondArray = PrimitiveArray<DurationSecondType>;
-pub type DurationMillisecondArray = PrimitiveArray<DurationMillisecondType>;
-pub type DurationMicrosecondArray = PrimitiveArray<DurationMicrosecondType>;
-pub type DurationNanosecondArray = PrimitiveArray<DurationNanosecondType>;
+// TODO add interval
 
 pub use self::array::ListArrayOps;
 pub use self::array::PrimitiveArrayOps;
@@ -148,21 +130,11 @@ pub type Time32SecondBufferBuilder = BufferBuilder<Time32SecondType>;
 pub type Time32MillisecondBufferBuilder = BufferBuilder<Time32MillisecondType>;
 pub type Time64MicrosecondBufferBuilder = BufferBuilder<Time64MicrosecondType>;
 pub type Time64NanosecondBufferBuilder = BufferBuilder<Time64NanosecondType>;
-pub type IntervalYearMonthBufferBuilder = BufferBuilder<IntervalYearMonthType>;
-pub type IntervalDayTimeBufferBuilder = BufferBuilder<IntervalDayTimeType>;
-pub type DurationSecondBufferBuilder = BufferBuilder<DurationSecondType>;
-pub type DurationMillisecondBufferBuilder = BufferBuilder<DurationMillisecondType>;
-pub type DurationMicrosecondBufferBuilder = BufferBuilder<DurationMicrosecondType>;
-pub type DurationNanosecondBufferBuilder = BufferBuilder<DurationNanosecondType>;
 
 pub use self::builder::ArrayBuilder;
 pub use self::builder::BinaryBuilder;
-pub use self::builder::FixedSizeBinaryBuilder;
-pub use self::builder::FixedSizeListBuilder;
 pub use self::builder::ListBuilder;
 pub use self::builder::PrimitiveBuilder;
-pub use self::builder::PrimitiveDictionaryBuilder;
-pub use self::builder::StringBuilder;
 pub use self::builder::StructBuilder;
 
 pub type BooleanBuilder = PrimitiveBuilder<BooleanType>;
@@ -187,14 +159,7 @@ pub type Time32SecondBuilder = PrimitiveBuilder<Time32SecondType>;
 pub type Time32MillisecondBuilder = PrimitiveBuilder<Time32MillisecondType>;
 pub type Time64MicrosecondBuilder = PrimitiveBuilder<Time64MicrosecondType>;
 pub type Time64NanosecondBuilder = PrimitiveBuilder<Time64NanosecondType>;
-pub type IntervalYearMonthBuilder = PrimitiveBuilder<IntervalYearMonthType>;
-pub type IntervalDayTimeBuilder = PrimitiveBuilder<IntervalDayTimeType>;
-pub type DurationSecondBuilder = PrimitiveBuilder<DurationSecondType>;
-pub type DurationMillisecondBuilder = PrimitiveBuilder<DurationMillisecondType>;
-pub type DurationMicrosecondBuilder = PrimitiveBuilder<DurationMicrosecondType>;
-pub type DurationNanosecondBuilder = PrimitiveBuilder<DurationNanosecondType>;
 
 // --------------------- Array Equality ---------------------
 
 pub use self::equal::ArrayEqual;
-pub use self::equal::JsonEqual;

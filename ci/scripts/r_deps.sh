@@ -20,19 +20,38 @@ set -ex
 
 : ${R_BIN:=R}
 
+: ${R_PRUNE_DEPS:=FALSE}
+R_PRUNE_DEPS=`echo $R_PRUNE_DEPS | tr '[:upper:]' '[:lower:]'`
+
+: ${R_DUCKDB_DEV:=FALSE}
+R_DUCKDB_DEV=`echo $R_DUCKDB_DEV | tr '[:upper:]' '[:lower:]'`
+
 source_dir=${1}/r
 
 pushd ${source_dir}
 
+if [ ${R_PRUNE_DEPS} = "true" ]; then
+  # To prevent the build from timing out, let's prune some optional deps (and their possible version requirements)
+  ${R_BIN} -e 'd <- read.dcf("DESCRIPTION")
+  to_prune <- c("duckdb", "DBI", "dbplyr", "decor", "knitr", "rmarkdown", "pkgload", "reticulate")
+  pattern <- paste0("\\n?", to_prune, " (\\\\(.*\\\\))?,?", collapse = "|")
+  d[,"Suggests"] <- gsub(pattern, "", d[,"Suggests"])
+  write.dcf(d, "DESCRIPTION")'
+fi
+
 # Install R package dependencies
-${R_BIN} -e "install.packages('remotes'); remotes::install_cran(c('glue', 'rcmdcheck'))"
-${R_BIN} -e "remotes::install_deps(dependencies = TRUE)"
-${R_BIN} -e "remotes::install_github('nealrichardson/decor')"
+# install.packages() emits warnings if packages fail to install,
+# but we want to error/fail the build.
+# options(warn=2) turns warnings into errors
+${R_BIN} -e "options(warn=2); install.packages('remotes'); remotes::install_cran(c('glue', 'rcmdcheck', 'sys')); remotes::install_deps(INSTALL_opts = '"${INSTALL_ARGS}"')"
+
+# Install DuckDB from github when requested
+if [ ${R_DUCKDB_DEV} == "true" ]; then
+  ${R_BIN} -e "remotes::install_github('duckdb/duckdb-r', build = FALSE)"
+fi
+
+# Separately install the optional/test dependencies but don't error on them,
+# they're not available everywhere and that's ok
+${R_BIN} -e "remotes::install_deps(dependencies = TRUE, INSTALL_opts = '"${INSTALL_ARGS}"')"
 
 popd
-
-if [ "$RPREFIX" = "/opt/R-devel" ]; then
-  # We need this on R-devel, which we test on rhub images, which have this env var set
-  curl -L https://sourceforge.net/projects/checkbaskisms/files/2.0.0.2/checkbashisms/download > /usr/local/bin/checkbashisms
-  chmod 755 /usr/local/bin/checkbashisms
-fi

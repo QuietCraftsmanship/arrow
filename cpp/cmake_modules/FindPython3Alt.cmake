@@ -23,29 +23,33 @@
 # - PYTHON_OTHER_LIBS
 # - NUMPY_INCLUDE_DIRS
 
-# Need CMake 3.15 or later for Python3_FIND_STRATEGY
-if(${CMAKE_VERSION} VERSION_LESS "3.15.0")
-  # Use deprecated Python- and NumPy-finding code
-  if(Python3Alt_FIND_REQUIRED)
-    find_package(PythonLibsNew REQUIRED)
-    find_package(NumPy REQUIRED)
-  else()
-    find_package(PythonLibsNew)
-    find_package(NumPy)
-  endif()
-  find_package_handle_standard_args(Python3Alt
-                                    REQUIRED_VARS
-                                    PYTHON_EXECUTABLE
-                                    PYTHON_LIBRARIES
-                                    PYTHON_INCLUDE_DIRS
-                                    NUMPY_INCLUDE_DIRS)
+if(Python3Alt_FOUND)
   return()
 endif()
 
+set(Python3Alt_FIND_PACKAGE_OPTIONS)
+set(Python3Alt_NumPy_FIND_PACKAGE_OPTIONS)
+if(Python3Alt_FIND_VERSION)
+  list(APPEND Python3Alt_FIND_PACKAGE_OPTIONS ${Python3Alt_FIND_VERSION})
+endif()
 if(Python3Alt_FIND_REQUIRED)
-  find_package(Python3 COMPONENTS Interpreter Development NumPy REQUIRED)
+  list(APPEND Python3Alt_FIND_PACKAGE_OPTIONS REQUIRED)
+  list(APPEND Python3Alt_NumPy_FIND_PACKAGE_OPTIONS REQUIRED)
+endif()
+if(Python3Alt_FIND_QUIETLY)
+  list(APPEND Python3Alt_FIND_PACKAGE_OPTIONS QUIET)
+  list(APPEND Python3Alt_NumPy_FIND_PACKAGE_OPTIONS QUIET)
+endif()
+
+if(CMAKE_VERSION VERSION_LESS 3.18.0)
+  # We need libpython to be present, so ask for the full "Development"
+  # component on CMake < 3.18, where "Development.Module" is not
+  # available.
+  find_package(Python3 ${Python3Alt_FIND_PACKAGE_OPTIONS} COMPONENTS Interpreter
+                                                                     Development NumPy)
 else()
-  find_package(Python3 COMPONENTS Interpreter Development NumPy)
+  find_package(Python3 ${Python3Alt_FIND_PACKAGE_OPTIONS}
+               COMPONENTS Interpreter Development.Module NumPy)
 endif()
 
 if(NOT Python3_FOUND)
@@ -62,12 +66,11 @@ get_target_property(NUMPY_INCLUDE_DIRS Python3::NumPy INTERFACE_INCLUDE_DIRECTOR
 # CMake's python3_add_library() doesn't apply the required extension suffix,
 # detect it ourselves.
 # (https://gitlab.kitware.com/cmake/cmake/issues/20408)
-execute_process(
-  COMMAND "${PYTHON_EXECUTABLE}" "-c"
-          "from distutils import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
-  RESULT_VARIABLE _PYTHON_RESULT
-  OUTPUT_VARIABLE _PYTHON_STDOUT
-  ERROR_VARIABLE _PYTHON_STDERR)
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-c"
+                        "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+                RESULT_VARIABLE _PYTHON_RESULT
+                OUTPUT_VARIABLE _PYTHON_STDOUT
+                ERROR_VARIABLE _PYTHON_STDERR)
 
 if(NOT _PYTHON_RESULT MATCHES 0)
   if(Python3Alt_FIND_REQUIRED)
@@ -82,9 +85,5 @@ function(PYTHON_ADD_MODULE name)
   set_target_properties(${name} PROPERTIES SUFFIX ${_EXT_SUFFIX})
 endfunction()
 
-find_package_handle_standard_args(Python3Alt
-                                  REQUIRED_VARS
-                                  PYTHON_EXECUTABLE
-                                  PYTHON_LIBRARIES
-                                  PYTHON_INCLUDE_DIRS
-                                  NUMPY_INCLUDE_DIRS)
+find_package_handle_standard_args(
+  Python3Alt REQUIRED_VARS PYTHON_EXECUTABLE PYTHON_INCLUDE_DIRS NUMPY_INCLUDE_DIRS)

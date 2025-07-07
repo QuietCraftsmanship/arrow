@@ -19,23 +19,28 @@
 /// dataset with possible partitioning according to available
 /// partitioning
 
+// This API is EXPERIMENTAL.
+
 #pragma once
 
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "arrow/dataset/partition.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
-#include "arrow/filesystem/filesystem.h"
-#include "arrow/filesystem/path_forest.h"
+#include "arrow/filesystem/type_fwd.h"
 #include "arrow/result.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/variant.h"
 
 namespace arrow {
 namespace dataset {
+
+/// \defgroup dataset-discovery Discovery API
+///
+/// @{
 
 struct InspectOptions {
   /// See `fragments` property.
@@ -53,6 +58,10 @@ struct InspectOptions {
   /// `kInspectAllFragments`. A value of `0` disables inspection of fragments
   /// altogether so only the partitioning schema will be inspected.
   int fragments = 1;
+
+  /// Control how to unify types. By default, types are merged strictly (the
+  /// type must match exactly, except nulls can be merged with other types).
+  Field::MergeOptions field_merge_options = Field::MergeOptions::Defaults();
 };
 
 struct FinishOptions {
@@ -84,13 +93,16 @@ class ARROW_DS_EXPORT DatasetFactory {
 
   /// \brief Create a Dataset
   Result<std::shared_ptr<Dataset>> Finish();
+  /// \brief Create a Dataset with the given schema (see \a InspectOptions::schema)
   Result<std::shared_ptr<Dataset>> Finish(std::shared_ptr<Schema> schema);
+  /// \brief Create a Dataset with the given options
   virtual Result<std::shared_ptr<Dataset>> Finish(FinishOptions options) = 0;
 
   /// \brief Optional root partition for the resulting Dataset.
-  const std::shared_ptr<Expression>& root_partition() const { return root_partition_; }
-  Status SetRootPartition(std::shared_ptr<Expression> partition) {
-    root_partition_ = partition;
+  const compute::Expression& root_partition() const { return root_partition_; }
+  /// \brief Set the root partition for the resulting Dataset.
+  Status SetRootPartition(compute::Expression partition) {
+    root_partition_ = std::move(partition);
     return Status::OK();
   }
 
@@ -99,11 +111,14 @@ class ARROW_DS_EXPORT DatasetFactory {
  protected:
   DatasetFactory();
 
-  std::shared_ptr<Expression> root_partition_;
+  compute::Expression root_partition_;
 };
+
+/// @}
 
 /// \brief DatasetFactory provides a way to inspect/discover a Dataset's
 /// expected schema before materialization.
+/// \ingroup dataset-implementations
 class ARROW_DS_EXPORT UnionDatasetFactory : public DatasetFactory {
  public:
   static Result<std::shared_ptr<DatasetFactory>> Make(
@@ -131,50 +146,53 @@ class ARROW_DS_EXPORT UnionDatasetFactory : public DatasetFactory {
   std::vector<std::shared_ptr<DatasetFactory>> factories_;
 };
 
+/// \ingroup dataset-filesystem
 struct FileSystemFactoryOptions {
-  // Either an explicit Partitioning or a PartitioningFactory to discover one.
-  //
-  // If a factory is provided, it will be used to infer a schema for partition fields
-  // based on file and directory paths then construct a Partitioning. The default
-  // is a Partitioning which will yield no partition information.
-  //
-  // The (explicit or discovered) partitioning will be applied to discovered files
-  // and the resulting partition information embedded in the Dataset.
+  /// Either an explicit Partitioning or a PartitioningFactory to discover one.
+  ///
+  /// If a factory is provided, it will be used to infer a schema for partition fields
+  /// based on file and directory paths then construct a Partitioning. The default
+  /// is a Partitioning which will yield no partition information.
+  ///
+  /// The (explicit or discovered) partitioning will be applied to discovered files
+  /// and the resulting partition information embedded in the Dataset.
   PartitioningOrFactory partitioning{Partitioning::Default()};
 
-  // For the purposes of applying the partitioning, paths will be stripped
-  // of the partition_base_dir. Files not matching the partition_base_dir
-  // prefix will be skipped for partition discovery. The ignored files will still
-  // be part of the Dataset, but will not have partition information.
-  //
-  // Example:
-  // partition_base_dir = "/dataset";
-  //
-  // - "/dataset/US/sales.csv" -> "US/sales.csv" will be given to the partitioning
-  //
-  // - "/home/john/late_sales.csv" -> Will be ignored for partition discovery.
-  //
-  // This is useful for partitioning which parses directory when ordering
-  // is important, e.g. DirectoryPartitioning.
+  /// For the purposes of applying the partitioning, paths will be stripped
+  /// of the partition_base_dir. Files not matching the partition_base_dir
+  /// prefix will be skipped for partition discovery. The ignored files will still
+  /// be part of the Dataset, but will not have partition information.
+  ///
+  /// Example:
+  /// partition_base_dir = "/dataset";
+  ///
+  /// - "/dataset/US/sales.csv" -> "US/sales.csv" will be given to the partitioning
+  ///
+  /// - "/home/john/late_sales.csv" -> Will be ignored for partition discovery.
+  ///
+  /// This is useful for partitioning which parses directory when ordering
+  /// is important, e.g. DirectoryPartitioning.
   std::string partition_base_dir;
 
-  // Invalid files (via selector or explicitly) will be excluded by checking
-  // with the FileFormat::IsSupported method.  This will incur IO for each files
-  // in a serial and single threaded fashion. Disabling this feature will skip the
-  // IO, but unsupported files may be present in the Dataset
-  // (resulting in an error at scan time).
+  /// Invalid files (via selector or explicitly) will be excluded by checking
+  /// with the FileFormat::IsSupported method.  This will incur IO for each files
+  /// in a serial and single threaded fashion. Disabling this feature will skip the
+  /// IO, but unsupported files may be present in the Dataset
+  /// (resulting in an error at scan time).
   bool exclude_invalid_files = false;
 
-  // Files matching one of the following prefix will be ignored by the
-  // discovery process. This is matched to the basename of a path.
-  //
-  // Example:
-  // ignore_prefixes = {"_", ".DS_STORE" };
-  //
-  // - "/dataset/data.csv" -> not ignored
-  // - "/dataset/_metadata" -> ignored
-  // - "/dataset/.DS_STORE" -> ignored
-  std::vector<std::string> ignore_prefixes = {
+  /// When discovering from a Selector (and not from an explicit file list), ignore
+  /// files and directories matching any of these prefixes.
+  ///
+  /// Example (with selector = "/dataset/**"):
+  /// selector_ignore_prefixes = {"_", ".DS_STORE" };
+  ///
+  /// - "/dataset/data.csv" -> not ignored
+  /// - "/dataset/_metadata" -> ignored
+  /// - "/dataset/.DS_STORE" -> ignored
+  /// - "/dataset/_hidden/dat" -> ignored
+  /// - "/dataset/nested/.DS_STORE" -> ignored
+  std::vector<std::string> selector_ignore_prefixes = {
       ".",
       "_",
   };
@@ -182,6 +200,7 @@ struct FileSystemFactoryOptions {
 
 /// \brief FileSystemDatasetFactory creates a Dataset from a vector of
 /// fs::FileInfo or a fs::FileSelector.
+/// \ingroup dataset-filesystem
 class ARROW_DS_EXPORT FileSystemDatasetFactory : public DatasetFactory {
  public:
   /// \brief Build a FileSystemDatasetFactory from an explicit list of
@@ -212,25 +231,42 @@ class ARROW_DS_EXPORT FileSystemDatasetFactory : public DatasetFactory {
       std::shared_ptr<fs::FileSystem> filesystem, fs::FileSelector selector,
       std::shared_ptr<FileFormat> format, FileSystemFactoryOptions options);
 
+  /// \brief Build a FileSystemDatasetFactory from an uri including filesystem
+  /// information.
+  ///
+  /// \param[in] uri passed to FileSystemDataset
+  /// \param[in] format passed to FileSystemDataset
+  /// \param[in] options see FileSystemFactoryOptions for more information.
+  static Result<std::shared_ptr<DatasetFactory>> Make(std::string uri,
+                                                      std::shared_ptr<FileFormat> format,
+                                                      FileSystemFactoryOptions options);
+
+  /// \brief Build a FileSystemDatasetFactory from an explicit list of
+  /// file information.
+  ///
+  /// \param[in] filesystem passed to FileSystemDataset
+  /// \param[in] files passed to FileSystemDataset
+  /// \param[in] format passed to FileSystemDataset
+  /// \param[in] options see FileSystemFactoryOptions for more information.
+  static Result<std::shared_ptr<DatasetFactory>> Make(
+      std::shared_ptr<fs::FileSystem> filesystem, const std::vector<fs::FileInfo>& files,
+      std::shared_ptr<FileFormat> format, FileSystemFactoryOptions options);
+
   Result<std::vector<std::shared_ptr<Schema>>> InspectSchemas(
       InspectOptions options) override;
 
   Result<std::shared_ptr<Dataset>> Finish(FinishOptions options) override;
 
  protected:
-  FileSystemDatasetFactory(std::shared_ptr<fs::FileSystem> filesystem,
-                           fs::PathForest forest, std::shared_ptr<FileFormat> format,
+  FileSystemDatasetFactory(std::vector<fs::FileInfo> files,
+                           std::shared_ptr<fs::FileSystem> filesystem,
+                           std::shared_ptr<FileFormat> format,
                            FileSystemFactoryOptions options);
-
-  static Result<fs::PathForest> Filter(const std::shared_ptr<fs::FileSystem>& filesystem,
-                                       const std::shared_ptr<FileFormat>& format,
-                                       const FileSystemFactoryOptions& options,
-                                       fs::PathForest forest);
 
   Result<std::shared_ptr<Schema>> PartitionSchema();
 
+  std::vector<fs::FileInfo> files_;
   std::shared_ptr<fs::FileSystem> fs_;
-  fs::PathForest forest_;
   std::shared_ptr<FileFormat> format_;
   FileSystemFactoryOptions options_;
 };

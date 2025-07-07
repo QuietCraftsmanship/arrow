@@ -23,33 +23,342 @@
 #' `open_dataset()` to point to a directory of data files and return a
 #' `Dataset`, then use `dplyr` methods to query it.
 #'
-#' @param sources Either a string path to a directory containing data files,
-#' or a list of `DatasetFactory` objects as created by [dataset_factory()].
-#' @param schema [Schema] for the dataset. If `NULL` (the default), the schema
+#' @section Partitioning:
+#'
+#' Data is often split into multiple files and nested in subdirectories based on the value of one or more
+#' columns in the data. It may be a column that is commonly referenced in
+#' queries, or it may be time-based, for some examples. Data that is divided
+#' this way is "partitioned," and the values for those partitioning columns are
+#' encoded into the file path segments.
+#' These path segments are effectively virtual columns in the dataset, and
+#' because their values are known prior to reading the files themselves, we can
+#' greatly speed up filtered queries by skipping some files entirely.
+#'
+#' Arrow supports reading partition information from file paths in two forms:
+#'
+#' * "Hive-style", deriving from the Apache Hive project and common to some
+#'   database systems. Partitions are encoded as "key=value" in path segments,
+#'   such as `"year=2019/month=1/file.parquet"`. While they may be awkward as
+#'   file names, they have the advantage of being self-describing.
+#' * "Directory" partitioning, which is Hive without the key names, like
+#'   `"2019/01/file.parquet"`. In order to use these, we need know at least
+#'   what names to give the virtual columns that come from the path segments.
+#'
+#' The default behavior in `open_dataset()` is to inspect the file paths
+#' contained in the provided directory, and if they look like Hive-style, parse
+#' them as Hive. If your dataset has Hive-style partitioning in the file paths,
+#' you do not need to provide anything in the `partitioning` argument to
+#' `open_dataset()` to use them. If you do provide a character vector of
+#' partition column names, they will be ignored if they match what is detected,
+#' and if they don't match, you'll get an error. (If you want to rename
+#' partition columns, do that using `select()` or `rename()` after opening the
+#' dataset.). If you provide a `Schema` and the names match what is detected,
+#' it will use the types defined by the Schema. In the example file path above,
+#' you could provide a Schema to specify that "month" should be `int8()`
+#' instead of the `int32()` it will be parsed as by default.
+#'
+#' If your file paths do not appear to be Hive-style, or if you pass
+#' `hive_style = FALSE`, the `partitioning` argument will be used to create
+#' Directory partitioning. A character vector of names is required to create
+#' partitions; you may instead provide a `Schema` to map those names to desired
+#' column types, as described above. If neither are provided, no partitioning
+#' information will be taken from the file paths.
+#'
+#' @param sources One of:
+#'   * a string path or URI to a directory containing data files
+#'   * a [FileSystem] that references a directory containing data files
+#'     (such as what is returned by [s3_bucket()])
+#'   * a string path or URI to a single file
+#'   * a character vector of paths or URIs to individual data files
+#'   * a list of `Dataset` objects as created by this function
+#'   * a list of `DatasetFactory` objects as created by [dataset_factory()].
+#'
+#' When `sources` is a vector of file URIs, they must all use the same protocol
+#' and point to files located in the same file system and having the same
+#' format.
+#' @param schema [Schema] for the `Dataset`. If `NULL` (the default), the schema
 #' will be inferred from the data sources.
-#' @param partitioning When `sources` is a file path, one of
-#'   * A `Schema`, in which case the file paths relative to `sources` will be
-#'    parsed, and path segments will be matched with the schema fields. For
-#'    example, `schema(year = int16(), month = int8())` would create partitions
-#'    for file paths like "2019/01/file.parquet", "2019/02/file.parquet", etc.
-#'   * A character vector that defines the field names corresponding to those
-#'    path segments (that is, you're providing the names that would correspond
-#'    to a `Schema` but the types will be autodetected)
-#'   * A `HivePartitioning` or `HivePartitioningFactory`, as returned
-#'    by [hive_partition()] which parses explicit or autodetected fields from
-#'    Hive-style path segments
+#' @param partitioning When `sources` is a directory path/URI, one of:
+#'   * a `Schema`, in which case the file paths relative to `sources` will be
+#'     parsed, and path segments will be matched with the schema fields.
+#'   * a character vector that defines the field names corresponding to those
+#'     path segments (that is, you're providing the names that would correspond
+#'     to a `Schema` but the types will be autodetected)
+#'   * a `Partitioning` or `PartitioningFactory`, such as returned
+#'     by [hive_partition()]
 #'   * `NULL` for no partitioning
-#' @param ... additional arguments passed to `dataset_factory()` when
-#' `sources` is a file path, otherwise ignored.
+#'
+#' The default is to autodetect Hive-style partitions unless
+#' `hive_style = FALSE`. See the "Partitioning" section for details.
+#' When `sources` is not a directory path/URI, `partitioning` is ignored.
+#' @param hive_style Logical: should `partitioning` be interpreted as
+#' Hive-style? Default is `NA`, which means to inspect the file paths for
+#' Hive-style partitioning and behave accordingly.
+#' @param unify_schemas logical: should all data fragments (files, `Dataset`s)
+#' be scanned in order to create a unified schema from them? If `FALSE`, only
+#' the first fragment will be inspected for its schema. Use this fast path
+#' when you know and trust that all fragments have an identical schema.
+#' The default is `FALSE` when creating a dataset from a directory path/URI or
+#' vector of file paths/URIs (because there may be many files and scanning may
+#' be slow) but `TRUE` when `sources` is a list of `Dataset`s (because there
+#' should be few `Dataset`s in the list and their `Schema`s are already in
+#' memory).
+#' @param format A [FileFormat] object, or a string identifier of the format of
+#' the files in `x`. This argument is ignored when `sources` is a list of `Dataset` objects.
+#' Currently supported values:
+#' * "parquet"
+#' * "ipc"/"arrow"/"feather", all aliases for each other; for Feather, note that
+#'   only version 2 files are supported
+#' * "csv"/"text", aliases for the same thing (because comma is the default
+#'   delimiter for text files
+#' * "tsv", equivalent to passing `format = "text", delimiter = "\t"`
+#' * "json", for JSON format datasets Note: only newline-delimited JSON (aka ND-JSON) datasets
+#'   are currently supported
+#' Default is "parquet", unless a `delimiter` is also specified, in which case
+#' it is assumed to be "text".
+#' @param ... additional arguments passed to `dataset_factory()` when `sources`
+#' is a directory path/URI or vector of file paths/URIs, otherwise ignored.
+#' These may include `format` to indicate the file format, or other
+#' format-specific options (see [read_csv_arrow()], [read_parquet()] and [read_feather()] on how to specify these).
+#' @inheritParams dataset_factory
 #' @return A [Dataset] R6 object. Use `dplyr` methods on it to query the data,
 #' or call [`$NewScan()`][Scanner] to construct a query directly.
 #' @export
-#' @seealso `vignette("dataset", package = "arrow")`
-#' @include arrow-package.R
-open_dataset <- function(sources, schema = NULL, partitioning = hive_partition(), ...) {
-  factory <- DatasetFactory$create(sources, partitioning = partitioning, ...)
-  factory$Finish(schema)
+#' @seealso \href{https://arrow.apache.org/docs/r/articles/dataset.html}{
+#' datasets article}
+#' @include arrow-object.R
+#' @examplesIf arrow_with_dataset() & arrow_with_parquet()
+#' # Set up directory for examples
+#' tf <- tempfile()
+#' dir.create(tf)
+#' on.exit(unlink(tf))
+#'
+#' write_dataset(mtcars, tf, partitioning = "cyl")
+#'
+#' # You can specify a directory containing the files for your dataset and
+#' # open_dataset will scan all files in your directory.
+#' open_dataset(tf)
+#'
+#' # You can also supply a vector of paths
+#' open_dataset(c(file.path(tf, "cyl=4/part-0.parquet"), file.path(tf, "cyl=8/part-0.parquet")))
+#'
+#' ## You must specify the file format if using a format other than parquet.
+#' tf2 <- tempfile()
+#' dir.create(tf2)
+#' on.exit(unlink(tf2))
+#' write_dataset(mtcars, tf2, format = "ipc")
+#' # This line will results in errors when you try to work with the data
+#' \dontrun{
+#' open_dataset(tf2)
+#' }
+#' # This line will work
+#' open_dataset(tf2, format = "ipc")
+#'
+#' ## You can specify file partitioning to include it as a field in your dataset
+#' # Create a temporary directory and write example dataset
+#' tf3 <- tempfile()
+#' dir.create(tf3)
+#' on.exit(unlink(tf3))
+#' write_dataset(airquality, tf3, partitioning = c("Month", "Day"), hive_style = FALSE)
+#'
+#' # View files - you can see the partitioning means that files have been written
+#' # to folders based on Month/Day values
+#' tf3_files <- list.files(tf3, recursive = TRUE)
+#'
+#' # With no partitioning specified, dataset contains all files but doesn't include
+#' # directory names as field names
+#' open_dataset(tf3)
+#'
+#' # Now that partitioning has been specified, your dataset contains columns for Month and Day
+#' open_dataset(tf3, partitioning = c("Month", "Day"))
+#'
+#' # If you want to specify the data types for your fields, you can pass in a Schema
+#' open_dataset(tf3, partitioning = schema(Month = int8(), Day = int8()))
+open_dataset <- function(sources,
+                         schema = NULL,
+                         partitioning = hive_partition(),
+                         hive_style = NA,
+                         unify_schemas = NULL,
+                         format = c("parquet", "arrow", "ipc", "feather", "csv", "tsv", "text", "json"),
+                         factory_options = list(),
+                         ...) {
+  stop_if_no_datasets()
+
+  if (is_list_of(sources, "Dataset")) {
+    if (is.null(schema)) {
+      if (is.null(unify_schemas) || isTRUE(unify_schemas)) {
+        # Default is to unify schemas here
+        schema <- unify_schemas(schemas = map(sources, ~ .$schema))
+      } else {
+        # Take the first one.
+        schema <- sources[[1]]$schema
+      }
+    }
+    # Enforce that all datasets have the same schema
+    assert_is(schema, "Schema")
+    sources <- lapply(sources, function(x) {
+      x$WithSchema(schema)
+    })
+    return(dataset___UnionDataset__create(sources, schema))
+  }
+
+  if (is_false(hive_style) &&
+    inherits(partitioning, "PartitioningFactory") &&
+    identical(partitioning$type_name, "hive")) {
+    # Allow default partitioning arg to be overridden by hive_style = FALSE
+    partitioning <- NULL
+  }
+
+  factory <- DatasetFactory$create(
+    sources,
+    partitioning = partitioning,
+    format = format,
+    schema = schema,
+    hive_style = hive_style,
+    factory_options = factory_options,
+    ...
+  )
+  tryCatch(
+    # Default is _not_ to inspect/unify schemas
+    factory$Finish(schema, isTRUE(unify_schemas)),
+    # n = 4 because we want the error to show up as being from open_dataset()
+    # and not augment_io_error_msg()
+    error = function(e, call = caller_env(n = 4)) {
+      augment_io_error_msg(e, call, format = format)
+    }
+  )
 }
+
+#' Open a multi-file dataset of CSV or other delimiter-separated format
+#'
+#' A wrapper around [open_dataset] which explicitly includes parameters mirroring [read_csv_arrow()],
+#' [read_delim_arrow()], and [read_tsv_arrow()] to allow for easy switching between functions
+#' for opening single files and functions for opening datasets.
+#'
+#' @inheritParams open_dataset
+#' @inheritParams read_delim_arrow
+#'
+#' @section Options currently supported by [read_delim_arrow()] which are not supported here:
+#' * `file` (instead, please specify files in `sources`)
+#' * `col_select` (instead, subset columns after dataset creation)
+#' * `as_data_frame` (instead, convert to data frame after dataset creation)
+#' * `parse_options`
+#'
+#' @examplesIf arrow_with_dataset()
+#' # Set up directory for examples
+#' tf <- tempfile()
+#' dir.create(tf)
+#' df <- data.frame(x = c("1", "2", "NULL"))
+#'
+#' file_path <- file.path(tf, "file1.txt")
+#' write.table(df, file_path, sep = ",", row.names = FALSE)
+#'
+#' read_csv_arrow(file_path, na = c("", "NA", "NULL"), col_names = "y", skip = 1)
+#' open_csv_dataset(file_path, na = c("", "NA", "NULL"), col_names = "y", skip = 1)
+#'
+#' unlink(tf)
+#' @seealso [open_dataset()]
+#' @export
+open_delim_dataset <- function(sources,
+                               schema = NULL,
+                               partitioning = hive_partition(),
+                               hive_style = NA,
+                               unify_schemas = NULL,
+                               factory_options = list(),
+                               delim = ",",
+                               quote = "\"",
+                               escape_double = TRUE,
+                               escape_backslash = FALSE,
+                               col_names = TRUE,
+                               col_types = NULL,
+                               na = c("", "NA"),
+                               skip_empty_rows = TRUE,
+                               skip = 0L,
+                               convert_options = NULL,
+                               read_options = NULL,
+                               timestamp_parsers = NULL,
+                               quoted_na = TRUE,
+                               parse_options = NULL) {
+  open_dataset(
+    sources = sources,
+    schema = schema,
+    partitioning = partitioning,
+    hive_style = hive_style,
+    unify_schemas = unify_schemas,
+    factory_options = factory_options,
+    format = "text",
+    delim = delim,
+    quote = quote,
+    escape_double = escape_double,
+    escape_backslash = escape_backslash,
+    col_names = col_names,
+    col_types = col_types,
+    na = na,
+    skip_empty_rows = skip_empty_rows,
+    skip = skip,
+    convert_options = convert_options,
+    read_options = read_options,
+    timestamp_parsers = timestamp_parsers,
+    quoted_na = quoted_na,
+    parse_options = parse_options
+  )
+}
+
+#' @rdname open_delim_dataset
+#' @export
+open_csv_dataset <- function(sources,
+                             schema = NULL,
+                             partitioning = hive_partition(),
+                             hive_style = NA,
+                             unify_schemas = NULL,
+                             factory_options = list(),
+                             quote = "\"",
+                             escape_double = TRUE,
+                             escape_backslash = FALSE,
+                             col_names = TRUE,
+                             col_types = NULL,
+                             na = c("", "NA"),
+                             skip_empty_rows = TRUE,
+                             skip = 0L,
+                             convert_options = NULL,
+                             read_options = NULL,
+                             timestamp_parsers = NULL,
+                             quoted_na = TRUE,
+                             parse_options = NULL) {
+  mc <- match.call()
+  mc$delim <- ","
+  mc[[1]] <- get("open_delim_dataset", envir = asNamespace("arrow"))
+  eval.parent(mc)
+}
+
+#' @rdname open_delim_dataset
+#' @export
+open_tsv_dataset <- function(sources,
+                             schema = NULL,
+                             partitioning = hive_partition(),
+                             hive_style = NA,
+                             unify_schemas = NULL,
+                             factory_options = list(),
+                             quote = "\"",
+                             escape_double = TRUE,
+                             escape_backslash = FALSE,
+                             col_names = TRUE,
+                             col_types = NULL,
+                             na = c("", "NA"),
+                             skip_empty_rows = TRUE,
+                             skip = 0L,
+                             convert_options = NULL,
+                             read_options = NULL,
+                             timestamp_parsers = NULL,
+                             quoted_na = TRUE,
+                             parse_options = NULL) {
+  mc <- match.call()
+  mc$delim <- "\t"
+  mc[[1]] <- get("open_delim_dataset", envir = asNamespace("arrow"))
+  eval.parent(mc)
+}
+
+
 
 #' Multi-file datasets
 #'
@@ -61,10 +370,7 @@ open_dataset <- function(sources, schema = NULL, partitioning = hive_partition()
 #' A `Dataset` contains one or more `Fragments`, such as files, of potentially
 #' differing type and partitioning.
 #'
-#' The `Dataset$create()` method instantiates a `Dataset` which wraps child Datasets.
-#' It takes the following arguments:
-#' * `children`: a list of [Dataset] objects
-#' * `schema`: a [Schema]
+#' For `Dataset$create()`, see [open_dataset()], which is an alias for it.
 #'
 #' `DatasetFactory` is used to provide finer control over the creation of `Dataset`s.
 #'
@@ -78,21 +384,31 @@ open_dataset <- function(sources, schema = NULL, partitioning = hive_partition()
 #' For the `DatasetFactory$create()` factory method, see [dataset_factory()], an
 #' alias for it. A `DatasetFactory` has:
 #'
-#' - `$Inspect()`: Returns a common [Schema] for all data discovered by the factory.
-#' - `$Finish(schema)`: Returns a `Dataset`
+#' - `$Inspect(unify_schemas)`: If `unify_schemas` is `TRUE`, all fragments
+#' will be scanned and a unified [Schema] will be created from them; if `FALSE`
+#' (default), only the first fragment will be inspected for its schema. Use this
+#' fast path when you know and trust that all fragments have an identical schema.
+#' - `$Finish(schema, unify_schemas)`: Returns a `Dataset`. If `schema` is provided,
+#' it will be used for the `Dataset`; if omitted, a `Schema` will be created from
+#' inspecting the fragments (files) in the dataset, following `unify_schemas`
+#' as described above.
 #'
 #' `FileSystemDatasetFactory$create()` is a lower-level factory method and
 #' takes the following arguments:
 #' * `filesystem`: A [FileSystem]
-#' * `selector`: A [FileSelector]
-#' * `format`: A string identifier of the format of the files in `path`.
-#'   Currently supported options are "parquet", "arrow", and "ipc" (an alias for
-#'   the Arrow file format)
+#' * `selector`: Either a [FileSelector] or `NULL`
+#' * `paths`: Either a character vector of file paths or `NULL`
+#' * `format`: A [FileFormat]
+#' * `partitioning`: Either `Partitioning`, `PartitioningFactory`, or `NULL`
 #' @section Methods:
 #'
 #' A `Dataset` has the following methods:
 #' - `$NewScan()`: Returns a [ScannerBuilder] for building a query
-#' - `$schema`: Active binding, returns the [Schema] of the Dataset
+#' - `$WithSchema()`: Returns a new Dataset with the specified schema.
+#'   This method currently supports only adding, removing, or reordering
+#'   fields in the schema: you cannot alter or cast the field types.
+#' - `$schema`: Active binding that returns the [Schema] of the Dataset; you
+#'   may also replace the dataset's schema by using `ds$schema <- new_schema`.
 #'
 #' `FileSystemDataset` has the following methods:
 #' - `$files`: Active binding, returns the files of the `FileSystemDataset`
@@ -103,56 +419,46 @@ open_dataset <- function(sources, schema = NULL, partitioning = hive_partition()
 #'
 #' @export
 #' @seealso [open_dataset()] for a simple interface to creating a `Dataset`
-Dataset <- R6Class("Dataset", inherit = ArrowObject,
+Dataset <- R6Class("Dataset",
+  inherit = ArrowObject,
   public = list(
-    ..dispatch = function() {
-      type <- self$type
-      if (type == "union") {
-        shared_ptr(UnionDataset, self$pointer())
-      } else if (type == "filesystem") {
-        shared_ptr(FileSystemDataset, self$pointer())
+    # @description
+    # Start a new scan of the data
+    # @return A [ScannerBuilder]
+    NewScan = function() dataset___Dataset__NewScan(self),
+    ToString = function() format_schema(self),
+    WithSchema = function(schema) {
+      assert_is(schema, "Schema")
+      dataset___Dataset__ReplaceSchema(self, schema)
+    }
+  ),
+  active = list(
+    schema = function(schema) {
+      if (missing(schema)) {
+        dataset___Dataset__schema(self)
       } else {
+        out <- self$WithSchema(schema)
+        # WithSchema returns a new object but we're modifying in place,
+        # so swap in that new C++ object pointer into our R6 object
+        self$set_pointer(out$pointer())
         self
       }
     },
-    #' @description
-    #' Start a new scan of the data
-    #' @return A [ScannerBuilder]
-    NewScan = function() unique_ptr(ScannerBuilder, dataset___Dataset__NewScan(self)),
-    ToString = function() self$schema$ToString()
-  ),
-  active = list(
-    #' @description
-    #' Return the Dataset's `Schema`
-    schema = function() shared_ptr(Schema, dataset___Dataset__schema(self)),
     metadata = function() self$schema$metadata,
-    num_rows = function() {
-      warning("Number of rows unknown; returning NA", call. = FALSE)
-      NA_integer_
-    },
+    num_rows = function() self$NewScan()$Finish()$CountRows(),
     num_cols = function() length(self$schema),
-    #' @description
-    #' Return the Dataset's type.
+    # @description
+    # Return the Dataset's type.
     type = function() dataset___Dataset__type_name(self)
   )
 )
-Dataset$create <- function(children, schema) {
-  # TODO: consider deleting Dataset$create since we have DatasetFactory$create
-  assert_is_list_of(children, "Dataset")
-  assert_is(schema, "Schema")
-  shared_ptr(Dataset, dataset___UnionDataset__create(children, schema))
-}
-
-#' @export
-names.Dataset <- function(x) names(x$schema)
-
-#' @export
-dim.Dataset <- function(x) c(x$num_rows, x$num_cols)
+Dataset$create <- open_dataset
 
 #' @name FileSystemDataset
 #' @rdname Dataset
 #' @export
-FileSystemDataset <- R6Class("FileSystemDataset", inherit = Dataset,
+FileSystemDataset <- R6Class("FileSystemDataset",
+  inherit = Dataset,
   public = list(
     .class_title = function() {
       nfiles <- length(self$files)
@@ -172,22 +478,18 @@ FileSystemDataset <- R6Class("FileSystemDataset", inherit = Dataset,
     }
   ),
   active = list(
-    #' @description
-    #' Return the files contained in this `FileSystemDataset`
+    # @description
+    # Return the files contained in this `FileSystemDataset`
     files = function() dataset___FileSystemDataset__files(self),
-    #' @description
-    #' Return the format of files in this `Dataset`
+    # @description
+    # Return the format of files in this `Dataset`
     format = function() {
-      shared_ptr(FileFormat, dataset___FileSystemDataset__format(self))$..dispatch()
+      dataset___FileSystemDataset__format(self)
     },
-    num_rows = function() {
-      if (!inherits(self$format, "ParquetFileFormat")) {
-        # TODO: implement for other file formats
-        warning("Number of rows unknown; returning NA", call. = FALSE)
-        NA_integer_
-      } else {
-        sum(map_int(self$files, ~ParquetFileReader$create(.x)$num_rows))
-      }
+    # @description
+    # Return the filesystem of files in this `Dataset`
+    filesystem = function() {
+      dataset___FileSystemDataset__filesystem(self)
     }
   )
 )
@@ -195,384 +497,84 @@ FileSystemDataset <- R6Class("FileSystemDataset", inherit = Dataset,
 #' @name UnionDataset
 #' @rdname Dataset
 #' @export
-UnionDataset <- R6Class("UnionDataset", inherit = Dataset,
+UnionDataset <- R6Class("UnionDataset",
+  inherit = Dataset,
   active = list(
-    #' @description
-    #' Return the UnionDataset's child `Dataset`s
+    # @description
+    # Return the UnionDataset's child `Dataset`s
     children = function() {
-      map(dataset___UnionDataset__children(self), ~shared_ptr(Dataset, .)$..dispatch())
+      dataset___UnionDataset__children(self)
     }
   )
 )
 
-#' @usage NULL
-#' @format NULL
+#' @name InMemoryDataset
 #' @rdname Dataset
 #' @export
-DatasetFactory <- R6Class("DatasetFactory", inherit = ArrowObject,
-  public = list(
-    Finish = function(schema = NULL) {
-      if (is.null(schema)) {
-        ptr <- dataset___DatasetFactory__Finish1(self)
-      } else {
-        ptr <- dataset___DatasetFactory__Finish2(self, schema)
-      }
-      shared_ptr(Dataset, ptr)$..dispatch()
-    },
-    Inspect = function() shared_ptr(Schema, dataset___DatasetFactory__Inspect(self))
-  )
-)
-DatasetFactory$create <- function(x,
-                                  filesystem = c("auto", "local"),
-                                  format = c("parquet", "arrow", "ipc"),
-                                  partitioning = NULL,
-                                  allow_not_found = FALSE,
-                                  recursive = TRUE,
-                                  ...) {
-  if (is.list(x) && all(map_lgl(x, ~inherits(., "DatasetFactory")))) {
-    return(shared_ptr(DatasetFactory, dataset___UnionDatasetFactory__Make(x)))
+InMemoryDataset <- R6Class("InMemoryDataset", inherit = Dataset)
+InMemoryDataset$create <- function(x) {
+  stop_if_no_datasets()
+  if (!inherits(x, "Table")) {
+    x <- Table$create(x)
+  }
+  dataset___InMemoryDataset__create(x)
+}
+
+
+#' @export
+names.Dataset <- function(x) names(x$schema)
+
+#' @export
+dim.Dataset <- function(x) c(x$num_rows, x$num_cols)
+
+#' @export
+dimnames.Dataset <- function(x) list(NULL, names(x))
+
+#' @export
+c.Dataset <- function(...) Dataset$create(list(...))
+
+#' @export
+as.data.frame.Dataset <- function(x, row.names = NULL, optional = FALSE, ...) {
+  collect.Dataset(x)
+}
+
+#' @export
+head.Dataset <- function(x, n = 6L, ...) {
+  head(Scanner$create(x), n)
+}
+
+#' @export
+tail.Dataset <- function(x, n = 6L, ...) {
+  tail(Scanner$create(x), n)
+}
+
+#' @export
+`[.Dataset` <- function(x, i, j, ..., drop = FALSE) {
+  if (nargs() == 2L) {
+    # List-like column extraction (x[i])
+    return(x[, i])
+  }
+  if (!missing(j)) {
+    x <- select.Dataset(x, all_of(j))
   }
 
-  if (!inherits(filesystem, "FileSystem")) {
-    filesystem <- match.arg(filesystem)
-    if (filesystem == "auto") {
-      # When there are other FileSystems supported, detect e.g. S3 from x
-      filesystem <- "local"
-    }
-    filesystem <- list(
-      local = LocalFileSystem
-      # We'll register other file systems here
-    )[[filesystem]]$create(...)
+  if (!missing(i)) {
+    x <- take_dataset_rows(x, i)
   }
-  selector <- FileSelector$create(
-    x,
-    allow_not_found = allow_not_found,
-    recursive = recursive
-  )
+  x
+}
 
-  if (is.character(format)) {
-    format <- FileFormat$create(match.arg(format))
-  } else {
-    assert_is(format, "FileFormat")
+take_dataset_rows <- function(x, i) {
+  if (!is.numeric(i) || any(i < 0)) {
+    stop("Only slicing with positive indices is supported", call. = FALSE)
   }
+  scanner <- Scanner$create(x)
+  i <- Array$create(i - 1)
+  dataset___Scanner__TakeRows(scanner, i)
+}
 
-  if (!is.null(partitioning)) {
-    if (inherits(partitioning, "Schema")) {
-      partitioning <- DirectoryPartitioning$create(partitioning)
-    } else if (is.character(partitioning)) {
-      # These are the column/field names, and we should autodetect their types
-      partitioning <- DirectoryPartitioningFactory$create(partitioning)
-    }
+stop_if_no_datasets <- function() {
+  if (!arrow_with_dataset()) {
+    stop("This build of the arrow package does not support Datasets", call. = FALSE)
   }
-  FileSystemDatasetFactory$create(filesystem, selector, format, partitioning)
-}
-
-
-#' Create a DatasetFactory
-#'
-#' A [Dataset] can constructed using one or more [DatasetFactory]s.
-#' This function helps you construct a `DatasetFactory` that you can pass to
-#' [open_dataset()].
-#'
-#' If you would only have a single `DatasetFactory` (for example, you have a
-#' single directory containing Parquet files), you can call `open_dataset()`
-#' directly. Use `dataset_factory()` when you
-#' want to combine different directories, file systems, or file formats.
-#'
-#' @param x A string file x containing data files, or
-#' a list of `DatasetFactory` objects whose datasets should be
-#' grouped. If this argument is specified it will be used to construct a
-#' `UnionDatasetFactory` and other arguments will be ignored.
-#' @param filesystem A string identifier for the filesystem corresponding to
-#' `x`. Currently only "local" is supported.
-#' @param format A string identifier of the format of the files in `x`.
-#' Currently supported options are "parquet", "arrow", and "ipc" (an alias for
-#' the Arrow file format)
-#' @param partitioning One of
-#'   * A `Schema`, in which case the file paths relative to `sources` will be
-#'    parsed, and path segments will be matched with the schema fields. For
-#'    example, `schema(year = int16(), month = int8())` would create partitions
-#'    for file paths like "2019/01/file.parquet", "2019/02/file.parquet", etc.
-#'   * A character vector that defines the field names corresponding to those
-#'    path segments (that is, you're providing the names that would correspond
-#'    to a `Schema` but the types will be autodetected)
-#'   * A `HivePartitioning` or `HivePartitioningFactory`, as returned
-#'    by [hive_partition()] which parses explicit or autodetected fields from
-#'    Hive-style path segments
-#'   * `NULL` for no partitioning
-#' @param allow_not_found logical: is `x` allowed to not exist? Default
-#' `FALSE`. See [FileSelector].
-#' @param recursive logical: should files be discovered in subdirectories of
-#' `x`? Default `TRUE`.
-#' @param ... Additional arguments passed to the [FileSystem] `$create()` method
-#' @return A `DatasetFactory` object. Pass this to [open_dataset()],
-#' in a list potentially with other `DatasetFactory` objects, to create
-#' a `Dataset`.
-#' @export
-dataset_factory <- DatasetFactory$create
-
-#' @usage NULL
-#' @format NULL
-#' @rdname Dataset
-#' @export
-FileSystemDatasetFactory <- R6Class("FileSystemDatasetFactory",
-  inherit = DatasetFactory
-)
-FileSystemDatasetFactory$create <- function(filesystem,
-                                            selector,
-                                            format,
-                                            partitioning = NULL) {
-  assert_is(filesystem, "FileSystem")
-  assert_is(selector, "FileSelector")
-  assert_is(format, "FileFormat")
-
-  if (is.null(partitioning)) {
-    ptr <- dataset___FileSystemDatasetFactory__Make1(filesystem, selector, format)
-  } else if (inherits(partitioning, "PartitioningFactory")) {
-    ptr <- dataset___FileSystemDatasetFactory__Make3(filesystem, selector, format, partitioning)
-  } else if (inherits(partitioning, "Partitioning")) {
-    ptr <- dataset___FileSystemDatasetFactory__Make2(filesystem, selector, format, partitioning)
-  } else {
-    stop(
-      "Expected 'partitioning' to be NULL, PartitioningFactory or Partitioning",
-      call. = FALSE
-    )
-  }
-
-  shared_ptr(FileSystemDatasetFactory, ptr)
-}
-
-#' Dataset file formats
-#'
-#' @description
-#' A `FileFormat` holds information about how to read and parse the files
-#' included in a `Dataset`. There are subclasses corresponding to the supported
-#' file formats (`ParquetFileFormat` and `IpcFileFormat`).
-#'
-#' @section Factory:
-#' `FileFormat$create()` takes the following arguments:
-#' * `format`: A string identifier of the format of the files in `path`.
-#'   Currently supported options are "parquet", "arrow", and "ipc" (an alias for
-#'   the Arrow file format)
-#' * `...`: Additional format-specific options
-#'   format="parquet":
-#'   * `use_buffered_stream`: Read files through buffered input streams rather than
-#'                            loading entire row groups at once. This may be enabled
-#'                            to reduce memory overhead. Disabled by default.
-#'   * `buffer_size`: Size of buffered stream, if enabled. Default is 8KB.
-#'   * `dict_columns`: Names of columns which should be read as dictionaries.
-#'
-#' It returns the appropriate subclass of `FileFormat` (e.g. `ParquetFileFormat`)
-#' @rdname FileFormat
-#' @name FileFormat
-#' @export
-FileFormat <- R6Class("FileFormat", inherit = ArrowObject,
-  public = list(
-    ..dispatch = function() {
-      type <- self$type
-      if (type == "parquet") {
-        shared_ptr(ParquetFileFormat, self$pointer())
-      } else if (type == "ipc") {
-        shared_ptr(IpcFileFormat, self$pointer())
-      } else {
-        self
-      }
-    }
-  ),
-  active = list(
-    #' @description
-    #' Return the `FileFormat`'s type
-    type = function() dataset___FileFormat__type_name(self)
-  )
-)
-FileFormat$create <- function(format, ...) {
-  if (format == "parquet") {
-    ParquetFileFormat$create(...)
-  } else if (format %in% c("ipc", "arrow")) { # These are aliases for the same thing
-    shared_ptr(IpcFileFormat, dataset___IpcFileFormat__Make())
-  } else {
-    stop("Unsupported file format: ", format, call. = FALSE)
-  }
-}
-
-#' @usage NULL
-#' @format NULL
-#' @rdname FileFormat
-#' @export
-ParquetFileFormat <- R6Class("ParquetFileFormat", inherit = FileFormat)
-ParquetFileFormat$create <- function(use_buffered_stream = FALSE,
-                                     buffer_size = 8196,
-                                     dict_columns = character(0)) {
-  shared_ptr(ParquetFileFormat, dataset___ParquetFileFormat__Make(
-    use_buffered_stream, buffer_size, dict_columns))
-}
-
-#' @usage NULL
-#' @format NULL
-#' @rdname FileFormat
-#' @export
-IpcFileFormat <- R6Class("IpcFileFormat", inherit = FileFormat)
-
-#' Scan the contents of a dataset
-#'
-#' @description
-#' A `Scanner` iterates over a [Dataset]'s fragments and returns data
-#' according to given row filtering and column projection. Use a
-#' `ScannerBuilder`, from a `Dataset`'s `$NewScan()` method, to construct one.
-#'
-#' @section Methods:
-#' `ScannerBuilder` has the following methods:
-#'
-#' - `$Project(cols)`: Indicate that the scan should only return columns given
-#' by `cols`, a character vector of column names
-#' - `$Filter(expr)`: Filter rows by an [Expression].
-#' - `$UseThreads(threads)`: logical: should the scan use multithreading?
-#' The method's default input is `TRUE`, but you must call the method to enable
-#' multithreading because the scanner default is `FALSE`.
-#' - `$BatchSize(batch_size)`: integer: Maximum row count of scanned record
-#' batches, default is 32K. If scanned record batches are overflowing memory
-#' then this method can be called to reduce their size.
-#' - `$schema`: Active binding, returns the [Schema] of the Dataset
-#' - `$Finish()`: Returns a `Scanner`
-#'
-#' `Scanner` currently has a single method, `$ToTable()`, which evaluates the
-#' query and returns an Arrow [Table].
-#' @rdname Scanner
-#' @name Scanner
-#' @export
-Scanner <- R6Class("Scanner", inherit = ArrowObject,
-  public = list(
-    ToTable = function() shared_ptr(Table, dataset___Scanner__ToTable(self))
-  )
-)
-
-#' @usage NULL
-#' @format NULL
-#' @rdname Scanner
-#' @export
-ScannerBuilder <- R6Class("ScannerBuilder", inherit = ArrowObject,
-  public = list(
-    Project = function(cols) {
-      assert_is(cols, "character")
-      dataset___ScannerBuilder__Project(self, cols)
-      self
-    },
-    Filter = function(expr) {
-      assert_is(expr, "Expression")
-      dataset___ScannerBuilder__Filter(self, expr)
-      self
-    },
-    UseThreads = function(threads = option_use_threads()) {
-      dataset___ScannerBuilder__UseThreads(self, threads)
-      self
-    },
-    BatchSize = function(batch_size) {
-      dataset___ScannerBuilder__BatchSize(self, batch_size)
-      self
-    },
-    Finish = function() unique_ptr(Scanner, dataset___ScannerBuilder__Finish(self))
-  ),
-  active = list(
-    schema = function() shared_ptr(Schema, dataset___ScannerBuilder__schema(self))
-  )
-)
-
-#' @export
-names.ScannerBuilder <- function(x) names(x$schema)
-
-#' Define Partitioning for a Dataset
-#'
-#' @description
-#' Pass a `Partitioning` object to a [FileSystemDatasetFactory]'s `$create()`
-#' method to indicate how the file's paths should be interpreted to define
-#' partitioning.
-#'
-#' `DirectoryPartitioning` describes how to interpret raw path segments, in
-#' order. For example, `schema(year = int16(), month = int8())` would define
-#' partitions for file paths like "2019/01/file.parquet",
-#' "2019/02/file.parquet", etc.
-#'
-#' `HivePartitioning` is for Hive-style partitioning, which embeds field
-#' names and values in path segments, such as
-#' "/year=2019/month=2/data.parquet". Because fields are named in the path
-#' segments, order does not matter.
-#'
-#' `PartitioningFactory` subclasses instruct the `DatasetFactory` to detect
-#' partition features from the file paths.
-#' @section Factory:
-#' Both `DirectoryPartitioning$create()` and `HivePartitioning$create()`
-#' methods take a [Schema] as a single input argument. The helper
-#' function [`hive_partition(...)`][hive_partition] is shorthand for
-#' `HivePartitioning$create(schema(...))`.
-#'
-#' With `DirectoryPartitioningFactory$create()`, you can provide just the
-#' names of the path segments (in our example, `c("year", "month")`), and
-#' the `DatasetFactory` will infer the data types for those partition variables.
-#' `HivePartitioningFactory$create()` takes no arguments: both variable names
-#' and their types can be inferred from the file paths. `hive_partition()` with
-#' no arguments returns a `HivePartitioningFactory`.
-#' @name Partitioning
-#' @rdname Partitioning
-#' @export
-Partitioning <- R6Class("Partitioning", inherit = ArrowObject)
-#' @usage NULL
-#' @format NULL
-#' @rdname Partitioning
-#' @export
-DirectoryPartitioning <- R6Class("DirectoryPartitioning", inherit = Partitioning)
-DirectoryPartitioning$create <- function(schema) {
-  shared_ptr(DirectoryPartitioning, dataset___DirectoryPartitioning(schema))
-}
-
-#' @usage NULL
-#' @format NULL
-#' @rdname Partitioning
-#' @export
-HivePartitioning <- R6Class("HivePartitioning", inherit = Partitioning)
-HivePartitioning$create <- function(schema) {
-  shared_ptr(HivePartitioning, dataset___HivePartitioning(schema))
-}
-
-#' Construct Hive partitioning
-#'
-#' Hive partitioning embeds field names and values in path segments, such as
-#' "/year=2019/month=2/data.parquet".
-#'
-#' Because fields are named in the path segments, order of fields passed to
-#' `hive_partition()` does not matter.
-#' @param ... named list of [data types][data-type], passed to [schema()]
-#' @return A [HivePartitioning][Partitioning], or a `HivePartitioningFactory` if
-#' calling `hive_partition()` with no arguments.
-#' @examples
-#' \donttest{
-#' hive_partition(year = int16(), month = int8())
-#' }
-#' @export
-hive_partition <- function(...) {
-  schm <- schema(...)
-  if (length(schm) == 0) {
-    HivePartitioningFactory$create()
-  } else {
-    HivePartitioning$create(schm)
-  }
-}
-
-PartitioningFactory <- R6Class("PartitioningFactory", inherit = ArrowObject)
-
-#' @usage NULL
-#' @format NULL
-#' @rdname Partitioning
-#' @export
-DirectoryPartitioningFactory <- R6Class("DirectoryPartitioningFactory ", inherit = PartitioningFactory)
-DirectoryPartitioningFactory$create <- function(x) {
-  shared_ptr(DirectoryPartitioningFactory, dataset___DirectoryPartitioning__MakeFactory(x))
-}
-
-#' @usage NULL
-#' @format NULL
-#' @rdname Partitioning
-#' @export
-HivePartitioningFactory <- R6Class("HivePartitioningFactory", inherit = PartitioningFactory)
-HivePartitioningFactory$create <- function() {
-  shared_ptr(HivePartitioningFactory, dataset___HivePartitioning__MakeFactory())
 }

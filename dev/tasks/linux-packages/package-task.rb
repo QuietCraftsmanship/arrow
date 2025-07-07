@@ -16,6 +16,7 @@
 # under the License.
 
 require "English"
+require "json"
 require "open-uri"
 require "time"
 
@@ -39,19 +40,22 @@ class PackageTask
       type = $2
       if type == "rc" and options[:rc_build_type] == :release
         @deb_upstream_version = base_version
+        @deb_archive_base_name_version = base_version
         @rpm_version = base_version
         @rpm_release = "1"
       else
         @deb_upstream_version = "#{base_version}~#{sub_version}"
+        @deb_archive_base_name_version = @version
         @rpm_version = base_version
         @rpm_release = "0.#{sub_version}"
       end
     else
       @deb_upstream_version = @version
+      @deb_archive_base_name_version = @version
       @rpm_version = @version
       @rpm_release = "1"
     end
-    @deb_release = "1"
+    @deb_release = ENV["DEB_RELEASE"] || "1"
   end
 
   def define
@@ -59,6 +63,7 @@ class PackageTask
     define_apt_task
     define_yum_task
     define_version_task
+    define_docker_tasks
   end
 
   private
@@ -72,20 +77,6 @@ class PackageTask
     ENV["DEBUG"] != "no"
   end
 
-  def git_directory?(directory)
-    candidate_paths = [".git", "HEAD"]
-    candidate_paths.any? do |candidate_path|
-      File.exist?(File.join(directory, candidate_path))
-    end
-  end
-
-  def latest_commit_time(git_directory)
-    return nil unless git_directory?(git_directory)
-    cd(git_directory) do
-      return Time.iso8601(`git log -n 1 --format=%aI`.chomp).utc
-    end
-  end
-
   def download(url, output_path)
     if File.directory?(output_path)
       base_name = url.split("/").last
@@ -96,14 +87,18 @@ class PackageTask
     unless File.exist?(absolute_output_path)
       mkdir_p(File.dirname(absolute_output_path))
       rake_output_message "Downloading... #{url}"
-      URI(url).open do |downloaded_file|
+      open_url(url) do |downloaded_file|
         File.open(absolute_output_path, "wb") do |output_file|
-          output_file.print(downloaded_file.read)
+          IO.copy_stream(downloaded_file, output_file)
         end
       end
     end
 
     absolute_output_path
+  end
+
+  def open_url(url, &block)
+    URI(url).open(&block)
   end
 
   def substitute_content(content)
@@ -112,39 +107,85 @@ class PackageTask
     end
   end
 
-  def run_docker(os, architecture=nil)
+  def docker_image(os, architecture)
+    image = "#{@package}-#{os}"
+    image << "-#{architecture}" if architecture
+    image
+  end
+
+  def docker_run(os, architecture, console: false)
     id = os
     id = "#{id}-#{architecture}" if architecture
-    docker_tag = "#{@package}-#{id}"
+    image = docker_image(os, architecture)
     build_command_line = [
       "docker",
       "build",
-      "--tag", docker_tag,
+      "--cache-from", image,
+      "--tag", image,
     ]
     run_command_line = [
       "docker",
       "run",
       "--rm",
-      "--tty",
+      "--log-driver", "none",
       "--volume", "#{Dir.pwd}:/host:rw",
     ]
+    if $stdin.tty?
+      run_command_line << "--interactive"
+      run_command_line << "--tty"
+    else
+      run_command_line.concat(["--attach", "STDOUT"])
+      run_command_line.concat(["--attach", "STDERR"])
+    end
+    build_dir = ENV["BUILD_DIR"]
+    if build_dir
+      build_dir = "#{File.expand_path(build_dir)}/#{id}"
+      mkdir_p(build_dir)
+      run_command_line.concat(["--volume", "#{build_dir}:/build:rw"])
+    end
     if debug_build?
       build_command_line.concat(["--build-arg", "DEBUG=yes"])
       run_command_line.concat(["--env", "DEBUG=yes"])
     end
+    pass_through_env_names = [
+      "DEB_BUILD_OPTIONS",
+      "RPM_BUILD_NCPUS",
+    ]
+    pass_through_env_names.each do |name|
+      value = ENV[name]
+      next unless value
+      run_command_line.concat(["--env", "#{name}=#{value}"])
+    end
     if File.exist?(File.join(id, "Dockerfile"))
       docker_context = id
     else
-      from = File.readlines(File.join(id, "from")).find do |line|
-        /^[a-z]/i =~ line
+      lines = File.readlines(File.join(id, "from"), encoding: "UTF-8")
+      from = lines.find do |line|
+        /^[a-z-]/i =~ line
       end
-      build_command_line.concat(["--build-arg", "FROM=#{from.chomp}"])
+      from_components = from.chomp.split
+      from = from_components.pop
+      build_arguments = from_components
+      case build_arguments
+      when ["--platform=linux/arm64"]
+        docker_info = JSON.parse(`docker info --format '{{json .}}'`)
+        case docker_info["Architecture"]
+        when "aarch64"
+          # Do nothing
+        else
+          # docker build ... -> docker buildx build ...
+          build_command_line[1, 0] = "buildx"
+          build_command_line.concat(build_arguments)
+        end
+      end
+      build_command_line.concat(["--build-arg", "FROM=#{from}"])
       docker_context = os
     end
     build_command_line.concat(docker_build_options(os, architecture))
     run_command_line.concat(docker_run_options(os, architecture))
     build_command_line << docker_context
-    run_command_line.concat([docker_tag, "/host/build.sh"])
+    run_command_line << image
+    run_command_line << "/host/build.sh" unless console
 
     sh(*build_command_line)
     sh(*run_command_line)
@@ -158,10 +199,53 @@ class PackageTask
     []
   end
 
+  def docker_pull(os, architecture)
+    image = docker_image(os, architecture)
+    command_line = [
+      "docker",
+      "pull",
+      image,
+    ]
+    command_line.concat(docker_pull_options(os, architecture))
+    sh(*command_line)
+  end
+
+  def docker_pull_options(os, architecture)
+    []
+  end
+
+  def docker_push(os, architecture)
+    image = docker_image(os, architecture)
+    command_line = [
+      "docker",
+      "push",
+      image,
+    ]
+    command_line.concat(docker_push_options(os, architecture))
+    sh(*command_line)
+  end
+
+  def docker_push_options(os, architecture)
+    []
+  end
+
   def define_dist_task
     define_archive_task
     desc "Create release package"
     task :dist => [@archive_name]
+  end
+
+  def split_target(target)
+    components = target.split("-")
+    if components[0, 2] == ["amazon", "linux"]
+      components[0, 2] = components[0, 2].join("-")
+    elsif components.values_at(0, 2) == ["centos", "stream"]
+      components[1, 2] = components[1, 2].join("-")
+    end
+    if components.size >= 3
+      components[2..-1] = components[2..-1].join("-")
+    end
+    components
   end
 
   def enable_apt?
@@ -172,28 +256,30 @@ class PackageTask
     return [] unless enable_apt?
 
     targets = (ENV["APT_TARGETS"] || "").split(",")
-    return targets unless targets.empty?
+    targets = apt_targets_default if targets.empty?
 
-    apt_targets_default
+    targets.find_all do |target|
+      Dir.exist?(File.join(apt_dir, target))
+    end
   end
 
   def apt_targets_default
     # Disable arm64 targets by default for now
     # because they require some setups on host.
     [
-      "debian-stretch",
-      # "debian-stretch-arm64",
-      "debian-buster",
-      # "debian-stretch-arm64",
-      "ubuntu-xenial",
-      # "ubuntu-xenial-arm64",
-      "ubuntu-bionic",
-      # "ubuntu-bionic-arm64",
-      "ubuntu-eoan",
-      # "ubuntu-eoan-arm64",
-      "ubuntu-focal",
-      # "ubuntu-focal-arm64",
+      "debian-bookworm",
+      # "debian-bookworm-arm64",
+      "debian-trixie",
+      # "debian-trixie-arm64",
+      "ubuntu-jammy",
+      # "ubuntu-jammy-arm64",
+      "ubuntu-noble",
+      # "ubuntu-noble-arm64",
     ]
+  end
+
+  def deb_archive_base_name
+    "#{@package}-#{@deb_archive_base_name_version}"
   end
 
   def deb_archive_name
@@ -204,14 +290,46 @@ class PackageTask
     "apt"
   end
 
-  def apt_build
+  def apt_prepare_debian_dir(tmp_dir, target)
+    source_debian_dir = nil
+    specific_debian_dir = "debian.#{target}"
+    distribution, code_name, _architecture = split_target(target)
+    platform = [distribution, code_name].join("-")
+    platform_debian_dir = "debian.#{platform}"
+    if File.exist?(specific_debian_dir)
+      source_debian_dir = specific_debian_dir
+    elsif File.exist?(platform_debian_dir)
+      source_debian_dir = platform_debian_dir
+    else
+      source_debian_dir = "debian"
+    end
+
+    prepared_debian_dir = "#{tmp_dir}/debian.#{target}"
+    cp_r(source_debian_dir, prepared_debian_dir)
+    control_in_path = "#{prepared_debian_dir}/control.in"
+    if File.exist?(control_in_path)
+      control_in = File.read(control_in_path, encoding: "UTF-8")
+      rm_f(control_in_path)
+      File.open("#{prepared_debian_dir}/control", "w") do |control|
+        prepared_control = apt_prepare_debian_control(control_in, target)
+        control.print(prepared_control)
+      end
+    end
+  end
+
+  def apt_prepare_debian_control(control_in, target)
+    message = "#{__method__} must be defined to use debian/control.in"
+    raise NotImplementedError, message
+  end
+
+  def apt_build(console: false)
     tmp_dir = "#{apt_dir}/tmp"
     rm_rf(tmp_dir)
     mkdir_p(tmp_dir)
     cp(deb_archive_name,
        File.join(tmp_dir, deb_archive_name))
-    Dir.glob("debian*") do |debian_dir|
-      cp_r(debian_dir, "#{tmp_dir}/#{debian_dir}")
+    apt_targets.each do |target|
+      apt_prepare_debian_dir(tmp_dir, target)
     end
 
     env_sh = "#{apt_dir}/env.sh"
@@ -222,12 +340,11 @@ VERSION=#{@deb_upstream_version}
       ENV
     end
 
-    cd(apt_dir) do
-      apt_targets.each do |target|
-        next unless Dir.exist?(target)
-        distribution, version, architecture = target.split("-", 3)
+    apt_targets.each do |target|
+      cd(apt_dir) do
+        distribution, version, architecture = split_target(target)
         os = "#{distribution}-#{version}"
-        run_docker(os, architecture)
+        docker_run(os, architecture, console: console)
       end
     end
   end
@@ -257,6 +374,13 @@ VERSION=#{@deb_upstream_version}
       task :build => build_dependencies do
         apt_build if enable_apt?
       end
+
+      namespace :build do
+        desc "Open console"
+        task :console => build_dependencies do
+          apt_build(console: true) if enable_apt?
+        end
+      end
     end
 
     desc "Release APT repositories"
@@ -274,29 +398,38 @@ VERSION=#{@deb_upstream_version}
     return [] unless enable_yum?
 
     targets = (ENV["YUM_TARGETS"] || "").split(",")
-    return targets unless targets.empty?
+    targets = yum_targets_default if targets.empty?
 
-    yum_targets_default
+    targets.find_all do |target|
+      Dir.exist?(File.join(yum_dir, target))
+    end
   end
 
   def yum_targets_default
     # Disable aarch64 targets by default for now
     # because they require some setups on host.
     [
-      "centos-6",
+      "almalinux-9",
+      # "almalinux-9-arch64",
+      "almalinux-8",
+      # "almalinux-8-arch64",
+      "amazon-linux-2023",
+      # "amazon-linux-2023-arch64",
+      "centos-9-stream",
+      # "centos-9-stream-aarch64",
+      "centos-8-stream",
+      # "centos-8-stream-aarch64",
       "centos-7",
       # "centos-7-aarch64",
-      "centos-8",
-      # "centos-8-aarch64",
     ]
-  end
-
-  def rpm_archive_name
-    "#{rpm_archive_base_name}.tar.gz"
   end
 
   def rpm_archive_base_name
     "#{@package}-#{@rpm_version}"
+  end
+
+  def rpm_archive_name
+    "#{rpm_archive_base_name}.tar.gz"
   end
 
   def yum_dir
@@ -324,7 +457,7 @@ VERSION=#{@deb_upstream_version}
     "#{yum_dir}/#{@rpm_package}.spec.in"
   end
 
-  def yum_build
+  def yum_build(console: false)
     tmp_dir = "#{yum_dir}/tmp"
     rm_rf(tmp_dir)
     mkdir_p(tmp_dir)
@@ -342,7 +475,7 @@ RELEASE=#{@rpm_release}
     end
 
     spec = "#{tmp_dir}/#{@rpm_package}.spec"
-    spec_in_data = File.read(yum_spec_in_path)
+    spec_in_data = File.read(yum_spec_in_path, encoding: "UTF-8")
     spec_data = substitute_content(spec_in_data) do |key, matched|
       yum_expand_variable(key) || matched
     end
@@ -350,12 +483,11 @@ RELEASE=#{@rpm_release}
       spec_file.print(spec_data)
     end
 
-    cd(yum_dir) do
-      yum_targets.each do |target|
-        next unless Dir.exist?(target)
-        distribution, version, architecture = target.split("-", 3)
+    yum_targets.each do |target|
+      cd(yum_dir) do
+        distribution, version, architecture = split_target(target)
         os = "#{distribution}-#{version}"
-        run_docker(os, architecture)
+        docker_run(os, architecture, console: console)
       end
     end
   end
@@ -383,6 +515,13 @@ RELEASE=#{@rpm_release}
       end
       task :build => build_dependencies do
         yum_build if enable_yum?
+      end
+
+      namespace :build do
+        desc "Open console"
+        task :console => build_dependencies do
+          yum_build(console: true) if enable_yum?
+        end
       end
     end
 
@@ -429,7 +568,7 @@ RELEASE=#{@rpm_release}
 
   def update_content(path)
     if File.exist?(path)
-      content = File.read(path)
+      content = File.read(path, encoding: "UTF-8")
     else
       content = ""
     end
@@ -470,6 +609,40 @@ RELEASE=#{@rpm_release}
       CHANGELOG
       content = content.sub(/^(Release:\s+)\d+/, "\\11")
       content.rstrip
+    end
+  end
+
+  def define_docker_tasks
+    namespace :docker do
+      pull_tasks = []
+      push_tasks = []
+
+      (apt_targets + yum_targets).each do |target|
+        distribution, version, architecture = split_target(target)
+        os = "#{distribution}-#{version}"
+
+        namespace :pull do
+          desc "Pull built image for #{target}"
+          task target do
+            docker_pull(os, architecture)
+          end
+          pull_tasks << "docker:pull:#{target}"
+        end
+
+        namespace :push do
+          desc "Push built image for #{target}"
+          task target do
+            docker_push(os, architecture)
+          end
+          push_tasks << "docker:push:#{target}"
+        end
+      end
+
+      desc "Pull built images"
+      task :pull => pull_tasks
+
+      desc "Push built images"
+      task :push => push_tasks
     end
   end
 end

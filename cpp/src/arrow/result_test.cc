@@ -26,6 +26,9 @@
 #include <gtest/gtest.h>
 
 #include "arrow/testing/gtest_compat.h"
+#include "arrow/testing/gtest_util.h"
+#include "arrow/testing/matchers.h"
+#include "arrow/util/functional.h"
 
 namespace arrow {
 
@@ -34,10 +37,10 @@ namespace {
 using ::testing::Eq;
 
 StatusCode kErrorCode = StatusCode::Invalid;
-constexpr char kErrorMessage[] = "Invalid argument";
+constexpr const char* kErrorMessage = "Invalid argument";
 
 const int kIntElement = 42;
-constexpr char kStringElement[] =
+constexpr const char* kStringElement =
     "The Answer to the Ultimate Question of Life, the Universe, and Everything";
 
 // A data type without a default constructor.
@@ -46,6 +49,10 @@ struct Foo {
   std::string baz;
 
   explicit Foo(int value) : bar(value), baz(kStringElement) {}
+
+  bool operator==(const Foo& other) const {
+    return (bar == other.bar) && (baz == other.baz);
+  }
 };
 
 // A data type with only copy constructors.
@@ -59,7 +66,7 @@ struct CopyOnlyDataType {
 };
 
 struct ImplicitlyCopyConvertible {
-  ImplicitlyCopyConvertible(const CopyOnlyDataType& co)  // NOLINT(runtime/explicit)
+  ImplicitlyCopyConvertible(const CopyOnlyDataType& co)  // NOLINT runtime/explicit
       : copy_only(co) {}
 
   CopyOnlyDataType copy_only;
@@ -72,9 +79,9 @@ struct MoveOnlyDataType {
   MoveOnlyDataType(const MoveOnlyDataType& other) = delete;
   MoveOnlyDataType& operator=(const MoveOnlyDataType& other) = delete;
 
-  MoveOnlyDataType(MoveOnlyDataType&& other) { MoveFrom(other); }
+  MoveOnlyDataType(MoveOnlyDataType&& other) { MoveFrom(&other); }
   MoveOnlyDataType& operator=(MoveOnlyDataType&& other) {
-    MoveFrom(other);
+    MoveFrom(&other);
     return *this;
   }
 
@@ -87,17 +94,17 @@ struct MoveOnlyDataType {
     }
   }
 
-  void MoveFrom(MoveOnlyDataType& other) {
+  void MoveFrom(MoveOnlyDataType* other) {
     Destroy();
-    data = other.data;
-    other.data = nullptr;
+    data = other->data;
+    other->data = nullptr;
   }
 
   int* data = nullptr;
 };
 
 struct ImplicitlyMoveConvertible {
-  ImplicitlyMoveConvertible(MoveOnlyDataType&& mo)  // NOLINT(runtime/explicit)
+  ImplicitlyMoveConvertible(MoveOnlyDataType&& mo)  // NOLINT runtime/explicit
       : move_only(std::move(mo)) {}
 
   MoveOnlyDataType move_only;
@@ -128,6 +135,10 @@ struct HeapAllocatedObject {
   }
 
   ~HeapAllocatedObject() { delete value; }
+
+  bool operator==(const HeapAllocatedObject& other) const {
+    return *value == *other.value;
+  }
 };
 
 // Constructs a Foo.
@@ -165,14 +176,6 @@ struct StringVectorCtor {
   std::vector<std::string> operator()() { return {kStringElement, kErrorMessage}; }
 };
 
-bool operator==(const Foo& lhs, const Foo& rhs) {
-  return (lhs.bar == rhs.bar) && (lhs.baz == rhs.baz);
-}
-
-bool operator==(const HeapAllocatedObject& lhs, const HeapAllocatedObject& rhs) {
-  return *lhs.value == *rhs.value;
-}
-
 // Returns an rvalue reference to the Result<T> object pointed to by
 // |result|.
 template <class T>
@@ -184,9 +187,8 @@ Result<T>&& MoveResult(Result<T>* result) {
 template <typename T>
 class ResultTest : public ::testing::Test {};
 
-typedef ::testing::Types<IntCtor, FooCtor, StringCtor, StringVectorCtor,
-                         HeapAllocatedObjectCtor>
-    TestTypes;
+using TestTypes = ::testing::Types<IntCtor, FooCtor, StringCtor, StringVectorCtor,
+                                   HeapAllocatedObjectCtor>;
 
 TYPED_TEST_SUITE(ResultTest, TestTypes);
 
@@ -713,6 +715,94 @@ TEST(ResultTest, Equality) {
     EXPECT_EQ(c.ValueOrDie(), (std::vector<int>{1, 2, 3, 4, 5}));
     EXPECT_NE(a, b);  // b's value was moved
   }
+}
+
+TEST(ResultTest, ViewAsStatus) {
+  Result<int> ok(3);
+  Result<int> err(Status::Invalid("error"));
+
+  auto ViewAsStatus = [](const void* ptr) { return static_cast<const Status*>(ptr); };
+
+  EXPECT_EQ(ViewAsStatus(&ok), &ok.status());
+  EXPECT_EQ(ViewAsStatus(&err), &err.status());
+}
+
+TEST(ResultTest, MatcherExamples) {
+  EXPECT_THAT(Result<int>(Status::Invalid("arbitrary error")),
+              Raises(StatusCode::Invalid));
+
+  EXPECT_THAT(Result<int>(Status::Invalid("arbitrary error")),
+              Raises(StatusCode::Invalid, testing::HasSubstr("arbitrary")));
+
+  // message doesn't match, so no match
+  EXPECT_THAT(
+      Result<int>(Status::Invalid("arbitrary error")),
+      testing::Not(Raises(StatusCode::Invalid, testing::HasSubstr("reasonable"))));
+
+  // different error code, so no match
+  EXPECT_THAT(Result<int>(Status::TypeError("arbitrary error")),
+              testing::Not(Raises(StatusCode::Invalid)));
+
+  // not an error, so no match
+  EXPECT_THAT(Result<int>(333), testing::Not(Raises(StatusCode::Invalid)));
+
+  EXPECT_THAT(Result<std::string>("hello world"),
+              ResultWith(testing::HasSubstr("hello")));
+
+  EXPECT_THAT(Result<std::string>(Status::Invalid("XXX")),
+              testing::Not(ResultWith(testing::HasSubstr("hello"))));
+
+  // holds a value, but that value doesn't match the given pattern
+  EXPECT_THAT(Result<std::string>("foo bar"),
+              testing::Not(ResultWith(testing::HasSubstr("hello"))));
+}
+
+TEST(ResultTest, MatcherDescriptions) {
+  testing::Matcher<Result<std::string>> matcher = ResultWith(testing::HasSubstr("hello"));
+
+  {
+    std::stringstream ss;
+    matcher.DescribeTo(&ss);
+    EXPECT_THAT(ss.str(), testing::StrEq("value has substring \"hello\""));
+  }
+
+  {
+    std::stringstream ss;
+    matcher.DescribeNegationTo(&ss);
+    EXPECT_THAT(ss.str(), testing::StrEq("value has no substring \"hello\""));
+  }
+}
+
+TEST(ResultTest, MatcherExplanations) {
+  testing::Matcher<Result<std::string>> matcher = ResultWith(testing::HasSubstr("hello"));
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_TRUE(matcher.MatchAndExplain(Result<std::string>("hello world"), &listener));
+    EXPECT_THAT(listener.str(), testing::StrEq("whose value \"hello world\" matches"));
+  }
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_FALSE(matcher.MatchAndExplain(Result<std::string>("foo bar"), &listener));
+    EXPECT_THAT(listener.str(), testing::StrEq("whose value \"foo bar\" doesn't match"));
+  }
+
+  {
+    testing::StringMatchResultListener listener;
+    EXPECT_FALSE(matcher.MatchAndExplain(Status::TypeError("XXX"), &listener));
+    EXPECT_THAT(listener.str(),
+                testing::StrEq("whose error \"Type error: XXX\" doesn't match"));
+  }
+}
+
+TEST(ResultTest, ValueOrGeneratedMoveOnlyGenerator) {
+  Result<MoveOnlyDataType> result = Status::Invalid("");
+  internal::FnOnce<MoveOnlyDataType()> alternative_generator = [] {
+    return MoveOnlyDataType{kIntElement};
+  };
+  auto out = std::move(result).ValueOrElse(std::move(alternative_generator));
+  EXPECT_EQ(*out.data, kIntElement);
 }
 
 }  // namespace

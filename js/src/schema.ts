@@ -15,72 +15,69 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Data } from './data';
-import { Vector } from './vector';
-import { DataType } from './type';
-import { selectArgs } from './util/args';
-import { selectFieldArgs } from './util/args';
-import { instance as comparer } from './visitor/typecomparator';
+import { MetadataVersion } from './enum.js';
+import { DataType, TypeMap } from './type.js';
 
-type VectorMap = { [key: string]: Vector };
-type Fields<T extends { [key: string]: DataType }> = (keyof T)[] | Field<T[keyof T]>[];
-type ChildData<T extends { [key: string]: DataType }> = T[keyof T][] | Data<T[keyof T]>[] | Vector<T[keyof T]>[];
-
-export class Schema<T extends { [key: string]: DataType } = any> {
-
-    public static from<T extends { [key: string]: DataType } = any>(children: T): Schema<T>;
-    public static from<T extends VectorMap = any>(children: T): Schema<{ [P in keyof T]: T[P]['type'] }>;
-    public static from<T extends { [key: string]: DataType } = any>(children: ChildData<T>, fields?: Fields<T>): Schema<T>;
-    /** @nocollapse */
-    public static from(...args: any[]) {
-        return Schema.new(args[0], args[1]);
-    }
-
-    public static new<T extends { [key: string]: DataType } = any>(children: T): Schema<T>;
-    public static new<T extends VectorMap = any>(children: T): Schema<{ [P in keyof T]: T[P]['type'] }>;
-    public static new<T extends { [key: string]: DataType } = any>(children: ChildData<T>, fields?: Fields<T>): Schema<T>;
-    /** @nocollapse */
-    public static new(...args: any[]) {
-        return new Schema(selectFieldArgs(args)[0]);
-    }
+export class Schema<T extends TypeMap = any> {
 
     public readonly fields: Field<T[keyof T]>[];
     public readonly metadata: Map<string, string>;
     public readonly dictionaries: Map<number, DataType>;
+    public readonly metadataVersion: MetadataVersion;
 
-    constructor(fields: Field[] = [],
-                metadata?: Map<string, string> | null,
-                dictionaries?: Map<number, DataType> | null) {
+    constructor(
+        fields: Field<T[keyof T]>[] = [],
+        metadata?: Map<string, string> | null,
+        dictionaries?: Map<number, DataType> | null,
+        metadataVersion = MetadataVersion.V5) {
         this.fields = (fields || []) as Field<T[keyof T]>[];
         this.metadata = metadata || new Map();
         if (!dictionaries) {
-            dictionaries = generateDictionaryMap(fields);
+            dictionaries = generateDictionaryMap(this.fields);
         }
         this.dictionaries = dictionaries;
+        this.metadataVersion = metadataVersion;
     }
     public get [Symbol.toStringTag]() { return 'Schema'; }
+
+    public get names(): (keyof T)[] { return this.fields.map((f) => f.name); }
+
     public toString() {
         return `Schema<{ ${this.fields.map((f, i) => `${i}: ${f}`).join(', ')} }>`;
     }
 
-    public compareTo(other?: Schema | null): other is Schema<T> {
-        return comparer.compareSchemas(this, other);
+    /**
+     * Construct a new Schema containing only specified fields.
+     *
+     * @param fieldNames Names of fields to keep.
+     * @returns A new Schema of fields matching the specified names.
+     */
+    public select<K extends keyof T = any>(fieldNames: K[]) {
+        const names = new Set<string | K>(fieldNames);
+        const fields = this.fields.filter((f) => names.has(f.name)) as Field<T[K]>[];
+        return new Schema<{ [P in K]: T[P] }>(fields, this.metadata);
     }
 
-    public select<K extends keyof T = any>(...columnNames: K[]) {
-        const names = columnNames.reduce((xs, x) => (xs[x] = true) && xs, Object.create(null));
-        return new Schema<{ [P in K]: T[P] }>(this.fields.filter((f) => names[f.name]), this.metadata);
-    }
-    public selectAt<K extends T[keyof T] = any>(...columnIndices: number[]) {
-        return new Schema<{ [key: string]: K }>(columnIndices.map((i) => this.fields[i]).filter(Boolean), this.metadata);
+    /**
+     * Construct a new Schema containing only fields at the specified indices.
+     *
+     * @param fieldIndices Indices of fields to keep.
+     * @returns A new Schema of fields at the specified indices.
+     */
+    public selectAt<K extends T = any>(fieldIndices: number[]) {
+        const fields = fieldIndices.map((i) => this.fields[i]).filter(Boolean) as Field<K[keyof K]>[];
+        return new Schema<K>(fields, this.metadata);
     }
 
-    public assign<R extends { [key: string]: DataType } = any>(schema: Schema<R>): Schema<T & R>;
-    public assign<R extends { [key: string]: DataType } = any>(...fields: (Field<R[keyof R]> | Field<R[keyof R]>[])[]): Schema<T & R>;
-    public assign<R extends { [key: string]: DataType } = any>(...args: (Schema<R> | Field<R[keyof R]> | Field<R[keyof R]>[])[]) {
+    public assign<R extends TypeMap = any>(schema: Schema<R>): Schema<T & R>;
+    public assign<R extends TypeMap = any>(...fields: (Field<R[keyof R]> | Field<R[keyof R]>[])[]): Schema<T & R>;
+    public assign<R extends TypeMap = any>(...args: (Schema<R> | Field<R[keyof R]> | Field<R[keyof R]>[])[]) {
 
-        const other = args[0] instanceof Schema ? args[0] as Schema<R>
-            : new Schema<R>(selectArgs<Field<R[keyof R]>>(Field, args));
+        const other = (args[0] instanceof Schema
+            ? args[0] as Schema<R>
+            : Array.isArray(args[0])
+                ? new Schema<R>(<Field<R[keyof R]>[]>args[0])
+                : new Schema<R>(<Field<R[keyof R]>[]>args));
 
         const curFields = [...this.fields] as Field[];
         const metadata = mergeMaps(mergeMaps(new Map(), this.metadata), other.metadata);
@@ -100,9 +97,15 @@ export class Schema<T extends { [key: string]: DataType } = any> {
     }
 }
 
+// Add these here so they're picked up by the externs creator
+// in the build, and closure-compiler doesn't minify them away
+(Schema.prototype as any).fields = <any>null;
+(Schema.prototype as any).metadata = <any>null;
+(Schema.prototype as any).dictionaries = <any>null;
+
 export class Field<T extends DataType = any> {
 
-    public static new<T extends DataType = any>(props: { name: string | number, type: T, nullable?: boolean, metadata?: Map<string, string> | null }): Field<T>;
+    public static new<T extends DataType = any>(props: { name: string | number; type: T; nullable?: boolean; metadata?: Map<string, string> | null }): Field<T>;
     public static new<T extends DataType = any>(name: string | number | Field<T>, type: T, nullable?: boolean, metadata?: Map<string, string> | null): Field<T>;
     /** @nocollapse */
     public static new<T extends DataType = any>(...args: any[]) {
@@ -131,19 +134,23 @@ export class Field<T extends DataType = any> {
     public get typeId() { return this.type.typeId; }
     public get [Symbol.toStringTag]() { return 'Field'; }
     public toString() { return `${this.name}: ${this.type}`; }
-    public compareTo(other?: Field | null): other is Field<T> {
-        return comparer.compareField(this, other);
-    }
-    public clone<R extends DataType = T>(props: { name?: string | number, type?: R, nullable?: boolean, metadata?: Map<string, string> | null }): Field<R>;
+    public clone<R extends DataType = T>(props: { name?: string | number; type?: R; nullable?: boolean; metadata?: Map<string, string> | null }): Field<R>;
     public clone<R extends DataType = T>(name?: string | number | Field<T>, type?: R, nullable?: boolean, metadata?: Map<string, string> | null): Field<R>;
     public clone<R extends DataType = T>(...args: any[]) {
         let [name, type, nullable, metadata] = args;
         (!args[0] || typeof args[0] !== 'object')
             ? ([name = this.name, type = this.type, nullable = this.nullable, metadata = this.metadata] = args)
-            : ({name = this.name, type = this.type, nullable = this.nullable, metadata = this.metadata} = args[0]);
+            : ({ name = this.name, type = this.type, nullable = this.nullable, metadata = this.metadata } = args[0]);
         return Field.new<R>(name, type, nullable, metadata);
     }
 }
+
+// Add these here so they're picked up by the externs creator
+// in the build, and closure-compiler doesn't minify them away
+(Field.prototype as any).type = null;
+(Field.prototype as any).name = null;
+(Field.prototype as any).nullable = null;
+(Field.prototype as any).metadata = null;
 
 /** @ignore */
 function mergeMaps<TKey, TVal>(m1?: Map<TKey, TVal> | null, m2?: Map<TKey, TVal> | null): Map<TKey, TVal> {
@@ -170,14 +177,3 @@ function generateDictionaryMap(fields: Field[], dictionaries = new Map<number, D
 
     return dictionaries;
 }
-
-// Add these here so they're picked up by the externs creator
-// in the build, and closure-compiler doesn't minify them away
-(Schema.prototype as any).fields = null;
-(Schema.prototype as any).metadata = null;
-(Schema.prototype as any).dictionaries = null;
-
-(Field.prototype as any).type = null;
-(Field.prototype as any).name = null;
-(Field.prototype as any).nullable = null;
-(Field.prototype as any).metadata = null;

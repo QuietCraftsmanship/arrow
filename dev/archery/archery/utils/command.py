@@ -24,8 +24,8 @@ from .logger import logger, ctx
 
 
 def default_bin(name, default):
-    assert(default)
-    env_name = "ARCHERY_%s_BIN".format(default.upper())
+    assert default
+    env_name = "ARCHERY_{0}_BIN".format(default.upper())
     return name if name else os.environ.get(env_name, default)
 
 
@@ -50,14 +50,18 @@ class capture_stdout:
 
 
 class Command:
-    """ A runnable command.
+    """
+    A runnable command.
 
     Class inheriting from the Command class must provide the bin
     property/attribute.
     """
 
+    def __init__(self, bin):
+        self.bin = bin
+
     def run(self, *argv, **kwargs):
-        assert(hasattr(self, "bin"))
+        assert hasattr(self, "bin")
         invocation = shlex.split(self.bin)
         invocation.extend(argv)
 
@@ -70,12 +74,14 @@ class Command:
         if "check" not in kwargs:
             kwargs["check"] = True
 
-        logger.debug(f"Executing `{invocation}`")
+        logger.debug("Executing `{}`".format(invocation))
         return subprocess.run(invocation, **kwargs)
 
     @property
     def available(self):
-        """ Indicate if the command binary is found in PATH. """
+        """
+        Indicate if the command binary is found in PATH.
+        """
         binary = shlex.split(self.bin)[0]
         return shutil.which(binary) is not None
 

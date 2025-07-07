@@ -19,102 +19,130 @@ name: NodeJS
 
 on:
   push:
+    branches:
+      - '**'
+      - '!dependabot/**'
+    tags:
+      - '**'
     paths:
+      - '.dockerignore'
       - '.github/workflows/js.yml'
-      - 'ci/**'
+      - 'ci/docker/*js.dockerfile'
+      - 'ci/scripts/js_*'
       - 'js/**'
   pull_request:
     paths:
+      - '.dockerignore'
       - '.github/workflows/js.yml'
-      - 'ci/**'
+      - 'ci/docker/*js.dockerfile'
+      - 'ci/scripts/js_*'
       - 'js/**'
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ARCHERY_DEBUG: 1
 
 jobs:
 
-  debian:
-    name: AMD64 Debian 10 NodeJS ${{ matrix.node }}
+  docker:
+    name: AMD64 Debian 12 NodeJS 18
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [11]
-    env:
-      NODE: ${{ matrix.node }}
+    timeout-minutes: 60
     steps:
       - name: Checkout Arrow
-        uses: actions/checkout@v2
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4.0.0
         with:
           fetch-depth: 0
-      - name: Fetch Submodules and Tags
-        shell: bash
-        run: ci/scripts/util_checkout.sh
-      - name: Docker Pull
-        run: docker-compose pull --ignore-pull-failures debian-js
-      - name: Docker Build
-        run: docker-compose build debian-js
-      - name: Docker Run
-        run: docker-compose run debian-js
-      - name: Docker Push
-        if: success() && github.event_name == 'push' && github.repository == 'apache/arrow'
-        continue-on-error: true
-        shell: bash
+      - name: Setup Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
+        with:
+          python-version: 3.12
+      - name: Setup Archery
+        run: pip install -e dev/archery[docker]
+      - name: Execute Docker Build
+        env:
+          ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
+          ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          docker login -u ${{ secrets.DOCKERHUB_USER }} \
-                       -p ${{ secrets.DOCKERHUB_TOKEN }}
-          docker-compose push debian-js
+          source ci/scripts/util_enable_core_dumps.sh
+          archery docker run debian-js
+      - name: Docker Push
+        if: >-
+          success() &&
+          github.event_name == 'push' &&
+          github.repository == 'apache/arrow' &&
+          github.ref_name == 'main'
+        env:
+          ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
+          ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+        run: archery docker push debian-js
 
   macos:
-    name: AMD64 MacOS 10.15 NodeJS ${{ matrix.node }}
-    runs-on: macos-latest
-    if: github.event_name == 'push'
+    name: AMD64 macOS 13 NodeJS ${{ matrix.node }}
+    runs-on: macos-13
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        node: [11]
+        node: [18]
     steps:
       - name: Checkout Arrow
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch Submodules and Tags
-        shell: bash
-        run: ci/scripts/util_checkout.sh
+      - name: Jest Cache
+        uses: actions/cache@v4
+        with:
+          path: js/.jest-cache
+          key: js-jest-cache-${{ runner.os }}-${{ hashFiles('js/src/**/*.ts', 'js/test/**/*.ts', 'js/yarn.lock') }}
+          restore-keys: js-jest-cache-${{ runner.os }}-
       - name: Install NodeJS
-        uses: actions/setup-node@v1
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
       - name: Build
         shell: bash
-        run: ci/scripts/js_build.sh $(pwd)
+        run: ci/scripts/js_build.sh $(pwd) build
       - name: Test
         shell: bash
-        run: ci/scripts/js_test.sh $(pwd)
+        run: ci/scripts/js_test.sh $(pwd) build
 
-  # TODO(kszucs): the windows build fails with platform specific npm error
-  # windows:
-  #   name: AMD64 Windows 2019 NodeJS ${{ matrix.node }}
-  #   runs-on: windows-latest
-  #   if: github.event_name == 'push'
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       node: [11]
-  #   steps:
-  #     - name: Checkout Arrow
-  #       uses: actions/checkout@v1
-  #       with:
-  #         submodules: true
-  #     - name: Install NodeJS
-  #       uses: actions/setup-node@v1
-  #       with:
-  #         node-version: ${{ matrix.node }}
-  #     - name: Install Platform Dependencies
-  #       shell: bash
-  #       run: npm install -g cross-env
-  #     - name: Build
-  #       shell: bash
-  #       run: ci/scripts/js_build.sh $(pwd)
-  #     - name: Test
-  #       shell: bash
-  #       run: ci/scripts/js_test.sh $(pwd)
+  windows:
+    name: AMD64 Windows NodeJS ${{ matrix.node }}
+    runs-on: windows-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18]
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Jest Cache
+        uses: actions/cache@v4
+        with:
+          path: js/.jest-cache
+          key: js-jest-cache-${{ runner.os }}-${{ hashFiles('js/src/**/*.ts', 'js/test/**/*.ts', 'js/yarn.lock') }}
+          restore-keys: js-jest-cache-${{ runner.os }}-
+      - name: Install NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Build
+        shell: bash
+        run: ci/scripts/js_build.sh $(pwd) build
+      - name: Test
+        shell: bash
+        run: ci/scripts/js_test.sh $(pwd) build

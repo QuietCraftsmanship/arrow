@@ -21,7 +21,7 @@ class TestSparseUnionArray < Test::Unit::TestCase
   sub_test_case(".new") do
     sub_test_case("default") do
       def setup
-        type_ids = build_int8_array([0, 1, nil, 1, 0])
+        type_ids = build_int8_array([0, 1, 0, 1, 0])
         fields = [
           build_int16_array([1, nil, nil, nil, 5]),
           build_string_array([nil, "b", nil, "d", nil]),
@@ -58,7 +58,7 @@ class TestSparseUnionArray < Test::Unit::TestCase
         ]
         type_codes = [11, 13]
         @data_type = Arrow::SparseUnionDataType.new(data_type_fields, type_codes)
-        type_ids = build_int8_array([11, 13, nil, 13, 11])
+        type_ids = build_int8_array([11, 13, 11, 13, 11])
         fields = [
           build_int16_array([1, nil, nil, nil, 5]),
           build_string_array([nil, "b", nil, "d", nil]),
@@ -69,6 +69,14 @@ class TestSparseUnionArray < Test::Unit::TestCase
       def test_value_data_type
         assert_equal(@data_type,
                      @array.value_data_type)
+      end
+
+      def test_type_code
+        assert_equal(11, @array.get_type_code(0))
+      end
+
+      def test_child_id
+        assert_equal(0, @array.get_child_id(0))
       end
 
       def test_field

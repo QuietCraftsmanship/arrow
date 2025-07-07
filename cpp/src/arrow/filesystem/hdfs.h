@@ -25,8 +25,7 @@
 #include "arrow/io/hdfs.h"
 #include "arrow/util/uri.h"
 
-namespace arrow {
-namespace fs {
+namespace arrow::fs {
 
 /// Options for the HDFS implementation.
 struct ARROW_EXPORT HdfsOptions {
@@ -41,15 +40,17 @@ struct ARROW_EXPORT HdfsOptions {
   int16_t replication = 3;
   int64_t default_block_size = 0;
 
-  void ConfigureEndPoint(const std::string& host, int port);
-  void ConfigureHdfsReplication(int16_t replication);
-  void ConfigureHdfsUser(const std::string& user_name);
-  void ConfigureHdfsBufferSize(int32_t buffer_size);
-  void ConfigureHdfsBlockSize(int64_t default_block_size);
+  void ConfigureEndPoint(std::string host, int port);
+  void ConfigureReplication(int16_t replication);
+  void ConfigureUser(std::string user_name);
+  void ConfigureBufferSize(int32_t buffer_size);
+  void ConfigureBlockSize(int64_t default_block_size);
+  void ConfigureKerberosTicketCachePath(std::string path);
+  void ConfigureExtraConf(std::string key, std::string val);
 
   bool Equals(const HdfsOptions& other) const;
 
-  static Result<HdfsOptions> FromUri(const ::arrow::internal::Uri& uri);
+  static Result<HdfsOptions> FromUri(const ::arrow::util::Uri& uri);
   static Result<HdfsOptions> FromUri(const std::string& uri);
 };
 
@@ -64,18 +65,26 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   std::string type_name() const override { return "hdfs"; }
   HdfsOptions options() const;
   bool Equals(const FileSystem& other) const override;
+  Result<std::string> PathFromUri(const std::string& uri_string) const override;
 
   /// \cond FALSE
+  using FileSystem::CreateDir;
+  using FileSystem::DeleteDirContents;
   using FileSystem::GetFileInfo;
+  using FileSystem::OpenAppendStream;
+  using FileSystem::OpenOutputStream;
   /// \endcond
+
   Result<FileInfo> GetFileInfo(const std::string& path) override;
   Result<std::vector<FileInfo>> GetFileInfo(const FileSelector& select) override;
 
-  Status CreateDir(const std::string& path, bool recursive = true) override;
+  Status CreateDir(const std::string& path, bool recursive) override;
 
   Status DeleteDir(const std::string& path) override;
 
-  Status DeleteDirContents(const std::string& path) override;
+  Status DeleteDirContents(const std::string& path, bool missing_dir_ok) override;
+
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -88,19 +97,21 @@ class ARROW_EXPORT HadoopFileSystem : public FileSystem {
   Result<std::shared_ptr<io::RandomAccessFile>> OpenInputFile(
       const std::string& path) override;
   Result<std::shared_ptr<io::OutputStream>> OpenOutputStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
-      const std::string& path) override;
+      const std::string& path,
+      const std::shared_ptr<const KeyValueMetadata>& metadata) override;
 
   /// Create a HdfsFileSystem instance from the given options.
-  static Result<std::shared_ptr<HadoopFileSystem>> Make(const HdfsOptions& options);
+  static Result<std::shared_ptr<HadoopFileSystem>> Make(
+      const HdfsOptions& options, const io::IOContext& = io::default_io_context());
 
  protected:
-  explicit HadoopFileSystem(const HdfsOptions& options);
+  HadoopFileSystem(const HdfsOptions& options, const io::IOContext&);
 
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace fs
-}  // namespace arrow
+}  // namespace arrow::fs

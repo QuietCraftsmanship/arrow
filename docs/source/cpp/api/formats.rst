@@ -19,20 +19,39 @@
 File Formats
 ============
 
-CSV
-===
+.. _cpp-api-csv:
 
-.. doxygenstruct:: arrow::csv::ReadOptions
+CSV reader
+==========
+
+.. doxygenstruct:: arrow::csv::ConvertOptions
    :members:
 
 .. doxygenstruct:: arrow::csv::ParseOptions
    :members:
 
-.. doxygenstruct:: arrow::csv::ConvertOptions
+.. doxygenstruct:: arrow::csv::ReadOptions
    :members:
 
 .. doxygenclass:: arrow::csv::TableReader
    :members:
+
+.. doxygenclass:: arrow::csv::StreamingReader
+   :members:
+
+CSV writer
+==========
+
+.. doxygenstruct:: arrow::csv::WriteOptions
+   :members:
+
+.. doxygengroup:: csv-write-functions
+   :content-only:
+
+.. doxygengroup:: csv-writer-factories
+   :content-only:
+
+.. _cpp-api-json:
 
 Line-separated JSON
 ===================
@@ -47,6 +66,11 @@ Line-separated JSON
 
 .. doxygenclass:: arrow::json::TableReader
    :members:
+
+.. doxygenclass:: arrow::json::StreamingReader
+   :members:
+
+.. _cpp-api-parquet:
 
 Parquet reader
 ==============
@@ -89,4 +113,16 @@ Parquet writer
 .. doxygenclass:: parquet::StreamWriter
    :members:
 
-.. TODO ORC
+.. _cpp-api-orc:
+
+ORC
+===
+
+.. doxygenclass:: arrow::adapters::orc::ORCFileReader
+   :members:
+
+.. doxygenstruct:: arrow::adapters::orc::WriteOptions
+   :members:
+
+.. doxygenclass:: arrow::adapters::orc::ORCFileWriter
+   :members:

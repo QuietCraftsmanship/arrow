@@ -22,44 +22,134 @@
 #include <cstring>
 #include <map>
 #include <memory>
-#include <string>
 #include <utility>
 #include <vector>
 
 #include "arrow/array.h"
 #include "arrow/buffer_builder.h"
 #include "arrow/compute/api.h"
+#include "arrow/io/memory.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/bit_stream_utils.h"
+#include "arrow/util/bit_stream_utils_internal.h"
+#include "arrow/util/bit_util.h"
+#include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/compression.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/rle_encoding.h"
+#include "arrow/util/crc32.h"
+#include "arrow/util/endian.h"
+#include "arrow/util/float16.h"
+#include "arrow/util/key_value_metadata.h"
+#include "arrow/util/logging_internal.h"
+#include "arrow/util/rle_encoding_internal.h"
+#include "arrow/util/type_traits.h"
+#include "arrow/visit_array_inline.h"
 #include "parquet/column_page.h"
 #include "parquet/encoding.h"
-#include "parquet/encryption_internal.h"
-#include "parquet/internal_file_encryptor.h"
+#include "parquet/encryption/encryption_internal.h"
+#include "parquet/encryption/internal_file_encryptor.h"
+#include "parquet/level_conversion.h"
 #include "parquet/metadata.h"
+#include "parquet/page_index.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/schema.h"
+#include "parquet/size_statistics.h"
 #include "parquet/statistics.h"
 #include "parquet/thrift_internal.h"
 #include "parquet/types.h"
 
+using arrow::Array;
+using arrow::ArrayData;
+using arrow::Datum;
+using arrow::Result;
 using arrow::Status;
-using arrow::BitUtil::BitWriter;
-using arrow::compute::Datum;
+using arrow::bit_util::BitWriter;
 using arrow::internal::checked_cast;
+using arrow::internal::checked_pointer_cast;
+using arrow::util::Float16;
 using arrow::util::RleEncoder;
+
+namespace bit_util = arrow::bit_util;
 
 namespace parquet {
 
 namespace {
 
-inline const int16_t* AddIfNotNull(const int16_t* base, int64_t offset) {
+// Visitor that extracts the value buffer from a FlatArray at a given offset.
+struct ValueBufferSlicer {
+  template <typename T>
+  ::arrow::enable_if_base_binary<typename T::TypeClass, Status> Visit(
+      const T& array, std::shared_ptr<Buffer>* buffer) {
+    auto data = array.data();
+    *buffer =
+        SliceBuffer(data->buffers[1], data->offset * sizeof(typename T::offset_type),
+                    data->length * sizeof(typename T::offset_type));
+    return Status::OK();
+  }
+
+  template <typename T>
+  ::arrow::enable_if_fixed_size_binary<typename T::TypeClass, Status> Visit(
+      const T& array, std::shared_ptr<Buffer>* buffer) {
+    auto data = array.data();
+    *buffer = SliceBuffer(data->buffers[1], data->offset * array.byte_width(),
+                          data->length * array.byte_width());
+    return Status::OK();
+  }
+
+  template <typename T>
+  ::arrow::enable_if_t<::arrow::has_c_type<typename T::TypeClass>::value &&
+                           !std::is_same<BooleanType, typename T::TypeClass>::value,
+                       Status>
+  Visit(const T& array, std::shared_ptr<Buffer>* buffer) {
+    auto data = array.data();
+    *buffer = SliceBuffer(
+        data->buffers[1],
+        ::arrow::TypeTraits<typename T::TypeClass>::bytes_required(data->offset),
+        ::arrow::TypeTraits<typename T::TypeClass>::bytes_required(data->length));
+    return Status::OK();
+  }
+
+  Status Visit(const ::arrow::BooleanArray& array, std::shared_ptr<Buffer>* buffer) {
+    auto data = array.data();
+    if (bit_util::IsMultipleOf8(data->offset)) {
+      *buffer = SliceBuffer(data->buffers[1], bit_util::BytesForBits(data->offset),
+                            bit_util::BytesForBits(data->length));
+      return Status::OK();
+    }
+    PARQUET_ASSIGN_OR_THROW(*buffer,
+                            ::arrow::internal::CopyBitmap(pool_, data->buffers[1]->data(),
+                                                          data->offset, data->length));
+    return Status::OK();
+  }
+#define NOT_IMPLEMENTED_VISIT(ArrowTypePrefix)                                      \
+  Status Visit(const ::arrow::ArrowTypePrefix##Array& array,                        \
+               std::shared_ptr<Buffer>* buffer) {                                   \
+    return Status::NotImplemented("Slicing not implemented for " #ArrowTypePrefix); \
+  }
+
+  NOT_IMPLEMENTED_VISIT(Null);
+  NOT_IMPLEMENTED_VISIT(Union);
+  NOT_IMPLEMENTED_VISIT(List);
+  NOT_IMPLEMENTED_VISIT(LargeList);
+  NOT_IMPLEMENTED_VISIT(ListView);
+  NOT_IMPLEMENTED_VISIT(LargeListView);
+  NOT_IMPLEMENTED_VISIT(Struct);
+  NOT_IMPLEMENTED_VISIT(FixedSizeList);
+  NOT_IMPLEMENTED_VISIT(Dictionary);
+  NOT_IMPLEMENTED_VISIT(RunEndEncoded);
+  NOT_IMPLEMENTED_VISIT(Extension);
+  NOT_IMPLEMENTED_VISIT(BinaryView);
+  NOT_IMPLEMENTED_VISIT(StringView);
+
+#undef NOT_IMPLEMENTED_VISIT
+
+  MemoryPool* pool_;
+};
+
+template <class T>
+inline const T* AddIfNotNull(const T* base, int64_t offset) {
   if (base != nullptr) {
     return base + offset;
   }
@@ -73,17 +163,17 @@ LevelEncoder::~LevelEncoder() {}
 
 void LevelEncoder::Init(Encoding::type encoding, int16_t max_level,
                         int num_buffered_values, uint8_t* data, int data_size) {
-  bit_width_ = BitUtil::Log2(max_level + 1);
+  bit_width_ = bit_util::Log2(max_level + 1);
   encoding_ = encoding;
   switch (encoding) {
     case Encoding::RLE: {
-      rle_encoder_.reset(new RleEncoder(data, data_size, bit_width_));
+      rle_encoder_ = std::make_unique<RleEncoder>(data, data_size, bit_width_);
       break;
     }
     case Encoding::BIT_PACKED: {
       int num_bytes =
-          static_cast<int>(BitUtil::BytesForBits(num_buffered_values * bit_width_));
-      bit_packed_encoder_.reset(new BitWriter(data, num_bytes));
+          static_cast<int>(bit_util::BytesForBits(num_buffered_values * bit_width_));
+      bit_packed_encoder_ = std::make_unique<BitWriter>(data, num_bytes);
       break;
     }
     default:
@@ -93,7 +183,7 @@ void LevelEncoder::Init(Encoding::type encoding, int16_t max_level,
 
 int LevelEncoder::MaxBufferSize(Encoding::type encoding, int16_t max_level,
                                 int num_buffered_values) {
-  int bit_width = BitUtil::Log2(max_level + 1);
+  int bit_width = bit_util::Log2(max_level + 1);
   int num_bytes = 0;
   switch (encoding) {
     case Encoding::RLE: {
@@ -105,7 +195,7 @@ int LevelEncoder::MaxBufferSize(Encoding::type encoding, int16_t max_level,
     }
     case Encoding::BIT_PACKED: {
       num_bytes =
-          static_cast<int>(BitUtil::BytesForBits(num_buffered_values * bit_width));
+          static_cast<int>(bit_util::BytesForBits(num_buffered_values * bit_width));
       break;
     }
     default:
@@ -150,11 +240,14 @@ int LevelEncoder::Encode(int batch_size, const int16_t* levels) {
 class SerializedPageWriter : public PageWriter {
  public:
   SerializedPageWriter(std::shared_ptr<ArrowOutputStream> sink, Compression::type codec,
-                       int compression_level, ColumnChunkMetaDataBuilder* metadata,
-                       int16_t row_group_ordinal, int16_t column_chunk_ordinal,
+                       ColumnChunkMetaDataBuilder* metadata, int16_t row_group_ordinal,
+                       int16_t column_chunk_ordinal, bool use_page_checksum_verification,
                        MemoryPool* pool = ::arrow::default_memory_pool(),
                        std::shared_ptr<Encryptor> meta_encryptor = nullptr,
-                       std::shared_ptr<Encryptor> data_encryptor = nullptr)
+                       std::shared_ptr<Encryptor> data_encryptor = nullptr,
+                       ColumnIndexBuilder* column_index_builder = nullptr,
+                       OffsetIndexBuilder* offset_index_builder = nullptr,
+                       const CodecOptions& codec_options = CodecOptions{})
       : sink_(std::move(sink)),
         metadata_(metadata),
         pool_(pool),
@@ -166,18 +259,26 @@ class SerializedPageWriter : public PageWriter {
         page_ordinal_(0),
         row_group_ordinal_(row_group_ordinal),
         column_ordinal_(column_chunk_ordinal),
+        page_checksum_verification_(use_page_checksum_verification),
         meta_encryptor_(std::move(meta_encryptor)),
         data_encryptor_(std::move(data_encryptor)),
-        encryption_buffer_(AllocateBuffer(pool, 0)) {
+        encryption_buffer_(AllocateBuffer(pool, 0)),
+        column_index_builder_(column_index_builder),
+        offset_index_builder_(offset_index_builder) {
     if (data_encryptor_ != nullptr || meta_encryptor_ != nullptr) {
       InitEncryption();
     }
-    compressor_ = GetCodec(codec, compression_level);
-    thrift_serializer_.reset(new ThriftSerializer);
+    compressor_ = GetCodec(codec, codec_options);
+    thrift_serializer_ = std::make_unique<ThriftSerializer>();
   }
 
   int64_t WriteDictionaryPage(const DictionaryPage& page) override {
-    int64_t uncompressed_size = page.size();
+    int64_t uncompressed_size = page.buffer()->size();
+    if (uncompressed_size > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Uncompressed dictionary page size overflows INT32_MAX. Size:",
+          uncompressed_size);
+    }
     std::shared_ptr<Buffer> compressed_data;
     if (has_compressor()) {
       auto buffer = std::static_pointer_cast<ResizableBuffer>(
@@ -194,14 +295,20 @@ class SerializedPageWriter : public PageWriter {
     dict_page_header.__set_is_sorted(page.is_sorted());
 
     const uint8_t* output_data_buffer = compressed_data->data();
+    if (compressed_data->size() > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Compressed dictionary page size overflows INT32_MAX. Size: ",
+          uncompressed_size);
+    }
     int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
 
     if (data_encryptor_.get()) {
       UpdateEncryption(encryption::kDictionaryPage);
       PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
-      output_data_len = data_encryptor_->Encrypt(compressed_data->data(), output_data_len,
-                                                 encryption_buffer_->mutable_data());
+          data_encryptor_->CiphertextLength(output_data_len), false));
+      output_data_len =
+          data_encryptor_->Encrypt(compressed_data->span_as<uint8_t>(),
+                                   encryption_buffer_->mutable_span_as<uint8_t>());
       output_data_buffer = encryption_buffer_->data();
     }
 
@@ -210,7 +317,11 @@ class SerializedPageWriter : public PageWriter {
     page_header.__set_uncompressed_page_size(static_cast<int32_t>(uncompressed_size));
     page_header.__set_compressed_page_size(static_cast<int32_t>(output_data_len));
     page_header.__set_dictionary_page_header(dict_page_header);
-    // TODO(PARQUET-594) crc checksum
+    if (page_checksum_verification_) {
+      uint32_t crc32 =
+          ::arrow::internal::crc32(/* prev */ 0, output_data_buffer, output_data_len);
+      page_header.__set_crc(static_cast<int32_t>(crc32));
+    }
 
     PARQUET_ASSIGN_OR_THROW(int64_t start_pos, sink_->Tell());
     if (dictionary_page_offset_ == 0) {
@@ -220,30 +331,30 @@ class SerializedPageWriter : public PageWriter {
     if (meta_encryptor_) {
       UpdateEncryption(encryption::kDictionaryPageHeader);
     }
-    int64_t header_size =
-        thrift_serializer_->Serialize(&page_header, sink_.get(), meta_encryptor_);
+    const int64_t header_size =
+        thrift_serializer_->Serialize(&page_header, sink_.get(), meta_encryptor_.get());
 
     PARQUET_THROW_NOT_OK(sink_->Write(output_data_buffer, output_data_len));
 
     total_uncompressed_size_ += uncompressed_size + header_size;
     total_compressed_size_ += output_data_len + header_size;
     ++dict_encoding_stats_[page.encoding()];
-
-    PARQUET_ASSIGN_OR_THROW(int64_t final_pos, sink_->Tell());
-    return final_pos - start_pos;
+    return uncompressed_size + header_size;
   }
 
   void Close(bool has_dictionary, bool fallback) override {
     if (meta_encryptor_ != nullptr) {
       UpdateEncryption(encryption::kColumnMetaData);
     }
+
+    // Serialized page writer does not need to adjust page offsets.
+    FinishPageIndexes(/*final_position=*/0);
+
     // index_page_offset = -1 since they are not supported
     metadata_->Finish(num_values_, dictionary_page_offset_, -1, data_page_offset_,
                       total_compressed_size_, total_uncompressed_size_, has_dictionary,
                       fallback, dict_encoding_stats_, data_encoding_stats_,
                       meta_encryptor_);
-    // Write metadata at end of column chunk
-    metadata_->WriteTo(sink_.get());
   }
 
   /**
@@ -268,24 +379,40 @@ class SerializedPageWriter : public PageWriter {
   }
 
   int64_t WriteDataPage(const DataPage& page) override {
-    int64_t uncompressed_size = page.uncompressed_size();
+    const int64_t uncompressed_size = page.uncompressed_size();
+    if (uncompressed_size > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException("Uncompressed data page size overflows INT32_MAX. Size:",
+                             uncompressed_size);
+    }
+
     std::shared_ptr<Buffer> compressed_data = page.buffer();
     const uint8_t* output_data_buffer = compressed_data->data();
-    int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
+    int64_t output_data_len = compressed_data->size();
+
+    if (output_data_len > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException("Compressed data page size overflows INT32_MAX. Size:",
+                             output_data_len);
+    }
 
     if (data_encryptor_.get()) {
       PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
+          data_encryptor_->CiphertextLength(output_data_len), false));
       UpdateEncryption(encryption::kDataPage);
-      output_data_len = data_encryptor_->Encrypt(compressed_data->data(), output_data_len,
-                                                 encryption_buffer_->mutable_data());
+      output_data_len =
+          data_encryptor_->Encrypt(compressed_data->span_as<uint8_t>(),
+                                   encryption_buffer_->mutable_span_as<uint8_t>());
       output_data_buffer = encryption_buffer_->data();
     }
 
     format::PageHeader page_header;
     page_header.__set_uncompressed_page_size(static_cast<int32_t>(uncompressed_size));
     page_header.__set_compressed_page_size(static_cast<int32_t>(output_data_len));
-    // TODO(PARQUET-594) crc checksum
+
+    if (page_checksum_verification_) {
+      uint32_t crc32 =
+          ::arrow::internal::crc32(/* prev */ 0, output_data_buffer, output_data_len);
+      page_header.__set_crc(static_cast<int32_t>(crc32));
+    }
 
     if (page.type() == PageType::DATA_PAGE) {
       const DataPageV1& v1_page = checked_cast<const DataPageV1&>(page);
@@ -305,17 +432,37 @@ class SerializedPageWriter : public PageWriter {
     if (meta_encryptor_) {
       UpdateEncryption(encryption::kDataPageHeader);
     }
-    int64_t header_size =
-        thrift_serializer_->Serialize(&page_header, sink_.get(), meta_encryptor_);
+    const int64_t header_size =
+        thrift_serializer_->Serialize(&page_header, sink_.get(), meta_encryptor_.get());
     PARQUET_THROW_NOT_OK(sink_->Write(output_data_buffer, output_data_len));
+
+    /// Collect page index
+    if (column_index_builder_ != nullptr) {
+      column_index_builder_->AddPage(page.statistics(), page.size_statistics());
+    }
+    if (offset_index_builder_ != nullptr) {
+      const int64_t compressed_size = output_data_len + header_size;
+      if (compressed_size > std::numeric_limits<int32_t>::max()) {
+        throw ParquetException("Compressed page size ", compressed_size,
+                               " overflows INT32_MAX.");
+      }
+      if (!page.first_row_index().has_value()) {
+        throw ParquetException("First row index is not set in data page.");
+      }
+      /// start_pos is a relative offset in the buffered mode. It should be
+      /// adjusted via OffsetIndexBuilder::Finish() after BufferedPageWriter
+      /// has flushed all data pages.
+      offset_index_builder_->AddPage(
+          start_pos, static_cast<int32_t>(compressed_size), *page.first_row_index(),
+          page.size_statistics().unencoded_byte_array_data_bytes);
+    }
 
     total_uncompressed_size_ += uncompressed_size + header_size;
     total_compressed_size_ += output_data_len + header_size;
     num_values_ += page.num_values();
     ++data_encoding_stats_[page.encoding()];
     ++page_ordinal_;
-    PARQUET_ASSIGN_OR_THROW(int64_t current_pos, sink_->Tell());
-    return current_pos - start_pos;
+    return uncompressed_size + header_size;
   }
 
   void SetDataPageHeader(format::PageHeader& page_header, const DataPageV1& page) {
@@ -326,13 +473,17 @@ class SerializedPageWriter : public PageWriter {
         ToThrift(page.definition_level_encoding()));
     data_page_header.__set_repetition_level_encoding(
         ToThrift(page.repetition_level_encoding()));
-    data_page_header.__set_statistics(ToThrift(page.statistics()));
+
+    // Write page statistics only when page index is not enabled.
+    if (column_index_builder_ == nullptr) {
+      data_page_header.__set_statistics(ToThrift(page.statistics()));
+    }
 
     page_header.__set_type(format::PageType::DATA_PAGE);
     page_header.__set_data_page_header(data_page_header);
   }
 
-  void SetDataPageV2Header(format::PageHeader& page_header, const DataPageV2 page) {
+  void SetDataPageV2Header(format::PageHeader& page_header, const DataPageV2& page) {
     format::DataPageHeaderV2 data_page_header;
     data_page_header.__set_num_values(page.num_values());
     data_page_header.__set_num_nulls(page.num_nulls());
@@ -345,10 +496,25 @@ class SerializedPageWriter : public PageWriter {
         page.repetition_levels_byte_length());
 
     data_page_header.__set_is_compressed(page.is_compressed());
-    data_page_header.__set_statistics(ToThrift(page.statistics()));
+
+    // Write page statistics only when page index is not enabled.
+    if (column_index_builder_ == nullptr) {
+      data_page_header.__set_statistics(ToThrift(page.statistics()));
+    }
 
     page_header.__set_type(format::PageType::DATA_PAGE_V2);
     page_header.__set_data_page_header_v2(data_page_header);
+  }
+
+  /// \brief Finish page index builders and update the stream offset to adjust
+  /// page offsets.
+  void FinishPageIndexes(int64_t final_position) {
+    if (column_index_builder_ != nullptr) {
+      column_index_builder_->Finish();
+    }
+    if (offset_index_builder_ != nullptr) {
+      offset_index_builder_->Finish(final_position);
+    }
   }
 
   bool has_compressor() override { return (compressor_ != nullptr); }
@@ -362,6 +528,12 @@ class SerializedPageWriter : public PageWriter {
   int64_t total_compressed_size() { return total_compressed_size_; }
 
   int64_t total_uncompressed_size() { return total_uncompressed_size_; }
+
+  int64_t total_compressed_bytes_written() const override {
+    return total_compressed_size_;
+  }
+
+  bool page_checksum_verification() { return page_checksum_verification_; }
 
  private:
   // To allow UpdateEncryption on Close
@@ -390,12 +562,12 @@ class SerializedPageWriter : public PageWriter {
         break;
       }
       case encryption::kDataPage: {
-        encryption::QuickUpdatePageAad(data_page_aad_, page_ordinal_);
+        encryption::QuickUpdatePageAad(page_ordinal_, &data_page_aad_);
         data_encryptor_->UpdateAad(data_page_aad_);
         break;
       }
       case encryption::kDataPageHeader: {
-        encryption::QuickUpdatePageAad(data_page_header_aad_, page_ordinal_);
+        encryption::QuickUpdatePageAad(page_ordinal_, &data_page_header_aad_);
         meta_encryptor_->UpdateAad(data_page_header_aad_);
         break;
       }
@@ -422,11 +594,18 @@ class SerializedPageWriter : public PageWriter {
   int64_t num_values_;
   int64_t dictionary_page_offset_;
   int64_t data_page_offset_;
+  // The uncompressed page size the page writer has already
+  //  written.
   int64_t total_uncompressed_size_;
+  // The compressed page size the page writer has already
+  //  written.
+  // If the column is UNCOMPRESSED, the size would be
+  //  equal to `total_uncompressed_size_`.
   int64_t total_compressed_size_;
-  int16_t page_ordinal_;
+  int32_t page_ordinal_;
   int16_t row_group_ordinal_;
   int16_t column_ordinal_;
+  bool page_checksum_verification_;
 
   std::unique_ptr<ThriftSerializer> thrift_serializer_;
 
@@ -443,23 +622,30 @@ class SerializedPageWriter : public PageWriter {
 
   std::map<Encoding::type, int32_t> dict_encoding_stats_;
   std::map<Encoding::type, int32_t> data_encoding_stats_;
+
+  ColumnIndexBuilder* column_index_builder_;
+  OffsetIndexBuilder* offset_index_builder_;
 };
 
 // This implementation of the PageWriter writes to the final sink on Close .
 class BufferedPageWriter : public PageWriter {
  public:
   BufferedPageWriter(std::shared_ptr<ArrowOutputStream> sink, Compression::type codec,
-                     int compression_level, ColumnChunkMetaDataBuilder* metadata,
-                     int16_t row_group_ordinal, int16_t current_column_ordinal,
+                     ColumnChunkMetaDataBuilder* metadata, int16_t row_group_ordinal,
+                     int16_t current_column_ordinal, bool use_page_checksum_verification,
                      MemoryPool* pool = ::arrow::default_memory_pool(),
                      std::shared_ptr<Encryptor> meta_encryptor = nullptr,
-                     std::shared_ptr<Encryptor> data_encryptor = nullptr)
+                     std::shared_ptr<Encryptor> data_encryptor = nullptr,
+                     ColumnIndexBuilder* column_index_builder = nullptr,
+                     OffsetIndexBuilder* offset_index_builder = nullptr,
+                     const CodecOptions& codec_options = CodecOptions{})
       : final_sink_(std::move(sink)), metadata_(metadata), has_dictionary_pages_(false) {
     in_memory_sink_ = CreateOutputStream(pool);
-    pager_ = std::unique_ptr<SerializedPageWriter>(
-        new SerializedPageWriter(in_memory_sink_, codec, compression_level, metadata,
-                                 row_group_ordinal, current_column_ordinal, pool,
-                                 std::move(meta_encryptor), std::move(data_encryptor)));
+    pager_ = std::make_unique<SerializedPageWriter>(
+        in_memory_sink_, codec, metadata, row_group_ordinal, current_column_ordinal,
+        use_page_checksum_verification, pool, std::move(meta_encryptor),
+        std::move(data_encryptor), column_index_builder, offset_index_builder,
+        codec_options);
   }
 
   int64_t WriteDictionaryPage(const DictionaryPage& page) override {
@@ -482,8 +668,8 @@ class BufferedPageWriter : public PageWriter {
                       has_dictionary, fallback, pager_->dict_encoding_stats_,
                       pager_->data_encoding_stats_, pager_->meta_encryptor_);
 
-    // Write metadata at end of column chunk
-    metadata_->WriteTo(in_memory_sink_.get());
+    // Buffered page writer needs to adjust page offsets.
+    pager_->FinishPageIndexes(final_position);
 
     // flush everything to the serialized sink
     PARQUET_ASSIGN_OR_THROW(auto buffer, in_memory_sink_->Finish());
@@ -500,6 +686,10 @@ class BufferedPageWriter : public PageWriter {
 
   bool has_compressor() override { return pager_->has_compressor(); }
 
+  int64_t total_compressed_bytes_written() const override {
+    return pager_->total_compressed_bytes_written();
+  }
+
  private:
   std::shared_ptr<ArrowOutputStream> final_sink_;
   ColumnChunkMetaDataBuilder* metadata_;
@@ -510,20 +700,23 @@ class BufferedPageWriter : public PageWriter {
 
 std::unique_ptr<PageWriter> PageWriter::Open(
     std::shared_ptr<ArrowOutputStream> sink, Compression::type codec,
-    int compression_level, ColumnChunkMetaDataBuilder* metadata,
-    int16_t row_group_ordinal, int16_t column_chunk_ordinal, MemoryPool* pool,
-    bool buffered_row_group, std::shared_ptr<Encryptor> meta_encryptor,
-    std::shared_ptr<Encryptor> data_encryptor) {
+    ColumnChunkMetaDataBuilder* metadata, int16_t row_group_ordinal,
+    int16_t column_chunk_ordinal, MemoryPool* pool, bool buffered_row_group,
+    std::shared_ptr<Encryptor> meta_encryptor, std::shared_ptr<Encryptor> data_encryptor,
+    bool page_write_checksum_enabled, ColumnIndexBuilder* column_index_builder,
+    OffsetIndexBuilder* offset_index_builder, const CodecOptions& codec_options) {
   if (buffered_row_group) {
-    return std::unique_ptr<PageWriter>(
-        new BufferedPageWriter(std::move(sink), codec, compression_level, metadata,
-                               row_group_ordinal, column_chunk_ordinal, pool,
-                               std::move(meta_encryptor), std::move(data_encryptor)));
+    return std::unique_ptr<PageWriter>(new BufferedPageWriter(
+        std::move(sink), codec, metadata, row_group_ordinal, column_chunk_ordinal,
+        page_write_checksum_enabled, pool, std::move(meta_encryptor),
+        std::move(data_encryptor), column_index_builder, offset_index_builder,
+        codec_options));
   } else {
-    return std::unique_ptr<PageWriter>(
-        new SerializedPageWriter(std::move(sink), codec, compression_level, metadata,
-                                 row_group_ordinal, column_chunk_ordinal, pool,
-                                 std::move(meta_encryptor), std::move(data_encryptor)));
+    return std::unique_ptr<PageWriter>(new SerializedPageWriter(
+        std::move(sink), codec, metadata, row_group_ordinal, column_chunk_ordinal,
+        page_write_checksum_enabled, pool, std::move(meta_encryptor),
+        std::move(data_encryptor), column_index_builder, offset_index_builder,
+        codec_options));
   }
 }
 
@@ -543,6 +736,7 @@ class ColumnWriterImpl {
                    Encoding::type encoding, const WriterProperties* properties)
       : metadata_(metadata),
         descr_(metadata->descr()),
+        level_info_(internal::LevelInfo::ComputeLevelInfo(metadata->descr())),
         pager_(std::move(pager)),
         has_dictionary_(use_dictionary),
         encoding_(encoding),
@@ -550,6 +744,8 @@ class ColumnWriterImpl {
         allocator_(properties->memory_pool()),
         num_buffered_values_(0),
         num_buffered_encoded_values_(0),
+        num_buffered_nulls_(0),
+        num_buffered_rows_(0),
         rows_written_(0),
         total_bytes_written_(0),
         total_compressed_bytes_(0),
@@ -563,6 +759,7 @@ class ColumnWriterImpl {
         std::static_pointer_cast<ResizableBuffer>(AllocateBuffer(allocator_, 0));
     uncompressed_data_ =
         std::static_pointer_cast<ResizableBuffer>(AllocateBuffer(allocator_, 0));
+
     if (pager_->has_compressor()) {
       compressor_temp_buffer_ =
           std::static_pointer_cast<ResizableBuffer>(AllocateBuffer(allocator_, 0));
@@ -579,11 +776,17 @@ class ColumnWriterImpl {
   // Serializes Dictionary Page if enabled
   virtual void WriteDictionaryPage() = 0;
 
+  // A convenience struct to combine the encoded statistics and size statistics
+  struct StatisticsPair {
+    EncodedStatistics encoded_stats;
+    SizeStatistics size_stats;
+  };
+
   // Plain-encoded statistics of the current page
-  virtual EncodedStatistics GetPageStatistics() = 0;
+  virtual StatisticsPair GetPageStatistics() = 0;
 
   // Plain-encoded statistics of the whole chunk
-  virtual EncodedStatistics GetChunkStatistics() = 0;
+  virtual StatisticsPair GetChunkStatistics() = 0;
 
   // Merges page statistics into chunk statistics, then resets the values
   virtual void ResetPageStatistics() = 0;
@@ -626,7 +829,13 @@ class ColumnWriterImpl {
   void FlushBufferedDataPages();
 
   ColumnChunkMetaDataBuilder* metadata_;
+  // key_value_metadata_ for the column chunk
+  // It would be nullptr if there is no KeyValueMetadata set.
+  std::shared_ptr<const KeyValueMetadata> key_value_metadata_;
   const ColumnDescriptor* descr_;
+  // scratch buffer if validity bits need to be recalculated.
+  std::shared_ptr<ResizableBuffer> bits_buffer_;
+  const internal::LevelInfo level_info_;
 
   std::unique_ptr<PageWriter> pager_;
 
@@ -646,17 +855,24 @@ class ColumnWriterImpl {
   // case.
   int64_t num_buffered_values_;
 
-  // The total number of stored values. For repeated or optional values, this
-  // number may be lower than num_buffered_values_.
+  // The total number of stored values in the data page. For repeated or optional
+  // values, this number may be lower than num_buffered_values_.
   int64_t num_buffered_encoded_values_;
 
-  // Total number of rows written with this ColumnWriter
-  int rows_written_;
+  // The total number of nulls stored in the data page.
+  int64_t num_buffered_nulls_;
 
-  // Records the total number of bytes written by the serializer
+  // Total number of rows buffered in the data page.
+  int64_t num_buffered_rows_;
+
+  // Total number of rows written with this ColumnWriter
+  int64_t rows_written_;
+
+  // Records the total number of uncompressed bytes written by the serializer
   int64_t total_bytes_written_;
 
   // Records the current number of compressed bytes in a column
+  // These bytes are unwritten to `pager_` yet
   int64_t total_compressed_bytes_;
 
   // Flag to check if the Writer has been closed
@@ -686,11 +902,13 @@ class ColumnWriterImpl {
   void ConcatenateBuffers(int64_t definition_levels_rle_size,
                           int64_t repetition_levels_rle_size,
                           const std::shared_ptr<Buffer>& values, uint8_t* combined) {
-    memcpy(combined, repetition_levels_rle_->data(), repetition_levels_rle_size);
+    memcpy(combined, repetition_levels_rle_->data(),
+           static_cast<size_t>(repetition_levels_rle_size));
     combined += repetition_levels_rle_size;
-    memcpy(combined, definition_levels_rle_->data(), definition_levels_rle_size);
+    memcpy(combined, definition_levels_rle_->data(),
+           static_cast<size_t>(definition_levels_rle_size));
     combined += definition_levels_rle_size;
-    memcpy(combined, values->data(), values->size());
+    memcpy(combined, values->data(), static_cast<size_t>(values->size()));
   }
 };
 
@@ -729,24 +947,24 @@ void ColumnWriterImpl::AddDataPage() {
   int64_t repetition_levels_rle_size = 0;
 
   std::shared_ptr<Buffer> values = GetValuesBuffer();
-  bool is_v1 = properties_->version() == ParquetVersion::PARQUET_1_0;
+  bool is_v1_data_page = properties_->data_page_version() == ParquetDataPageVersion::V1;
 
   if (descr_->max_definition_level() > 0) {
-    definition_levels_rle_size =
-        RleEncodeLevels(definition_levels_sink_.data(), definition_levels_rle_.get(),
-                        descr_->max_definition_level(), /*include_length_prefix=*/is_v1);
+    definition_levels_rle_size = RleEncodeLevels(
+        definition_levels_sink_.data(), definition_levels_rle_.get(),
+        descr_->max_definition_level(), /*include_length_prefix=*/is_v1_data_page);
   }
 
   if (descr_->max_repetition_level() > 0) {
-    repetition_levels_rle_size =
-        RleEncodeLevels(repetition_levels_sink_.data(), repetition_levels_rle_.get(),
-                        descr_->max_repetition_level(), /*include_length_prefix=*/is_v1);
+    repetition_levels_rle_size = RleEncodeLevels(
+        repetition_levels_sink_.data(), repetition_levels_rle_.get(),
+        descr_->max_repetition_level(), /*include_length_prefix=*/is_v1_data_page);
   }
 
   int64_t uncompressed_size =
       definition_levels_rle_size + repetition_levels_rle_size + values->size();
 
-  if (is_v1) {
+  if (is_v1_data_page) {
     BuildDataPageV1(definition_levels_rle_size, repetition_levels_rle_size,
                     uncompressed_size, values);
   } else {
@@ -758,6 +976,8 @@ void ColumnWriterImpl::AddDataPage() {
   InitSinks();
   num_buffered_values_ = 0;
   num_buffered_encoded_values_ = 0;
+  num_buffered_rows_ = 0;
+  num_buffered_nulls_ = 0;
 }
 
 void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
@@ -769,8 +989,7 @@ void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
   PARQUET_THROW_NOT_OK(uncompressed_data_->Resize(uncompressed_size, false));
   ConcatenateBuffers(definition_levels_rle_size, repetition_levels_rle_size, values,
                      uncompressed_data_->mutable_data());
-
-  EncodedStatistics page_stats = GetPageStatistics();
+  auto [page_stats, page_size_stats] = GetPageStatistics();
   page_stats.ApplyStatSizeLimits(properties_->max_statistics_size(descr_->path()));
   page_stats.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
   ResetPageStatistics();
@@ -783,22 +1002,26 @@ void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
     compressed_data = uncompressed_data_;
   }
 
+  int32_t num_values = static_cast<int32_t>(num_buffered_values_);
+  int64_t first_row_index = rows_written_ - num_buffered_rows_;
+
   // Write the page to OutputStream eagerly if there is no dictionary or
   // if dictionary encoding has fallen back to PLAIN
   if (has_dictionary_ && !fallback_) {  // Save pages until end of dictionary encoding
-    std::shared_ptr<Buffer> compressed_data_copy;
-    PARQUET_THROW_NOT_OK(compressed_data->Copy(0, compressed_data->size(), allocator_,
-                                               &compressed_data_copy));
-    std::unique_ptr<DataPage> page_ptr(new DataPageV1(
-        compressed_data_copy, static_cast<int32_t>(num_buffered_values_), encoding_,
-        Encoding::RLE, Encoding::RLE, uncompressed_size, page_stats));
+    PARQUET_ASSIGN_OR_THROW(
+        auto compressed_data_copy,
+        compressed_data->CopySlice(0, compressed_data->size(), allocator_));
+    std::unique_ptr<DataPage> page_ptr = std::make_unique<DataPageV1>(
+        compressed_data_copy, num_values, encoding_, Encoding::RLE, Encoding::RLE,
+        uncompressed_size, std::move(page_stats), first_row_index,
+        std::move(page_size_stats));
     total_compressed_bytes_ += page_ptr->size() + sizeof(format::PageHeader);
 
     data_pages_.push_back(std::move(page_ptr));
   } else {  // Eagerly write pages
-    DataPageV1 page(compressed_data, static_cast<int32_t>(num_buffered_values_),
-                    encoding_, Encoding::RLE, Encoding::RLE, uncompressed_size,
-                    page_stats);
+    DataPageV1 page(compressed_data, num_values, encoding_, Encoding::RLE, Encoding::RLE,
+                    uncompressed_size, std::move(page_stats), first_row_index,
+                    std::move(page_size_stats));
     WriteDataPage(page);
   }
 }
@@ -809,13 +1032,15 @@ void ColumnWriterImpl::BuildDataPageV2(int64_t definition_levels_rle_size,
                                        const std::shared_ptr<Buffer>& values) {
   // Compress the values if needed. Repetition and definition levels are uncompressed in
   // V2.
-  std::shared_ptr<Buffer> compressed_values;
-  if (pager_->has_compressor()) {
+  bool page_is_compressed = false;
+  if (pager_->has_compressor() && values->size() > 0) {
     pager_->Compress(*values, compressor_temp_buffer_.get());
-    compressed_values = compressor_temp_buffer_;
-  } else {
-    compressed_values = values;
+    if (compressor_temp_buffer_->size() < values->size()) {
+      page_is_compressed = true;
+    }
   }
+  std::shared_ptr<Buffer> compressed_values =
+      (page_is_compressed ? compressor_temp_buffer_ : values);
 
   // Concatenate uncompressed levels and the possibly compressed values
   int64_t combined_size =
@@ -825,29 +1050,38 @@ void ColumnWriterImpl::BuildDataPageV2(int64_t definition_levels_rle_size,
   ConcatenateBuffers(definition_levels_rle_size, repetition_levels_rle_size,
                      compressed_values, combined->mutable_data());
 
-  EncodedStatistics page_stats = GetPageStatistics();
+  auto [page_stats, page_size_stats] = GetPageStatistics();
   page_stats.ApplyStatSizeLimits(properties_->max_statistics_size(descr_->path()));
   page_stats.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
   ResetPageStatistics();
 
   int32_t num_values = static_cast<int32_t>(num_buffered_values_);
-  int32_t null_count = static_cast<int32_t>(page_stats.null_count);
+  int32_t null_count = static_cast<int32_t>(num_buffered_nulls_);
+  int32_t num_rows = static_cast<int32_t>(num_buffered_rows_);
   int32_t def_levels_byte_length = static_cast<int32_t>(definition_levels_rle_size);
   int32_t rep_levels_byte_length = static_cast<int32_t>(repetition_levels_rle_size);
+  int64_t first_row_index = rows_written_ - num_buffered_rows_;
+
+  // page_stats.null_count is not set when page_statistics_ is nullptr. It is only used
+  // here for safety check.
+  DCHECK(!page_stats.has_null_count || page_stats.null_count == null_count);
 
   // Write the page to OutputStream eagerly if there is no dictionary or
   // if dictionary encoding has fallen back to PLAIN
   if (has_dictionary_ && !fallback_) {  // Save pages until end of dictionary encoding
-    std::shared_ptr<Buffer> data_copy;
-    PARQUET_THROW_NOT_OK(combined->Copy(0, combined->size(), allocator_, &data_copy));
-    std::unique_ptr<DataPage> page_ptr(new DataPageV2(
-        combined, num_values, null_count, num_values, encoding_, def_levels_byte_length,
-        rep_levels_byte_length, uncompressed_size, pager_->has_compressor()));
+    PARQUET_ASSIGN_OR_THROW(auto data_copy,
+                            combined->CopySlice(0, combined->size(), allocator_));
+    std::unique_ptr<DataPage> page_ptr = std::make_unique<DataPageV2>(
+        combined, num_values, null_count, num_rows, encoding_, def_levels_byte_length,
+        rep_levels_byte_length, uncompressed_size, page_is_compressed,
+        std::move(page_stats), first_row_index, std::move(page_size_stats));
     total_compressed_bytes_ += page_ptr->size() + sizeof(format::PageHeader);
     data_pages_.push_back(std::move(page_ptr));
   } else {
-    DataPageV2 page(combined, num_values, null_count, num_values, encoding_,
-                    def_levels_byte_length, rep_levels_byte_length, uncompressed_size);
+    DataPageV2 page(combined, num_values, null_count, num_rows, encoding_,
+                    def_levels_byte_length, rep_levels_byte_length, uncompressed_size,
+                    page_is_compressed, std::move(page_stats), first_row_index,
+                    std::move(page_size_stats));
     WriteDataPage(page);
   }
 }
@@ -861,7 +1095,7 @@ int64_t ColumnWriterImpl::Close() {
 
     FlushBufferedDataPages();
 
-    EncodedStatistics chunk_statistics = GetChunkStatistics();
+    auto [chunk_statistics, chunk_size_statistics] = GetChunkStatistics();
     chunk_statistics.ApplyStatSizeLimits(
         properties_->max_statistics_size(descr_->path()));
     chunk_statistics.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
@@ -870,6 +1104,10 @@ int64_t ColumnWriterImpl::Close() {
     if (rows_written_ > 0 && chunk_statistics.is_set()) {
       metadata_->SetStatistics(chunk_statistics);
     }
+    if (rows_written_ > 0 && chunk_size_statistics.is_set()) {
+      metadata_->SetSizeStatistics(chunk_size_statistics);
+    }
+    metadata_->SetKeyValueMetadata(key_value_metadata_);
     pager_->Close(has_dictionary_, fallback_);
   }
 
@@ -895,11 +1133,59 @@ template <typename Action>
 inline void DoInBatches(int64_t total, int64_t batch_size, Action&& action) {
   int64_t num_batches = static_cast<int>(total / batch_size);
   for (int round = 0; round < num_batches; round++) {
-    action(round * batch_size, batch_size);
+    action(round * batch_size, batch_size, /*check_page_size=*/true);
   }
   // Write the remaining values
   if (total % batch_size > 0) {
-    action(num_batches * batch_size, total % batch_size);
+    action(num_batches * batch_size, total % batch_size, /*check_page_size=*/true);
+  }
+}
+
+template <typename Action>
+inline void DoInBatches(const int16_t* def_levels, const int16_t* rep_levels,
+                        int64_t num_levels, int64_t batch_size, Action&& action,
+                        bool pages_change_on_record_boundaries) {
+  if (!pages_change_on_record_boundaries || !rep_levels) {
+    // If rep_levels is null, then we are writing a non-repeated column.
+    // In this case, every record contains only one level.
+    return DoInBatches(num_levels, batch_size, std::forward<Action>(action));
+  }
+
+  int64_t offset = 0;
+  while (offset < num_levels) {
+    int64_t end_offset = std::min(offset + batch_size, num_levels);
+
+    // Find next record boundary (i.e. ref_level = 0)
+    while (end_offset < num_levels && rep_levels[end_offset] != 0) {
+      end_offset++;
+    }
+
+    if (end_offset < num_levels) {
+      // This is not the last chunk of batch and end_offset is a record boundary.
+      // It is a good chance to check the page size.
+      action(offset, end_offset - offset, /*check_page_size=*/true);
+    } else {
+      DCHECK_EQ(end_offset, num_levels);
+      // This is the last chunk of batch, and we do not know whether end_offset is a
+      // record boundary. Find the offset to beginning of last record in this chunk,
+      // so we can check page size.
+      int64_t last_record_begin_offset = num_levels - 1;
+      while (last_record_begin_offset >= offset &&
+             rep_levels[last_record_begin_offset] != 0) {
+        last_record_begin_offset--;
+      }
+
+      if (offset < last_record_begin_offset) {
+        // We have found the beginning of last record and can check page size.
+        action(offset, last_record_begin_offset - offset, /*check_page_size=*/true);
+        offset = last_record_begin_offset;
+      }
+
+      // There is no record boundary in this chunk and cannot check page size.
+      action(offset, end_offset - offset, /*check_page_size=*/false);
+    }
+
+    offset = end_offset;
   }
 }
 
@@ -907,8 +1193,7 @@ bool DictionaryDirectWriteSupported(const ::arrow::Array& array) {
   DCHECK_EQ(array.type_id(), ::arrow::Type::DICTIONARY);
   const ::arrow::DictionaryType& dict_type =
       static_cast<const ::arrow::DictionaryType&>(*array.type());
-  auto id = dict_type.value_type()->id();
-  return id == ::arrow::Type::BINARY || id == ::arrow::Type::STRING;
+  return ::arrow::is_base_binary_like(dict_type.value_type()->id());
 }
 
 Status ConvertDictionaryToDense(const ::arrow::Array& array, MemoryPool* pool,
@@ -916,71 +1201,81 @@ Status ConvertDictionaryToDense(const ::arrow::Array& array, MemoryPool* pool,
   const ::arrow::DictionaryType& dict_type =
       static_cast<const ::arrow::DictionaryType&>(*array.type());
 
-  // TODO(ARROW-1648): Remove this special handling once we require an Arrow
-  // version that has this fixed.
-  if (dict_type.value_type()->id() == ::arrow::Type::NA) {
-    *out = std::make_shared<::arrow::NullArray>(array.length());
-    return Status::OK();
-  }
-
-  ::arrow::compute::FunctionContext ctx(pool);
-  Datum cast_output;
-  RETURN_NOT_OK(::arrow::compute::Cast(&ctx, Datum(array.data()), dict_type.value_type(),
-                                       ::arrow::compute::CastOptions(), &cast_output));
+  ::arrow::compute::ExecContext ctx(pool);
+  ARROW_ASSIGN_OR_RAISE(Datum cast_output,
+                        ::arrow::compute::Cast(array.data(), dict_type.value_type(),
+                                               ::arrow::compute::CastOptions(), &ctx));
   *out = cast_output.make_array();
   return Status::OK();
 }
 
-static inline bool IsDictionaryEncoding(Encoding::type encoding) {
-  return encoding == Encoding::PLAIN_DICTIONARY;
-}
-
-template <typename DType>
-class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<DType> {
+template <typename ParquetType>
+class TypedColumnWriterImpl : public ColumnWriterImpl,
+                              public TypedColumnWriter<ParquetType> {
  public:
-  using T = typename DType::c_type;
+  using T = typename ParquetType::c_type;
 
   TypedColumnWriterImpl(ColumnChunkMetaDataBuilder* metadata,
                         std::unique_ptr<PageWriter> pager, const bool use_dictionary,
                         Encoding::type encoding, const WriterProperties* properties)
       : ColumnWriterImpl(metadata, std::move(pager), use_dictionary, encoding,
                          properties) {
-    current_encoder_ = MakeEncoder(DType::type_num, encoding, use_dictionary, descr_,
-                                   properties->memory_pool());
+    current_encoder_ = MakeEncoder(ParquetType::type_num, encoding, use_dictionary,
+                                   descr_, properties->memory_pool());
+    // We have to dynamic_cast as some compilers don't want to static_cast
+    // through virtual inheritance.
+    current_value_encoder_ =
+        dynamic_cast<TypedEncoder<ParquetType>*>(current_encoder_.get());
+    // Will be null if not using dictionary, but that's ok
+    current_dict_encoder_ =
+        dynamic_cast<DictEncoder<ParquetType>*>(current_encoder_.get());
 
     if (properties->statistics_enabled(descr_->path()) &&
         (SortOrder::UNKNOWN != descr_->sort_order())) {
-      page_statistics_ = MakeStatistics<DType>(descr_, allocator_);
-      chunk_statistics_ = MakeStatistics<DType>(descr_, allocator_);
+      page_statistics_ = MakeStatistics<ParquetType>(descr_, allocator_);
+      chunk_statistics_ = MakeStatistics<ParquetType>(descr_, allocator_);
     }
+    if (properties->size_statistics_level() == SizeStatisticsLevel::ColumnChunk ||
+        properties->size_statistics_level() == SizeStatisticsLevel::PageAndColumnChunk) {
+      page_size_statistics_ = SizeStatistics::Make(descr_);
+      chunk_size_statistics_ = SizeStatistics::Make(descr_);
+    }
+    pages_change_on_record_boundaries_ =
+        properties->data_page_version() == ParquetDataPageVersion::V2 ||
+        properties->page_index_enabled(descr_->path());
   }
 
   int64_t Close() override { return ColumnWriterImpl::Close(); }
 
-  void WriteBatch(int64_t num_values, const int16_t* def_levels,
-                  const int16_t* rep_levels, const T* values) override {
+  int64_t WriteBatch(int64_t num_values, const int16_t* def_levels,
+                     const int16_t* rep_levels, const T* values) override {
     // We check for DataPage limits only after we have inserted the values. If a user
     // writes a large number of values, the DataPage size can be much above the limit.
     // The purpose of this chunking is to bound this. Even if a user writes large number
     // of values, the chunking will ensure the AddDataPage() is called at a reasonable
     // pagesize limit
     int64_t value_offset = 0;
-    auto WriteChunk = [&](int64_t offset, int64_t batch_size) {
+
+    auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
       int64_t values_to_write = WriteLevels(batch_size, AddIfNotNull(def_levels, offset),
                                             AddIfNotNull(rep_levels, offset));
+
       // PARQUET-780
       if (values_to_write > 0) {
         DCHECK_NE(nullptr, values);
       }
-      WriteValues(values + value_offset, values_to_write, batch_size - values_to_write);
-      CommitWriteAndCheckPageLimit(batch_size, values_to_write);
+      const int64_t num_nulls = batch_size - values_to_write;
+      WriteValues(AddIfNotNull(values, value_offset), values_to_write, num_nulls);
+      CommitWriteAndCheckPageLimit(batch_size, values_to_write, num_nulls, check_page);
       value_offset += values_to_write;
 
       // Dictionary size checked separately from data page size since we
       // circumvent this check when writing ::arrow::DictionaryArray directly
       CheckDictionarySizeLimit();
     };
-    DoInBatches(num_values, properties_->write_batch_size(), WriteChunk);
+    DoInBatches(def_levels, rep_levels, num_values, properties_->write_batch_size(),
+                WriteChunk, pages_change_on_record_boundaries());
+    return value_offset;
   }
 
   void WriteBatchSpaced(int64_t num_values, const int16_t* def_levels,
@@ -988,35 +1283,71 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
                         int64_t valid_bits_offset, const T* values) override {
     // Like WriteBatch, but for spaced values
     int64_t value_offset = 0;
-    auto WriteChunk = [&](int64_t offset, int64_t batch_size) {
+    auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
       int64_t batch_num_values = 0;
       int64_t batch_num_spaced_values = 0;
+      int64_t null_count;
+      MaybeCalculateValidityBits(AddIfNotNull(def_levels, offset), batch_size,
+                                 &batch_num_values, &batch_num_spaced_values,
+                                 &null_count);
+
       WriteLevelsSpaced(batch_size, AddIfNotNull(def_levels, offset),
-                        AddIfNotNull(rep_levels, offset), &batch_num_values,
-                        &batch_num_spaced_values);
-      WriteValuesSpaced(values + value_offset, batch_num_values, batch_num_spaced_values,
-                        valid_bits, valid_bits_offset + value_offset);
-      CommitWriteAndCheckPageLimit(batch_size, batch_num_spaced_values);
+                        AddIfNotNull(rep_levels, offset));
+      if (bits_buffer_ != nullptr) {
+        WriteValuesSpaced(AddIfNotNull(values, value_offset), batch_num_values,
+                          batch_num_spaced_values, bits_buffer_->data(), /*offset=*/0,
+                          /*num_levels=*/batch_size, null_count);
+      } else {
+        WriteValuesSpaced(AddIfNotNull(values, value_offset), batch_num_values,
+                          batch_num_spaced_values, valid_bits,
+                          valid_bits_offset + value_offset, /*num_levels=*/batch_size,
+                          null_count);
+      }
+      CommitWriteAndCheckPageLimit(batch_size, batch_num_spaced_values, null_count,
+                                   check_page);
       value_offset += batch_num_spaced_values;
 
       // Dictionary size checked separately from data page size since we
       // circumvent this check when writing ::arrow::DictionaryArray directly
       CheckDictionarySizeLimit();
     };
-    DoInBatches(num_values, properties_->write_batch_size(), WriteChunk);
+    DoInBatches(def_levels, rep_levels, num_values, properties_->write_batch_size(),
+                WriteChunk, pages_change_on_record_boundaries());
   }
 
   Status WriteArrow(const int16_t* def_levels, const int16_t* rep_levels,
-                    int64_t num_levels, const ::arrow::Array& array,
-                    ArrowWriteContext* ctx) override {
-    if (array.type()->id() == ::arrow::Type::DICTIONARY) {
-      return WriteArrowDictionary(def_levels, rep_levels, num_levels, array, ctx);
-    } else {
-      return WriteArrowDense(def_levels, rep_levels, num_levels, array, ctx);
+                    int64_t num_levels, const ::arrow::Array& leaf_array,
+                    ArrowWriteContext* ctx, bool leaf_field_nullable) override {
+    BEGIN_PARQUET_CATCH_EXCEPTIONS
+    // Leaf nulls are canonical when there is only a single null element after a list
+    // and it is at the leaf.
+    bool single_nullable_element =
+        (level_info_.def_level == level_info_.repeated_ancestor_def_level + 1) &&
+        leaf_field_nullable;
+    if (!leaf_field_nullable && leaf_array.null_count() != 0) {
+      return Status::Invalid("Column '", descr_->name(),
+                             "' is declared non-nullable but contains nulls");
     }
+    bool maybe_parent_nulls = level_info_.HasNullableValues() && !single_nullable_element;
+    if (maybe_parent_nulls) {
+      ARROW_ASSIGN_OR_RAISE(
+          bits_buffer_,
+          ::arrow::AllocateResizableBuffer(
+              bit_util::BytesForBits(properties_->write_batch_size()), ctx->memory_pool));
+      bits_buffer_->ZeroPadding();
+    }
+
+    if (leaf_array.type()->id() == ::arrow::Type::DICTIONARY) {
+      return WriteArrowDictionary(def_levels, rep_levels, num_levels, leaf_array, ctx,
+                                  maybe_parent_nulls);
+    } else {
+      return WriteArrowDense(def_levels, rep_levels, num_levels, leaf_array, ctx,
+                             maybe_parent_nulls);
+    }
+    END_PARQUET_CATCH_EXCEPTIONS
   }
 
-  int64_t EstimatedBufferedValueBytes() const override {
+  int64_t estimated_buffered_value_bytes() const override {
     return current_encoder_->EstimatedDataEncodedSize();
   }
 
@@ -1030,35 +1361,72 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
   // plain encoding is circumvented
   Status WriteArrowDictionary(const int16_t* def_levels, const int16_t* rep_levels,
                               int64_t num_levels, const ::arrow::Array& array,
-                              ArrowWriteContext* context);
+                              ArrowWriteContext* context, bool maybe_parent_nulls);
 
   Status WriteArrowDense(const int16_t* def_levels, const int16_t* rep_levels,
                          int64_t num_levels, const ::arrow::Array& array,
-                         ArrowWriteContext* context);
+                         ArrowWriteContext* context, bool maybe_parent_nulls);
+
+  template <typename ArrowType>
+  Status WriteArrowSerialize(const int16_t* def_levels, const int16_t* rep_levels,
+                             int64_t num_levels, const ::arrow::Array& array,
+                             ArrowWriteContext* ctx, bool maybe_parent_nulls);
+
+  Status WriteArrowZeroCopy(const int16_t* def_levels, const int16_t* rep_levels,
+                            int64_t num_levels, const ::arrow::Array& array,
+                            ArrowWriteContext* ctx, bool maybe_parent_nulls) {
+    const auto& data = checked_cast<const ::arrow::PrimitiveArray&>(array);
+    const T* values = data.data()->GetValues<T>(1);
+    bool no_nulls =
+        this->descr()->schema_node()->is_required() || (array.null_count() == 0);
+
+    if (!maybe_parent_nulls && no_nulls) {
+      PARQUET_CATCH_NOT_OK(WriteBatch(num_levels, def_levels, rep_levels, values));
+    } else {
+      PARQUET_CATCH_NOT_OK(WriteBatchSpaced(num_levels, def_levels, rep_levels,
+                                            data.null_bitmap_data(), data.offset(),
+                                            values));
+    }
+    return Status::OK();
+  }
+
+  Status WriteArrowTimestamps(const int16_t* def_levels, const int16_t* rep_levels,
+                              int64_t num_levels, const ::arrow::Array& values,
+                              ArrowWriteContext* ctx, bool maybe_parent_nulls) {
+    return Status::NotImplemented("Timestamps writing is only implemented for Int64Type");
+  }
 
   void WriteDictionaryPage() override {
-    // We have to dynamic cast here because of TypedEncoder<Type> as
-    // some compilers don't want to cast through virtual inheritance
-    auto dict_encoder = dynamic_cast<DictEncoder<DType>*>(current_encoder_.get());
-    DCHECK(dict_encoder);
-    std::shared_ptr<ResizableBuffer> buffer =
-        AllocateBuffer(properties_->memory_pool(), dict_encoder->dict_encoded_size());
-    dict_encoder->WriteDict(buffer->mutable_data());
+    DCHECK(current_dict_encoder_);
+    std::shared_ptr<ResizableBuffer> buffer = AllocateBuffer(
+        properties_->memory_pool(), current_dict_encoder_->dict_encoded_size());
+    current_dict_encoder_->WriteDict(buffer->mutable_data());
 
-    DictionaryPage page(buffer, dict_encoder->num_entries(),
+    DictionaryPage page(buffer, current_dict_encoder_->num_entries(),
                         properties_->dictionary_page_encoding());
     total_bytes_written_ += pager_->WriteDictionaryPage(page);
   }
 
-  EncodedStatistics GetPageStatistics() override {
-    EncodedStatistics result;
-    if (page_statistics_) result = page_statistics_->Encode();
+  StatisticsPair GetPageStatistics() override {
+    StatisticsPair result;
+    if (page_statistics_) {
+      result.encoded_stats = page_statistics_->Encode();
+    }
+    if (properties_->size_statistics_level() == SizeStatisticsLevel::PageAndColumnChunk) {
+      ARROW_DCHECK(page_size_statistics_ != nullptr);
+      result.size_stats = *page_size_statistics_;
+    }
     return result;
   }
 
-  EncodedStatistics GetChunkStatistics() override {
-    EncodedStatistics result;
-    if (chunk_statistics_) result = chunk_statistics_->Encode();
+  StatisticsPair GetChunkStatistics() override {
+    StatisticsPair result;
+    if (chunk_statistics_) {
+      result.encoded_stats = chunk_statistics_->Encode();
+    }
+    if (chunk_size_statistics_) {
+      result.size_stats = *chunk_size_statistics_;
+    }
     return result;
   }
 
@@ -1066,6 +1434,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
     if (chunk_statistics_ != nullptr) {
       chunk_statistics_->Merge(*page_statistics_);
       page_statistics_->Reset();
+    }
+    if (page_size_statistics_ != nullptr) {
+      chunk_size_statistics_->Merge(*page_size_statistics_);
+      page_size_statistics_->Reset();
     }
   }
 
@@ -1079,14 +1451,50 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
 
   int64_t total_bytes_written() const override { return total_bytes_written_; }
 
+  int64_t total_compressed_bytes_written() const override {
+    return pager_->total_compressed_bytes_written();
+  }
+
   const WriterProperties* properties() override { return properties_; }
 
+  bool pages_change_on_record_boundaries() const {
+    return pages_change_on_record_boundaries_;
+  }
+
+  void AddKeyValueMetadata(
+      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata) override {
+    if (closed_) {
+      throw ParquetException("Cannot add key-value metadata to closed column");
+    }
+    if (key_value_metadata_ == nullptr) {
+      key_value_metadata_ = key_value_metadata;
+    } else if (key_value_metadata != nullptr) {
+      key_value_metadata_ = key_value_metadata_->Merge(*key_value_metadata);
+    }
+  }
+
+  void ResetKeyValueMetadata() override {
+    if (closed_) {
+      throw ParquetException("Cannot add key-value metadata to closed column");
+    }
+    key_value_metadata_ = nullptr;
+  }
+
  private:
-  using ValueEncoderType = typename EncodingTraits<DType>::Encoder;
-  using TypedStats = TypedStatistics<DType>;
+  using ValueEncoderType = typename EncodingTraits<ParquetType>::Encoder;
+  using TypedStats = TypedStatistics<ParquetType>;
   std::unique_ptr<Encoder> current_encoder_;
+  // Downcasted observers of current_encoder_.
+  // The downcast is performed once as opposed to at every use since
+  // dynamic_cast is so expensive, and static_cast is not available due
+  // to virtual inheritance.
+  ValueEncoderType* current_value_encoder_;
+  DictEncoder<ParquetType>* current_dict_encoder_;
   std::shared_ptr<TypedStats> page_statistics_;
   std::shared_ptr<TypedStats> chunk_statistics_;
+  std::unique_ptr<SizeStatistics> page_size_statistics_;
+  std::shared_ptr<SizeStatistics> chunk_size_statistics_;
+  bool pages_change_on_record_boundaries_;
 
   // If writing a sequence of ::arrow::DictionaryArray to the writer, we keep the
   // dictionary passed to DictEncoder<T>::PutDictionary so we can check
@@ -1094,59 +1502,17 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
   // which case we call back to the dense write path)
   std::shared_ptr<::arrow::Array> preserved_dictionary_;
 
-  int64_t WriteLevels(int64_t num_values, const int16_t* def_levels,
+  int64_t WriteLevels(int64_t num_levels, const int16_t* def_levels,
                       const int16_t* rep_levels) {
+    // Update histograms now, to maximize cache efficiency.
+    UpdateLevelHistogram(num_levels, def_levels, rep_levels);
+
     int64_t values_to_write = 0;
     // If the field is required and non-repeated, there are no definition levels
     if (descr_->max_definition_level() > 0) {
-      for (int64_t i = 0; i < num_values; ++i) {
-        if (def_levels[i] == descr_->max_definition_level()) {
-          ++values_to_write;
-        }
-      }
-
-      WriteDefinitionLevels(num_values, def_levels);
-    } else {
-      // Required field, write all values
-      values_to_write = num_values;
-    }
-
-    // Not present for non-repeated fields
-    if (descr_->max_repetition_level() > 0) {
-      // A row could include more than one value
-      // Count the occasions where we start a new row
-      for (int64_t i = 0; i < num_values; ++i) {
-        if (rep_levels[i] == 0) {
-          rows_written_++;
-        }
-      }
-
-      WriteRepetitionLevels(num_values, rep_levels);
-    } else {
-      // Each value is exactly one row
-      rows_written_ += static_cast<int>(num_values);
-    }
-    return values_to_write;
-  }
-
-  void WriteLevelsSpaced(int64_t num_levels, const int16_t* def_levels,
-                         const int16_t* rep_levels, int64_t* out_values_to_write,
-                         int64_t* out_spaced_values_to_write) {
-    int64_t values_to_write = 0;
-    int64_t spaced_values_to_write = 0;
-    // If the field is required and non-repeated, there are no definition levels
-    if (descr_->max_definition_level() > 0) {
-      // Minimal definition level for which spaced values are written
-      int16_t min_spaced_def_level = descr_->max_definition_level();
-      if (descr_->schema_node()->is_optional()) {
-        min_spaced_def_level--;
-      }
       for (int64_t i = 0; i < num_levels; ++i) {
         if (def_levels[i] == descr_->max_definition_level()) {
           ++values_to_write;
-        }
-        if (def_levels[i] >= min_spaced_def_level) {
-          ++spaced_values_to_write;
         }
       }
 
@@ -1154,7 +1520,6 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
     } else {
       // Required field, write all values
       values_to_write = num_levels;
-      spaced_values_to_write = num_levels;
     }
 
     // Not present for non-repeated fields
@@ -1164,37 +1529,168 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
       for (int64_t i = 0; i < num_levels; ++i) {
         if (rep_levels[i] == 0) {
           rows_written_++;
+          num_buffered_rows_++;
         }
       }
 
       WriteRepetitionLevels(num_levels, rep_levels);
     } else {
       // Each value is exactly one row
-      rows_written_ += static_cast<int>(num_levels);
+      rows_written_ += num_levels;
+      num_buffered_rows_ += num_levels;
     }
-
-    *out_values_to_write = values_to_write;
-    *out_spaced_values_to_write = spaced_values_to_write;
+    return values_to_write;
   }
 
-  void CommitWriteAndCheckPageLimit(int64_t num_levels, int64_t num_values) {
+  // This method will always update the three output parameters,
+  // out_values_to_write, out_spaced_values_to_write and null_count.  Additionally
+  // it will update the validity bitmap if required (i.e. if at least one level
+  // of nullable structs directly precede the leaf node).
+  void MaybeCalculateValidityBits(const int16_t* def_levels, int64_t batch_size,
+                                  int64_t* out_values_to_write,
+                                  int64_t* out_spaced_values_to_write,
+                                  int64_t* null_count) {
+    if (bits_buffer_ == nullptr) {
+      if (level_info_.def_level == 0) {
+        // In this case def levels should be null and we only
+        // need to output counts which will always be equal to
+        // the batch size passed in (max def_level == 0 indicates
+        // there cannot be repeated or null fields).
+        DCHECK_EQ(def_levels, nullptr);
+        *out_values_to_write = batch_size;
+        *out_spaced_values_to_write = batch_size;
+        *null_count = 0;
+      } else {
+        for (int x = 0; x < batch_size; x++) {
+          *out_values_to_write += def_levels[x] == level_info_.def_level ? 1 : 0;
+          *out_spaced_values_to_write +=
+              def_levels[x] >= level_info_.repeated_ancestor_def_level ? 1 : 0;
+        }
+        *null_count = batch_size - *out_values_to_write;
+      }
+      return;
+    }
+    // Shrink to fit possible causes another allocation, and would only be necessary
+    // on the last batch.
+    int64_t new_bitmap_size = bit_util::BytesForBits(batch_size);
+    if (new_bitmap_size != bits_buffer_->size()) {
+      PARQUET_THROW_NOT_OK(
+          bits_buffer_->Resize(new_bitmap_size, /*shrink_to_fit=*/false));
+      bits_buffer_->ZeroPadding();
+    }
+    internal::ValidityBitmapInputOutput io;
+    io.valid_bits = bits_buffer_->mutable_data();
+    io.values_read_upper_bound = batch_size;
+    internal::DefLevelsToBitmap(def_levels, batch_size, level_info_, &io);
+    *out_values_to_write = io.values_read - io.null_count;
+    *out_spaced_values_to_write = io.values_read;
+    *null_count = io.null_count;
+  }
+
+  Result<std::shared_ptr<Array>> MaybeReplaceValidity(std::shared_ptr<Array> array,
+                                                      int64_t new_null_count,
+                                                      ::arrow::MemoryPool* memory_pool) {
+    if (bits_buffer_ == nullptr) {
+      return array;
+    }
+    std::vector<std::shared_ptr<Buffer>> buffers = array->data()->buffers;
+    if (buffers.empty()) {
+      return array;
+    }
+    buffers[0] = bits_buffer_;
+    // Should be a leaf array.
+    DCHECK_GT(buffers.size(), 1);
+    ValueBufferSlicer slicer{memory_pool};
+    if (array->data()->offset > 0) {
+      RETURN_NOT_OK(::arrow::VisitArrayInline(*array, &slicer, &buffers[1]));
+    }
+    return ::arrow::MakeArray(std::make_shared<ArrayData>(
+        array->type(), array->length(), std::move(buffers), new_null_count));
+  }
+
+  void WriteLevelsSpaced(int64_t num_levels, const int16_t* def_levels,
+                         const int16_t* rep_levels) {
+    // Update histograms now, to maximize cache efficiency.
+    UpdateLevelHistogram(num_levels, def_levels, rep_levels);
+
+    // If the field is required and non-repeated, there are no definition levels
+    if (descr_->max_definition_level() > 0) {
+      WriteDefinitionLevels(num_levels, def_levels);
+    }
+    // Not present for non-repeated fields
+    if (descr_->max_repetition_level() > 0) {
+      // A row could include more than one value
+      // Count the occasions where we start a new row
+      for (int64_t i = 0; i < num_levels; ++i) {
+        if (rep_levels[i] == 0) {
+          rows_written_++;
+          num_buffered_rows_++;
+        }
+      }
+      WriteRepetitionLevels(num_levels, rep_levels);
+    } else {
+      // Each value is exactly one row
+      rows_written_ += num_levels;
+      num_buffered_rows_ += num_levels;
+    }
+  }
+
+  void UpdateLevelHistogram(int64_t num_levels, const int16_t* def_levels,
+                            const int16_t* rep_levels) const {
+    if (page_size_statistics_ == nullptr) {
+      return;
+    }
+
+    auto add_levels = [](std::vector<int64_t>& level_histogram,
+                         ::arrow::util::span<const int16_t> levels, int16_t max_level) {
+      if (max_level == 0) {
+        return;
+      }
+      ARROW_DCHECK_EQ(static_cast<size_t>(max_level) + 1, level_histogram.size());
+      ::parquet::UpdateLevelHistogram(levels, level_histogram);
+    };
+
+    add_levels(page_size_statistics_->definition_level_histogram,
+               {def_levels, static_cast<size_t>(num_levels)},
+               descr_->max_definition_level());
+    add_levels(page_size_statistics_->repetition_level_histogram,
+               {rep_levels, static_cast<size_t>(num_levels)},
+               descr_->max_repetition_level());
+  }
+
+  // Update the unencoded data bytes for ByteArray only per the specification.
+  void UpdateUnencodedDataBytes() const {
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (page_size_statistics_ != nullptr) {
+        page_size_statistics_->IncrementUnencodedByteArrayDataBytes(
+            current_encoder_->ReportUnencodedDataBytes());
+      }
+    }
+  }
+
+  void CommitWriteAndCheckPageLimit(int64_t num_levels, int64_t num_values,
+                                    int64_t num_nulls, bool check_page_size) {
     num_buffered_values_ += num_levels;
     num_buffered_encoded_values_ += num_values;
+    num_buffered_nulls_ += num_nulls;
 
-    if (current_encoder_->EstimatedDataEncodedSize() >= properties_->data_pagesize()) {
+    if (check_page_size &&
+        current_encoder_->EstimatedDataEncodedSize() >= properties_->data_pagesize()) {
       AddDataPage();
     }
   }
 
   void FallbackToPlainEncoding() {
-    if (IsDictionaryEncoding(current_encoder_->encoding())) {
+    if (IsDictionaryIndexEncoding(current_encoder_->encoding())) {
       WriteDictionaryPage();
       // Serialize the buffered Dictionary Indices
       FlushBufferedDataPages();
       fallback_ = true;
       // Only PLAIN encoding is supported for fallback in V1
-      current_encoder_ = MakeEncoder(DType::type_num, Encoding::PLAIN, false, descr_,
-                                     properties_->memory_pool());
+      current_encoder_ = MakeEncoder(ParquetType::type_num, Encoding::PLAIN, false,
+                                     descr_, properties_->memory_pool());
+      current_value_encoder_ = dynamic_cast<ValueEncoderType*>(current_encoder_.get());
+      current_dict_encoder_ = nullptr;  // not using dict
       encoding_ = Encoding::PLAIN;
     }
   }
@@ -1212,46 +1708,54 @@ class TypedColumnWriterImpl : public ColumnWriterImpl, public TypedColumnWriter<
       return;
     }
 
-    // We have to dynamic cast here because TypedEncoder<Type> as some compilers
-    // don't want to cast through virtual inheritance
-    auto dict_encoder = dynamic_cast<DictEncoder<DType>*>(current_encoder_.get());
-    if (dict_encoder->dict_encoded_size() >= properties_->dictionary_pagesize_limit()) {
+    if (current_dict_encoder_->dict_encoded_size() >=
+        properties_->dictionary_pagesize_limit()) {
       FallbackToPlainEncoding();
     }
   }
 
   void WriteValues(const T* values, int64_t num_values, int64_t num_nulls) {
-    dynamic_cast<ValueEncoderType*>(current_encoder_.get())
-        ->Put(values, static_cast<int>(num_values));
+    current_value_encoder_->Put(values, static_cast<int>(num_values));
     if (page_statistics_ != nullptr) {
       page_statistics_->Update(values, num_values, num_nulls);
     }
+    UpdateUnencodedDataBytes();
   }
 
+  /// \brief Write values with spaces and update page statistics accordingly.
+  ///
+  /// \param values input buffer of values to write, including spaces.
+  /// \param num_values number of non-null values in the values buffer.
+  /// \param num_spaced_values length of values buffer, including spaces and does not
+  ///   count some nulls from ancestor (e.g. empty lists).
+  /// \param valid_bits validity bitmap of values buffer, which does not include some
+  ///   nulls from ancestor (e.g. empty lists).
+  /// \param valid_bits_offset offset to valid_bits bitmap.
+  /// \param num_levels number of levels to write, including nulls from values buffer
+  ///   and nulls from ancestor (e.g. empty lists).
+  /// \param num_nulls number of nulls in the values buffer as well as nulls from the
+  ///   ancestor (e.g. empty lists).
   void WriteValuesSpaced(const T* values, int64_t num_values, int64_t num_spaced_values,
-                         const uint8_t* valid_bits, int64_t valid_bits_offset) {
-    if (descr_->schema_node()->is_optional()) {
-      dynamic_cast<ValueEncoderType*>(current_encoder_.get())
-          ->PutSpaced(values, static_cast<int>(num_spaced_values), valid_bits,
-                      valid_bits_offset);
+                         const uint8_t* valid_bits, int64_t valid_bits_offset,
+                         int64_t num_levels, int64_t num_nulls) {
+    if (num_values != num_spaced_values) {
+      current_value_encoder_->PutSpaced(values, static_cast<int>(num_spaced_values),
+                                        valid_bits, valid_bits_offset);
     } else {
-      dynamic_cast<ValueEncoderType*>(current_encoder_.get())
-          ->Put(values, static_cast<int>(num_values));
+      current_value_encoder_->Put(values, static_cast<int>(num_values));
     }
     if (page_statistics_ != nullptr) {
-      const int64_t num_nulls = num_spaced_values - num_values;
-      page_statistics_->UpdateSpaced(values, valid_bits, valid_bits_offset, num_values,
-                                     num_nulls);
+      page_statistics_->UpdateSpaced(values, valid_bits, valid_bits_offset,
+                                     num_spaced_values, num_values, num_nulls);
     }
+    UpdateUnencodedDataBytes();
   }
 };
 
-template <typename DType>
-Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(const int16_t* def_levels,
-                                                          const int16_t* rep_levels,
-                                                          int64_t num_levels,
-                                                          const ::arrow::Array& array,
-                                                          ArrowWriteContext* ctx) {
+template <typename ParquetType>
+Status TypedColumnWriterImpl<ParquetType>::WriteArrowDictionary(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   // If this is the first time writing a DictionaryArray, then there's
   // a few possible paths to take:
   //
@@ -1271,10 +1775,11 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(const int16_t* def_lev
     std::shared_ptr<::arrow::Array> dense_array;
     RETURN_NOT_OK(
         ConvertDictionaryToDense(array, properties_->memory_pool(), &dense_array));
-    return WriteArrowDense(def_levels, rep_levels, num_levels, *dense_array, ctx);
+    return WriteArrowDense(def_levels, rep_levels, num_levels, *dense_array, ctx,
+                           maybe_parent_nulls);
   };
 
-  if (!IsDictionaryEncoding(current_encoder_->encoding()) ||
+  if (!IsDictionaryIndexEncoding(current_encoder_->encoding()) ||
       !DictionaryDirectWriteSupported(array)) {
     // No longer dictionary-encoding for whatever reason, maybe we never were
     // or we decided to stop. Note that WriteArrow can be invoked multiple
@@ -1285,20 +1790,68 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(const int16_t* def_lev
     return WriteDense();
   }
 
-  auto dict_encoder = dynamic_cast<DictEncoder<DType>*>(current_encoder_.get());
+  auto dict_encoder = dynamic_cast<DictEncoder<ParquetType>*>(current_encoder_.get());
   const auto& data = checked_cast<const ::arrow::DictionaryArray&>(array);
   std::shared_ptr<::arrow::Array> dictionary = data.dictionary();
   std::shared_ptr<::arrow::Array> indices = data.indices();
 
+  auto update_stats = [&](int64_t num_chunk_levels,
+                          const std::shared_ptr<Array>& chunk_indices) {
+    // TODO(PARQUET-2068) This approach may make two copies.  First, a copy of the
+    // indices array to a (hopefully smaller) referenced indices array.  Second, a copy
+    // of the values array to a (probably not smaller) referenced values array.
+    //
+    // Once the MinMax kernel supports all data types we should use that kernel instead
+    // as it does not make any copies.
+    ::arrow::compute::ExecContext exec_ctx(ctx->memory_pool);
+    exec_ctx.set_use_threads(false);
+
+    std::shared_ptr<::arrow::Array> referenced_dictionary;
+    PARQUET_ASSIGN_OR_THROW(::arrow::Datum referenced_indices,
+                            ::arrow::compute::Unique(*chunk_indices, &exec_ctx));
+
+    // On first run, we might be able to re-use the existing dictionary
+    if (referenced_indices.length() == dictionary->length()) {
+      referenced_dictionary = dictionary;
+    } else {
+      PARQUET_ASSIGN_OR_THROW(
+          ::arrow::Datum referenced_dictionary_datum,
+          ::arrow::compute::Take(dictionary, referenced_indices,
+                                 ::arrow::compute::TakeOptions(/*boundscheck=*/false),
+                                 &exec_ctx));
+      referenced_dictionary = referenced_dictionary_datum.make_array();
+    }
+
+    int64_t non_null_count = chunk_indices->length() - chunk_indices->null_count();
+    page_statistics_->IncrementNullCount(num_chunk_levels - non_null_count);
+    page_statistics_->IncrementNumValues(non_null_count);
+    page_statistics_->Update(*referenced_dictionary, /*update_counts=*/false);
+  };
+
   int64_t value_offset = 0;
-  auto WriteIndicesChunk = [&](int64_t offset, int64_t batch_size) {
+  auto WriteIndicesChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
     int64_t batch_num_values = 0;
     int64_t batch_num_spaced_values = 0;
+    int64_t null_count = ::arrow::kUnknownNullCount;
+    // Bits is not null for nullable values.  At this point in the code we can't
+    // determine if the leaf array has the same null values as any parents it might have
+    // had so we need to recompute it from def levels.
+    MaybeCalculateValidityBits(AddIfNotNull(def_levels, offset), batch_size,
+                               &batch_num_values, &batch_num_spaced_values, &null_count);
     WriteLevelsSpaced(batch_size, AddIfNotNull(def_levels, offset),
-                      AddIfNotNull(rep_levels, offset), &batch_num_values,
-                      &batch_num_spaced_values);
-    dict_encoder->PutIndices(*indices->Slice(value_offset, batch_num_spaced_values));
-    CommitWriteAndCheckPageLimit(batch_size, batch_num_values);
+                      AddIfNotNull(rep_levels, offset));
+    std::shared_ptr<Array> writeable_indices =
+        indices->Slice(value_offset, batch_num_spaced_values);
+    if (page_statistics_) {
+      update_stats(/*num_chunk_levels=*/batch_size, writeable_indices);
+    }
+    PARQUET_ASSIGN_OR_THROW(
+        writeable_indices,
+        MaybeReplaceValidity(writeable_indices, null_count, ctx->memory_pool));
+    dict_encoder->PutIndices(*writeable_indices);
+    // Update unencoded byte array data size to size statistics
+    UpdateUnencodedDataBytes();
+    CommitWriteAndCheckPageLimit(batch_size, batch_num_values, null_count, check_page);
     value_offset += batch_num_spaced_values;
   };
 
@@ -1307,11 +1860,14 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(const int16_t* def_lev
     // It's a new dictionary. Call PutDictionary and keep track of it
     PARQUET_CATCH_NOT_OK(dict_encoder->PutDictionary(*dictionary));
 
-    // TODO(wesm): If some dictionary values are unobserved, then the
-    // statistics will be inaccurate. Do we care enough to fix it?
-    if (page_statistics_ != nullptr) {
-      PARQUET_CATCH_NOT_OK(page_statistics_->Update(*dictionary));
+    // If there were duplicate value in the dictionary, the encoder's memo table
+    // will be out of sync with the indices in the Arrow array.
+    // The easiest solution for this uncommon case is to fallback to plain encoding.
+    if (dict_encoder->num_entries() != dictionary->length()) {
+      PARQUET_CATCH_NOT_OK(FallbackToPlainEncoding());
+      return WriteDense();
     }
+
     preserved_dictionary_ = dictionary;
   } else if (!dictionary->Equals(*preserved_dictionary_)) {
     // Dictionary has changed
@@ -1319,8 +1875,9 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(const int16_t* def_lev
     return WriteDense();
   }
 
-  PARQUET_CATCH_NOT_OK(
-      DoInBatches(num_levels, properties_->write_batch_size(), WriteIndicesChunk));
+  PARQUET_CATCH_NOT_OK(DoInBatches(def_levels, rep_levels, num_levels,
+                                   properties_->write_batch_size(), WriteIndicesChunk,
+                                   pages_change_on_record_boundaries()));
   return Status::OK();
 }
 
@@ -1345,66 +1902,42 @@ struct SerializeFunctor {
   }
 };
 
-template <typename ParquetType, typename ArrowType>
-Status WriteArrowSerialize(const ::arrow::Array& array, int64_t num_levels,
-                           const int16_t* def_levels, const int16_t* rep_levels,
-                           ArrowWriteContext* ctx,
-                           TypedColumnWriter<ParquetType>* writer) {
-  using ParquetCType = typename ParquetType::c_type;
+template <typename ParquetType>
+template <typename ArrowType>
+Status TypedColumnWriterImpl<ParquetType>::WriteArrowSerialize(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   using ArrayType = typename ::arrow::TypeTraits<ArrowType>::ArrayType;
+  using ParquetCType = typename ParquetType::c_type;
 
   ParquetCType* buffer = nullptr;
   PARQUET_THROW_NOT_OK(ctx->GetScratchData<ParquetCType>(array.length(), &buffer));
 
-  bool no_nulls =
-      writer->descr()->schema_node()->is_required() || (array.null_count() == 0);
-
   SerializeFunctor<ParquetType, ArrowType> functor;
   RETURN_NOT_OK(functor.Serialize(checked_cast<const ArrayType&>(array), ctx, buffer));
-
-  if (no_nulls) {
-    PARQUET_CATCH_NOT_OK(writer->WriteBatch(num_levels, def_levels, rep_levels, buffer));
+  bool no_nulls =
+      this->descr()->schema_node()->is_required() || (array.null_count() == 0);
+  if (!maybe_parent_nulls && no_nulls) {
+    PARQUET_CATCH_NOT_OK(WriteBatch(num_levels, def_levels, rep_levels, buffer));
   } else {
-    PARQUET_CATCH_NOT_OK(writer->WriteBatchSpaced(num_levels, def_levels, rep_levels,
-                                                  array.null_bitmap_data(),
-                                                  array.offset(), buffer));
+    PARQUET_CATCH_NOT_OK(WriteBatchSpaced(num_levels, def_levels, rep_levels,
+                                          array.null_bitmap_data(), array.offset(),
+                                          buffer));
   }
   return Status::OK();
 }
 
-template <typename ParquetType>
-Status WriteArrowZeroCopy(const ::arrow::Array& array, int64_t num_levels,
-                          const int16_t* def_levels, const int16_t* rep_levels,
-                          ArrowWriteContext* ctx,
-                          TypedColumnWriter<ParquetType>* writer) {
-  using T = typename ParquetType::c_type;
-  const auto& data = static_cast<const ::arrow::PrimitiveArray&>(array);
-  const T* values = nullptr;
-  // The values buffer may be null if the array is empty (ARROW-2744)
-  if (data.values() != nullptr) {
-    values = reinterpret_cast<const T*>(data.values()->data()) + data.offset();
-  } else {
-    DCHECK_EQ(data.length(), 0);
+#define WRITE_SERIALIZE_CASE(ArrowEnum)                                               \
+  case ::arrow::Type::ArrowEnum: {                                                    \
+    using ArrowType = typename ::arrow::TypeIdTraits<::arrow::Type::ArrowEnum>::Type; \
+    return WriteArrowSerialize<ArrowType>(def_levels, rep_levels, num_levels, array,  \
+                                          ctx, maybe_parent_nulls);                   \
   }
-  if (writer->descr()->schema_node()->is_required() || (data.null_count() == 0)) {
-    PARQUET_CATCH_NOT_OK(writer->WriteBatch(num_levels, def_levels, rep_levels, values));
-  } else {
-    PARQUET_CATCH_NOT_OK(writer->WriteBatchSpaced(num_levels, def_levels, rep_levels,
-                                                  data.null_bitmap_data(), data.offset(),
-                                                  values));
-  }
-  return Status::OK();
-}
 
-#define WRITE_SERIALIZE_CASE(ArrowEnum, ArrowType, ParquetType)  \
-  case ::arrow::Type::ArrowEnum:                                 \
-    return WriteArrowSerialize<ParquetType, ::arrow::ArrowType>( \
-        array, num_levels, def_levels, rep_levels, ctx, this);
-
-#define WRITE_ZERO_COPY_CASE(ArrowEnum, ArrowType, ParquetType)                       \
-  case ::arrow::Type::ArrowEnum:                                                      \
-    return WriteArrowZeroCopy<ParquetType>(array, num_levels, def_levels, rep_levels, \
-                                           ctx, this);
+#define WRITE_ZERO_COPY_CASE(ArrowEnum)                                       \
+  case ::arrow::Type::ArrowEnum:                                              \
+    return WriteArrowZeroCopy(def_levels, rep_levels, num_levels, array, ctx, \
+                              maybe_parent_nulls);
 
 #define ARROW_UNSUPPORTED()                                          \
   std::stringstream ss;                                              \
@@ -1426,16 +1959,14 @@ struct SerializeFunctor<BooleanType, ::arrow::BooleanType> {
 };
 
 template <>
-Status TypedColumnWriterImpl<BooleanType>::WriteArrowDense(const int16_t* def_levels,
-                                                           const int16_t* rep_levels,
-                                                           int64_t num_levels,
-                                                           const ::arrow::Array& array,
-                                                           ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<BooleanType>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   if (array.type_id() != ::arrow::Type::BOOL) {
     ARROW_UNSUPPORTED();
   }
-  return WriteArrowSerialize<BooleanType, ::arrow::BooleanType>(
-      array, num_levels, def_levels, rep_levels, ctx, this);
+  return WriteArrowSerialize<::arrow::BooleanType>(def_levels, rep_levels, num_levels,
+                                                   array, ctx, maybe_parent_nulls);
 }
 
 // ----------------------------------------------------------------------
@@ -1449,6 +1980,47 @@ struct SerializeFunctor<Int32Type, ::arrow::Date64Type> {
       *out++ = static_cast<int32_t>(*input++ / 86400000);
     }
     return Status::OK();
+  }
+};
+
+template <typename ParquetType, typename ArrowType>
+struct SerializeFunctor<
+    ParquetType, ArrowType,
+    ::arrow::enable_if_t<::arrow::is_decimal_type<ArrowType>::value&& ::arrow::internal::
+                             IsOneOf<ParquetType, Int32Type, Int64Type>::value>> {
+  using value_type = typename ParquetType::c_type;
+
+  Status Serialize(const typename ::arrow::TypeTraits<ArrowType>::ArrayType& array,
+                   ArrowWriteContext* ctx, value_type* out) {
+    if (array.null_count() == 0) {
+      for (int64_t i = 0; i < array.length(); i++) {
+        out[i] = TransferValue<ArrowType::kByteWidth>(array.Value(i));
+      }
+    } else {
+      for (int64_t i = 0; i < array.length(); i++) {
+        out[i] =
+            array.IsValid(i) ? TransferValue<ArrowType::kByteWidth>(array.Value(i)) : 0;
+      }
+    }
+
+    return Status::OK();
+  }
+
+  template <int byte_width>
+  value_type TransferValue(const uint8_t* in) const {
+    static_assert(byte_width == 16 || byte_width == 32,
+                  "only 16 and 32 byte Decimals supported");
+    value_type value = 0;
+    if constexpr (byte_width == 16) {
+      ::arrow::Decimal128 decimal_value(in);
+      PARQUET_THROW_NOT_OK(decimal_value.ToInteger(&value));
+    } else {
+      ::arrow::Decimal256 decimal_value(in);
+      // Decimal256 does not provide ToInteger, but we are sure it fits in the target
+      // integer type.
+      value = static_cast<value_type>(decimal_value.low_bits());
+    }
+    return value;
   }
 };
 
@@ -1469,24 +2041,24 @@ struct SerializeFunctor<Int32Type, ::arrow::Time32Type> {
 };
 
 template <>
-Status TypedColumnWriterImpl<Int32Type>::WriteArrowDense(const int16_t* def_levels,
-                                                         const int16_t* rep_levels,
-                                                         int64_t num_levels,
-                                                         const ::arrow::Array& array,
-                                                         ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<Int32Type>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   switch (array.type()->id()) {
     case ::arrow::Type::NA: {
       PARQUET_CATCH_NOT_OK(WriteBatch(num_levels, def_levels, rep_levels, nullptr));
     } break;
-      WRITE_SERIALIZE_CASE(INT8, Int8Type, Int32Type)
-      WRITE_SERIALIZE_CASE(UINT8, UInt8Type, Int32Type)
-      WRITE_SERIALIZE_CASE(INT16, Int16Type, Int32Type)
-      WRITE_SERIALIZE_CASE(UINT16, UInt16Type, Int32Type)
-      WRITE_SERIALIZE_CASE(UINT32, UInt32Type, Int32Type)
-      WRITE_ZERO_COPY_CASE(INT32, Int32Type, Int32Type)
-      WRITE_ZERO_COPY_CASE(DATE32, Date32Type, Int32Type)
-      WRITE_SERIALIZE_CASE(DATE64, Date64Type, Int32Type)
-      WRITE_SERIALIZE_CASE(TIME32, Time32Type, Int32Type)
+      WRITE_SERIALIZE_CASE(INT8)
+      WRITE_SERIALIZE_CASE(UINT8)
+      WRITE_SERIALIZE_CASE(INT16)
+      WRITE_SERIALIZE_CASE(UINT16)
+      WRITE_SERIALIZE_CASE(UINT32)
+      WRITE_ZERO_COPY_CASE(INT32)
+      WRITE_ZERO_COPY_CASE(DATE32)
+      WRITE_SERIALIZE_CASE(DATE64)
+      WRITE_SERIALIZE_CASE(TIME32)
+      WRITE_SERIALIZE_CASE(DECIMAL128)
+      WRITE_SERIALIZE_CASE(DECIMAL256)
     default:
       ARROW_UNSUPPORTED()
   }
@@ -1593,30 +2165,34 @@ struct SerializeFunctor<Int64Type, ::arrow::TimestampType> {
 #undef COERCE_INVALID
 #undef COERCE_MULTIPLY
 
-Status WriteTimestamps(const ::arrow::Array& values, int64_t num_levels,
-                       const int16_t* def_levels, const int16_t* rep_levels,
-                       ArrowWriteContext* ctx, TypedColumnWriter<Int64Type>* writer) {
+template <>
+Status TypedColumnWriterImpl<Int64Type>::WriteArrowTimestamps(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& values, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   const auto& source_type = static_cast<const ::arrow::TimestampType&>(*values.type());
 
   auto WriteCoerce = [&](const ArrowWriterProperties* properties) {
     ArrowWriteContext temp_ctx = *ctx;
     temp_ctx.properties = properties;
-    return WriteArrowSerialize<Int64Type, ::arrow::TimestampType>(
-        values, num_levels, def_levels, rep_levels, &temp_ctx, writer);
+    return WriteArrowSerialize<::arrow::TimestampType>(
+        def_levels, rep_levels, num_levels, values, &temp_ctx, maybe_parent_nulls);
   };
+
+  const ParquetVersion::type version = this->properties()->version();
 
   if (ctx->properties->coerce_timestamps_enabled()) {
     // User explicitly requested coercion to specific unit
     if (source_type.unit() == ctx->properties->coerce_timestamps_unit()) {
       // No data conversion necessary
-      return WriteArrowZeroCopy<Int64Type>(values, num_levels, def_levels, rep_levels,
-                                           ctx, writer);
+      return WriteArrowZeroCopy(def_levels, rep_levels, num_levels, values, ctx,
+                                maybe_parent_nulls);
     } else {
       return WriteCoerce(ctx->properties);
     }
-  } else if (writer->properties()->version() == ParquetVersion::PARQUET_1_0 &&
+  } else if ((version == ParquetVersion::PARQUET_1_0 ||
+              version == ParquetVersion::PARQUET_2_4) &&
              source_type.unit() == ::arrow::TimeUnit::NANO) {
-    // Absent superseding user instructions, when writing Parquet version 1.0 files,
+    // Absent superseding user instructions, when writing Parquet version <= 2.4 files,
     // timestamps in nanoseconds are coerced to microseconds
     std::shared_ptr<ArrowWriterProperties> properties =
         (ArrowWriterProperties::Builder())
@@ -1634,105 +2210,111 @@ Status WriteTimestamps(const ::arrow::Array& values, int64_t num_levels,
     return WriteCoerce(properties.get());
   } else {
     // No data conversion necessary
-    return WriteArrowZeroCopy<Int64Type>(values, num_levels, def_levels, rep_levels, ctx,
-                                         writer);
+    return WriteArrowZeroCopy(def_levels, rep_levels, num_levels, values, ctx,
+                              maybe_parent_nulls);
   }
 }
 
 template <>
-Status TypedColumnWriterImpl<Int64Type>::WriteArrowDense(const int16_t* def_levels,
-                                                         const int16_t* rep_levels,
-                                                         int64_t num_levels,
-                                                         const ::arrow::Array& array,
-                                                         ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<Int64Type>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   switch (array.type()->id()) {
     case ::arrow::Type::TIMESTAMP:
-      return WriteTimestamps(array, num_levels, def_levels, rep_levels, ctx, this);
-      WRITE_ZERO_COPY_CASE(INT64, Int64Type, Int64Type)
-      WRITE_SERIALIZE_CASE(UINT32, UInt32Type, Int64Type)
-      WRITE_SERIALIZE_CASE(UINT64, UInt64Type, Int64Type)
-      WRITE_ZERO_COPY_CASE(TIME64, Time64Type, Int64Type)
+      return WriteArrowTimestamps(def_levels, rep_levels, num_levels, array, ctx,
+                                  maybe_parent_nulls);
+      WRITE_ZERO_COPY_CASE(INT64)
+      WRITE_SERIALIZE_CASE(UINT32)
+      WRITE_SERIALIZE_CASE(UINT64)
+      WRITE_ZERO_COPY_CASE(TIME64)
+      WRITE_ZERO_COPY_CASE(DURATION)
+      WRITE_SERIALIZE_CASE(DECIMAL128)
+      WRITE_SERIALIZE_CASE(DECIMAL256)
     default:
       ARROW_UNSUPPORTED();
   }
 }
 
 template <>
-Status TypedColumnWriterImpl<Int96Type>::WriteArrowDense(const int16_t* def_levels,
-                                                         const int16_t* rep_levels,
-                                                         int64_t num_levels,
-                                                         const ::arrow::Array& array,
-                                                         ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<Int96Type>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   if (array.type_id() != ::arrow::Type::TIMESTAMP) {
     ARROW_UNSUPPORTED();
   }
-  return WriteArrowSerialize<Int96Type, ::arrow::TimestampType>(
-      array, num_levels, def_levels, rep_levels, ctx, this);
+  return WriteArrowSerialize<::arrow::TimestampType>(def_levels, rep_levels, num_levels,
+                                                     array, ctx, maybe_parent_nulls);
 }
 
 // ----------------------------------------------------------------------
 // Floating point types
 
 template <>
-Status TypedColumnWriterImpl<FloatType>::WriteArrowDense(const int16_t* def_levels,
-                                                         const int16_t* rep_levels,
-                                                         int64_t num_levels,
-                                                         const ::arrow::Array& array,
-                                                         ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<FloatType>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   if (array.type_id() != ::arrow::Type::FLOAT) {
     ARROW_UNSUPPORTED();
   }
-  return WriteArrowZeroCopy<FloatType>(array, num_levels, def_levels, rep_levels, ctx,
-                                       this);
+  return WriteArrowZeroCopy(def_levels, rep_levels, num_levels, array, ctx,
+                            maybe_parent_nulls);
 }
 
 template <>
-Status TypedColumnWriterImpl<DoubleType>::WriteArrowDense(const int16_t* def_levels,
-                                                          const int16_t* rep_levels,
-                                                          int64_t num_levels,
-                                                          const ::arrow::Array& array,
-                                                          ArrowWriteContext* ctx) {
+Status TypedColumnWriterImpl<DoubleType>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   if (array.type_id() != ::arrow::Type::DOUBLE) {
     ARROW_UNSUPPORTED();
   }
-  return WriteArrowZeroCopy<DoubleType>(array, num_levels, def_levels, rep_levels, ctx,
-                                        this);
+  return WriteArrowZeroCopy(def_levels, rep_levels, num_levels, array, ctx,
+                            maybe_parent_nulls);
 }
 
 // ----------------------------------------------------------------------
 // Write Arrow to BYTE_ARRAY
 
 template <>
-Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(const int16_t* def_levels,
-                                                             const int16_t* rep_levels,
-                                                             int64_t num_levels,
-                                                             const ::arrow::Array& array,
-                                                             ArrowWriteContext* ctx) {
-  if (array.type()->id() != ::arrow::Type::BINARY &&
-      array.type()->id() != ::arrow::Type::STRING) {
+Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
+  if (!::arrow::is_base_binary_like(array.type()->id())) {
     ARROW_UNSUPPORTED();
   }
 
   int64_t value_offset = 0;
-  auto WriteChunk = [&](int64_t offset, int64_t batch_size) {
+  auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
     int64_t batch_num_values = 0;
     int64_t batch_num_spaced_values = 0;
+    int64_t null_count = 0;
+
+    MaybeCalculateValidityBits(AddIfNotNull(def_levels, offset), batch_size,
+                               &batch_num_values, &batch_num_spaced_values, &null_count);
     WriteLevelsSpaced(batch_size, AddIfNotNull(def_levels, offset),
-                      AddIfNotNull(rep_levels, offset), &batch_num_values,
-                      &batch_num_spaced_values);
-    std::shared_ptr<::arrow::Array> data_slice =
+                      AddIfNotNull(rep_levels, offset));
+    std::shared_ptr<Array> data_slice =
         array.Slice(value_offset, batch_num_spaced_values);
+    PARQUET_ASSIGN_OR_THROW(
+        data_slice, MaybeReplaceValidity(data_slice, null_count, ctx->memory_pool));
+
     current_encoder_->Put(*data_slice);
+    // Null values in ancestors count as nulls.
+    const int64_t non_null = data_slice->length() - data_slice->null_count();
     if (page_statistics_ != nullptr) {
-      page_statistics_->Update(*data_slice);
+      page_statistics_->Update(*data_slice, /*update_counts=*/false);
+      page_statistics_->IncrementNullCount(batch_size - non_null);
+      page_statistics_->IncrementNumValues(non_null);
     }
-    CommitWriteAndCheckPageLimit(batch_size, batch_num_values);
+    UpdateUnencodedDataBytes();
+    CommitWriteAndCheckPageLimit(batch_size, batch_num_values, batch_size - non_null,
+                                 check_page);
     CheckDictionarySizeLimit();
     value_offset += batch_num_spaced_values;
   };
 
-  PARQUET_CATCH_NOT_OK(
-      DoInBatches(num_levels, properties_->write_batch_size(), WriteChunk));
+  PARQUET_CATCH_NOT_OK(DoInBatches(def_levels, rep_levels, num_levels,
+                                   properties_->write_batch_size(), WriteChunk,
+                                   pages_change_on_record_boundaries()));
   return Status::OK();
 }
 
@@ -1766,24 +2348,27 @@ struct SerializeFunctor<
 // ----------------------------------------------------------------------
 // Write Arrow to Decimal128
 
-using ::arrow::internal::checked_pointer_cast;
-
-// Requires a custom serializer because decimal128 in parquet are in big-endian
+// Requires a custom serializer because decimal in parquet are in big-endian
 // format. Thus, a temporary local buffer is required.
 template <typename ParquetType, typename ArrowType>
-struct SerializeFunctor<ParquetType, ArrowType, ::arrow::enable_if_decimal<ArrowType>> {
-  Status Serialize(const ::arrow::Decimal128Array& array, ArrowWriteContext* ctx,
-                   FLBA* out) {
+struct SerializeFunctor<
+    ParquetType, ArrowType,
+    ::arrow::enable_if_t<
+        ::arrow::is_decimal_type<ArrowType>::value &&
+        !::arrow::internal::IsOneOf<ParquetType, Int32Type, Int64Type>::value>> {
+  Status Serialize(const typename ::arrow::TypeTraits<ArrowType>::ArrayType& array,
+                   ArrowWriteContext* ctx, FLBA* out) {
     AllocateScratch(array, ctx);
     auto offset = Offset(array);
 
     if (array.null_count() == 0) {
       for (int64_t i = 0; i < array.length(); i++) {
-        out[i] = FixDecimalEndianess(array.GetValue(i), offset);
+        out[i] = FixDecimalEndianness<ArrowType::kByteWidth>(array.GetValue(i), offset);
       }
     } else {
       for (int64_t i = 0; i < array.length(); i++) {
-        out[i] = array.IsValid(i) ? FixDecimalEndianess(array.GetValue(i), offset)
+        out[i] = array.IsValid(i) ? FixDecimalEndianness<ArrowType::kByteWidth>(
+                                        array.GetValue(i), offset)
                                   : FixedLenByteArray();
       }
     }
@@ -1792,26 +2377,38 @@ struct SerializeFunctor<ParquetType, ArrowType, ::arrow::enable_if_decimal<Arrow
   }
 
   // Parquet's Decimal are stored with FixedLength values where the length is
-  // proportional to the precision. Arrow's Decimal are always stored with 16
+  // proportional to the precision. Arrow's Decimal are always stored with 16/32
   // bytes. Thus the internal FLBA pointer must be adjusted by the offset calculated
   // here.
-  int32_t Offset(const ::arrow::Decimal128Array& array) {
-    auto decimal_type = checked_pointer_cast<::arrow::Decimal128Type>(array.type());
-    return decimal_type->byte_width() - internal::DecimalSize(decimal_type->precision());
+  int32_t Offset(const Array& array) {
+    auto decimal_type = checked_pointer_cast<::arrow::DecimalType>(array.type());
+    return decimal_type->byte_width() -
+           ::arrow::DecimalType::DecimalSize(decimal_type->precision());
   }
 
-  void AllocateScratch(const ::arrow::Decimal128Array& array, ArrowWriteContext* ctx) {
+  void AllocateScratch(const typename ::arrow::TypeTraits<ArrowType>::ArrayType& array,
+                       ArrowWriteContext* ctx) {
     int64_t non_null_count = array.length() - array.null_count();
-    int64_t size = non_null_count * 16;
+    int64_t size = non_null_count * ArrowType::kByteWidth;
     scratch_buffer = AllocateBuffer(ctx->memory_pool, size);
     scratch = reinterpret_cast<int64_t*>(scratch_buffer->mutable_data());
   }
 
-  FixedLenByteArray FixDecimalEndianess(const uint8_t* in, int64_t offset) {
+  template <int byte_width>
+  FixedLenByteArray FixDecimalEndianness(const uint8_t* in, int64_t offset) {
     const auto* u64_in = reinterpret_cast<const int64_t*>(in);
     auto out = reinterpret_cast<const uint8_t*>(scratch) + offset;
-    *scratch++ = ::arrow::BitUtil::ToBigEndian(u64_in[1]);
-    *scratch++ = ::arrow::BitUtil::ToBigEndian(u64_in[0]);
+    static_assert(byte_width == 16 || byte_width == 32,
+                  "only 16 and 32 byte Decimals supported");
+    if (byte_width == 32) {
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[3]);
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[2]);
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[1]);
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[0]);
+    } else {
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[1]);
+      *scratch++ = ::arrow::bit_util::ToBigEndian(u64_in[0]);
+    }
     return FixedLenByteArray(out);
   }
 
@@ -1819,15 +2416,42 @@ struct SerializeFunctor<ParquetType, ArrowType, ::arrow::enable_if_decimal<Arrow
   int64_t* scratch;
 };
 
+// ----------------------------------------------------------------------
+// Write Arrow to Float16
+
+// Requires a custom serializer because Float16s in Parquet are stored as a 2-byte
+// (little-endian) FLBA, whereas in Arrow they're a native `uint16_t`.
 template <>
-Status TypedColumnWriterImpl<FLBAType>::WriteArrowDense(const int16_t* def_levels,
-                                                        const int16_t* rep_levels,
-                                                        int64_t num_levels,
-                                                        const ::arrow::Array& array,
-                                                        ArrowWriteContext* ctx) {
+struct SerializeFunctor<::parquet::FLBAType, ::arrow::HalfFloatType> {
+  Status Serialize(const ::arrow::HalfFloatArray& array, ArrowWriteContext*, FLBA* out) {
+    const uint16_t* values = array.raw_values();
+    if (array.null_count() == 0) {
+      for (int64_t i = 0; i < array.length(); ++i) {
+        out[i] = ToFLBA(&values[i]);
+      }
+    } else {
+      for (int64_t i = 0; i < array.length(); ++i) {
+        out[i] = array.IsValid(i) ? ToFLBA(&values[i]) : FLBA{};
+      }
+    }
+    return Status::OK();
+  }
+
+ private:
+  FLBA ToFLBA(const uint16_t* value_ptr) const {
+    return FLBA{reinterpret_cast<const uint8_t*>(value_ptr)};
+  }
+};
+
+template <>
+Status TypedColumnWriterImpl<FLBAType>::WriteArrowDense(
+    const int16_t* def_levels, const int16_t* rep_levels, int64_t num_levels,
+    const ::arrow::Array& array, ArrowWriteContext* ctx, bool maybe_parent_nulls) {
   switch (array.type()->id()) {
-    WRITE_SERIALIZE_CASE(FIXED_SIZE_BINARY, FixedSizeBinaryType, FLBAType)
-    WRITE_SERIALIZE_CASE(DECIMAL, Decimal128Type, FLBAType)
+    WRITE_SERIALIZE_CASE(FIXED_SIZE_BINARY)
+    WRITE_SERIALIZE_CASE(DECIMAL128)
+    WRITE_SERIALIZE_CASE(DECIMAL256)
+    WRITE_SERIALIZE_CASE(HALF_FLOAT)
     default:
       break;
   }
@@ -1844,6 +2468,13 @@ std::shared_ptr<ColumnWriter> ColumnWriter::Make(ColumnChunkMetaDataBuilder* met
   const bool use_dictionary = properties->dictionary_enabled(descr->path()) &&
                               descr->physical_type() != Type::BOOLEAN;
   Encoding::type encoding = properties->encoding(descr->path());
+  if (encoding == Encoding::UNKNOWN) {
+    encoding = (descr->physical_type() == Type::BOOLEAN &&
+                properties->version() != ParquetVersion::PARQUET_1_0 &&
+                properties->data_page_version() == ParquetDataPageVersion::V2)
+                   ? Encoding::RLE
+                   : Encoding::PLAIN;
+  }
   if (use_dictionary) {
     encoding = properties->dictionary_index_encoding();
   }

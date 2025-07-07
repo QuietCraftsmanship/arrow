@@ -31,7 +31,7 @@
 
 #include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 
 namespace arrow {
@@ -39,6 +39,9 @@ namespace util {
 namespace internal {
 
 namespace {
+
+constexpr int kBZ2MinCompressionLevel = 1;
+constexpr int kBZ2MaxCompressionLevel = 9;
 
 // Max number of bytes the bz2 APIs accept at a time
 constexpr auto kSizeLimit =
@@ -262,7 +265,12 @@ class BZ2Codec : public Codec {
     return ptr;
   }
 
-  const char* name() const override { return "bz2"; }
+  Compression::type compression_type() const override { return Compression::BZ2; }
+
+  int compression_level() const override { return compression_level_; }
+  int minimum_compression_level() const override { return kBZ2MinCompressionLevel; }
+  int maximum_compression_level() const override { return kBZ2MaxCompressionLevel; }
+  int default_compression_level() const override { return kBZ2DefaultCompressionLevel; }
 
  private:
   int compression_level_;
@@ -271,7 +279,7 @@ class BZ2Codec : public Codec {
 }  // namespace
 
 std::unique_ptr<Codec> MakeBZ2Codec(int compression_level) {
-  return std::unique_ptr<Codec>(new BZ2Codec(compression_level));
+  return std::make_unique<BZ2Codec>(compression_level);
 }
 
 }  // namespace internal

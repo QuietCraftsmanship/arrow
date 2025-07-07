@@ -15,20 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-context("install_arrow()")
+test_that("arrow_repos", {
+  cran <- "https://cloud.r-project.org/"
+  ours <- "https://dl.example.com/ursalabs/fake_repo"
+  other <- "https://cran.fiocruz.br/"
 
-r_only({
-  test_that("arrow_repos", {
-    old <- options(repos=c(CRAN = "@CRAN@")) # Restore default
-    on.exit(options(old))
-    cran <- "https://cloud.r-project.org/"
-    bt <- "https://dl.bintray.com/ursalabs/arrow-r"
-    other <- "https://cran.fiocruz.br/"
+  opts <- list(
+    repos = c(CRAN = "@CRAN@"), # Restore default
+    arrow.dev_repo = ours
+  )
+  withr::with_options(opts, {
     expect_identical(arrow_repos(), cran)
-    expect_identical(arrow_repos(c(cran, bt)), cran)
-    expect_identical(arrow_repos(c(bt, other)), other)
-    expect_identical(arrow_repos(nightly = TRUE), c(bt, cran))
-    expect_identical(arrow_repos(c(cran, bt), nightly = TRUE), c(bt, cran))
-    expect_identical(arrow_repos(c(bt, other), nightly = TRUE), c(bt, other))
+    expect_identical(arrow_repos(c(cran, ours)), cran)
+    expect_identical(arrow_repos(c(ours, other)), other)
+    expect_identical(arrow_repos(nightly = TRUE), c(ours, cran))
+    expect_identical(arrow_repos(c(cran, ours), nightly = TRUE), c(ours, cran))
+    expect_identical(arrow_repos(c(ours, other), nightly = TRUE), c(ours, other))
   })
+})
+
+test_that("on_rosetta() does not warn", {
+  # There is no warning
+  expect_warning(on_rosetta(), NA)
 })

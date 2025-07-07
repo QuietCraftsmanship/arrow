@@ -25,17 +25,24 @@
 #' `buffer()` lets you create an `arrow::Buffer` from an R object
 #' @section Methods:
 #'
-#' - `$is_mutable()` :
-#' - `$ZeroPadding()` :
-#' - `$size()` :
-#' - `$capacity()`:
+#' - `$is_mutable` : is this buffer mutable?
+#' - `$ZeroPadding()` : zero bytes in padding, i.e. bytes between size and capacity
+#' - `$size` : size in memory, in bytes
+#' - `$capacity`: possible capacity, in bytes
 #'
-#' @rdname buffer
-#' @name buffer
+#' @rdname Buffer-class
+#' @name Buffer
+#' @examples
+#' my_buffer <- buffer(c(1, 2, 3, 4))
+#' my_buffer$is_mutable
+#' my_buffer$ZeroPadding()
+#' my_buffer$size
+#' my_buffer$capacity
 #' @export
-#' @include arrow-package.R
+#' @include arrow-object.R
 #' @include enums.R
-Buffer <- R6Class("Buffer", inherit = ArrowObject,
+Buffer <- R6Class("Buffer",
+  inherit = ArrowObject,
   public = list(
     ZeroPadding = function() Buffer__ZeroPadding(self),
     data = function() Buffer__data(self),
@@ -43,7 +50,6 @@ Buffer <- R6Class("Buffer", inherit = ArrowObject,
       inherits(other, "Buffer") && Buffer__Equals(self, other)
     }
   ),
-
   active = list(
     is_mutable = function() Buffer__is_mutable(self),
     size = function() Buffer__size(self),
@@ -55,7 +61,7 @@ Buffer$create <- function(x) {
   if (inherits(x, "Buffer")) {
     x
   } else if (inherits(x, c("raw", "numeric", "integer", "complex"))) {
-    shared_ptr(Buffer, r___RBuffer__initialize(x))
+    r___RBuffer__initialize(x)
   } else if (inherits(x, "BufferOutputStream")) {
     x$finish()
   } else {
@@ -63,8 +69,11 @@ Buffer$create <- function(x) {
   }
 }
 
+#' Create a Buffer
+#' @rdname buffer
 #' @param x R object. Only raw, numeric and integer vectors are currently supported
 #' @return an instance of `Buffer` that borrows memory from `x`
+#' @seealso [Buffer]
 #' @export
 buffer <- Buffer$create
 

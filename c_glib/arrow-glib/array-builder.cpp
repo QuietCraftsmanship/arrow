@@ -17,14 +17,11 @@
  * under the License.
  */
 
-#ifdef HAVE_CONFIG_H
-#  include <config.h>
-#endif
-
 #include <arrow-glib/array-builder.hpp>
 #include <arrow-glib/data-type.hpp>
-#include <arrow-glib/decimal128.hpp>
+#include <arrow-glib/decimal.hpp>
 #include <arrow-glib/error.hpp>
+#include <arrow-glib/interval.hpp>
 #include <arrow-glib/type.hpp>
 
 template <typename BUILDER, typename VALUE>
@@ -35,24 +32,21 @@ garrow_array_builder_append_value(GArrowArrayBuilder *builder,
                                   const gchar *context)
 {
   auto arrow_builder =
-    static_cast<BUILDER>(garrow_array_builder_get_raw(builder));
+    std::static_pointer_cast<BUILDER>(garrow_array_builder_get_raw(builder));
   auto status = arrow_builder->Append(value);
   return garrow_error_check(error, status, context);
 }
 
-template <typename BUILDER, typename VALUE>
+template <typename VALUE, typename APPEND_FUNCTION>
 gboolean
-garrow_array_builder_append_values(GArrowArrayBuilder *builder,
-                                   VALUE *values,
+garrow_array_builder_append_values(VALUE *values,
                                    gint64 values_length,
                                    const gboolean *is_valids,
                                    gint64 is_valids_length,
                                    GError **error,
-                                   const gchar *context)
+                                   const gchar *context,
+                                   APPEND_FUNCTION append_function)
 {
-  auto arrow_builder =
-    static_cast<BUILDER>(garrow_array_builder_get_raw(builder));
-  arrow::Status status;
   if (is_valids_length > 0) {
     if (values_length != is_valids_length) {
       g_set_error(error,
@@ -70,35 +64,59 @@ garrow_array_builder_append_values(GArrowArrayBuilder *builder,
     const gint64 chunk_size = 4096;
     gint64 n_chunks = is_valids_length / chunk_size;
     gint64 n_remains = is_valids_length % chunk_size;
-    for (gint64 i = 0; i < n_chunks; ++i) {
+    gint64 n_loops = n_chunks;
+    if (n_remains > 0) {
+      ++n_loops;
+    }
+    for (gint64 i = 0; i < n_loops; ++i) {
       uint8_t valid_bytes[chunk_size];
       gint64 offset = chunk_size * i;
       const gboolean *chunked_is_valids = is_valids + offset;
-      for (gint64 j = 0; j < chunk_size; ++j) {
+      gint64 n_values;
+      if (i == n_chunks) {
+        n_values = n_remains;
+      } else {
+        n_values = chunk_size;
+      }
+      for (gint64 j = 0; j < n_values; ++j) {
         valid_bytes[j] = chunked_is_valids[j];
       }
-      status = arrow_builder->AppendValues(values + offset,
-                                           chunk_size,
-                                           valid_bytes);
+      auto status = append_function(values + offset, n_values, valid_bytes);
       if (!garrow_error_check(error, status, context)) {
         return FALSE;
       }
     }
-    {
-      uint8_t valid_bytes[n_remains];
-      gint64 offset = chunk_size * n_chunks;
-      const gboolean *chunked_is_valids = is_valids + offset;
-      for (gint64 i = 0; i < n_remains; ++i) {
-        valid_bytes[i] = chunked_is_valids[i];
-      }
-      status = arrow_builder->AppendValues(values + offset,
-                                           n_remains,
-                                           valid_bytes);
-    }
+    return TRUE;
   } else {
-    status = arrow_builder->AppendValues(values, values_length, nullptr);
+    auto status = append_function(values, values_length, nullptr);
+    return garrow_error_check(error, status, context);
   }
-  return garrow_error_check(error, status, context);
+}
+
+template <typename BUILDER, typename VALUE>
+gboolean
+garrow_array_builder_append_values(GArrowArrayBuilder *builder,
+                                   VALUE *values,
+                                   gint64 values_length,
+                                   const gboolean *is_valids,
+                                   gint64 is_valids_length,
+                                   GError **error,
+                                   const gchar *context)
+{
+  auto arrow_builder =
+    std::static_pointer_cast<BUILDER>(garrow_array_builder_get_raw(builder));
+  return garrow_array_builder_append_values(
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    context,
+    [&arrow_builder](VALUE *values,
+                     gint64 values_length,
+                     const uint8_t *valid_bytes) -> arrow::Status {
+      return arrow_builder->AppendValues(values, values_length, valid_bytes);
+    });
 }
 
 template <typename BUILDER>
@@ -112,7 +130,7 @@ garrow_array_builder_append_values(GArrowArrayBuilder *builder,
                                    const gchar *context)
 {
   auto arrow_builder =
-    static_cast<BUILDER>(garrow_array_builder_get_raw(builder));
+    std::static_pointer_cast<BUILDER>(garrow_array_builder_get_raw(builder));
   arrow::Status status;
   if (is_valids_length > 0 && values_length != is_valids_length) {
     g_set_error(error,
@@ -130,22 +148,45 @@ garrow_array_builder_append_values(GArrowArrayBuilder *builder,
   const gint64 chunk_size = 4096;
   gint64 n_chunks = values_length / chunk_size;
   gint64 n_remains = values_length % chunk_size;
-  for (gint64 i = 0; i < n_chunks; ++i) {
+  gint64 n_loops = n_chunks;
+  if (n_remains > 0) {
+    ++n_loops;
+  }
+  for (gint64 i = 0; i < n_loops; ++i) {
     std::vector<std::string> strings;
     uint8_t *valid_bytes = nullptr;
     uint8_t valid_bytes_buffer[chunk_size];
     if (is_valids_length > 0) {
       valid_bytes = valid_bytes_buffer;
     }
+    gboolean is_valids_buffer[chunk_size];
     const gint64 offset = chunk_size * i;
-    for (gint64 j = 0; j < chunk_size; ++j) {
+    gint64 n_values;
+    if (i == n_chunks) {
+      n_values = n_remains;
+    } else {
+      n_values = chunk_size;
+    }
+    for (gint64 j = 0; j < n_values; ++j) {
       auto value = values[offset + j];
-      size_t data_size;
-      auto raw_data = g_bytes_get_data(value, &data_size);
-      strings.push_back(std::string(static_cast<const char *>(raw_data),
-                                    data_size));
-      if (valid_bytes) {
-        valid_bytes_buffer[j] = is_valids[offset + j];
+      if (value) {
+        size_t data_size;
+        auto raw_data = g_bytes_get_data(value, &data_size);
+        strings.push_back(std::string(static_cast<const char *>(raw_data), data_size));
+        if (valid_bytes) {
+          valid_bytes_buffer[j] = is_valids[offset + j];
+        }
+      } else {
+        strings.push_back("");
+        valid_bytes_buffer[j] = 0;
+        if (!valid_bytes) {
+          if (j > 0) {
+            memset(valid_bytes_buffer, 1, sizeof(uint8_t) * j - 1);
+          }
+          valid_bytes = valid_bytes_buffer;
+          memset(is_valids_buffer, TRUE, sizeof(gboolean) * chunk_size);
+          is_valids = is_valids_buffer;
+        }
       }
     }
     status = arrow_builder->AppendValues(strings, valid_bytes);
@@ -153,66 +194,151 @@ garrow_array_builder_append_values(GArrowArrayBuilder *builder,
       return FALSE;
     }
   }
-  {
-    std::vector<std::string> strings;
-    uint8_t *valid_bytes = nullptr;
-    uint8_t valid_bytes_buffer[chunk_size];
-    const gint64 offset = chunk_size * n_chunks;
-    if (is_valids_length > 0) {
-      valid_bytes = valid_bytes_buffer;
-    }
-    for (gint64 i = 0; i < n_remains; ++i) {
-      auto value = values[offset + i];
-      size_t data_size;
-      auto raw_data = g_bytes_get_data(value, &data_size);
-      strings.push_back(std::string(static_cast<const char *>(raw_data),
-                                    data_size));
-      if (valid_bytes) {
-        valid_bytes_buffer[i] = is_valids[offset + i];
-      }
-    }
-    status = arrow_builder->AppendValues(strings, valid_bytes);
-  }
-  return garrow_error_check(error, status, context);
+  return TRUE;
 }
 
-template <typename BUILDER>
+template <typename VALUE, typename GET_VALUE_FUNCTION>
 gboolean
-garrow_array_builder_append_null(GArrowArrayBuilder *builder,
-                                 GError **error,
-                                 const gchar *context)
+garrow_array_builder_append_values(GArrowArrayBuilder *builder,
+                                   VALUE *values,
+                                   gint64 values_length,
+                                   const gboolean *is_valids,
+                                   gint64 is_valids_length,
+                                   GError **error,
+                                   const gchar *context,
+                                   GET_VALUE_FUNCTION get_value_function)
 {
-  auto arrow_builder =
-    static_cast<BUILDER>(garrow_array_builder_get_raw(builder));
-  auto status = arrow_builder->AppendNull();
-  return garrow_error_check(error, status, context);
-}
-
-template <typename BUILDER>
-gboolean
-garrow_array_builder_append_nulls(GArrowArrayBuilder *builder,
-                                  gint64 n,
-                                  GError **error,
-                                  const gchar *context)
-{
-  if (n < 0) {
+  auto arrow_builder = std::static_pointer_cast<arrow::FixedSizeBinaryBuilder>(
+    garrow_array_builder_get_raw(builder));
+  if (is_valids_length > 0 && values_length != is_valids_length) {
     g_set_error(error,
                 GARROW_ERROR,
                 GARROW_ERROR_INVALID,
-                "%s: the number of nulls must be 0 or larger: "
+                "%s: values length and is_valids length must be equal: "
+                "<%" G_GINT64_FORMAT "> != "
                 "<%" G_GINT64_FORMAT ">",
                 context,
-                n);
+                values_length,
+                is_valids_length);
     return FALSE;
   }
-  if (n == 0) {
+
+  auto value_size = arrow_builder->byte_width();
+  const gint64 chunk_size = 4096;
+  gint64 n_chunks = values_length / chunk_size;
+  gint64 n_remains = values_length % chunk_size;
+  gint64 n_loops = n_chunks;
+  if (n_remains > 0) {
+    ++n_loops;
+  }
+  std::vector<uint8_t> data(value_size * chunk_size);
+  for (gint64 i = 0; i < n_loops; ++i) {
+    uint8_t *valid_bytes = nullptr;
+    uint8_t valid_bytes_buffer[chunk_size];
+    if (is_valids_length > 0) {
+      valid_bytes = valid_bytes_buffer;
+    }
+    const gint64 offset = chunk_size * i;
+    gint64 n_values;
+    if (i == n_chunks) {
+      n_values = n_remains;
+    } else {
+      n_values = chunk_size;
+    }
+    for (gint64 j = 0; j < n_values; ++j) {
+      bool is_valid = true;
+      if (is_valids) {
+        is_valid = is_valids[offset + j];
+      }
+      VALUE value = nullptr;
+      if (is_valid) {
+        value = values[offset + j];
+      }
+      if (value) {
+        get_value_function(data.data() + (value_size * j), value, value_size);
+      } else {
+        is_valid = false;
+        if (!valid_bytes) {
+          valid_bytes = valid_bytes_buffer;
+          memset(valid_bytes_buffer, true, j);
+        }
+      }
+      if (valid_bytes) {
+        valid_bytes_buffer[j] = is_valid;
+      }
+    }
+    auto status = arrow_builder->AppendValues(data.data(), n_values, valid_bytes);
+    if (!garrow_error_check(error, status, context)) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+template <typename BUILDER>
+gboolean
+garrow_array_builder_append_values(GArrowArrayBuilder *builder,
+                                   GBytes *values,
+                                   const gboolean *is_valids,
+                                   gint64 is_valids_length,
+                                   GError **error,
+                                   const gchar *context)
+{
+  auto arrow_builder =
+    std::static_pointer_cast<BUILDER>(garrow_array_builder_get_raw(builder));
+  auto value_size = arrow_builder->byte_width();
+  gsize raw_values_size;
+  auto raw_values =
+    static_cast<const uint8_t *>(g_bytes_get_data(values, &raw_values_size));
+  const gint64 n_values = raw_values_size / value_size;
+  if (is_valids_length > 0 && n_values != is_valids_length) {
+    g_set_error(error,
+                GARROW_ERROR,
+                GARROW_ERROR_INVALID,
+                "%s: the number of values and is_valids length must be equal: "
+                "<%" G_GINT64_FORMAT "> != "
+                "<%" G_GINT64_FORMAT ">",
+                context,
+                n_values,
+                is_valids_length);
+    return FALSE;
+  }
+
+  if (is_valids_length == 0) {
+    auto status = arrow_builder->AppendValues(raw_values, n_values);
+    if (!garrow_error_check(error, status, context)) {
+      return FALSE;
+    }
     return TRUE;
   }
 
-  auto arrow_builder =
-    static_cast<BUILDER>(garrow_array_builder_get_raw(builder));
-  auto status = arrow_builder->AppendNulls(n);
-  return garrow_error_check(error, status, context);
+  const gint64 chunk_size = 4096;
+  gint64 n_chunks = n_values / chunk_size;
+  gint64 n_remains = n_values % chunk_size;
+  gint64 n_loops = n_chunks;
+  if (n_remains > 0) {
+    ++n_loops;
+  }
+  for (gint64 i = 0; i < n_loops; ++i) {
+    uint8_t valid_bytes[chunk_size];
+    const auto offset = chunk_size * i;
+    gint64 n_values;
+    if (i == n_chunks) {
+      n_values = n_remains;
+    } else {
+      n_values = chunk_size;
+    }
+    for (gint64 j = 0; j < n_values; ++j) {
+      valid_bytes[j] = is_valids[offset + j];
+    }
+    auto status = arrow_builder->AppendValues(raw_values + (value_size * offset),
+                                              n_values,
+                                              valid_bytes);
+    if (!garrow_error_check(error, status, context)) {
+      return FALSE;
+    }
+  }
+  return TRUE;
 }
 
 G_BEGIN_DECLS
@@ -268,6 +394,9 @@ G_BEGIN_DECLS
  * #GArrowUInt64ArrayBuilder is the class to create a new
  * #GArrowUInt64Array.
  *
+ * #GArrowHalfFloatArrayBuilder is the class to creating a new
+ * #GArrowHalfFloatArray.
+ *
  * #GArrowFloatArrayBuilder is the class to creating a new
  * #GArrowFloatArray.
  *
@@ -286,6 +415,9 @@ G_BEGIN_DECLS
  * #GArrowLargeStringArrayBuilder is the class to create a new
  * #GArrowLargeStringArray.
  *
+ * #GArrowFixedSizeBinaryArrayBuilder is the class to create a new
+ * #GArrowFixedSizeBinaryArray.
+ *
  * #GArrowDate32ArrayBuilder is the class to create a new
  * #GArrowDate32Array.
  *
@@ -301,6 +433,18 @@ G_BEGIN_DECLS
  * #GArrowTime64ArrayBuilder is the class to create a new
  * #GArrowTime64Array.
  *
+ * #GArrowMonthIntervalArrayBuilder is the class to create a new
+ * #GArrowMonthIntervalArray.
+ *
+ * #GArrowDayTimeIntervalArrayBuilder is the class to create a new
+ * #GArrowDayTimeIntervalArray.
+ *
+ * #GArrowMonthDayNanoArrayBuilder is the class to create a new
+ * #GArrowMonthDayNanoArray.
+ *
+ * #GArrowStringDictionaryArrayBuilder is the class to create a new
+ * #GArrowDictionaryArray with a dictionary array of #GArrowStringArray.
+ *
  * #GArrowListArrayBuilder is the class to create a new
  * #GArrowListArray.
  *
@@ -313,14 +457,33 @@ G_BEGIN_DECLS
  * #GArrowMapArrayBuilder is the class to create a new
  * #GArrowMapArray.
  *
+ * #GArrowDecimal32ArrayBuilder is the class to create a new
+ * #GArrowDecimal32Array.
+ *
+ * #GArrowDecimal64ArrayBuilder is the class to create a new
+ * #GArrowDecimal64Array.
+ *
  * #GArrowDecimal128ArrayBuilder is the class to create a new
  * #GArrowDecimal128Array.
+ *
+ * #GArrowDecimal256ArrayBuilder is the class to create a new
+ * #GArrowDecimal256Array.
+ *
+ * #GArrowUnionArrayBuilder is the base class for union builder class
+ * such as #GArrowDenseUnionArrayBuilder.
+ *
+ * #GArrowDenseUnionArrayBuilder is the class to create a new
+ * #GArrowDenseUnionArray.
+ *
+ * #GArrowSparseUnionArrayBuilder is the class to create a new
+ * #GArrowSparseUnionArray.
  */
 
-typedef struct GArrowArrayBuilderPrivate_ {
-  arrow::ArrayBuilder *array_builder;
-  gboolean have_ownership;
-} GArrowArrayBuilderPrivate;
+struct GArrowArrayBuilderPrivate
+{
+  std::shared_ptr<arrow::ArrayBuilder> array_builder;
+  GList *children;
+};
 
 enum {
   PROP_0,
@@ -331,21 +494,25 @@ G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE(GArrowArrayBuilder,
                                     garrow_array_builder,
                                     G_TYPE_OBJECT)
 
-#define GARROW_ARRAY_BUILDER_GET_PRIVATE(obj)         \
-  static_cast<GArrowArrayBuilderPrivate *>(           \
-     garrow_array_builder_get_instance_private(       \
-       GARROW_ARRAY_BUILDER(obj)))
+#define GARROW_ARRAY_BUILDER_GET_PRIVATE(obj)                                            \
+  static_cast<GArrowArrayBuilderPrivate *>(                                              \
+    garrow_array_builder_get_instance_private(GARROW_ARRAY_BUILDER(obj)))
 
 static void
 garrow_array_builder_finalize(GObject *object)
 {
   auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(object);
-
-  if (priv->have_ownership) {
-    delete priv->array_builder;
-  }
-
+  priv->array_builder.~shared_ptr();
   G_OBJECT_CLASS(garrow_array_builder_parent_class)->finalize(object);
+}
+
+static void
+garrow_array_builder_dispose(GObject *object)
+{
+  auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(object);
+  g_list_free_full(priv->children, g_object_unref);
+  priv->children = nullptr;
+  G_OBJECT_CLASS(garrow_array_builder_parent_class)->dispose(object);
 }
 
 static void
@@ -359,21 +526,8 @@ garrow_array_builder_set_property(GObject *object,
   switch (prop_id) {
   case PROP_ARRAY_BUILDER:
     priv->array_builder =
-      static_cast<arrow::ArrayBuilder *>(g_value_get_pointer(value));
+      *static_cast<std::shared_ptr<arrow::ArrayBuilder> *>(g_value_get_pointer(value));
     break;
-  default:
-    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
-    break;
-  }
-}
-
-static void
-garrow_array_builder_get_property(GObject *object,
-                                  guint prop_id,
-                                  GValue *value,
-                                  GParamSpec *pspec)
-{
-  switch (prop_id) {
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     break;
@@ -384,26 +538,24 @@ static void
 garrow_array_builder_init(GArrowArrayBuilder *builder)
 {
   auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(builder);
-  priv->have_ownership = TRUE;
+  new (&priv->array_builder) std::shared_ptr<arrow::ArrayBuilder>;
 }
 
 static void
 garrow_array_builder_class_init(GArrowArrayBuilderClass *klass)
 {
-  GObjectClass *gobject_class;
-  GParamSpec *spec;
+  auto gobject_class = G_OBJECT_CLASS(klass);
 
-  gobject_class = G_OBJECT_CLASS(klass);
-
-  gobject_class->finalize     = garrow_array_builder_finalize;
+  gobject_class->finalize = garrow_array_builder_finalize;
+  gobject_class->dispose = garrow_array_builder_dispose;
   gobject_class->set_property = garrow_array_builder_set_property;
-  gobject_class->get_property = garrow_array_builder_get_property;
 
-  spec = g_param_spec_pointer("array-builder",
-                              "Array builder",
-                              "The raw arrow::ArrayBuilder *",
-                              static_cast<GParamFlags>(G_PARAM_WRITABLE |
-                                                       G_PARAM_CONSTRUCT_ONLY));
+  GParamSpec *spec;
+  spec = g_param_spec_pointer(
+    "array-builder",
+    "Array builder",
+    "The raw std::shared_ptr<arrow::ArrayBuilder>",
+    static_cast<GParamFlags>(G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY));
   g_object_class_install_property(gobject_class, PROP_ARRAY_BUILDER, spec);
 }
 
@@ -416,24 +568,10 @@ garrow_array_builder_new(const std::shared_ptr<arrow::DataType> &type,
   std::unique_ptr<arrow::ArrayBuilder> arrow_builder;
   auto status = arrow::MakeBuilder(memory_pool, type, &arrow_builder);
   if (!garrow_error_check(error, status, context)) {
-    return NULL;
+    return nullptr;
   }
-  return garrow_array_builder_new_raw(arrow_builder.release());
-}
-
-/**
- * garrow_array_builder_release_ownership: (skip)
- * @builder: A #GArrowArrayBuilder.
- *
- * Release ownership of `arrow::ArrayBuilder` in `builder`.
- *
- * Since: 0.8.0
- */
-void
-garrow_array_builder_release_ownership(GArrowArrayBuilder *builder)
-{
-  auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(builder);
-  priv->have_ownership = FALSE;
+  std::shared_ptr<arrow::ArrayBuilder> shared_arrow_builder(std::move(arrow_builder));
+  return garrow_array_builder_new_raw(&shared_arrow_builder);
 }
 
 /**
@@ -490,6 +628,252 @@ garrow_array_builder_finish(GArrowArrayBuilder *builder, GError **error)
   }
 }
 
+/**
+ * garrow_array_builder_reset:
+ * @builder: A #GArrowArrayBuilder.
+ *
+ * Since: 2.0.0
+ */
+void
+garrow_array_builder_reset(GArrowArrayBuilder *builder)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  arrow_builder->Reset();
+}
+
+/**
+ * garrow_array_builder_get_capacity:
+ * @builder: A #GArrowArrayBuilder.
+ *
+ * Returns: The capacity of the building array.
+ *
+ * Since: 2.0.0
+ */
+gint64
+garrow_array_builder_get_capacity(GArrowArrayBuilder *builder)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  return arrow_builder->capacity();
+}
+
+/**
+ * garrow_array_builder_get_length:
+ * @builder: A #GArrowArrayBuilder.
+ *
+ * Returns: The current length of the building array.
+ *
+ * Since: 2.0.0
+ */
+gint64
+garrow_array_builder_get_length(GArrowArrayBuilder *builder)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  return arrow_builder->length();
+}
+
+/**
+ * garrow_array_builder_get_n_nulls:
+ * @builder: A #GArrowArrayBuilder.
+ *
+ * Returns: The current number of null elements in the building array.
+ *
+ * Since: 2.0.0
+ */
+gint64
+garrow_array_builder_get_n_nulls(GArrowArrayBuilder *builder)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  return arrow_builder->null_count();
+}
+
+/**
+ * garrow_array_builder_get_child:
+ * @builder: A #GArrowArrayBuilder.
+ * @i: The index of the child.
+ *
+ * Returns: (transfer none): The #GArrowArrayBuilder for the i-th child.
+ *
+ * Since: 12.0.0
+ */
+GArrowArrayBuilder *
+garrow_array_builder_get_child(GArrowArrayBuilder *builder, gint i)
+{
+  auto children = garrow_array_builder_get_children(builder);
+  auto child = g_list_nth_data(children, i);
+  return GARROW_ARRAY_BUILDER(child);
+}
+
+/**
+ * garrow_array_builder_get_children:
+ * @builder: A #GArrowArrayBuilder.
+ *
+ * Returns: (element-type GArrowArrayBuilder) (transfer none):
+ *   The #GArrowArrayBuilder for all fields.
+ *
+ * Since: 12.0.0
+ */
+GList *
+garrow_array_builder_get_children(GArrowArrayBuilder *builder)
+{
+  auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(builder);
+  if (!priv->children) {
+    auto arrow_builder = garrow_array_builder_get_raw(builder);
+    GList *children = nullptr;
+    for (int i = 0; i < arrow_builder->num_children(); ++i) {
+      auto arrow_child = arrow_builder->child_builder(i);
+      auto child = garrow_array_builder_new_raw(&arrow_child);
+      children = g_list_prepend(children, child);
+    }
+    priv->children = g_list_reverse(children);
+  }
+  return priv->children;
+}
+
+/**
+ * garrow_array_builder_resize:
+ * @builder: A #GArrowArrayBuilder.
+ * @capacity: A new capacity.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_array_builder_resize(GArrowArrayBuilder *builder, gint64 capacity, GError **error)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->Resize(capacity);
+  return garrow_error_check(error, status, "[array-builder][resize]");
+}
+
+/**
+ * garrow_array_builder_reserve:
+ * @builder: A #GArrowArrayBuilder.
+ * @additional_capacity: The additional capacity to be reserved.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_array_builder_reserve(GArrowArrayBuilder *builder,
+                             gint64 additional_capacity,
+                             GError **error)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->Reserve(additional_capacity);
+  return garrow_error_check(error, status, "[array-builder][reserve]");
+}
+
+/**
+ * garrow_array_builder_append_null:
+ * @builder: A #GArrowArrayBuilder.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_array_builder_append_null(GArrowArrayBuilder *builder, GError **error)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->AppendNull();
+  return garrow_error_check(error, status, "[array-builder][append-null]");
+}
+
+/**
+ * garrow_array_builder_append_nulls:
+ * @builder: A #GArrowArrayBuilder.
+ * @n: The number of null values to be appended.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple nulls at once. It's more efficient than multiple
+ * garrow_array_builder_append_null() calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_array_builder_append_nulls(GArrowArrayBuilder *builder, gint64 n, GError **error)
+{
+  const gchar *context = "[array-builder][append-nulls]";
+  if (n < 0) {
+    g_set_error(error,
+                GARROW_ERROR,
+                GARROW_ERROR_INVALID,
+                "%s: the number of nulls must be 0 or larger: "
+                "<%" G_GINT64_FORMAT ">",
+                context,
+                n);
+    return FALSE;
+  }
+  if (n == 0) {
+    return TRUE;
+  }
+
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->AppendNulls(n);
+  return garrow_error_check(error, status, context);
+}
+
+/**
+ * garrow_array_builder_append_empty_value:
+ * @builder: A #GArrowArrayBuilder.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_array_builder_append_empty_value(GArrowArrayBuilder *builder, GError **error)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->AppendEmptyValue();
+  return garrow_error_check(error, status, "[array-builder][append-empty-value]");
+}
+
+/**
+ * garrow_array_builder_append_empty_values:
+ * @builder: A #GArrowArrayBuilder.
+ * @n: The number of null values to be appended.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple empty values at once. It's more efficient than multiple
+ * garrow_array_builder_append_empty_value() calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_array_builder_append_empty_values(GArrowArrayBuilder *builder,
+                                         gint64 n,
+                                         GError **error)
+{
+  const gchar *context = "[array-builder][append-empty-values]";
+  if (n < 0) {
+    g_set_error(error,
+                GARROW_ERROR,
+                GARROW_ERROR_INVALID,
+                "%s: the number of empty values must be 0 or larger: "
+                "<%" G_GINT64_FORMAT ">",
+                context,
+                n);
+    return FALSE;
+  }
+  if (n == 0) {
+    return TRUE;
+  }
+
+  auto arrow_builder = garrow_array_builder_get_raw(builder);
+  auto status = arrow_builder->AppendEmptyValues(n);
+  return garrow_error_check(error, status, context);
+}
 
 G_DEFINE_TYPE(GArrowNullArrayBuilder,
               garrow_null_array_builder,
@@ -515,56 +899,52 @@ garrow_null_array_builder_class_init(GArrowNullArrayBuilderClass *klass)
 GArrowNullArrayBuilder *
 garrow_null_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::null(),
-                                          NULL,
-                                          "[null-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::null(), NULL, "[null-array-builder][new]");
   return GARROW_NULL_ARRAY_BUILDER(builder);
 }
 
 /**
- * garrow_null_array_builder_append_null:
+ * garrow_null_array_builder_append_null: (skip)
  * @builder: A #GArrowNullArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.13.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_null_array_builder_append_null(GArrowNullArrayBuilder *builder,
-                                      GError **error)
+garrow_null_array_builder_append_null(GArrowNullArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::NullBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[null-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_null_array_builder_append_nulls:
+ * garrow_null_array_builder_append_nulls: (skip)
  * @builder: A #GArrowNullArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.13.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_null_array_builder_append_nulls(GArrowNullArrayBuilder *builder,
                                        gint64 n,
                                        GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::NullBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[null-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowBooleanArrayBuilder,
               garrow_boolean_array_builder,
@@ -588,9 +968,8 @@ garrow_boolean_array_builder_class_init(GArrowBooleanArrayBuilderClass *klass)
 GArrowBooleanArrayBuilder *
 garrow_boolean_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::boolean(),
-                                          NULL,
-                                          "[boolean-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::boolean(), NULL, "[boolean-array-builder][new]");
   return GARROW_BOOLEAN_ARRAY_BUILDER(builder);
 }
 
@@ -628,11 +1007,11 @@ garrow_boolean_array_builder_append_value(GArrowBooleanArrayBuilder *builder,
                                           gboolean value,
                                           GError **error)
 {
-  return garrow_array_builder_append_value<arrow::BooleanBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     static_cast<bool>(value),
-     error,
-     "[boolean-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::BooleanBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    static_cast<bool>(value),
+    error,
+    "[boolean-array-builder][append-value]");
 }
 
 /**
@@ -648,7 +1027,7 @@ garrow_boolean_array_builder_append_value(GArrowBooleanArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -662,66 +1041,62 @@ garrow_boolean_array_builder_append_values(GArrowBooleanArrayBuilder *builder,
                                            gint64 is_valids_length,
                                            GError **error)
 {
-  guint8 arrow_values[values_length];
+  std::vector<guint8> arrow_values(values_length);
   for (gint64 i = 0; i < values_length; ++i) {
     arrow_values[i] = values[i];
   }
-  return garrow_array_builder_append_values<arrow::BooleanBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     arrow_values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[boolean-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::BooleanBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    arrow_values.data(),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[boolean-array-builder][append-values]");
 }
 
 /**
- * garrow_boolean_array_builder_append_null:
+ * garrow_boolean_array_builder_append_null: (skip)
  * @builder: A #GArrowBooleanArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
 garrow_boolean_array_builder_append_null(GArrowBooleanArrayBuilder *builder,
                                          GError **error)
 {
-  return garrow_array_builder_append_null<arrow::BooleanBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[boolean-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_boolean_array_builder_append_nulls:
+ * garrow_boolean_array_builder_append_nulls: (skip)
  * @builder: A #GArrowBooleanArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_boolean_array_builder_append_nulls(GArrowBooleanArrayBuilder *builder,
                                           gint64 n,
                                           GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::BooleanBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[boolean-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
 
-
-G_DEFINE_TYPE(GArrowIntArrayBuilder,
-              garrow_int_array_builder,
-              GARROW_TYPE_ARRAY_BUILDER)
+G_DEFINE_TYPE(GArrowIntArrayBuilder, garrow_int_array_builder, GARROW_TYPE_ARRAY_BUILDER)
 
 static void
 garrow_int_array_builder_init(GArrowIntArrayBuilder *builder)
@@ -744,9 +1119,10 @@ GArrowIntArrayBuilder *
 garrow_int_array_builder_new(void)
 {
   auto memory_pool = arrow::default_memory_pool();
-  auto arrow_builder = new arrow::AdaptiveIntBuilder(memory_pool);
-  auto builder = garrow_array_builder_new_raw(arrow_builder,
-                                              GARROW_TYPE_INT_ARRAY_BUILDER);
+  auto arrow_builder = std::static_pointer_cast<arrow::ArrayBuilder>(
+    std::make_shared<arrow::AdaptiveIntBuilder>(memory_pool));
+  auto builder =
+    garrow_array_builder_new_raw(&arrow_builder, GARROW_TYPE_INT_ARRAY_BUILDER);
   return GARROW_INT_ARRAY_BUILDER(builder);
 }
 
@@ -786,11 +1162,11 @@ garrow_int_array_builder_append_value(GArrowIntArrayBuilder *builder,
                                       gint64 value,
                                       GError **error)
 {
-  return garrow_array_builder_append_value<arrow::AdaptiveIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[int-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::AdaptiveIntBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[int-array-builder][append-value]");
 }
 
 /**
@@ -806,7 +1182,7 @@ garrow_int_array_builder_append_value(GArrowIntArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -820,60 +1196,57 @@ garrow_int_array_builder_append_values(GArrowIntArrayBuilder *builder,
                                        gint64 is_valids_length,
                                        GError **error)
 {
-  return garrow_array_builder_append_values<arrow::AdaptiveIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[int-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::AdaptiveIntBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[int-array-builder][append-values]");
 }
 
 /**
- * garrow_int_array_builder_append_null:
+ * garrow_int_array_builder_append_null: (skip)
  * @builder: A #GArrowIntArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.6.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_int_array_builder_append_null(GArrowIntArrayBuilder *builder,
-                                     GError **error)
+garrow_int_array_builder_append_null(GArrowIntArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::AdaptiveIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[int-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_int_array_builder_append_nulls:
+ * garrow_int_array_builder_append_nulls: (skip)
  * @builder: A #GArrowIntArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_int_array_builder_append_nulls(GArrowIntArrayBuilder *builder,
                                       gint64 n,
                                       GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::AdaptiveIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[int-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowUIntArrayBuilder,
               garrow_uint_array_builder,
@@ -900,9 +1273,10 @@ GArrowUIntArrayBuilder *
 garrow_uint_array_builder_new(void)
 {
   auto memory_pool = arrow::default_memory_pool();
-  auto arrow_builder = new arrow::AdaptiveUIntBuilder(memory_pool);
-  auto builder = garrow_array_builder_new_raw(arrow_builder,
-                                              GARROW_TYPE_UINT_ARRAY_BUILDER);
+  auto arrow_builder = std::static_pointer_cast<arrow::ArrayBuilder>(
+    std::make_shared<arrow::AdaptiveUIntBuilder>(memory_pool));
+  auto builder =
+    garrow_array_builder_new_raw(&arrow_builder, GARROW_TYPE_UINT_ARRAY_BUILDER);
   return GARROW_UINT_ARRAY_BUILDER(builder);
 }
 
@@ -942,11 +1316,11 @@ garrow_uint_array_builder_append_value(GArrowUIntArrayBuilder *builder,
                                        guint64 value,
                                        GError **error)
 {
-  return garrow_array_builder_append_value<arrow::AdaptiveUIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[uint-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::AdaptiveUIntBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[uint-array-builder][append-value]");
 }
 
 /**
@@ -962,7 +1336,7 @@ garrow_uint_array_builder_append_value(GArrowUIntArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -976,60 +1350,57 @@ garrow_uint_array_builder_append_values(GArrowUIntArrayBuilder *builder,
                                         gint64 is_valids_length,
                                         GError **error)
 {
-  return garrow_array_builder_append_values<arrow::AdaptiveUIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const uint64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[uint-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::AdaptiveUIntBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const uint64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[uint-array-builder][append-values]");
 }
 
 /**
- * garrow_uint_array_builder_append_null:
+ * garrow_uint_array_builder_append_null: (skip)
  * @builder: A #GArrowUIntArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_uint_array_builder_append_null(GArrowUIntArrayBuilder *builder,
-                                      GError **error)
+garrow_uint_array_builder_append_null(GArrowUIntArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::AdaptiveUIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[uint-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_uint_array_builder_append_nulls:
+ * garrow_uint_array_builder_append_nulls: (skip)
  * @builder: A #GArrowUIntArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_uint_array_builder_append_nulls(GArrowUIntArrayBuilder *builder,
                                        gint64 n,
                                        GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::AdaptiveUIntBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[uint-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowInt8ArrayBuilder,
               garrow_int8_array_builder,
@@ -1053,9 +1424,8 @@ garrow_int8_array_builder_class_init(GArrowInt8ArrayBuilderClass *klass)
 GArrowInt8ArrayBuilder *
 garrow_int8_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::int8(),
-                                          NULL,
-                                          "[int8-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::int8(), NULL, "[int8-array-builder][new]");
   return GARROW_INT8_ARRAY_BUILDER(builder);
 }
 
@@ -1093,11 +1463,11 @@ garrow_int8_array_builder_append_value(GArrowInt8ArrayBuilder *builder,
                                        gint8 value,
                                        GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Int8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[int8-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Int8Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[int8-array-builder][append-value]");
 }
 
 /**
@@ -1113,7 +1483,7 @@ garrow_int8_array_builder_append_value(GArrowInt8ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1127,58 +1497,55 @@ garrow_int8_array_builder_append_values(GArrowInt8ArrayBuilder *builder,
                                         gint64 is_valids_length,
                                         GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Int8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[int8-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Int8Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[int8-array-builder][append-values]");
 }
 
 /**
- * garrow_int8_array_builder_append_null:
+ * garrow_int8_array_builder_append_null: (skip)
  * @builder: A #GArrowInt8ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_int8_array_builder_append_null(GArrowInt8ArrayBuilder *builder,
-                                      GError **error)
+garrow_int8_array_builder_append_null(GArrowInt8ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Int8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[int8-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_int8_array_builder_append_nulls:
+ * garrow_int8_array_builder_append_nulls: (skip)
  * @builder: A #GArrowInt8ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_int8_array_builder_append_nulls(GArrowInt8ArrayBuilder *builder,
                                        gint64 n,
                                        GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Int8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[int8-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowUInt8ArrayBuilder,
               garrow_uint8_array_builder,
@@ -1202,9 +1569,8 @@ garrow_uint8_array_builder_class_init(GArrowUInt8ArrayBuilderClass *klass)
 GArrowUInt8ArrayBuilder *
 garrow_uint8_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::uint8(),
-                                          NULL,
-                                          "[uint8-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::uint8(), NULL, "[uint8-array-builder][new]");
   return GARROW_UINT8_ARRAY_BUILDER(builder);
 }
 
@@ -1239,14 +1605,14 @@ garrow_uint8_array_builder_append(GArrowUInt8ArrayBuilder *builder,
  */
 gboolean
 garrow_uint8_array_builder_append_value(GArrowUInt8ArrayBuilder *builder,
-                                  guint8 value,
-                                  GError **error)
+                                        guint8 value,
+                                        GError **error)
 {
-  return garrow_array_builder_append_value<arrow::UInt8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[uint8-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::UInt8Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[uint8-array-builder][append-value]");
 }
 
 /**
@@ -1262,7 +1628,7 @@ garrow_uint8_array_builder_append_value(GArrowUInt8ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1276,58 +1642,55 @@ garrow_uint8_array_builder_append_values(GArrowUInt8ArrayBuilder *builder,
                                          gint64 is_valids_length,
                                          GError **error)
 {
-  return garrow_array_builder_append_values<arrow::UInt8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[uint8-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::UInt8Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[uint8-array-builder][append-values]");
 }
 
 /**
- * garrow_uint8_array_builder_append_null:
+ * garrow_uint8_array_builder_append_null: (skip)
  * @builder: A #GArrowUInt8ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_uint8_array_builder_append_null(GArrowUInt8ArrayBuilder *builder,
-                                       GError **error)
+garrow_uint8_array_builder_append_null(GArrowUInt8ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::UInt8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[uint8-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_uint8_array_builder_append_nulls:
+ * garrow_uint8_array_builder_append_nulls: (skip)
  * @builder: A #GArrowUInt8ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_uint8_array_builder_append_nulls(GArrowUInt8ArrayBuilder *builder,
                                         gint64 n,
                                         GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::UInt8Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[uint8-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowInt16ArrayBuilder,
               garrow_int16_array_builder,
@@ -1351,9 +1714,8 @@ garrow_int16_array_builder_class_init(GArrowInt16ArrayBuilderClass *klass)
 GArrowInt16ArrayBuilder *
 garrow_int16_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::int16(),
-                                          NULL,
-                                          "[int16-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::int16(), NULL, "[int16-array-builder][new]");
   return GARROW_INT16_ARRAY_BUILDER(builder);
 }
 
@@ -1391,11 +1753,11 @@ garrow_int16_array_builder_append_value(GArrowInt16ArrayBuilder *builder,
                                         gint16 value,
                                         GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Int16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[int16-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Int16Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[int16-array-builder][append-value]");
 }
 
 /**
@@ -1411,7 +1773,7 @@ garrow_int16_array_builder_append_value(GArrowInt16ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1425,58 +1787,55 @@ garrow_int16_array_builder_append_values(GArrowInt16ArrayBuilder *builder,
                                          gint64 is_valids_length,
                                          GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Int16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[int16-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Int16Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[int16-array-builder][append-values]");
 }
 
 /**
- * garrow_int16_array_builder_append_null:
+ * garrow_int16_array_builder_append_null: (skip)
  * @builder: A #GArrowInt16ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_int16_array_builder_append_null(GArrowInt16ArrayBuilder *builder,
-                                       GError **error)
+garrow_int16_array_builder_append_null(GArrowInt16ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Int16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[int16-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_int16_array_builder_append_nulls:
+ * garrow_int16_array_builder_append_nulls: (skip)
  * @builder: A #GArrowInt16ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_int16_array_builder_append_nulls(GArrowInt16ArrayBuilder *builder,
                                         gint64 n,
                                         GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Int16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[int16-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowUInt16ArrayBuilder,
               garrow_uint16_array_builder,
@@ -1500,9 +1859,8 @@ garrow_uint16_array_builder_class_init(GArrowUInt16ArrayBuilderClass *klass)
 GArrowUInt16ArrayBuilder *
 garrow_uint16_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::uint16(),
-                                          NULL,
-                                          "[uint16-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::uint16(), NULL, "[uint16-array-builder][new]");
   return GARROW_UINT16_ARRAY_BUILDER(builder);
 }
 
@@ -1540,11 +1898,11 @@ garrow_uint16_array_builder_append_value(GArrowUInt16ArrayBuilder *builder,
                                          guint16 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::UInt16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[uint16-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::UInt16Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[uint16-array-builder][append-value]");
 }
 
 /**
@@ -1560,7 +1918,7 @@ garrow_uint16_array_builder_append_value(GArrowUInt16ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1574,58 +1932,55 @@ garrow_uint16_array_builder_append_values(GArrowUInt16ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::UInt16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[uint16-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::UInt16Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[uint16-array-builder][append-values]");
 }
 
 /**
- * garrow_uint16_array_builder_append_null:
+ * garrow_uint16_array_builder_append_null: (skip)
  * @builder: A #GArrowUInt16ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_uint16_array_builder_append_null(GArrowUInt16ArrayBuilder *builder,
-                                        GError **error)
+garrow_uint16_array_builder_append_null(GArrowUInt16ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::UInt16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[uint16-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_uint16_array_builder_append_nulls:
+ * garrow_uint16_array_builder_append_nulls: (skip)
  * @builder: A #GArrowUInt16ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_uint16_array_builder_append_nulls(GArrowUInt16ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::UInt16Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[uint16-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowInt32ArrayBuilder,
               garrow_int32_array_builder,
@@ -1649,9 +2004,8 @@ garrow_int32_array_builder_class_init(GArrowInt32ArrayBuilderClass *klass)
 GArrowInt32ArrayBuilder *
 garrow_int32_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::int32(),
-                                          NULL,
-                                          "[int32-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::int32(), NULL, "[int32-array-builder][new]");
   return GARROW_INT32_ARRAY_BUILDER(builder);
 }
 
@@ -1689,11 +2043,11 @@ garrow_int32_array_builder_append_value(GArrowInt32ArrayBuilder *builder,
                                         gint32 value,
                                         GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Int32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[int32-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Int32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[int32-array-builder][append-value]");
 }
 
 /**
@@ -1709,7 +2063,7 @@ garrow_int32_array_builder_append_value(GArrowInt32ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1723,58 +2077,55 @@ garrow_int32_array_builder_append_values(GArrowInt32ArrayBuilder *builder,
                                          gint64 is_valids_length,
                                          GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Int32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[int32-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Int32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[int32-array-builder][append-values]");
 }
 
 /**
- * garrow_int32_array_builder_append_null:
+ * garrow_int32_array_builder_append_null: (skip)
  * @builder: A #GArrowInt32ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_int32_array_builder_append_null(GArrowInt32ArrayBuilder *builder,
-                                       GError **error)
+garrow_int32_array_builder_append_null(GArrowInt32ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Int32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[int32-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_int32_array_builder_append_nulls:
+ * garrow_int32_array_builder_append_nulls: (skip)
  * @builder: A #GArrowInt32ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_int32_array_builder_append_nulls(GArrowInt32ArrayBuilder *builder,
                                         gint64 n,
                                         GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Int32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[int32-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowUInt32ArrayBuilder,
               garrow_uint32_array_builder,
@@ -1798,9 +2149,8 @@ garrow_uint32_array_builder_class_init(GArrowUInt32ArrayBuilderClass *klass)
 GArrowUInt32ArrayBuilder *
 garrow_uint32_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::uint32(),
-                                          NULL,
-                                          "[uint32-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::uint32(), NULL, "[uint32-array-builder][new]");
   return GARROW_UINT32_ARRAY_BUILDER(builder);
 }
 
@@ -1838,11 +2188,11 @@ garrow_uint32_array_builder_append_value(GArrowUInt32ArrayBuilder *builder,
                                          guint32 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::UInt32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[uint32-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::UInt32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[uint32-array-builder][append-value]");
 }
 
 /**
@@ -1858,7 +2208,7 @@ garrow_uint32_array_builder_append_value(GArrowUInt32ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -1872,58 +2222,55 @@ garrow_uint32_array_builder_append_values(GArrowUInt32ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::UInt32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[uint32-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::UInt32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[uint32-array-builder][append-values]");
 }
 
 /**
- * garrow_uint32_array_builder_append_null:
+ * garrow_uint32_array_builder_append_null: (skip)
  * @builder: A #GArrowUInt32ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_uint32_array_builder_append_null(GArrowUInt32ArrayBuilder *builder,
-                                        GError **error)
+garrow_uint32_array_builder_append_null(GArrowUInt32ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::UInt32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[uint32-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_uint32_array_builder_append_nulls:
+ * garrow_uint32_array_builder_append_nulls: (skip)
  * @builder: A #GArrowUInt32ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_uint32_array_builder_append_nulls(GArrowUInt32ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::UInt32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[uint32-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowInt64ArrayBuilder,
               garrow_int64_array_builder,
@@ -1947,9 +2294,8 @@ garrow_int64_array_builder_class_init(GArrowInt64ArrayBuilderClass *klass)
 GArrowInt64ArrayBuilder *
 garrow_int64_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::int64(),
-                                          NULL,
-                                          "[int64-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::int64(), NULL, "[int64-array-builder][new]");
   return GARROW_INT64_ARRAY_BUILDER(builder);
 }
 
@@ -1987,11 +2333,11 @@ garrow_int64_array_builder_append_value(GArrowInt64ArrayBuilder *builder,
                                         gint64 value,
                                         GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Int64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[int64-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Int64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[int64-array-builder][append-value]");
 }
 
 /**
@@ -2007,7 +2353,7 @@ garrow_int64_array_builder_append_value(GArrowInt64ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -2021,58 +2367,55 @@ garrow_int64_array_builder_append_values(GArrowInt64ArrayBuilder *builder,
                                          gint64 is_valids_length,
                                          GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Int64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[int64-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Int64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[int64-array-builder][append-values]");
 }
 
 /**
- * garrow_int64_array_builder_append_null:
+ * garrow_int64_array_builder_append_null: (skip)
  * @builder: A #GArrowInt64ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_int64_array_builder_append_null(GArrowInt64ArrayBuilder *builder,
-                                       GError **error)
+garrow_int64_array_builder_append_null(GArrowInt64ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Int64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[int64-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_int64_array_builder_append_nulls:
+ * garrow_int64_array_builder_append_nulls: (skip)
  * @builder: A #GArrowInt64ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_int64_array_builder_append_nulls(GArrowInt64ArrayBuilder *builder,
                                         gint64 n,
                                         GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Int64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[int64-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowUInt64ArrayBuilder,
               garrow_uint64_array_builder,
@@ -2096,9 +2439,8 @@ garrow_uint64_array_builder_class_init(GArrowUInt64ArrayBuilderClass *klass)
 GArrowUInt64ArrayBuilder *
 garrow_uint64_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::uint64(),
-                                          NULL,
-                                          "[uint64-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::uint64(), NULL, "[uint64-array-builder][new]");
   return GARROW_UINT64_ARRAY_BUILDER(builder);
 }
 
@@ -2115,8 +2457,8 @@ garrow_uint64_array_builder_new(void)
  */
 gboolean
 garrow_uint64_array_builder_append(GArrowUInt64ArrayBuilder *builder,
-                                  guint64 value,
-                                  GError **error)
+                                   guint64 value,
+                                   GError **error)
 {
   return garrow_uint64_array_builder_append_value(builder, value, error);
 }
@@ -2136,11 +2478,11 @@ garrow_uint64_array_builder_append_value(GArrowUInt64ArrayBuilder *builder,
                                          guint64 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::UInt64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[uint64-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::UInt64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[uint64-array-builder][append-value]");
 }
 
 /**
@@ -2156,7 +2498,7 @@ garrow_uint64_array_builder_append_value(GArrowUInt64ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -2170,58 +2512,144 @@ garrow_uint64_array_builder_append_values(GArrowUInt64ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::UInt64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const uint64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[uint64-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::UInt64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const uint64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[uint64-array-builder][append-values]");
 }
 
 /**
- * garrow_uint64_array_builder_append_null:
+ * garrow_uint64_array_builder_append_null: (skip)
  * @builder: A #GArrowUInt64ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_uint64_array_builder_append_null(GArrowUInt64ArrayBuilder *builder,
-                                        GError **error)
+garrow_uint64_array_builder_append_null(GArrowUInt64ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::UInt64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[uint64-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_uint64_array_builder_append_nulls:
+ * garrow_uint64_array_builder_append_nulls: (skip)
  * @builder: A #GArrowUInt64ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_uint64_array_builder_append_nulls(GArrowUInt64ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::UInt64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[uint64-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
 
+G_DEFINE_TYPE(GArrowHalfFloatArrayBuilder,
+              garrow_half_float_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_half_float_array_builder_init(GArrowHalfFloatArrayBuilder *builder)
+{
+}
+
+static void
+garrow_half_float_array_builder_class_init(GArrowHalfFloatArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_half_float_array_builder_new:
+ *
+ * Returns: A newly created #GArrowHalfFloatArrayBuilder.
+ *
+ * Since: 11.0.0
+ */
+GArrowHalfFloatArrayBuilder *
+garrow_half_float_array_builder_new(void)
+{
+  auto builder = garrow_array_builder_new(arrow::float16(),
+                                          nullptr,
+                                          "[half-float-array-builder][new]");
+  return GARROW_HALF_FLOAT_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_half_float_array_builder_append_value:
+ * @builder: A #GArrowHalfFloatArrayBuilder.
+ * @value: A 16-bit float value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 11.0.0
+ */
+gboolean
+garrow_half_float_array_builder_append_value(GArrowHalfFloatArrayBuilder *builder,
+                                             guint16 value,
+                                             GError **error)
+{
+  return garrow_array_builder_append_value<arrow::HalfFloatBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[half-float-array-builder][append-value]");
+}
+
+/**
+ * garrow_half_float_array_builder_append_values:
+ * @builder: A #GArrowHalfFloatArrayBuilder.
+ * @values: (array length=values_length): The array of 16-bit float.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 11.0.0
+ */
+gboolean
+garrow_half_float_array_builder_append_values(GArrowHalfFloatArrayBuilder *builder,
+                                              const guint16 *values,
+                                              gint64 values_length,
+                                              const gboolean *is_valids,
+                                              gint64 is_valids_length,
+                                              GError **error)
+{
+  return garrow_array_builder_append_values<arrow::HalfFloatBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[half-float-array-builder][append-values]");
+}
 
 G_DEFINE_TYPE(GArrowFloatArrayBuilder,
               garrow_float_array_builder,
@@ -2245,9 +2673,8 @@ garrow_float_array_builder_class_init(GArrowFloatArrayBuilderClass *klass)
 GArrowFloatArrayBuilder *
 garrow_float_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::float32(),
-                                          NULL,
-                                          "[float-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::float32(), NULL, "[float-array-builder][new]");
   return GARROW_FLOAT_ARRAY_BUILDER(builder);
 }
 
@@ -2285,11 +2712,11 @@ garrow_float_array_builder_append_value(GArrowFloatArrayBuilder *builder,
                                         gfloat value,
                                         GError **error)
 {
-  return garrow_array_builder_append_value<arrow::FloatBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[float-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::FloatBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[float-array-builder][append-value]");
 }
 
 /**
@@ -2305,7 +2732,7 @@ garrow_float_array_builder_append_value(GArrowFloatArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -2319,58 +2746,55 @@ garrow_float_array_builder_append_values(GArrowFloatArrayBuilder *builder,
                                          gint64 is_valids_length,
                                          GError **error)
 {
-  return garrow_array_builder_append_values<arrow::FloatBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[float-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::FloatBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[float-array-builder][append-values]");
 }
 
 /**
- * garrow_float_array_builder_append_null:
+ * garrow_float_array_builder_append_null: (skip)
  * @builder: A #GArrowFloatArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_float_array_builder_append_null(GArrowFloatArrayBuilder *builder,
-                                       GError **error)
+garrow_float_array_builder_append_null(GArrowFloatArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::FloatBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[float-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_float_array_builder_append_nulls:
+ * garrow_float_array_builder_append_nulls: (skip)
  * @builder: A #GArrowFloatArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_float_array_builder_append_nulls(GArrowFloatArrayBuilder *builder,
                                         gint64 n,
                                         GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::FloatBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[float-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowDoubleArrayBuilder,
               garrow_double_array_builder,
@@ -2394,9 +2818,8 @@ garrow_double_array_builder_class_init(GArrowDoubleArrayBuilderClass *klass)
 GArrowDoubleArrayBuilder *
 garrow_double_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::float64(),
-                                          NULL,
-                                          "[double-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::float64(), NULL, "[double-array-builder][new]");
   return GARROW_DOUBLE_ARRAY_BUILDER(builder);
 }
 
@@ -2434,11 +2857,11 @@ garrow_double_array_builder_append_value(GArrowDoubleArrayBuilder *builder,
                                          gdouble value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::DoubleBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[double-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::DoubleBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[double-array-builder][append-value]");
 }
 
 /**
@@ -2454,7 +2877,7 @@ garrow_double_array_builder_append_value(GArrowDoubleArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -2468,58 +2891,55 @@ garrow_double_array_builder_append_values(GArrowDoubleArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::DoubleBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[double-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::DoubleBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[double-array-builder][append-values]");
 }
 
 /**
- * garrow_double_array_builder_append_null:
+ * garrow_double_array_builder_append_null: (skip)
  * @builder: A #GArrowDoubleArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_double_array_builder_append_null(GArrowDoubleArrayBuilder *builder,
-                                        GError **error)
+garrow_double_array_builder_append_null(GArrowDoubleArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::DoubleBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[double-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_double_array_builder_append_nulls:
+ * garrow_double_array_builder_append_nulls: (skip)
  * @builder: A #GArrowDoubleArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_double_array_builder_append_nulls(GArrowDoubleArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::DoubleBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[double-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowBinaryArrayBuilder,
               garrow_binary_array_builder,
@@ -2543,9 +2963,8 @@ garrow_binary_array_builder_class_init(GArrowBinaryArrayBuilderClass *klass)
 GArrowBinaryArrayBuilder *
 garrow_binary_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::binary(),
-                                          NULL,
-                                          "[binary-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::binary(), NULL, "[binary-array-builder][new]");
   return GARROW_BINARY_ARRAY_BUILDER(builder);
 }
 
@@ -2587,14 +3006,10 @@ garrow_binary_array_builder_append_value(GArrowBinaryArrayBuilder *builder,
                                          gint32 length,
                                          GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::BinaryBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append(value, length);
-  return garrow_error_check(error,
-                            status,
-                            "[binary-array-builder][append-value]");
+  return garrow_error_check(error, status, "[binary-array-builder][append-value]");
 }
 
 /**
@@ -2605,29 +3020,24 @@ garrow_binary_array_builder_append_value(GArrowBinaryArrayBuilder *builder,
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_binary_array_builder_append_value_bytes(GArrowBinaryArrayBuilder *builder,
                                                GBytes *value,
                                                GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::BinaryBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   gsize size;
-  gconstpointer data = g_bytes_get_data(value, &size);
-  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data),
-                                      size);
-  return garrow_error_check(error,
-                            status,
-                            "[binary-array-builder][append-value-bytes]");
+  auto data = g_bytes_get_data(value, &size);
+  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data), size);
+  return garrow_error_check(error, status, "[binary-array-builder][append-value-bytes]");
 }
 
 /**
  * garrow_binary_array_builder_append_values:
- * @builder: A #GArrowLargeBinaryArrayBuilder.
+ * @builder: A #GArrowBinaryArrayBuilder.
  * @values: (array length=values_length): The array of #GBytes.
  * @values_length: The length of @values.
  * @is_valids: (nullable) (array length=is_valids_length): The array of
@@ -2638,11 +3048,11 @@ garrow_binary_array_builder_append_value_bytes(GArrowBinaryArrayBuilder *builder
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_binary_array_builder_append_values(GArrowBinaryArrayBuilder *builder,
@@ -2652,55 +3062,52 @@ garrow_binary_array_builder_append_values(GArrowBinaryArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::BinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[binary-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::BinaryBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[binary-array-builder][append-values]");
 }
 
 /**
- * garrow_binary_array_builder_append_null:
+ * garrow_binary_array_builder_append_null: (skip)
  * @builder: A #GArrowBinaryArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_binary_array_builder_append_null(GArrowBinaryArrayBuilder *builder,
-                                        GError **error)
+garrow_binary_array_builder_append_null(GArrowBinaryArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::BinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[binary-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_binary_array_builder_append_nulls:
+ * garrow_binary_array_builder_append_nulls: (skip)
  * @builder: A #GArrowBinaryArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_binary_array_builder_append_nulls(GArrowBinaryArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::BinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[binary-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowLargeBinaryArrayBuilder,
               garrow_large_binary_array_builder,
@@ -2721,7 +3128,7 @@ garrow_large_binary_array_builder_class_init(GArrowLargeBinaryArrayBuilderClass 
  *
  * Returns: A newly created #GArrowLargeBinaryArrayBuilder.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 GArrowLargeBinaryArrayBuilder *
 garrow_large_binary_array_builder_new(void)
@@ -2741,7 +3148,7 @@ garrow_large_binary_array_builder_new(void)
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_large_binary_array_builder_append_value(GArrowLargeBinaryArrayBuilder *builder,
@@ -2749,14 +3156,10 @@ garrow_large_binary_array_builder_append_value(GArrowLargeBinaryArrayBuilder *bu
                                                gint64 length,
                                                GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::LargeBinaryBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::LargeBinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append(value, length);
-  return garrow_error_check(error,
-                            status,
-                            "[large-binary-array-builder][append-value]");
+  return garrow_error_check(error, status, "[large-binary-array-builder][append-value]");
 }
 
 /**
@@ -2767,21 +3170,17 @@ garrow_large_binary_array_builder_append_value(GArrowLargeBinaryArrayBuilder *bu
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
-garrow_large_binary_array_builder_append_value_bytes(GArrowLargeBinaryArrayBuilder *builder,
-                                                     GBytes *value,
-                                                     GError **error)
+garrow_large_binary_array_builder_append_value_bytes(
+  GArrowLargeBinaryArrayBuilder *builder, GBytes *value, GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::LargeBinaryBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::LargeBinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   gsize size;
   gconstpointer data = g_bytes_get_data(value, &size);
-  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data),
-                                      size);
+  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data), size);
   return garrow_error_check(error,
                             status,
                             "[large-binary-array-builder][append-value-bytes]");
@@ -2800,11 +3199,11 @@ garrow_large_binary_array_builder_append_value_bytes(GArrowLargeBinaryArrayBuild
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_large_binary_array_builder_append_values(GArrowLargeBinaryArrayBuilder *builder,
@@ -2814,57 +3213,55 @@ garrow_large_binary_array_builder_append_values(GArrowLargeBinaryArrayBuilder *b
                                                 gint64 is_valids_length,
                                                 GError **error)
 {
-  return garrow_array_builder_append_values<arrow::LargeBinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[large-binary-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::LargeBinaryBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[large-binary-array-builder][append-values]");
 }
 
 /**
- * garrow_large_binary_array_builder_append_null:
+ * garrow_large_binary_array_builder_append_null: (skip)
  * @builder: A #GArrowLargeBinaryArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
 garrow_large_binary_array_builder_append_null(GArrowLargeBinaryArrayBuilder *builder,
                                               GError **error)
 {
-  return garrow_array_builder_append_null<arrow::LargeBinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[large-binary-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_large_binary_array_builder_append_nulls:
+ * garrow_large_binary_array_builder_append_nulls: (skip)
  * @builder: A #GArrowLargeBinaryArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_large_binary_array_builder_append_nulls(GArrowLargeBinaryArrayBuilder *builder,
                                                gint64 n,
                                                GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::LargeBinaryBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[large-binary-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowStringArrayBuilder,
               garrow_string_array_builder,
@@ -2888,9 +3285,8 @@ garrow_string_array_builder_class_init(GArrowStringArrayBuilderClass *klass)
 GArrowStringArrayBuilder *
 garrow_string_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::utf8(),
-                                          NULL,
-                                          "[string-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::utf8(), NULL, "[string-array-builder][new]");
   return GARROW_STRING_ARRAY_BUILDER(builder);
 }
 
@@ -2942,22 +3338,40 @@ garrow_string_array_builder_append_value(GArrowStringArrayBuilder *builder,
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_string_array_builder_append_string(GArrowStringArrayBuilder *builder,
                                           const gchar *value,
                                           GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::StringBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  return garrow_string_array_builder_append_string_len(builder,
+                                                       value,
+                                                       static_cast<gint32>(strlen(value)),
+                                                       error);
+}
 
-  auto status = arrow_builder->Append(value,
-                                      static_cast<gint32>(strlen(value)));
-  return garrow_error_check(error,
-                            status,
-                            "[string-array-builder][append-string]");
+/**
+ * garrow_string_array_builder_append_string_len:
+ * @builder: A #GArrowStringArrayBuilder.
+ * @value: A string value.
+ * @length: The length of @value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_string_array_builder_append_string_len(GArrowStringArrayBuilder *builder,
+                                              const gchar *value,
+                                              gint32 length,
+                                              GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto status = arrow_builder->Append(value, length);
+  return garrow_error_check(error, status, "[string-array-builder][append-string]");
 }
 
 /**
@@ -2973,7 +3387,7 @@ garrow_string_array_builder_append_string(GArrowStringArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3011,11 +3425,11 @@ garrow_string_array_builder_append_values(GArrowStringArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_string_array_builder_append_strings(GArrowStringArrayBuilder *builder,
@@ -3025,16 +3439,15 @@ garrow_string_array_builder_append_strings(GArrowStringArrayBuilder *builder,
                                            gint64 is_valids_length,
                                            GError **error)
 {
-  return garrow_array_builder_append_values<arrow::StringBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[string-array-builder][append-strings]");
+  return garrow_array_builder_append_values<arrow::StringBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[string-array-builder][append-strings]");
 }
-
 
 G_DEFINE_TYPE(GArrowLargeStringArrayBuilder,
               garrow_large_string_array_builder,
@@ -3055,7 +3468,7 @@ garrow_large_string_array_builder_class_init(GArrowLargeStringArrayBuilderClass 
  *
  * Returns: A newly created #GArrowLargeStringArrayBuilder.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 GArrowLargeStringArrayBuilder *
 garrow_large_string_array_builder_new(void)
@@ -3074,20 +3487,44 @@ garrow_large_string_array_builder_new(void)
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_large_string_array_builder_append_string(GArrowLargeStringArrayBuilder *builder,
                                                 const gchar *value,
                                                 GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::LargeStringBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-  auto status = arrow_builder->Append(value);
+  return garrow_large_string_array_builder_append_string_len(
+    builder,
+    value,
+    static_cast<gint64>(strlen(value)),
+    error);
+}
+
+/**
+ * garrow_large_string_array_builder_append_string_len:
+ * @builder: A #GArrowLargeStringArrayBuilder.
+ * @value: A string value.
+ * @length: The length of @value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_large_string_array_builder_append_string_len(
+  GArrowLargeStringArrayBuilder *builder,
+  const gchar *value,
+  gint64 length,
+  GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::LargeStringBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto status = arrow_builder->Append(value, length);
   return garrow_error_check(error,
                             status,
-                            "[large-string-array-builder][append-string]");
+                            "[large-string-array-builder][append-string-len]");
 }
 
 /**
@@ -3103,11 +3540,11 @@ garrow_large_string_array_builder_append_string(GArrowLargeStringArrayBuilder *b
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_large_string_array_builder_append_strings(GArrowLargeStringArrayBuilder *builder,
@@ -3117,16 +3554,201 @@ garrow_large_string_array_builder_append_strings(GArrowLargeStringArrayBuilder *
                                                  gint64 is_valids_length,
                                                  GError **error)
 {
-  return garrow_array_builder_append_values<arrow::LargeStringBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[large-string-array-builder][append-strings]");
+  return garrow_array_builder_append_values<arrow::LargeStringBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[large-string-array-builder][append-strings]");
 }
 
+G_DEFINE_TYPE(GArrowFixedSizeBinaryArrayBuilder,
+              garrow_fixed_size_binary_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_fixed_size_binary_array_builder_init(GArrowFixedSizeBinaryArrayBuilder *builder)
+{
+}
+
+static void
+garrow_fixed_size_binary_array_builder_class_init(
+  GArrowFixedSizeBinaryArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_fixed_size_binary_array_builder_new:
+ * @data_type: A #GArrowFixedSizeBinaryDataType for created array.
+ *
+ * Returns: A newly created #GArrowFixedSizeBinaryArrayBuilder.
+ */
+GArrowFixedSizeBinaryArrayBuilder *
+garrow_fixed_size_binary_array_builder_new(GArrowFixedSizeBinaryDataType *data_type)
+{
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder = garrow_array_builder_new(arrow_data_type,
+                                          NULL,
+                                          "[fixed-size-binary-array-builder][new]");
+  return GARROW_FIXED_SIZE_BINARY_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_fixed_size_binary_array_builder_append_value:
+ * @builder: A #GArrowFixedSizeBinaryArrayBuilder.
+ * @value: (nullable) (array length=length): A binary value.
+ * @length: A value length.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_fixed_size_binary_array_builder_append_value(
+  GArrowFixedSizeBinaryArrayBuilder *builder,
+  const guint8 *value,
+  gint32 length,
+  GError **error)
+{
+  const gchar *context = "[fixed-size-binary-array-builder][append-value]";
+  auto arrow_builder = std::static_pointer_cast<arrow::FixedSizeBinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  arrow::Status status;
+  if (value) {
+    if (arrow_builder->byte_width() != length) {
+      g_set_error(error,
+                  GARROW_ERROR,
+                  GARROW_ERROR_INVALID,
+                  "%s: value size must be <%d>: <%d>",
+                  context,
+                  arrow_builder->byte_width(),
+                  length);
+      return FALSE;
+    }
+    status = arrow_builder->Append(value);
+  } else {
+    status = arrow_builder->AppendNull();
+  }
+  return garrow_error_check(error, status, context);
+}
+
+/**
+ * garrow_fixed_size_binary_array_builder_append_value_bytes:
+ * @builder: A #GArrowFixedSizeBinaryArrayBuilder.
+ * @value: A binary value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_fixed_size_binary_array_builder_append_value_bytes(
+  GArrowFixedSizeBinaryArrayBuilder *builder, GBytes *value, GError **error)
+{
+  const gchar *context = "[fixed-size-binary-array-builder][append-value-bytes]";
+  auto arrow_builder = std::static_pointer_cast<arrow::FixedSizeBinaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+
+  gsize size;
+  auto data = g_bytes_get_data(value, &size);
+  if (arrow_builder->byte_width() != static_cast<gint32>(size)) {
+    g_set_error(error,
+                GARROW_ERROR,
+                GARROW_ERROR_INVALID,
+                "%s: value size must be <%d>: <%" G_GSIZE_FORMAT ">",
+                context,
+                arrow_builder->byte_width(),
+                size);
+    return FALSE;
+  }
+  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data));
+  return garrow_error_check(error, status, context);
+}
+
+/**
+ * garrow_fixed_size_binary_array_builder_append_values:
+ * @builder: A #GArrowFixedSizeBinaryArrayBuilder.
+ * @values: (array length=values_length): The array of #GBytes.
+ * @values_length: The length of @values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_fixed_size_binary_array_builder_append_values(
+  GArrowFixedSizeBinaryArrayBuilder *builder,
+  GBytes **values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  return garrow_array_builder_append_values(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[fixed-size-binary-array-builder][append-values]",
+    [](guint8 *output, GBytes *value, gsize size) {
+      size_t data_size;
+      auto raw_data = g_bytes_get_data(value, &data_size);
+      memcpy(output, raw_data, size);
+    });
+}
+
+/**
+ * garrow_fixed_size_binary_array_builder_append_values_packed:
+ * @builder: A #GArrowFixedSizeBinaryArrayBuilder.
+ * @values: A #GBytes that contains multiple values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * This is more efficient than
+ * garrow_fixed_size_binary_array_builder_append_values().
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_fixed_size_binary_array_builder_append_values_packed(
+  GArrowFixedSizeBinaryArrayBuilder *builder,
+  GBytes *values,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  return garrow_array_builder_append_values<arrow::FixedSizeBinaryBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    is_valids,
+    is_valids_length,
+    error,
+    "[fixed-size-binary-array-builder][append-values-packed]");
+}
 
 G_DEFINE_TYPE(GArrowDate32ArrayBuilder,
               garrow_date32_array_builder,
@@ -3152,9 +3774,8 @@ garrow_date32_array_builder_class_init(GArrowDate32ArrayBuilderClass *klass)
 GArrowDate32ArrayBuilder *
 garrow_date32_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::date32(),
-                                          NULL,
-                                          "[date32-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::date32(), NULL, "[date32-array-builder][new]");
   return GARROW_DATE32_ARRAY_BUILDER(builder);
 }
 
@@ -3194,11 +3815,11 @@ garrow_date32_array_builder_append_value(GArrowDate32ArrayBuilder *builder,
                                          gint32 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Date32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[date32-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Date32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[date32-array-builder][append-value]");
 }
 
 /**
@@ -3215,7 +3836,7 @@ garrow_date32_array_builder_append_value(GArrowDate32ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3229,60 +3850,57 @@ garrow_date32_array_builder_append_values(GArrowDate32ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Date32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[date32-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Date32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[date32-array-builder][append-values]");
 }
 
 /**
- * garrow_date32_array_builder_append_null:
+ * garrow_date32_array_builder_append_null: (skip)
  * @builder: A #GArrowDate32ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.7.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_date32_array_builder_append_null(GArrowDate32ArrayBuilder *builder,
-                                        GError **error)
+garrow_date32_array_builder_append_null(GArrowDate32ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Date32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[date32-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_date32_array_builder_append_nulls:
+ * garrow_date32_array_builder_append_nulls: (skip)
  * @builder: A #GArrowDate32ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_date32_array_builder_append_nulls(GArrowDate32ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Date32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[date32-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowDate64ArrayBuilder,
               garrow_date64_array_builder,
@@ -3308,9 +3926,8 @@ garrow_date64_array_builder_class_init(GArrowDate64ArrayBuilderClass *klass)
 GArrowDate64ArrayBuilder *
 garrow_date64_array_builder_new(void)
 {
-  auto builder = garrow_array_builder_new(arrow::date64(),
-                                          NULL,
-                                          "[date64-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow::date64(), NULL, "[date64-array-builder][new]");
   return GARROW_DATE64_ARRAY_BUILDER(builder);
 }
 
@@ -3350,11 +3967,11 @@ garrow_date64_array_builder_append_value(GArrowDate64ArrayBuilder *builder,
                                          gint64 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Date64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[date64-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Date64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[date64-array-builder][append-value]");
 }
 
 /**
@@ -3371,7 +3988,7 @@ garrow_date64_array_builder_append_value(GArrowDate64ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3385,60 +4002,57 @@ garrow_date64_array_builder_append_values(GArrowDate64ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Date64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[date64-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Date64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[date64-array-builder][append-values]");
 }
 
 /**
- * garrow_date64_array_builder_append_null:
+ * garrow_date64_array_builder_append_null: (skip)
  * @builder: A #GArrowDate64ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.7.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_date64_array_builder_append_null(GArrowDate64ArrayBuilder *builder,
-                                        GError **error)
+garrow_date64_array_builder_append_null(GArrowDate64ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Date64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[date64-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_date64_array_builder_append_nulls:
+ * garrow_date64_array_builder_append_nulls: (skip)
  * @builder: A #GArrowDate64ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_date64_array_builder_append_nulls(GArrowDate64ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Date64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[date64-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowTimestampArrayBuilder,
               garrow_timestamp_array_builder,
@@ -3466,9 +4080,8 @@ GArrowTimestampArrayBuilder *
 garrow_timestamp_array_builder_new(GArrowTimestampDataType *data_type)
 {
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          NULL,
-                                          "[timestamp-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[timestamp-array-builder][new]");
   return GARROW_TIMESTAMP_ARRAY_BUILDER(builder);
 }
 
@@ -3508,11 +4121,11 @@ garrow_timestamp_array_builder_append_value(GArrowTimestampArrayBuilder *builder
                                             gint64 value,
                                             GError **error)
 {
-  return garrow_array_builder_append_value<arrow::TimestampBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[timestamp-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::TimestampBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[timestamp-array-builder][append-value]");
 }
 
 /**
@@ -3529,7 +4142,7 @@ garrow_timestamp_array_builder_append_value(GArrowTimestampArrayBuilder *builder
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3543,60 +4156,58 @@ garrow_timestamp_array_builder_append_values(GArrowTimestampArrayBuilder *builde
                                              gint64 is_valids_length,
                                              GError **error)
 {
-  return garrow_array_builder_append_values<arrow::TimestampBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[timestamp-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::TimestampBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[timestamp-array-builder][append-values]");
 }
 
 /**
- * garrow_timestamp_array_builder_append_null:
+ * garrow_timestamp_array_builder_append_null: (skip)
  * @builder: A #GArrowTimestampArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.7.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
 garrow_timestamp_array_builder_append_null(GArrowTimestampArrayBuilder *builder,
                                            GError **error)
 {
-  return garrow_array_builder_append_null<arrow::TimestampBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[timestamp-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_timestamp_array_builder_append_nulls:
+ * garrow_timestamp_array_builder_append_nulls: (skip)
  * @builder: A #GArrowTimestampArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_timestamp_array_builder_append_nulls(GArrowTimestampArrayBuilder *builder,
                                             gint64 n,
                                             GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::TimestampBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[timestamp-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowTime32ArrayBuilder,
               garrow_time32_array_builder,
@@ -3624,9 +4235,8 @@ GArrowTime32ArrayBuilder *
 garrow_time32_array_builder_new(GArrowTime32DataType *data_type)
 {
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          NULL,
-                                          "[time32-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[time32-array-builder][new]");
   return GARROW_TIME32_ARRAY_BUILDER(builder);
 }
 
@@ -3666,11 +4276,11 @@ garrow_time32_array_builder_append_value(GArrowTime32ArrayBuilder *builder,
                                          gint32 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Time32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[time32-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Time32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[time32-array-builder][append-value]");
 }
 
 /**
@@ -3687,7 +4297,7 @@ garrow_time32_array_builder_append_value(GArrowTime32ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3701,60 +4311,57 @@ garrow_time32_array_builder_append_values(GArrowTime32ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Time32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     values,
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[time32-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Time32Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[time32-array-builder][append-values]");
 }
 
 /**
- * garrow_time32_array_builder_append_null:
+ * garrow_time32_array_builder_append_null: (skip)
  * @builder: A #GArrowTime32ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.7.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_time32_array_builder_append_null(GArrowTime32ArrayBuilder *builder,
-                                        GError **error)
+garrow_time32_array_builder_append_null(GArrowTime32ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Time32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[time32-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_time32_array_builder_append_nulls:
+ * garrow_time32_array_builder_append_nulls: (skip)
  * @builder: A #GArrowTime32ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_time32_array_builder_append_nulls(GArrowTime32ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Time32Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[time32-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
-
 
 G_DEFINE_TYPE(GArrowTime64ArrayBuilder,
               garrow_time64_array_builder,
@@ -3782,9 +4389,8 @@ GArrowTime64ArrayBuilder *
 garrow_time64_array_builder_new(GArrowTime64DataType *data_type)
 {
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          NULL,
-                                          "[time64-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[time64-array-builder][new]");
   return GARROW_TIME64_ARRAY_BUILDER(builder);
 }
 
@@ -3824,11 +4430,11 @@ garrow_time64_array_builder_append_value(GArrowTime64ArrayBuilder *builder,
                                          gint64 value,
                                          GError **error)
 {
-  return garrow_array_builder_append_value<arrow::Time64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     value,
-     error,
-     "[time64-array-builder][append-value]");
+  return garrow_array_builder_append_value<arrow::Time64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[time64-array-builder][append-value]");
 }
 
 /**
@@ -3845,7 +4451,7 @@ garrow_time64_array_builder_append_value(GArrowTime64ArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
@@ -3859,62 +4465,876 @@ garrow_time64_array_builder_append_values(GArrowTime64ArrayBuilder *builder,
                                           gint64 is_valids_length,
                                           GError **error)
 {
-  return garrow_array_builder_append_values<arrow::Time64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int64_t *>(values),
-     values_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[time64-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::Time64Builder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int64_t *>(values),
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[time64-array-builder][append-values]");
 }
 
 /**
- * garrow_time64_array_builder_append_null:
+ * garrow_time64_array_builder_append_null: (skip)
  * @builder: A #GArrowTime64ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.7.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_time64_array_builder_append_null(GArrowTime64ArrayBuilder *builder,
-                                        GError **error)
+garrow_time64_array_builder_append_null(GArrowTime64ArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Time64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[time64-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_time64_array_builder_append_nulls:
+ * garrow_time64_array_builder_append_nulls: (skip)
  * @builder: A #GArrowTime64ArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * Since: 0.8.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_time64_array_builder_append_nulls(GArrowTime64ArrayBuilder *builder,
                                          gint64 n,
                                          GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::Time64Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[time64-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
 
+G_DEFINE_TYPE(GArrowMonthIntervalArrayBuilder,
+              garrow_month_interval_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
 
-typedef struct GArrowListArrayBuilderPrivate_ {
+static void
+garrow_month_interval_array_builder_init(GArrowMonthIntervalArrayBuilder *builder)
+{
+}
+
+static void
+garrow_month_interval_array_builder_class_init(
+  GArrowMonthIntervalArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_month_interval_array_builder_new:
+ *
+ * Returns: A newly created #GArrowMonthIntervalArrayBuilder.
+ *
+ * Since: 8.0.0
+ */
+GArrowMonthIntervalArrayBuilder *
+garrow_month_interval_array_builder_new(void)
+{
+  auto builder = garrow_array_builder_new(arrow::month_interval(),
+                                          NULL,
+                                          "[month-interval-array-builder][new]");
+  return GARROW_MONTH_INTERVAL_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_month_interval_array_builder_append_value:
+ * @builder: A #GArrowMonthIntervalArrayBuilder.
+ * @value: The month.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_month_interval_array_builder_append_value(GArrowMonthIntervalArrayBuilder *builder,
+                                                 gint32 value,
+                                                 GError **error)
+{
+  return garrow_array_builder_append_value<arrow::MonthIntervalBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    value,
+    error,
+    "[month-interval-array-builder][append-value]");
+}
+
+/**
+ * garrow_month_interval_array_builder_append_values:
+ * @builder: A #GArrowMonthIntervalArrayBuilder.
+ * @values: (array length=values_length): The array of the month.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_month_interval_array_builder_append_values(
+  GArrowMonthIntervalArrayBuilder *builder,
+  const gint32 *values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  return garrow_array_builder_append_values<arrow::MonthIntervalBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[month-interval-array-builder][append-values]");
+}
+
+G_DEFINE_TYPE(GArrowDayTimeIntervalArrayBuilder,
+              garrow_day_time_interval_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_day_time_interval_array_builder_init(GArrowDayTimeIntervalArrayBuilder *builder)
+{
+}
+
+static void
+garrow_day_time_interval_array_builder_class_init(
+  GArrowDayTimeIntervalArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_day_time_interval_array_builder_new:
+ *
+ * Returns: A newly created #GArrowDayTimeIntervalArrayBuilder.
+ *
+ * Since: 8.0.0
+ */
+GArrowDayTimeIntervalArrayBuilder *
+garrow_day_time_interval_array_builder_new(void)
+{
+  auto builder = garrow_array_builder_new(arrow::day_time_interval(),
+                                          NULL,
+                                          "[day-time-interval-array-builder][new]");
+  return GARROW_DAY_TIME_INTERVAL_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_day_time_interval_array_builder_append_value:
+ * @builder: A #GArrowDayTimeIntervalArrayBuilder.
+ * @value: A #GArrowDayMillisecond.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_day_time_interval_array_builder_append_value(
+  GArrowDayTimeIntervalArrayBuilder *builder, GArrowDayMillisecond *value, GError **error)
+{
+  if (value) {
+    auto arrow_day_millisecond = garrow_day_millisecond_get_raw(value);
+    return garrow_array_builder_append_value<arrow::DayTimeIntervalBuilder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_day_millisecond,
+      error,
+      "[day-time-interval-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
+}
+
+/**
+ * garrow_day_time_interval_array_builder_append_values:
+ * @builder: A #GArrowDayTimeIntervalArrayBuilder.
+ * @values: (array length=values_length): The array of a #GArrowDayMillisecond.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_day_time_interval_array_builder_append_values(
+  GArrowDayTimeIntervalArrayBuilder *builder,
+  const GArrowDayMillisecond **values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::DayTimeIntervalBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+
+  return garrow_array_builder_append_values(
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[day-time-interval-array-builder][append-values]",
+    [&arrow_builder](const GArrowDayMillisecond **values,
+                     gint64 values_length,
+                     const uint8_t *valid_bytes) -> arrow::Status {
+      for (int i = 0; i < values_length; i++) {
+        arrow::Status status;
+        if (!valid_bytes || valid_bytes[i]) {
+          auto arrow_value = garrow_day_millisecond_get_raw(values[i]);
+          status = arrow_builder->Append(*arrow_value);
+        } else {
+          status = arrow_builder->AppendNull();
+        }
+        if (!status.ok()) {
+          return status;
+        }
+      };
+
+      return arrow::Status::OK();
+    });
+}
+
+G_DEFINE_TYPE(GArrowMonthDayNanoIntervalArrayBuilder,
+              garrow_month_day_nano_interval_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_month_day_nano_interval_array_builder_init(
+  GArrowMonthDayNanoIntervalArrayBuilder *builder)
+{
+}
+
+static void
+garrow_month_day_nano_interval_array_builder_class_init(
+  GArrowMonthDayNanoIntervalArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_month_day_nano_interval_array_builder_new:
+ *
+ * Returns: A newly created #GArrowMonthDayNanoIntervalArrayBuilder.
+ *
+ * Since: 8.0.0
+ */
+GArrowMonthDayNanoIntervalArrayBuilder *
+garrow_month_day_nano_interval_array_builder_new(void)
+{
+  auto builder = garrow_array_builder_new(arrow::month_day_nano_interval(),
+                                          NULL,
+                                          "[month-day-nano-interval-array-builder][new]");
+  return GARROW_MONTH_DAY_NANO_INTERVAL_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_month_day_nano_interval_array_builder_append_value:
+ * @builder: A #GArrowMonthDayNanoIntervalArrayBuilder.
+ * @value: A #GArrowMonthDayNano.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_month_day_nano_interval_array_builder_append_value(
+  GArrowMonthDayNanoIntervalArrayBuilder *builder,
+  GArrowMonthDayNano *value,
+  GError **error)
+{
+  if (value) {
+    auto arrow_month_day_nano = garrow_month_day_nano_get_raw(value);
+    return garrow_array_builder_append_value<arrow::MonthDayNanoIntervalBuilder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_month_day_nano,
+      error,
+      "[month-day-nano-interval-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
+}
+
+/**
+ * garrow_month_day_nano_interval_array_builder_append_values:
+ * @builder: A #GArrowMonthDayNanoIntervalArrayBuilder.
+ * @values: (array length=values_length): The array of a #GArrowMonthDayNano.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 8.0.0
+ */
+gboolean
+garrow_month_day_nano_interval_array_builder_append_values(
+  GArrowMonthDayNanoIntervalArrayBuilder *builder,
+  const GArrowMonthDayNano **values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::MonthDayNanoIntervalBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+
+  return garrow_array_builder_append_values(
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[month-day-nano-interval-array-builder][append-values]",
+    [&arrow_builder](const GArrowMonthDayNano **values,
+                     gint64 values_length,
+                     const uint8_t *valid_bytes) -> arrow::Status {
+      for (int i = 0; i < values_length; i++) {
+        arrow::Status status;
+        if (!valid_bytes || valid_bytes[i]) {
+          auto arrow_value = garrow_month_day_nano_get_raw(values[i]);
+          status = arrow_builder->Append(*arrow_value);
+        } else {
+          status = arrow_builder->AppendNull();
+        }
+        if (!status.ok()) {
+          return status;
+        }
+      };
+
+      return arrow::Status::OK();
+    });
+}
+
+G_DEFINE_TYPE(GArrowBinaryDictionaryArrayBuilder,
+              garrow_binary_dictionary_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_binary_dictionary_array_builder_init(GArrowBinaryDictionaryArrayBuilder *builder)
+{
+}
+
+static void
+garrow_binary_dictionary_array_builder_class_init(
+  GArrowBinaryDictionaryArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_new:
+ *
+ * Returns: A newly created #GArrowBinaryDictionaryArrayBuilder.
+ *
+ * Since: 2.0.0
+ */
+GArrowBinaryDictionaryArrayBuilder *
+garrow_binary_dictionary_array_builder_new(void)
+{
+  // We can use arrow:int8() for the index type of the following arrow_dict_type
+  // because arrow::MakeBuilder creates a dictionary builder with
+  // arrow::AdaptiveIntBuilder.
+  auto arrow_dict_type = arrow::dictionary(arrow::int8(), arrow::binary());
+  auto builder = garrow_array_builder_new(arrow_dict_type,
+                                          nullptr,
+                                          "[binary-dictionary-array-builder][new]");
+  return GARROW_BINARY_DICTIONARY_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_append_null: (skip)
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
+ */
+gboolean
+garrow_binary_dictionary_array_builder_append_null(
+  GArrowBinaryDictionaryArrayBuilder *builder, GError **error)
+{
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_append_value:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @value: (array length=length): A binary value.
+ * @length: A value length.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_append_value(
+  GArrowBinaryDictionaryArrayBuilder *builder,
+  const guint8 *value,
+  gint32 length,
+  GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto status = arrow_builder->Append(value, length);
+  return garrow_error_check(error,
+                            status,
+                            "[binary-dictionary-array-builder][append-value]");
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_append_value_bytes:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @value: A binary value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_append_value_bytes(
+  GArrowBinaryDictionaryArrayBuilder *builder, GBytes *value, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  gsize size;
+  auto data = g_bytes_get_data(value, &size);
+  auto status = arrow_builder->Append(static_cast<const uint8_t *>(data), size);
+  return garrow_error_check(error,
+                            status,
+                            "[binary-dictionary-array-builder][append-value-bytes]");
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_append_array:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @array: A #GArrowBinaryArray.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_append_array(
+  GArrowBinaryDictionaryArrayBuilder *builder, GArrowBinaryArray *array, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto arrow_array = garrow_array_get_raw<arrow::BinaryType>(GARROW_ARRAY(array));
+  auto status = arrow_builder->AppendArray(*arrow_array);
+  return garrow_error_check(error,
+                            status,
+                            "[binary-dictionary-array-builder][append-binary-array]");
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_append_indices:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @values: (array length=values_length): The array of indices.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   %TRUE or %FALSE that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append dictionary indices directly without modifying the internal memo.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_append_indices(
+  GArrowBinaryDictionaryArrayBuilder *builder,
+  const gint64 *values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  static const char *context = "[binary-dictionary-array-builder][append-indices]";
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto append_function = [&arrow_builder](const gint64 *values,
+                                          gint64 values_length,
+                                          const uint8_t *valid_bytes) -> arrow::Status {
+    auto int64_t_values = reinterpret_cast<const int64_t *>(values);
+    return arrow_builder->AppendIndices(int64_t_values, values_length, valid_bytes);
+  };
+  return garrow_array_builder_append_values(values,
+                                            values_length,
+                                            is_valids,
+                                            is_valids_length,
+                                            error,
+                                            context,
+                                            append_function);
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_get_dictionary_length:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ *
+ * Returns: A number of entries in the dictionary.
+ *
+ * Since: 2.0.0
+ */
+gint64
+garrow_binary_dictionary_array_builder_get_dictionary_length(
+  GArrowBinaryDictionaryArrayBuilder *builder)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  return arrow_builder->dictionary_length();
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_finish_delta:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @out_indices: (out): The built #GArrowArray containing indices.
+ * @out_delta: (out): The built #GArrowArray containing dictionary.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_finish_delta(
+  GArrowBinaryDictionaryArrayBuilder *builder,
+  GArrowArray **out_indices,
+  GArrowArray **out_delta,
+  GError **error)
+{
+  static const char *context = "[binary-dictionary-array-builder][finish-delta]";
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  std::shared_ptr<arrow::Array> arrow_indices, arrow_delta;
+  auto status = arrow_builder->FinishDelta(&arrow_indices, &arrow_delta);
+  if (!garrow_error_check(error, status, context)) {
+    return FALSE;
+  }
+  *out_indices = garrow_array_new_raw(&arrow_indices);
+  *out_delta = garrow_array_new_raw(&arrow_delta);
+  return TRUE;
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_insert_memo_values:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ * @values: A #GArrowBinaryArray.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_binary_dictionary_array_builder_insert_memo_values(
+  GArrowBinaryDictionaryArrayBuilder *builder, GArrowBinaryArray *values, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto arrow_array = garrow_array_get_raw<arrow::BinaryType>(GARROW_ARRAY(values));
+  auto status = arrow_builder->InsertMemoValues(*arrow_array);
+  return garrow_error_check(error,
+                            status,
+                            "[binary-dictionary-array-builder][insert-memo-values]");
+}
+
+/**
+ * garrow_binary_dictionary_array_builder_reset_full:
+ * @builder: A #GArrowBinaryDictionaryArrayBuilder.
+ *
+ * Reset and also clear accumulated dictionary values in memo table.
+ *
+ * Since: 2.0.0
+ */
+void
+garrow_binary_dictionary_array_builder_reset_full(
+  GArrowBinaryDictionaryArrayBuilder *builder)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BinaryDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  arrow_builder->ResetFull();
+}
+
+G_DEFINE_TYPE(GArrowStringDictionaryArrayBuilder,
+              garrow_string_dictionary_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_string_dictionary_array_builder_init(GArrowStringDictionaryArrayBuilder *builder)
+{
+}
+
+static void
+garrow_string_dictionary_array_builder_class_init(
+  GArrowStringDictionaryArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_string_dictionary_array_builder_new:
+ *
+ * Returns: A newly created #GArrowStringDictionaryArrayBuilder.
+ *
+ * Since: 2.0.0
+ */
+GArrowStringDictionaryArrayBuilder *
+garrow_string_dictionary_array_builder_new(void)
+{
+  // We can use arrow:int8() for the index type of the following arrow_dict_type
+  // because arrow::MakeBuilder creates a dictionary builder with
+  // arrow::AdaptiveIntBuilder.
+  auto arrow_dict_type = arrow::dictionary(arrow::int8(), arrow::utf8());
+  auto builder = garrow_array_builder_new(arrow_dict_type,
+                                          nullptr,
+                                          "[string-dictionary-array-builder][new]");
+  return GARROW_STRING_DICTIONARY_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_string_dictionary_array_builder_append_null: (skip)
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
+ */
+gboolean
+garrow_string_dictionary_array_builder_append_null(
+  GArrowStringDictionaryArrayBuilder *builder, GError **error)
+{
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+}
+
+/**
+ * garrow_string_dictionary_array_builder_append_string:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @value: A string value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_string_dictionary_array_builder_append_string(
+  GArrowStringDictionaryArrayBuilder *builder, const gchar *value, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto status = arrow_builder->Append(value, static_cast<guint32>(strlen(value)));
+  return garrow_error_check(error,
+                            status,
+                            "[string-dictionary-array-builder][append-string]");
+}
+
+/**
+ * garrow_string_dictionary_array_builder_append_array:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @array: A #GArrowStringArray.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_string_dictionary_array_builder_append_array(
+  GArrowStringDictionaryArrayBuilder *builder, GArrowStringArray *array, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto arrow_array = garrow_array_get_raw<arrow::StringType>(GARROW_ARRAY(array));
+  auto status = arrow_builder->AppendArray(*arrow_array);
+  return garrow_error_check(error,
+                            status,
+                            "[string-dictionary-array-builder][append-string-array]");
+}
+
+/**
+ * garrow_string_dictionary_array_builder_append_indices:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @values: (array length=values_length): The array of indices.
+ * @values_length: The length of `values`.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   %TRUE or %FALSE that shows whether the Nth value is valid or not. If the
+ *   Nth `is_valids` is %TRUE, the Nth `values` is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of `is_valids`.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append dictionary indices directly without modifying the internal memo.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_string_dictionary_array_builder_append_indices(
+  GArrowStringDictionaryArrayBuilder *builder,
+  const gint64 *values,
+  gint64 values_length,
+  const gboolean *is_valids,
+  gint64 is_valids_length,
+  GError **error)
+{
+  static const char *context = "[string-dictionary-array-builder][append-indices]";
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto append_function = [&arrow_builder](const gint64 *values,
+                                          gint64 values_length,
+                                          const uint8_t *valid_bytes) -> arrow::Status {
+    auto int64_t_values = reinterpret_cast<const int64_t *>(values);
+    return arrow_builder->AppendIndices(int64_t_values, values_length, valid_bytes);
+  };
+  return garrow_array_builder_append_values(values,
+                                            values_length,
+                                            is_valids,
+                                            is_valids_length,
+                                            error,
+                                            context,
+                                            append_function);
+}
+
+/**
+ * garrow_string_dictionary_array_builder_get_dictionary_length:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ *
+ * Returns: A number of entries in the dictionary.
+ *
+ * Since: 2.0.0
+ */
+gint64
+garrow_string_dictionary_array_builder_get_dictionary_length(
+  GArrowStringDictionaryArrayBuilder *builder)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  return arrow_builder->dictionary_length();
+}
+
+/**
+ * garrow_string_dictionary_array_builder_finish_delta:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @out_indices: (out): The built #GArrowArray containing indices.
+ * @out_delta: (out): The built #GArrowArray containing dictionary.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_string_dictionary_array_builder_finish_delta(
+  GArrowStringDictionaryArrayBuilder *builder,
+  GArrowArray **out_indices,
+  GArrowArray **out_delta,
+  GError **error)
+{
+  static const char *context = "[string-dictionary-array-builder][finish-delta]";
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  std::shared_ptr<arrow::Array> arrow_indices, arrow_delta;
+  auto status = arrow_builder->FinishDelta(&arrow_indices, &arrow_delta);
+  if (!garrow_error_check(error, status, context)) {
+    return FALSE;
+  }
+  *out_indices = garrow_array_new_raw(&arrow_indices);
+  *out_delta = garrow_array_new_raw(&arrow_delta);
+  return TRUE;
+}
+
+/**
+ * garrow_string_dictionary_array_builder_insert_memo_values:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ * @values: A #GArrowStringArray.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 2.0.0
+ */
+gboolean
+garrow_string_dictionary_array_builder_insert_memo_values(
+  GArrowStringDictionaryArrayBuilder *builder, GArrowStringArray *values, GError **error)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto arrow_array = garrow_array_get_raw<arrow::StringType>(GARROW_ARRAY(values));
+  auto status = arrow_builder->InsertMemoValues(*arrow_array);
+  return garrow_error_check(error,
+                            status,
+                            "[string-dictionary-array-builder][insert-memo-values]");
+}
+
+/**
+ * garrow_string_dictionary_array_builder_reset_full:
+ * @builder: A #GArrowStringDictionaryArrayBuilder.
+ *
+ * Reset and also clear accumulated dictionary values in memo table.
+ *
+ * Since: 2.0.0
+ */
+void
+garrow_string_dictionary_array_builder_reset_full(
+  GArrowStringDictionaryArrayBuilder *builder)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::StringDictionaryBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  arrow_builder->ResetFull();
+}
+
+typedef struct GArrowListArrayBuilderPrivate_
+{
   GArrowArrayBuilder *value_builder;
 } GArrowListArrayBuilderPrivate;
 
@@ -3922,10 +5342,9 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowListArrayBuilder,
                            garrow_list_array_builder,
                            GARROW_TYPE_ARRAY_BUILDER)
 
-#define GARROW_LIST_ARRAY_BUILDER_GET_PRIVATE(obj)         \
-  static_cast<GArrowListArrayBuilderPrivate *>(            \
-     garrow_list_array_builder_get_instance_private(       \
-       GARROW_LIST_ARRAY_BUILDER(obj)))
+#define GARROW_LIST_ARRAY_BUILDER_GET_PRIVATE(obj)                                       \
+  static_cast<GArrowListArrayBuilderPrivate *>(                                          \
+    garrow_list_array_builder_get_instance_private(GARROW_LIST_ARRAY_BUILDER(obj)))
 
 static void
 garrow_list_array_builder_dispose(GObject *object)
@@ -3963,8 +5382,7 @@ garrow_list_array_builder_class_init(GArrowListArrayBuilderClass *klass)
  * Returns: A newly created #GArrowListArrayBuilder.
  */
 GArrowListArrayBuilder *
-garrow_list_array_builder_new(GArrowListDataType *data_type,
-                              GError **error)
+garrow_list_array_builder_new(GArrowListDataType *data_type, GError **error)
 {
   if (!GARROW_IS_LIST_DATA_TYPE(data_type)) {
     g_set_error(error,
@@ -3974,11 +5392,9 @@ garrow_list_array_builder_new(GArrowListDataType *data_type,
     return NULL;
   }
 
-  auto arrow_data_type =
-    garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          error,
-                                          "[list-array-builder][new]");
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, error, "[list-array-builder][new]");
   return GARROW_LIST_ARRAY_BUILDER(builder);
 }
 
@@ -4029,8 +5445,7 @@ garrow_list_array_builder_new(GArrowListDataType *data_type,
  *   Use garrow_list_array_builder_append_value() instead.
  */
 gboolean
-garrow_list_array_builder_append(GArrowListArrayBuilder *builder,
-                                 GError **error)
+garrow_list_array_builder_append(GArrowListArrayBuilder *builder, GError **error)
 {
   return garrow_list_array_builder_append_value(builder, error);
 }
@@ -4081,34 +5496,30 @@ garrow_list_array_builder_append(GArrowListArrayBuilder *builder,
  * Since: 0.12.0
  */
 gboolean
-garrow_list_array_builder_append_value(GArrowListArrayBuilder *builder,
-                                       GError **error)
+garrow_list_array_builder_append_value(GArrowListArrayBuilder *builder, GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::ListBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::ListBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append();
   return garrow_error_check(error, status, "[list-array-builder][append-value]");
 }
 
 /**
- * garrow_list_array_builder_append_null:
+ * garrow_list_array_builder_append_null: (skip)
  * @builder: A #GArrowListArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * It appends a new NULL element.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_list_array_builder_append_null(GArrowListArrayBuilder *builder,
-                                      GError **error)
+garrow_list_array_builder_append_null(GArrowListArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::ListBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[list-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
@@ -4122,18 +5533,16 @@ garrow_list_array_builder_get_value_builder(GArrowListArrayBuilder *builder)
 {
   auto priv = GARROW_LIST_ARRAY_BUILDER_GET_PRIVATE(builder);
   if (!priv->value_builder) {
-    auto arrow_builder =
-      static_cast<arrow::ListBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+    auto arrow_builder = std::static_pointer_cast<arrow::ListBuilder>(
+      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
     auto arrow_value_builder = arrow_builder->value_builder();
     priv->value_builder = garrow_array_builder_new_raw(arrow_value_builder);
-    garrow_array_builder_release_ownership(priv->value_builder);
   }
   return priv->value_builder;
 }
 
-
-typedef struct GArrowLargeListArrayBuilderPrivate_ {
+typedef struct GArrowLargeListArrayBuilderPrivate_
+{
   GArrowArrayBuilder *value_builder;
 } GArrowLargeListArrayBuilderPrivate;
 
@@ -4141,10 +5550,10 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowLargeListArrayBuilder,
                            garrow_large_list_array_builder,
                            GARROW_TYPE_ARRAY_BUILDER)
 
-#define GARROW_LARGE_LIST_ARRAY_BUILDER_GET_PRIVATE(obj)        \
-  static_cast<GArrowLargeListArrayBuilderPrivate *>(            \
-     garrow_large_list_array_builder_get_instance_private(      \
-       GARROW_LARGE_LIST_ARRAY_BUILDER(obj)))
+#define GARROW_LARGE_LIST_ARRAY_BUILDER_GET_PRIVATE(obj)                                 \
+  static_cast<GArrowLargeListArrayBuilderPrivate *>(                                     \
+    garrow_large_list_array_builder_get_instance_private(                                \
+      GARROW_LARGE_LIST_ARRAY_BUILDER(obj)))
 
 static void
 garrow_large_list_array_builder_dispose(GObject *object)
@@ -4179,11 +5588,10 @@ garrow_large_list_array_builder_class_init(GArrowLargeListArrayBuilderClass *kla
  *
  * Returns: A newly created #GArrowLargeListArrayBuilder.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 GArrowLargeListArrayBuilder *
-garrow_large_list_array_builder_new(GArrowLargeListDataType *data_type,
-                                    GError **error)
+garrow_large_list_array_builder_new(GArrowLargeListDataType *data_type, GError **error)
 {
   if (!GARROW_IS_LARGE_LIST_DATA_TYPE(data_type)) {
     g_set_error(error,
@@ -4193,11 +5601,9 @@ garrow_large_list_array_builder_new(GArrowLargeListDataType *data_type,
     return NULL;
   }
 
-  auto arrow_data_type =
-    garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          error,
-                                          "[large-list-array-builder][new]");
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, error, "[large-list-array-builder][new]");
   return GARROW_LARGE_LIST_ARRAY_BUILDER(builder);
 }
 
@@ -4214,22 +5620,20 @@ garrow_large_list_array_builder_new(GArrowLargeListDataType *data_type,
  * specified to constructor. You can get `value_builder` by
  * garrow_large_list_array_builder_get_value_builder().
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 gboolean
 garrow_large_list_array_builder_append_value(GArrowLargeListArrayBuilder *builder,
                                              GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::LargeListBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::LargeListBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append();
   return garrow_error_check(error, status, "[large-list-array-builder][append-value]");
 }
 
 /**
- * garrow_large_list_array_builder_append_null:
+ * garrow_large_list_array_builder_append_null: (skip)
  * @builder: A #GArrowLargeListArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
@@ -4237,16 +5641,16 @@ garrow_large_list_array_builder_append_value(GArrowLargeListArrayBuilder *builde
  *
  * It appends a new NULL element.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
 garrow_large_list_array_builder_append_null(GArrowLargeListArrayBuilder *builder,
                                             GError **error)
 {
-  return garrow_array_builder_append_null<arrow::LargeListBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[large-list-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
@@ -4255,55 +5659,28 @@ garrow_large_list_array_builder_append_null(GArrowLargeListArrayBuilder *builder
  *
  * Returns: (transfer none): The #GArrowArrayBuilder for values.
  *
- * Since: 1.0.0
+ * Since: 0.16.0
  */
 GArrowArrayBuilder *
 garrow_large_list_array_builder_get_value_builder(GArrowLargeListArrayBuilder *builder)
 {
   auto priv = GARROW_LARGE_LIST_ARRAY_BUILDER_GET_PRIVATE(builder);
   if (!priv->value_builder) {
-    auto arrow_builder =
-      static_cast<arrow::LargeListBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+    auto arrow_builder = std::static_pointer_cast<arrow::LargeListBuilder>(
+      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
     auto arrow_value_builder = arrow_builder->value_builder();
     priv->value_builder = garrow_array_builder_new_raw(arrow_value_builder);
-    garrow_array_builder_release_ownership(priv->value_builder);
   }
   return priv->value_builder;
 }
 
+G_DEFINE_TYPE(GArrowStructArrayBuilder,
+              garrow_struct_array_builder,
+              GARROW_TYPE_ARRAY_BUILDER)
 
-typedef struct GArrowStructArrayBuilderPrivate_ {
-  GList *field_builders;
-} GArrowStructArrayBuilderPrivate;
-
-G_DEFINE_TYPE_WITH_PRIVATE(GArrowStructArrayBuilder,
-                           garrow_struct_array_builder,
-                           GARROW_TYPE_ARRAY_BUILDER)
-
-#define GARROW_STRUCT_ARRAY_BUILDER_GET_PRIVATE(obj)         \
-  static_cast<GArrowStructArrayBuilderPrivate *>(            \
-     garrow_struct_array_builder_get_instance_private(       \
-       GARROW_STRUCT_ARRAY_BUILDER(obj)))
-
-static void
-garrow_struct_array_builder_dispose(GObject *object)
-{
-  auto priv = GARROW_STRUCT_ARRAY_BUILDER_GET_PRIVATE(object);
-
-  for (auto node = priv->field_builders; node; node = g_list_next(node)) {
-    auto field_builder = static_cast<GArrowArrayBuilder *>(node->data);
-    GArrowArrayBuilderPrivate *field_builder_priv;
-
-    field_builder_priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(field_builder);
-    field_builder_priv->array_builder = nullptr;
-    g_object_unref(field_builder);
-  }
-  g_list_free(priv->field_builders);
-  priv->field_builders = NULL;
-
-  G_OBJECT_CLASS(garrow_struct_array_builder_parent_class)->dispose(object);
-}
+#define GARROW_STRUCT_ARRAY_BUILDER_GET_PRIVATE(obj)                                     \
+  static_cast<GArrowStructArrayBuilderPrivate *>(                                        \
+    garrow_struct_array_builder_get_instance_private(GARROW_STRUCT_ARRAY_BUILDER(obj)))
 
 static void
 garrow_struct_array_builder_init(GArrowStructArrayBuilder *builder)
@@ -4313,11 +5690,6 @@ garrow_struct_array_builder_init(GArrowStructArrayBuilder *builder)
 static void
 garrow_struct_array_builder_class_init(GArrowStructArrayBuilderClass *klass)
 {
-  GObjectClass *gobject_class;
-
-  gobject_class = G_OBJECT_CLASS(klass);
-
-  gobject_class->dispose = garrow_struct_array_builder_dispose;
 }
 
 /**
@@ -4328,8 +5700,7 @@ garrow_struct_array_builder_class_init(GArrowStructArrayBuilderClass *klass)
  * Returns: A newly created #GArrowStructArrayBuilder.
  */
 GArrowStructArrayBuilder *
-garrow_struct_array_builder_new(GArrowStructDataType *data_type,
-                                GError **error)
+garrow_struct_array_builder_new(GArrowStructDataType *data_type, GError **error)
 {
   if (!GARROW_IS_STRUCT_DATA_TYPE(data_type)) {
     g_set_error(error,
@@ -4340,9 +5711,8 @@ garrow_struct_array_builder_new(GArrowStructDataType *data_type,
   }
 
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          error,
-                                          "[struct-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, error, "[struct-array-builder][new]");
   return GARROW_STRUCT_ARRAY_BUILDER(builder);
 }
 
@@ -4368,8 +5738,7 @@ garrow_struct_array_builder_new(GArrowStructDataType *data_type,
  *   Use garrow_struct_array_builder_append_value() instead.
  */
 gboolean
-garrow_struct_array_builder_append(GArrowStructArrayBuilder *builder,
-                                   GError **error)
+garrow_struct_array_builder_append(GArrowStructArrayBuilder *builder, GError **error)
 {
   return garrow_struct_array_builder_append_value(builder, error);
 }
@@ -4398,33 +5767,28 @@ gboolean
 garrow_struct_array_builder_append_value(GArrowStructArrayBuilder *builder,
                                          GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::StructBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::StructBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append();
-  return garrow_error_check(error,
-                            status,
-                            "[struct-array-builder][append-value]");
+  return garrow_error_check(error, status, "[struct-array-builder][append-value]");
 }
 
 /**
- * garrow_struct_array_builder_append_null:
+ * garrow_struct_array_builder_append_null: (skip)
  * @builder: A #GArrowStructArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
  * It appends a new NULL element.
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_struct_array_builder_append_null(GArrowStructArrayBuilder *builder,
-                                        GError **error)
+garrow_struct_array_builder_append_null(GArrowStructArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::StructBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[struct-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
@@ -4433,46 +5797,34 @@ garrow_struct_array_builder_append_null(GArrowStructArrayBuilder *builder,
  * @i: The index of the field in the struct.
  *
  * Returns: (transfer none): The #GArrowArrayBuilder for the i-th field.
+ *
+ * Deprecated: 12.0.0:
+ *   Use garrow_array_builder_get_child() instead.
  */
 GArrowArrayBuilder *
-garrow_struct_array_builder_get_field_builder(GArrowStructArrayBuilder *builder,
-                                              gint i)
+garrow_struct_array_builder_get_field_builder(GArrowStructArrayBuilder *builder, gint i)
 {
-  auto field_builders = garrow_struct_array_builder_get_field_builders(builder);
-  auto field_builder = g_list_nth_data(field_builders, i);
-  return static_cast<GArrowArrayBuilder *>(field_builder);
+  return garrow_array_builder_get_child(GARROW_ARRAY_BUILDER(builder), i);
 }
 
 /**
  * garrow_struct_array_builder_get_field_builders:
  * @builder: A #GArrowStructArrayBuilder.
  *
- * Returns: (element-type GArrowArray) (transfer none):
+ * Returns: (element-type GArrowArrayBuilder) (transfer none):
  *   The #GArrowArrayBuilder for all fields.
+ *
+ * Deprecated: 12.0.0:
+ *   Use garrow_array_builder_get_children() instead.
  */
 GList *
 garrow_struct_array_builder_get_field_builders(GArrowStructArrayBuilder *builder)
 {
-  auto priv = GARROW_STRUCT_ARRAY_BUILDER_GET_PRIVATE(builder);
-  if (!priv->field_builders) {
-    auto arrow_struct_builder =
-      static_cast<arrow::StructBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
-    GList *field_builders = NULL;
-    for (int i = 0; i < arrow_struct_builder->num_fields(); ++i) {
-      auto arrow_field_builder = arrow_struct_builder->field_builder(i);
-      auto field_builder = garrow_array_builder_new_raw(arrow_field_builder);
-      field_builders = g_list_prepend(field_builders, field_builder);
-    }
-    priv->field_builders = g_list_reverse(field_builders);
-  }
-
-  return priv->field_builders;
+  return garrow_array_builder_get_children(GARROW_ARRAY_BUILDER(builder));
 }
 
-
-typedef struct GArrowMapArrayBuilderPrivate_ {
+typedef struct GArrowMapArrayBuilderPrivate_
+{
   GArrowArrayBuilder *key_builder;
   GArrowArrayBuilder *item_builder;
   GArrowArrayBuilder *value_builder;
@@ -4482,10 +5834,9 @@ G_DEFINE_TYPE_WITH_PRIVATE(GArrowMapArrayBuilder,
                            garrow_map_array_builder,
                            GARROW_TYPE_ARRAY_BUILDER)
 
-#define GARROW_MAP_ARRAY_BUILDER_GET_PRIVATE(object)      \
-  static_cast<GArrowMapArrayBuilderPrivate *>(            \
-     garrow_map_array_builder_get_instance_private(       \
-       GARROW_MAP_ARRAY_BUILDER(object)))
+#define GARROW_MAP_ARRAY_BUILDER_GET_PRIVATE(object)                                     \
+  static_cast<GArrowMapArrayBuilderPrivate *>(                                           \
+    garrow_map_array_builder_get_instance_private(GARROW_MAP_ARRAY_BUILDER(object)))
 
 static void
 garrow_map_array_builder_dispose(GObject *object)
@@ -4531,11 +5882,10 @@ garrow_map_array_builder_class_init(GArrowMapArrayBuilderClass *klass)
  * Returns: (nullable): A newly created #GArrowMapArrayBuilder on success,
  *   %NULL on error.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 GArrowMapArrayBuilder *
-garrow_map_array_builder_new(GArrowMapDataType *data_type,
-                             GError **error)
+garrow_map_array_builder_new(GArrowMapDataType *data_type, GError **error)
 {
   if (!GARROW_IS_MAP_DATA_TYPE(data_type)) {
     g_set_error(error,
@@ -4546,9 +5896,8 @@ garrow_map_array_builder_new(GArrowMapDataType *data_type,
   }
 
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          error,
-                                          "[map-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, error, "[map-array-builder][new]");
   if (builder) {
     return GARROW_MAP_ARRAY_BUILDER(builder);
   } else {
@@ -4563,20 +5912,15 @@ garrow_map_array_builder_new(GArrowMapDataType *data_type,
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 gboolean
-garrow_map_array_builder_append_value(GArrowMapArrayBuilder *builder,
-                                      GError **error)
+garrow_map_array_builder_append_value(GArrowMapArrayBuilder *builder, GError **error)
 {
-  auto arrow_builder =
-    static_cast<arrow::MapBuilder *>(
-      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
-
+  auto arrow_builder = std::static_pointer_cast<arrow::MapBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
   auto status = arrow_builder->Append();
-  return garrow::check(error,
-                       status,
-                       "[map-array-builder][append-value]");
+  return garrow::check(error, status, "[map-array-builder][append-value]");
 }
 
 /**
@@ -4592,11 +5936,11 @@ garrow_map_array_builder_append_value(GArrowMapArrayBuilder *builder,
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple values at once. It's more efficient than multiple
- * `append()` and `append_null()` calls.
+ * `append` and `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 gboolean
 garrow_map_array_builder_append_values(GArrowMapArrayBuilder *builder,
@@ -4606,58 +5950,56 @@ garrow_map_array_builder_append_values(GArrowMapArrayBuilder *builder,
                                        gint64 is_valids_length,
                                        GError **error)
 {
-  return garrow_array_builder_append_values<arrow::MapBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     reinterpret_cast<const int32_t *>(offsets),
-     offsets_length,
-     is_valids,
-     is_valids_length,
-     error,
-     "[map-array-builder][append-values]");
+  return garrow_array_builder_append_values<arrow::MapBuilder>(
+    GARROW_ARRAY_BUILDER(builder),
+    reinterpret_cast<const int32_t *>(offsets),
+    offsets_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[map-array-builder][append-values]");
 }
 
 /**
- * garrow_map_array_builder_append_null:
+ * garrow_map_array_builder_append_null: (skip)
  * @builder: A #GArrowMapArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
-garrow_map_array_builder_append_null(GArrowMapArrayBuilder *builder,
-                                     GError **error)
+garrow_map_array_builder_append_null(GArrowMapArrayBuilder *builder, GError **error)
 {
-  return garrow_array_builder_append_null<arrow::MapBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[map-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
 }
 
 /**
- * garrow_map_array_builder_append_nulls:
+ * garrow_map_array_builder_append_nulls: (skip)
  * @builder: A #GArrowMapArrayBuilder.
  * @n: The number of null values to be appended.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Append multiple nulls at once. It's more efficient than multiple
- * `append_null()` calls.
+ * `append_null` calls.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_nulls() instead.
  */
 gboolean
 garrow_map_array_builder_append_nulls(GArrowMapArrayBuilder *builder,
                                       gint64 n,
                                       GError **error)
 {
-  return garrow_array_builder_append_nulls<arrow::MapBuilder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     n,
-     error,
-     "[map-array-builder][append-nulls]");
+  return garrow_array_builder_append_nulls(GARROW_ARRAY_BUILDER(builder), n, error);
 }
 
 /**
@@ -4666,19 +6008,17 @@ garrow_map_array_builder_append_nulls(GArrowMapArrayBuilder *builder,
  *
  * Returns: (transfer none): The #GArrowArrayBuilder for key values.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 GArrowArrayBuilder *
 garrow_map_array_builder_get_key_builder(GArrowMapArrayBuilder *builder)
 {
   auto priv = GARROW_MAP_ARRAY_BUILDER_GET_PRIVATE(builder);
   if (!priv->key_builder) {
-    auto arrow_builder =
-      static_cast<arrow::MapBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+    auto arrow_builder = std::static_pointer_cast<arrow::MapBuilder>(
+      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
     auto arrow_key_builder = arrow_builder->key_builder();
     priv->key_builder = garrow_array_builder_new_raw(arrow_key_builder);
-    garrow_array_builder_release_ownership(priv->key_builder);
   }
   return priv->key_builder;
 }
@@ -4689,19 +6029,17 @@ garrow_map_array_builder_get_key_builder(GArrowMapArrayBuilder *builder)
  *
  * Returns: (transfer none): The #GArrowArrayBuilder for item values.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 GArrowArrayBuilder *
 garrow_map_array_builder_get_item_builder(GArrowMapArrayBuilder *builder)
 {
   auto priv = GARROW_MAP_ARRAY_BUILDER_GET_PRIVATE(builder);
   if (!priv->item_builder) {
-    auto arrow_builder =
-      static_cast<arrow::MapBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+    auto arrow_builder = std::static_pointer_cast<arrow::MapBuilder>(
+      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
     auto arrow_item_builder = arrow_builder->item_builder();
     priv->item_builder = garrow_array_builder_new_raw(arrow_item_builder);
-    garrow_array_builder_release_ownership(priv->item_builder);
   }
   return priv->item_builder;
 }
@@ -4715,27 +6053,222 @@ garrow_map_array_builder_get_item_builder(GArrowMapArrayBuilder *builder)
  *   garrow_map_array_builder_get_item_builder(). You can build map entries as a list of
  *   struct values with this builder.
  *
- * Since: 1.0.0
+ * Since: 0.17.0
  */
 GArrowArrayBuilder *
 garrow_map_array_builder_get_value_builder(GArrowMapArrayBuilder *builder)
 {
   auto priv = GARROW_MAP_ARRAY_BUILDER_GET_PRIVATE(builder);
   if (!priv->value_builder) {
-    auto arrow_builder =
-      static_cast<arrow::MapBuilder *>(
-        garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+    auto arrow_builder = std::static_pointer_cast<arrow::MapBuilder>(
+      garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
     auto arrow_value_builder = arrow_builder->value_builder();
     priv->value_builder = garrow_array_builder_new_raw(arrow_value_builder);
-    garrow_array_builder_release_ownership(priv->value_builder);
   }
   return priv->value_builder;
 }
 
+G_DEFINE_TYPE(GArrowDecimal32ArrayBuilder,
+              garrow_decimal32_array_builder,
+              GARROW_TYPE_FIXED_SIZE_BINARY_ARRAY_BUILDER)
+
+static void
+garrow_decimal32_array_builder_init(GArrowDecimal32ArrayBuilder *builder)
+{
+}
+
+static void
+garrow_decimal32_array_builder_class_init(GArrowDecimal32ArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_decimal32_array_builder_new:
+ * @data_type: #GArrowDecimal32DataType for the decimal.
+ *
+ * Returns: A newly created #GArrowDecimal32ArrayBuilder.
+ *
+ * Since: 19.0.0
+ */
+GArrowDecimal32ArrayBuilder *
+garrow_decimal32_array_builder_new(GArrowDecimal32DataType *data_type)
+{
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[decimal32-array-builder][new]");
+  return GARROW_DECIMAL32_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_decimal32_array_builder_append_value:
+ * @builder: A #GArrowDecimal32ArrayBuilder.
+ * @value: (nullable): A decimal value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 19.0.0
+ */
+gboolean
+garrow_decimal32_array_builder_append_value(GArrowDecimal32ArrayBuilder *builder,
+                                            GArrowDecimal32 *value,
+                                            GError **error)
+{
+  if (value) {
+    auto arrow_decimal = garrow_decimal32_get_raw(value);
+    return garrow_array_builder_append_value<arrow::Decimal32Builder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_decimal,
+      error,
+      "[decimal32-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
+}
+
+/**
+ * garrow_decimal32_array_builder_append_values:
+ * @builder: A #GArrowDecimal32ArrayBuilder.
+ * @values: (array length=values_length): The array of #GArrowDecimal32.
+ * @values_length: The length of @values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 19.0.0
+ */
+gboolean
+garrow_decimal32_array_builder_append_values(GArrowDecimal32ArrayBuilder *builder,
+                                             GArrowDecimal32 **values,
+                                             gint64 values_length,
+                                             const gboolean *is_valids,
+                                             gint64 is_valids_length,
+                                             GError **error)
+{
+  return garrow_array_builder_append_values(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[decimal32-array-builder][append-values]",
+    [](guint8 *output, GArrowDecimal32 *value, gsize size) {
+      auto arrow_decimal = garrow_decimal32_get_raw(value);
+      arrow_decimal->ToBytes(output);
+    });
+}
+
+G_DEFINE_TYPE(GArrowDecimal64ArrayBuilder,
+              garrow_decimal64_array_builder,
+              GARROW_TYPE_FIXED_SIZE_BINARY_ARRAY_BUILDER)
+
+static void
+garrow_decimal64_array_builder_init(GArrowDecimal64ArrayBuilder *builder)
+{
+}
+
+static void
+garrow_decimal64_array_builder_class_init(GArrowDecimal64ArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_decimal64_array_builder_new:
+ * @data_type: #GArrowDecimal64DataType for the decimal.
+ *
+ * Returns: A newly created #GArrowDecimal64ArrayBuilder.
+ *
+ * Since: 19.0.0
+ */
+GArrowDecimal64ArrayBuilder *
+garrow_decimal64_array_builder_new(GArrowDecimal64DataType *data_type)
+{
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[decimal64-array-builder][new]");
+  return GARROW_DECIMAL64_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_decimal64_array_builder_append_value:
+ * @builder: A #GArrowDecimal64ArrayBuilder.
+ * @value: (nullable): A decimal value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 19.0.0
+ */
+gboolean
+garrow_decimal64_array_builder_append_value(GArrowDecimal64ArrayBuilder *builder,
+                                            GArrowDecimal64 *value,
+                                            GError **error)
+{
+  if (value) {
+    auto arrow_decimal = garrow_decimal64_get_raw(value);
+    return garrow_array_builder_append_value<arrow::Decimal64Builder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_decimal,
+      error,
+      "[decimal64-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
+}
+
+/**
+ * garrow_decimal64_array_builder_append_values:
+ * @builder: A #GArrowDecimal64ArrayBuilder.
+ * @values: (array length=values_length): The array of #GArrowDecimal64.
+ * @values_length: The length of @values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 19.0.0
+ */
+gboolean
+garrow_decimal64_array_builder_append_values(GArrowDecimal64ArrayBuilder *builder,
+                                             GArrowDecimal64 **values,
+                                             gint64 values_length,
+                                             const gboolean *is_valids,
+                                             gint64 is_valids_length,
+                                             GError **error)
+{
+  return garrow_array_builder_append_values(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[decimal64-array-builder][append-values]",
+    [](guint8 *output, GArrowDecimal64 *value, gsize size) {
+      auto arrow_decimal = garrow_decimal64_get_raw(value);
+      arrow_decimal->ToBytes(output);
+    });
+}
 
 G_DEFINE_TYPE(GArrowDecimal128ArrayBuilder,
               garrow_decimal128_array_builder,
-              GARROW_TYPE_ARRAY_BUILDER)
+              GARROW_TYPE_FIXED_SIZE_BINARY_ARRAY_BUILDER)
 
 static void
 garrow_decimal128_array_builder_init(GArrowDecimal128ArrayBuilder *builder)
@@ -4759,9 +6292,8 @@ GArrowDecimal128ArrayBuilder *
 garrow_decimal128_array_builder_new(GArrowDecimal128DataType *data_type)
 {
   auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
-  auto builder = garrow_array_builder_new(arrow_data_type,
-                                          NULL,
-                                          "[decimal128-array-builder][new]");
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[decimal128-array-builder][new]");
   return GARROW_DECIMAL128_ARRAY_BUILDER(builder);
 }
 
@@ -4789,7 +6321,7 @@ garrow_decimal128_array_builder_append(GArrowDecimal128ArrayBuilder *builder,
 /**
  * garrow_decimal128_array_builder_append_value:
  * @builder: A #GArrowDecimal128ArrayBuilder.
- * @value: A decimal value.
+ * @value: (nullable): A decimal value.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
  * Returns: %TRUE on success, %FALSE if there was an error.
@@ -4801,16 +6333,61 @@ garrow_decimal128_array_builder_append_value(GArrowDecimal128ArrayBuilder *build
                                              GArrowDecimal128 *value,
                                              GError **error)
 {
-  auto arrow_decimal = garrow_decimal128_get_raw(value);
-  return garrow_array_builder_append_value<arrow::Decimal128Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     *arrow_decimal,
-     error,
-     "[decimal128-array-builder][append-value]");
+  if (value) {
+    auto arrow_decimal = garrow_decimal128_get_raw(value);
+    return garrow_array_builder_append_value<arrow::Decimal128Builder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_decimal,
+      error,
+      "[decimal128-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
 }
 
 /**
- * garrow_decimal128_array_builder_append_null:
+ * garrow_decimal128_array_builder_append_values:
+ * @builder: A #GArrowDecimal128ArrayBuilder.
+ * @values: (array length=values_length): The array of #GArrowDecimal128.
+ * @values_length: The length of @values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_decimal128_array_builder_append_values(GArrowDecimal128ArrayBuilder *builder,
+                                              GArrowDecimal128 **values,
+                                              gint64 values_length,
+                                              const gboolean *is_valids,
+                                              gint64 is_valids_length,
+                                              GError **error)
+{
+  return garrow_array_builder_append_values(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[decimal128-array-builder][append-values]",
+    [](guint8 *output, GArrowDecimal128 *value, gsize size) {
+      auto arrow_decimal = garrow_decimal128_get_raw(value);
+      arrow_decimal->ToBytes(output);
+    });
+}
+
+/**
+ * garrow_decimal128_array_builder_append_null: (skip)
  * @builder: A #GArrowDecimal128ArrayBuilder.
  * @error: (nullable): Return location for a #GError or %NULL.
  *
@@ -4819,25 +6396,305 @@ garrow_decimal128_array_builder_append_value(GArrowDecimal128ArrayBuilder *build
  * It appends a new NULL element.
  *
  * Since: 0.12.0
+ *
+ * Deprecated: 3.0.0:
+ *   Use garrow_array_builder_append_null() instead.
  */
 gboolean
 garrow_decimal128_array_builder_append_null(GArrowDecimal128ArrayBuilder *builder,
                                             GError **error)
 {
-  return garrow_array_builder_append_null<arrow::Decimal128Builder *>
-    (GARROW_ARRAY_BUILDER(builder),
-     error,
-     "[decimal128-array-builder][append-null]");
+  return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+}
+
+G_DEFINE_TYPE(GArrowDecimal256ArrayBuilder,
+              garrow_decimal256_array_builder,
+              GARROW_TYPE_FIXED_SIZE_BINARY_ARRAY_BUILDER)
+
+static void
+garrow_decimal256_array_builder_init(GArrowDecimal256ArrayBuilder *builder)
+{
+}
+
+static void
+garrow_decimal256_array_builder_class_init(GArrowDecimal256ArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_decimal256_array_builder_new:
+ * @data_type: #GArrowDecimal256DataType for the decimal.
+ *
+ * Returns: A newly created #GArrowDecimal256ArrayBuilder.
+ *
+ * Since: 3.0.0
+ */
+GArrowDecimal256ArrayBuilder *
+garrow_decimal256_array_builder_new(GArrowDecimal256DataType *data_type)
+{
+  auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+  auto builder =
+    garrow_array_builder_new(arrow_data_type, NULL, "[decimal256-array-builder][new]");
+  return GARROW_DECIMAL256_ARRAY_BUILDER(builder);
+}
+
+/**
+ * garrow_decimal256_array_builder_append_value:
+ * @builder: A #GArrowDecimal256ArrayBuilder.
+ * @value: (nullable): A decimal value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_decimal256_array_builder_append_value(GArrowDecimal256ArrayBuilder *builder,
+                                             GArrowDecimal256 *value,
+                                             GError **error)
+{
+  if (value) {
+    auto arrow_decimal = garrow_decimal256_get_raw(value);
+    return garrow_array_builder_append_value<arrow::Decimal256Builder>(
+      GARROW_ARRAY_BUILDER(builder),
+      *arrow_decimal,
+      error,
+      "[decimal256-array-builder][append-value]");
+  } else {
+    return garrow_array_builder_append_null(GARROW_ARRAY_BUILDER(builder), error);
+  }
+}
+
+/**
+ * garrow_decimal256_array_builder_append_values:
+ * @builder: A #GArrowDecimal256ArrayBuilder.
+ * @values: (array length=values_length): The array of #GArrowDecimal256.
+ * @values_length: The length of @values.
+ * @is_valids: (nullable) (array length=is_valids_length): The array of
+ *   boolean that shows whether the Nth value is valid or not. If the
+ *   Nth @is_valids is %TRUE, the Nth @values is valid value. Otherwise
+ *   the Nth value is null value.
+ * @is_valids_length: The length of @is_valids.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append multiple values at once. It's more efficient than multiple
+ * `append` and `append_null` calls.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 3.0.0
+ */
+gboolean
+garrow_decimal256_array_builder_append_values(GArrowDecimal256ArrayBuilder *builder,
+                                              GArrowDecimal256 **values,
+                                              gint64 values_length,
+                                              const gboolean *is_valids,
+                                              gint64 is_valids_length,
+                                              GError **error)
+{
+  return garrow_array_builder_append_values(
+    GARROW_ARRAY_BUILDER(builder),
+    values,
+    values_length,
+    is_valids,
+    is_valids_length,
+    error,
+    "[decimal256-array-builder][append-values]",
+    [](guint8 *output, GArrowDecimal256 *value, gsize size) {
+      auto arrow_decimal = garrow_decimal256_get_raw(value);
+      arrow_decimal->ToBytes(output);
+    });
+}
+
+G_DEFINE_ABSTRACT_TYPE(GArrowUnionArrayBuilder,
+                       garrow_union_array_builder,
+                       GARROW_TYPE_ARRAY_BUILDER)
+
+static void
+garrow_union_array_builder_init(GArrowUnionArrayBuilder *builder)
+{
+}
+
+static void
+garrow_union_array_builder_class_init(GArrowUnionArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_union_array_builder_append_child:
+ * @builder: A #GArrowUnionArrayBuilder.
+ * @child: A #GArrowArrayBuilder for new child.
+ * @field_name: (nullable): A field name for new child.
+ *
+ * Returns: The type ID for the appended child.
+ *
+ * Since: 12.0.00
+ */
+gint8
+garrow_union_array_builder_append_child(GArrowUnionArrayBuilder *builder,
+                                        GArrowArrayBuilder *child,
+                                        const gchar *field_name)
+{
+  auto arrow_builder = std::static_pointer_cast<arrow::BasicUnionBuilder>(
+    garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder)));
+  auto arrow_child = garrow_array_builder_get_raw(child);
+  if (!field_name) {
+    field_name = "";
+  }
+  return arrow_builder->AppendChild(arrow_child, field_name);
+}
+
+/**
+ * garrow_union_array_builder_append_value:
+ * @builder: A #GArrowUnionArrayBuilder.
+ * @value: A type ID value.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Append an element to the union array.
+ *
+ * If @builder is #GArrowDenseUnionArrayBuilder, this must be followed by an
+ * append to the appropriate child builder.
+ *
+ * If @builder is #GArrowSparseUnionArrayBuilder, this must be
+ * followed by appends to all child builders. The corresponding child
+ * builder must be appended to independently after this method is
+ * called, and all other child builders must have null or empty value
+ * appended.
+ *
+ * Returns: %TRUE on success, %FALSE if there was an error.
+ *
+ * Since: 12.0.0
+ */
+gboolean
+garrow_union_array_builder_append_value(GArrowUnionArrayBuilder *builder,
+                                        gint8 value,
+                                        GError **error)
+{
+  auto arrow_builder = garrow_array_builder_get_raw(GARROW_ARRAY_BUILDER(builder));
+  arrow::Status status;
+  if (GARROW_IS_DENSE_UNION_ARRAY_BUILDER(builder)) {
+    auto arrow_union_builder =
+      std::static_pointer_cast<arrow::DenseUnionBuilder>(arrow_builder);
+    status = arrow_union_builder->Append(value);
+  } else {
+    auto arrow_union_builder =
+      std::static_pointer_cast<arrow::SparseUnionBuilder>(arrow_builder);
+    status = arrow_union_builder->Append(value);
+  }
+  return garrow_error_check(error, status, "[union-array-builder][append-value]");
+}
+
+G_END_DECLS
+template <typename BUILDER>
+GArrowArrayBuilder *
+garrow_union_array_builder_new(GArrowUnionDataType *data_type,
+                               GType builder_gtype,
+                               const gchar *context,
+                               GError **error)
+{
+  if (data_type) {
+    auto arrow_data_type = garrow_data_type_get_raw(GARROW_DATA_TYPE(data_type));
+    return garrow_array_builder_new(arrow_data_type, error, context);
+  } else {
+    auto memory_pool = arrow::default_memory_pool();
+    auto arrow_builder = std::static_pointer_cast<arrow::ArrayBuilder>(
+      std::make_shared<BUILDER>(memory_pool));
+    return garrow_array_builder_new_raw(&arrow_builder, builder_gtype);
+  }
+}
+G_BEGIN_DECLS
+
+G_DEFINE_TYPE(GArrowDenseUnionArrayBuilder,
+              garrow_dense_union_array_builder,
+              GARROW_TYPE_UNION_ARRAY_BUILDER)
+
+static void
+garrow_dense_union_array_builder_init(GArrowDenseUnionArrayBuilder *builder)
+{
+}
+
+static void
+garrow_dense_union_array_builder_class_init(GArrowDenseUnionArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_dense_union_array_builder_new:
+ * @data_type: (nullable): #GArrowDenseUnionDataType for the dense
+ *   union. If this is %NULL, you start an empty children dense
+ *   union. You can add children by
+ *   multiple `garrow_union_array_builder_append_child()` calls.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowDenseUnionArrayBuilder
+ *   on success, %NULL on error.
+ *
+ * Since: 12.0.0
+ */
+GArrowDenseUnionArrayBuilder *
+garrow_dense_union_array_builder_new(GArrowDenseUnionDataType *data_type, GError **error)
+{
+  auto builder = garrow_union_array_builder_new<arrow::DenseUnionBuilder>(
+    GARROW_UNION_DATA_TYPE(data_type),
+    GARROW_TYPE_DENSE_UNION_ARRAY_BUILDER,
+    "[dense-union-array-builder][new]",
+    error);
+  if (!builder) {
+    return nullptr;
+  }
+  return GARROW_DENSE_UNION_ARRAY_BUILDER(builder);
+}
+
+G_DEFINE_TYPE(GArrowSparseUnionArrayBuilder,
+              garrow_sparse_union_array_builder,
+              GARROW_TYPE_UNION_ARRAY_BUILDER)
+
+static void
+garrow_sparse_union_array_builder_init(GArrowSparseUnionArrayBuilder *builder)
+{
+}
+
+static void
+garrow_sparse_union_array_builder_class_init(GArrowSparseUnionArrayBuilderClass *klass)
+{
+}
+
+/**
+ * garrow_sparse_union_array_builder_new:
+ * @data_type: (nullable): #GArrowSparseUnionDataType for the sparse
+ *   union. If this is %NULL, you start an empty children sparse
+ *   union. You can add children by
+ *   multiple `garrow_union_array_builder_append_child()` calls.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowSparseUnionArrayBuilder
+ *   on success, %NULL on error.
+ *
+ * Since: 12.0.0
+ */
+GArrowSparseUnionArrayBuilder *
+garrow_sparse_union_array_builder_new(GArrowSparseUnionDataType *data_type,
+                                      GError **error)
+{
+  auto builder = garrow_union_array_builder_new<arrow::SparseUnionBuilder>(
+    GARROW_UNION_DATA_TYPE(data_type),
+    GARROW_TYPE_SPARSE_UNION_ARRAY_BUILDER,
+    "[sparse-union-array-builder][new]",
+    error);
+  if (!builder) {
+    return nullptr;
+  }
+  return GARROW_SPARSE_UNION_ARRAY_BUILDER(builder);
 }
 
 G_END_DECLS
 
 GArrowArrayBuilder *
-garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
+garrow_array_builder_new_raw(std::shared_ptr<arrow::ArrayBuilder> *arrow_builder,
                              GType type)
 {
   if (type == G_TYPE_INVALID) {
-    switch (arrow_builder->type()->id()) {
+    switch ((*arrow_builder)->type()->id()) {
     case arrow::Type::type::NA:
       type = GARROW_TYPE_NULL_ARRAY_BUILDER;
       break;
@@ -4868,6 +6725,9 @@ garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
     case arrow::Type::type::INT64:
       type = GARROW_TYPE_INT64_ARRAY_BUILDER;
       break;
+    case arrow::Type::type::HALF_FLOAT:
+      type = GARROW_TYPE_HALF_FLOAT_ARRAY_BUILDER;
+      break;
     case arrow::Type::type::FLOAT:
       type = GARROW_TYPE_FLOAT_ARRAY_BUILDER;
       break;
@@ -4886,6 +6746,9 @@ garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
     case arrow::Type::type::LARGE_STRING:
       type = GARROW_TYPE_LARGE_STRING_ARRAY_BUILDER;
       break;
+    case arrow::Type::type::FIXED_SIZE_BINARY:
+      type = GARROW_TYPE_FIXED_SIZE_BINARY_ARRAY_BUILDER;
+      break;
     case arrow::Type::type::DATE32:
       type = GARROW_TYPE_DATE32_ARRAY_BUILDER;
       break;
@@ -4901,6 +6764,15 @@ garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
     case arrow::Type::type::TIME64:
       type = GARROW_TYPE_TIME64_ARRAY_BUILDER;
       break;
+    case arrow::Type::type::INTERVAL_MONTHS:
+      type = GARROW_TYPE_MONTH_INTERVAL_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::INTERVAL_DAY_TIME:
+      type = GARROW_TYPE_DAY_TIME_INTERVAL_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::INTERVAL_MONTH_DAY_NANO:
+      type = GARROW_TYPE_MONTH_DAY_NANO_INTERVAL_ARRAY_BUILDER;
+      break;
     case arrow::Type::type::LIST:
       type = GARROW_TYPE_LIST_ARRAY_BUILDER;
       break;
@@ -4913,8 +6785,40 @@ garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
     case arrow::Type::type::MAP:
       type = GARROW_TYPE_MAP_ARRAY_BUILDER;
       break;
-    case arrow::Type::type::DECIMAL:
+    case arrow::Type::type::DECIMAL32:
+      type = GARROW_TYPE_DECIMAL32_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::DECIMAL64:
+      type = GARROW_TYPE_DECIMAL64_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::DECIMAL128:
       type = GARROW_TYPE_DECIMAL128_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::DECIMAL256:
+      type = GARROW_TYPE_DECIMAL256_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::DICTIONARY:
+      {
+        auto dict_type =
+          std::static_pointer_cast<arrow::DictionaryType>((*arrow_builder)->type());
+        switch (dict_type->value_type()->id()) {
+        case arrow::Type::type::BINARY:
+          type = GARROW_TYPE_BINARY_DICTIONARY_ARRAY_BUILDER;
+          break;
+        case arrow::Type::type::STRING:
+          type = GARROW_TYPE_STRING_DICTIONARY_ARRAY_BUILDER;
+          break;
+        default:
+          type = GARROW_TYPE_ARRAY_BUILDER;
+          break;
+        }
+      }
+      break;
+    case arrow::Type::type::DENSE_UNION:
+      type = GARROW_TYPE_DENSE_UNION_ARRAY_BUILDER;
+      break;
+    case arrow::Type::type::SPARSE_UNION:
+      type = GARROW_TYPE_SPARSE_UNION_ARRAY_BUILDER;
       break;
     default:
       type = GARROW_TYPE_ARRAY_BUILDER;
@@ -4923,13 +6827,26 @@ garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder,
   }
 
   auto builder =
-    GARROW_ARRAY_BUILDER(g_object_new(type,
-                                      "array-builder", arrow_builder,
-                                      NULL));
+    GARROW_ARRAY_BUILDER(g_object_new(type, "array-builder", arrow_builder, NULL));
   return builder;
 }
 
-arrow::ArrayBuilder *
+GArrowArrayBuilder *
+garrow_array_builder_new_raw(arrow::ArrayBuilder *arrow_builder, GType type)
+{
+  struct NothingDeleter
+  {
+    void
+    operator()(arrow::ArrayBuilder *arrow_builder)
+    {
+    }
+  };
+  std::shared_ptr<arrow::ArrayBuilder> arrow_shared_builder(arrow_builder,
+                                                            NothingDeleter());
+  return garrow_array_builder_new_raw(&arrow_shared_builder, type);
+}
+
+std::shared_ptr<arrow::ArrayBuilder>
 garrow_array_builder_get_raw(GArrowArrayBuilder *builder)
 {
   auto priv = GARROW_ARRAY_BUILDER_GET_PRIVATE(builder);

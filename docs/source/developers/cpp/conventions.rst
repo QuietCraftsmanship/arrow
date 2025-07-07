@@ -15,6 +15,8 @@
 .. specific language governing permissions and limitations
 .. under the License.
 
+.. highlight:: cpp
+
 ===========
 Conventions
 ===========
@@ -34,15 +36,29 @@ C++ header files use the ``.h`` extension. Any header file name not
 containing ``internal`` is considered to be a public header, and will be
 automatically installed by the build.
 
+Comments and Docstrings
+=======================
+
+Regular comments start with ``//``.
+
+Doxygen docstrings start with ``///``, and Doxygen directives start with ``\``,
+like this::
+
+   /// \brief Allocate a fixed size mutable buffer from a memory pool, zero its padding.
+   ///
+   /// \param[in] size size of buffer to allocate
+   /// \param[in] pool a memory pool
+   ARROW_EXPORT
+   Result<std::unique_ptr<Buffer>> AllocateBuffer(const int64_t size,
+                                                  MemoryPool* pool = NULLPTR);
+
+The summary line of a docstring uses the infinitive, not the indicative
+(for example, "Allocate a buffer" rather than "Allocates a buffer").
+
 Memory Pools
 ============
 
-We provide a default memory pool with ``arrow::default_memory_pool()``. As a
-matter of convenience, some of the array builder classes have constructors
-which use the default pool without explicitly passing it. One can override the
-default optional memory pool by defining the ``ARROW_MEMORY_POOL_DEFAULT``
-macro to an assignment of a global function,
-e.g. ``= my_default_memory_pool()``.
+We provide a default memory pool with ``arrow::default_memory_pool()``.
 
 Error Handling and Exceptions
 =============================

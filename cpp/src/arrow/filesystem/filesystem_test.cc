@@ -20,14 +20,17 @@
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "arrow/filesystem/filesystem.h"
 #include "arrow/filesystem/mockfs.h"
 #include "arrow/filesystem/path_util.h"
 #include "arrow/filesystem/test_util.h"
+#include "arrow/filesystem/util_internal.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/util/key_value_metadata.h"
 
 namespace arrow {
 namespace fs {
@@ -85,6 +88,34 @@ TEST(PathUtil, SplitAbstractPath) {
   AssertPartsEqual(parts, {"abc", "def.ghi"});
 }
 
+TEST(PathUtil, SliceAbstractPath) {
+  std::string path = "abc";
+  ASSERT_EQ("abc", SliceAbstractPath(path, 0, 1));
+  ASSERT_EQ("abc", SliceAbstractPath(path, 0, 2));
+  ASSERT_EQ("", SliceAbstractPath(path, 0, 0));
+  ASSERT_EQ("", SliceAbstractPath(path, 1, 0));
+
+  path = "abc/def\\x/y.ext";
+  ASSERT_EQ("abc/def\\x/y.ext", SliceAbstractPath(path, 0, 4));
+  ASSERT_EQ("abc/def\\x/y.ext", SliceAbstractPath(path, 0, 3));
+  ASSERT_EQ("abc/def\\x", SliceAbstractPath(path, 0, 2));
+  ASSERT_EQ("abc", SliceAbstractPath(path, 0, 1));
+  ASSERT_EQ("def\\x/y.ext", SliceAbstractPath(path, 1, 2));
+  ASSERT_EQ("def\\x/y.ext", SliceAbstractPath(path, 1, 3));
+  ASSERT_EQ("def\\x", SliceAbstractPath(path, 1, 1));
+  ASSERT_EQ("y.ext", SliceAbstractPath(path, 2, 1));
+  ASSERT_EQ("", SliceAbstractPath(path, 3, 1));
+
+  path = "x/y\\z";
+  ASSERT_EQ("x", SliceAbstractPath(path, 0, 1));
+  ASSERT_EQ("x/y", SliceAbstractPath(path, 0, 1, /*sep=*/'\\'));
+
+  // Invalid cases but we shouldn't crash
+  ASSERT_EQ("", SliceAbstractPath(path, -1, 1));
+  ASSERT_EQ("", SliceAbstractPath(path, 0, -1));
+  ASSERT_EQ("", SliceAbstractPath(path, -1, -1));
+}
+
 TEST(PathUtil, GetAbstractPathExtension) {
   ASSERT_EQ(GetAbstractPathExtension("abc.txt"), "txt");
   ASSERT_EQ(GetAbstractPathExtension("dir/abc.txt"), "txt");
@@ -94,6 +125,19 @@ TEST(PathUtil, GetAbstractPathExtension) {
   ASSERT_EQ(GetAbstractPathExtension("abc"), "");
   ASSERT_EQ(GetAbstractPathExtension("/dir/abc"), "");
   ASSERT_EQ(GetAbstractPathExtension("/run.d/abc"), "");
+}
+
+TEST(PathUtil, GetAbstractPathDepth) {
+  ASSERT_EQ(0, GetAbstractPathDepth(""));
+  ASSERT_EQ(0, GetAbstractPathDepth("/"));
+  ASSERT_EQ(1, GetAbstractPathDepth("foo"));
+  ASSERT_EQ(1, GetAbstractPathDepth("foo/"));
+  ASSERT_EQ(1, GetAbstractPathDepth("/foo"));
+  ASSERT_EQ(1, GetAbstractPathDepth("/foo/"));
+  ASSERT_EQ(2, GetAbstractPathDepth("/foo/bar"));
+  ASSERT_EQ(2, GetAbstractPathDepth("/foo/bar/"));
+  ASSERT_EQ(2, GetAbstractPathDepth("foo/bar"));
+  ASSERT_EQ(2, GetAbstractPathDepth("foo/bar/"));
 }
 
 TEST(PathUtil, GetAbstractPathParent) {
@@ -107,6 +151,18 @@ TEST(PathUtil, GetAbstractPathParent) {
   AssertPairEqual(pair, {"abc/def", "ghi"});
   pair = GetAbstractPathParent("abc/def\\ghi");
   AssertPairEqual(pair, {"abc", "def\\ghi"});
+}
+
+TEST(PathUtil, ValidateAbstractPath) {
+  ASSERT_OK(ValidateAbstractPath(""));
+  ASSERT_OK(ValidateAbstractPath("abc"));
+  ASSERT_OK(ValidateAbstractPath("abc/def"));
+  ASSERT_OK(ValidateAbstractPath("abc/def.ghi"));
+  ASSERT_OK(ValidateAbstractPath("abc/def\\ghi"));
+
+  // Extraneous separators
+  ASSERT_RAISES(Invalid, ValidateAbstractPath("//"));
+  ASSERT_RAISES(Invalid, ValidateAbstractPath("abc//def"));
 }
 
 TEST(PathUtil, ValidateAbstractPathParts) {
@@ -139,7 +195,7 @@ TEST(PathUtil, ConcatAbstractPath) {
 }
 
 TEST(PathUtil, JoinAbstractPath) {
-  std::vector<std::string> parts = {"abc", "def", "ghi", "jkl"};
+  std::vector<std::string> parts = {"abc", "def", "ghi", "", "jkl"};
 
   ASSERT_EQ("abc/def/ghi/jkl", JoinAbstractPath(parts.begin(), parts.end()));
   ASSERT_EQ("def/ghi", JoinAbstractPath(parts.begin() + 1, parts.begin() + 3));
@@ -188,6 +244,16 @@ TEST(PathUtil, RemoveLeadingSlash) {
   ASSERT_EQ("abc/def/", std::string(RemoveLeadingSlash("//abc/def/")));
 }
 
+TEST(PathUtil, IsAncestorOf) {
+  ASSERT_TRUE(IsAncestorOf("", ""));
+  ASSERT_TRUE(IsAncestorOf("", "/hello"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello"));
+  ASSERT_FALSE(IsAncestorOf("/hello", "/world"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello/world"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello/world/how/are/you"));
+  ASSERT_FALSE(IsAncestorOf("/hello/w", "/hello/world"));
+}
+
 TEST(PathUtil, MakeAbstractPathRelative) {
   ASSERT_OK_AND_EQ("", MakeAbstractPathRelative("/", "/"));
   ASSERT_OK_AND_EQ("foo/bar", MakeAbstractPathRelative("/", "/foo/bar"));
@@ -223,6 +289,21 @@ TEST(PathUtil, AncestorsFromBasePath) {
             V({"foo/bar", "foo/bar/baz"}));
 }
 
+TEST(PathUtil, MinimalCreateDirSet) {
+  using V = std::vector<std::string>;
+
+  ASSERT_EQ(MinimalCreateDirSet({}), V{});
+  ASSERT_EQ(MinimalCreateDirSet({"foo"}), V{"foo"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar"}), V{"foo/bar"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar/baz"}), V{"foo/bar/baz"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar", "foo/bar"}), V{"foo/bar"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar", "foo", "foo/baz", "foo/baz/quux"}),
+            V({"foo/bar", "foo/baz/quux"}));
+
+  ASSERT_EQ(MinimalCreateDirSet({""}), V{});
+  ASSERT_EQ(MinimalCreateDirSet({"", "/foo"}), V{"/foo"});
+}
+
 TEST(PathUtil, ToBackslashes) {
   ASSERT_EQ(ToBackslashes("foo/bar"), "foo\\bar");
   ASSERT_EQ(ToBackslashes("//foo/bar/"), "\\\\foo\\bar\\");
@@ -239,24 +320,94 @@ TEST(PathUtil, ToSlashes) {
 #endif
 }
 
+TEST(PathUtil, Globber) {
+  Globber empty("");
+  ASSERT_FALSE(empty.Matches("/1.txt"));
+
+  Globber star("/*");
+  ASSERT_TRUE(star.Matches("/a.txt"));
+  ASSERT_TRUE(star.Matches("/b.csv"));
+  ASSERT_FALSE(star.Matches("/foo/c.parquet"));
+
+  Globber question("/a?b");
+  ASSERT_TRUE(question.Matches("/acb"));
+  ASSERT_FALSE(question.Matches("/a/b"));
+
+  Globber localfs_linux("/f?o/bar/a?/1*.txt");
+  ASSERT_TRUE(localfs_linux.Matches("/foo/bar/a1/1.txt"));
+  ASSERT_TRUE(localfs_linux.Matches("/f#o/bar/ab/1000.txt"));
+  ASSERT_FALSE(localfs_linux.Matches("/f#o/bar/ab/1/23.txt"));
+
+  Globber localfs_windows("C:/f?o/bar/a?/1*.txt");
+  ASSERT_TRUE(localfs_windows.Matches("C:/f_o/bar/ac/1000.txt"));
+
+  Globber remotefs("/my|bucket(#?)/foo{*}/[?]bar~/b&z/a: *-c.txt");
+  ASSERT_TRUE(remotefs.Matches("/my|bucket(#0)/foo{}/[?]bar~/b&z/a: -c.txt"));
+  ASSERT_TRUE(remotefs.Matches("/my|bucket(#%)/foo{abc}/[_]bar~/b&z/a: ab-c.txt"));
+
+  Globber wildcards("/bucket?/f\\?o/\\*/*.parquet");
+  ASSERT_TRUE(wildcards.Matches("/bucket0/f?o/*/abc.parquet"));
+  ASSERT_FALSE(wildcards.Matches("/bucket0/foo/ab/a.parquet"));
+}
+
+void TestGlobFiles(const std::string& base_dir) {
+  auto fs = std::make_shared<MockFileSystem>(TimePoint{});
+
+  auto check_entries = [](const std::vector<FileInfo>& infos,
+                          std::vector<std::string> expected) -> void {
+    std::vector<std::string> actual(infos.size());
+    std::transform(infos.begin(), infos.end(), actual.begin(),
+                   [](const FileInfo& file) { return file.path(); });
+    std::sort(actual.begin(), actual.end());
+    ASSERT_EQ(actual, expected);
+  };
+
+  ASSERT_OK(fs->CreateDir(base_dir + "A/CD"));
+  ASSERT_OK(fs->CreateDir(base_dir + "AB/CD"));
+  ASSERT_OK(fs->CreateDir(base_dir + "AB/CD/ab"));
+  CreateFile(fs.get(), base_dir + "A/CD/ab.txt", "data");
+  CreateFile(fs.get(), base_dir + "AB/CD/a.txt", "data");
+  CreateFile(fs.get(), base_dir + "AB/CD/abc.txt", "data");
+  CreateFile(fs.get(), base_dir + "AB/CD/ab/c.txt", "data");
+
+  FileInfoVector infos;
+  ASSERT_OK_AND_ASSIGN(infos, GlobFiles(fs, base_dir + "A*/CD/?b*.txt"));
+  ASSERT_EQ(infos.size(), 2);
+  check_entries(infos, {base_dir + "A/CD/ab.txt", base_dir + "AB/CD/abc.txt"});
+
+  ASSERT_OK_AND_ASSIGN(infos, GlobFiles(fs, base_dir + "A*/CD/?/b*.txt"));
+  ASSERT_EQ(infos.size(), 0);
+}
+
+TEST(InternalUtil, GlobFilesWithoutLeadingSlash) { TestGlobFiles(""); }
+
+TEST(InternalUtil, GlobFilesWithLeadingSlash) { TestGlobFiles("/"); }
+
 ////////////////////////////////////////////////////////////////////////////
 // Generic MockFileSystem tests
 
+template <typename MockFileSystemType>
 class TestMockFSGeneric : public ::testing::Test, public GenericFileSystemTest {
  public:
   void SetUp() override {
     time_ = TimePoint(TimePoint::duration(42));
-    fs_ = std::make_shared<MockFileSystem>(time_);
+    fs_ = std::make_shared<MockFileSystemType>(time_);
   }
 
  protected:
   std::shared_ptr<FileSystem> GetEmptyFileSystem() override { return fs_; }
 
+  bool have_file_metadata() const override { return true; }
+
   TimePoint time_;
-  std::shared_ptr<MockFileSystem> fs_;
+  std::shared_ptr<FileSystem> fs_;
 };
 
-GENERIC_FS_TEST_FUNCTIONS(TestMockFSGeneric);
+using MockFileSystemTypes = ::testing::Types<MockFileSystem, MockAsyncFileSystem>;
+
+TYPED_TEST_SUITE(TestMockFSGeneric, MockFileSystemTypes);
+
+GENERIC_FS_TYPED_TEST_FUNCTIONS(TestMockFSGeneric);
 
 ////////////////////////////////////////////////////////////////////////////
 // Concrete MockFileSystem tests
@@ -426,6 +577,18 @@ TEST_F(TestMockFS, OpenOutputStream) {
   ASSERT_OK(stream->Close());
   CheckDirs({});
   CheckFiles({{"ab", time_, ""}});
+
+  // With metadata
+  auto metadata = KeyValueMetadata::Make({"some key"}, {"some value"});
+  ASSERT_OK_AND_ASSIGN(stream, fs_->OpenOutputStream("cd", metadata));
+  ASSERT_OK(WriteString(stream.get(), "data"));
+  ASSERT_OK(stream->Close());
+  CheckFiles({{"ab", time_, ""}, {"cd", time_, "data"}});
+
+  ASSERT_OK_AND_ASSIGN(auto input, fs_->OpenInputStream("cd"));
+  ASSERT_OK_AND_ASSIGN(auto got_metadata, input->ReadMetadata());
+  ASSERT_NE(got_metadata, nullptr);
+  ASSERT_TRUE(got_metadata->Equals(*metadata));
 }
 
 TEST_F(TestMockFS, OpenAppendStream) {
@@ -469,6 +632,13 @@ TEST_F(TestMockFS, FileSystemFromUri) {
   CheckDirs({});
   ASSERT_OK_AND_ASSIGN(fs_, FileSystemFromUri("mock:///foo/bar?q=zzz", &path));
   ASSERT_EQ(path, "foo/bar");
+  CheckDirs({});
+  ASSERT_OK_AND_ASSIGN(fs_, FileSystemFromUri("mock:/folder+name/bar?q=zzz", &path));
+  ASSERT_EQ(path, "folder+name/bar");
+  CheckDirs({});
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("syntax error at character ' ' (position 12)"),
+      FileSystemFromUri("mock:/folder name/bar", &path));
   CheckDirs({});
 }
 
@@ -593,6 +763,32 @@ TEST_F(TestSubTreeFileSystem, CopyFile) {
   CheckFiles({{"sub/tree/AB/ef", time_, "data"},
               {"sub/tree/ab", time_, "data"},
               {"sub/tree/cd", time_, "data"}});
+}
+
+TEST_F(TestSubTreeFileSystem, CopyFiles) {
+  ASSERT_OK(subfs_->CreateDir("AB"));
+  ASSERT_OK(subfs_->CreateDir("CD/CD"));
+  ASSERT_OK(subfs_->CreateDir("EF/EF/EF"));
+
+  CreateFile("AB/ab", "ab");
+  CreateFile("CD/CD/cd", "cd");
+  CreateFile("EF/EF/EF/ef", "ef");
+
+  ASSERT_OK(fs_->CreateDir("sub/copy"));
+  auto dest_fs = std::make_shared<SubTreeFileSystem>("sub/copy", fs_);
+
+  FileSelector sel;
+  sel.recursive = true;
+  ASSERT_OK(CopyFiles(subfs_, sel, dest_fs, ""));
+
+  CheckFiles({
+      {"sub/copy/AB/ab", time_, "ab"},
+      {"sub/copy/CD/CD/cd", time_, "cd"},
+      {"sub/copy/EF/EF/EF/ef", time_, "ef"},
+      {"sub/tree/AB/ab", time_, "ab"},
+      {"sub/tree/CD/CD/cd", time_, "cd"},
+      {"sub/tree/EF/EF/EF/ef", time_, "ef"},
+  });
 }
 
 TEST_F(TestSubTreeFileSystem, OpenInputStream) {

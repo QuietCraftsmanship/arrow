@@ -21,6 +21,7 @@
 #include <memory>
 
 #include "arrow/buffer.h"
+#include "arrow/c/abi.h"
 #include "arrow/io/concurrency.h"
 #include "arrow/type_fwd.h"
 
@@ -55,17 +56,6 @@ class ARROW_EXPORT CudaBuffer : public Buffer {
   /// \note This function returns an error if the buffer isn't backed
   /// by GPU memory
   static Result<std::shared_ptr<CudaBuffer>> FromBuffer(std::shared_ptr<Buffer> buffer);
-
-  /// \brief Convert back generic buffer into CudaBuffer
-  /// \param[in] buffer buffer to convert
-  /// \param[out] out conversion result
-  /// \return Status
-  ///
-  /// \note This function returns an error if the buffer isn't backed
-  /// by GPU memory
-  ARROW_DEPRECATED("Use Result-returning version")
-  static Status FromBuffer(std::shared_ptr<Buffer> buffer,
-                           std::shared_ptr<CudaBuffer>* out);
 
   /// \brief Copy memory from GPU device to CPU host
   /// \param[in] position start position inside buffer to copy bytes from
@@ -107,15 +97,6 @@ class ARROW_EXPORT CudaBuffer : public Buffer {
   /// when the CudaBuffer is destructed
   virtual Result<std::shared_ptr<CudaIpcMemHandle>> ExportForIpc();
 
-  /// \brief Expose this device buffer as IPC memory which can be used in other processes
-  /// \param[out] handle the exported IPC handle
-  /// \return Status
-  ///
-  /// \note After calling this function, this device memory will not be freed
-  /// when the CudaBuffer is destructed
-  ARROW_DEPRECATED("Use Result-returning version")
-  virtual Status ExportForIpc(std::shared_ptr<CudaIpcMemHandle>* handle);
-
   const std::shared_ptr<CudaContext>& context() const { return context_; }
 
  protected:
@@ -130,7 +111,8 @@ class ARROW_EXPORT CudaBuffer : public Buffer {
 /// \brief Device-accessible CPU memory created using cudaHostAlloc
 class ARROW_EXPORT CudaHostBuffer : public MutableBuffer {
  public:
-  using MutableBuffer::MutableBuffer;
+  CudaHostBuffer(uint8_t* data, const int64_t size);
+
   ~CudaHostBuffer();
 
   /// \brief Return a device address the GPU can read this memory from.
@@ -148,26 +130,11 @@ class ARROW_EXPORT CudaIpcMemHandle {
   /// \return Handle or Status
   static Result<std::shared_ptr<CudaIpcMemHandle>> FromBuffer(const void* opaque_handle);
 
-  /// \brief Create CudaIpcMemHandle from opaque buffer (e.g. from another process)
-  /// \param[in] opaque_handle a CUipcMemHandle as a const void*
-  /// \param[out] handle the CudaIpcMemHandle instance
-  /// \return Status
-  ARROW_DEPRECATED("Use Result-returning version")
-  static Status FromBuffer(const void* opaque_handle,
-                           std::shared_ptr<CudaIpcMemHandle>* handle);
-
   /// \brief Write CudaIpcMemHandle to a Buffer
   /// \param[in] pool a MemoryPool to allocate memory from
   /// \return Buffer or Status
   Result<std::shared_ptr<Buffer>> Serialize(
       MemoryPool* pool = default_memory_pool()) const;
-
-  /// \brief Write CudaIpcMemHandle to a Buffer
-  /// \param[in] pool a MemoryPool to allocate memory from
-  /// \param[out] out the serialized buffer
-  /// \return Status
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status Serialize(MemoryPool* pool, std::shared_ptr<Buffer>* out) const;
 
  private:
   explicit CudaIpcMemHandle(const void* handle);
@@ -284,26 +251,20 @@ ARROW_EXPORT
 Result<std::shared_ptr<CudaHostBuffer>> AllocateCudaHostBuffer(int device_number,
                                                                const int64_t size);
 
-/// \brief Allocate CUDA-accessible memory on CPU host
-///
-/// The GPU will benefit from fast access to this CPU-located buffer,
-/// including fast memory copy.
-///
-/// \param[in] device_number device to expose host memory
-/// \param[in] size number of bytes
-/// \param[out] out the allocated buffer
-/// \return Status
-ARROW_DEPRECATED("Use Result-returning version")
-ARROW_EXPORT
-Status AllocateCudaHostBuffer(int device_number, const int64_t size,
-                              std::shared_ptr<CudaHostBuffer>* out);
-
 /// Low-level: get a device address through which the CPU data be accessed.
+ARROW_EXPORT
 Result<uintptr_t> GetDeviceAddress(const uint8_t* cpu_data,
                                    const std::shared_ptr<CudaContext>& ctx);
 
 /// Low-level: get a CPU address through which the device data be accessed.
+ARROW_EXPORT
 Result<uint8_t*> GetHostAddress(uintptr_t device_ptr);
+
+ARROW_DEPRECATED(
+    "Deprecated in 16.0.0. The CUDA device is registered by default, and you can use "
+    "arrow::DefaultDeviceMapper instead.")
+Result<std::shared_ptr<MemoryManager>> DefaultMemoryMapper(ArrowDeviceType device_type,
+                                                           int64_t device_id);
 
 }  // namespace cuda
 }  // namespace arrow

@@ -33,10 +33,6 @@ Arrow Flight
 .. warning:: Flight is currently unstable. APIs are subject to change,
              though we don't expect drastic changes.
 
-.. warning:: Flight is currently not distributed as part of wheels or
-             in Conda - it is only available when built from source
-             appropriately.
-
 Common Types
 ------------
 
@@ -50,6 +46,8 @@ Common Types
     FlightEndpoint
     FlightInfo
     Location
+    MetadataRecordBatchReader
+    MetadataRecordBatchWriter
     Ticket
     Result
 
@@ -59,8 +57,11 @@ Flight Client
 .. autosummary::
    :toctree: ../generated/
 
+    connect
     FlightCallOptions
     FlightClient
+    FlightStreamReader
+    FlightStreamWriter
     ClientMiddlewareFactory
     ClientMiddleware
 
@@ -70,9 +71,12 @@ Flight Server
 .. autosummary::
    :toctree: ../generated/
 
+    FlightDataStream
+    FlightMetadataWriter
     FlightServerBase
     GeneratorStream
     RecordBatchStream
+    ServerCallContext
     ServerMiddlewareFactory
     ServerMiddleware
 
@@ -84,6 +88,22 @@ Authentication
 
     ClientAuthHandler
     ServerAuthHandler
+
+Errors
+------
+
+.. autosummary::
+   :toctree: ../generated/
+
+    FlightError
+    FlightCancelledError
+    FlightInternalError
+    FlightServerError
+    FlightTimedOutError
+    FlightUnauthenticatedError
+    FlightUnauthorizedError
+    FlightUnavailableError
+    FlightWriteSizeExceededError
 
 Middleware
 ----------

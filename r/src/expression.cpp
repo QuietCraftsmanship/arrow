@@ -17,148 +17,117 @@
 
 #include "./arrow_types.h"
 
-#if defined(ARROW_R_WITH_ARROW)
+#include <arrow/compute/api_scalar.h>
+#include <arrow/compute/expression.h>
+
+namespace compute = ::arrow::compute;
+
+std::shared_ptr<compute::FunctionOptions> make_compute_options(std::string func_name,
+                                                               cpp11::list options);
 
 // [[arrow::export]]
-std::shared_ptr<ds::Expression> dataset___expr__field_ref(std::string name) {
-  return std::make_shared<ds::FieldExpression>(std::move(name));
+bool compute___expr__equals(const std::shared_ptr<compute::Expression>& lhs,
+                            const std::shared_ptr<compute::Expression>& rhs) {
+  return lhs->Equals(*rhs);
 }
-
 // [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__equal(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::equal(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__not_equal(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::not_equal(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__greater(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::greater(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__greater_equal(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::greater_equal(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__less(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::less(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ComparisonExpression> dataset___expr__less_equal(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::less_equal(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::InExpression> dataset___expr__in(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<arrow::Array>& rhs) {
-  return std::make_shared<ds::InExpression>(lhs->In(rhs));
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::AndExpression> dataset___expr__and(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::and_(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::OrExpression> dataset___expr__or(
-    const std::shared_ptr<ds::Expression>& lhs,
-    const std::shared_ptr<ds::Expression>& rhs) {
-  return ds::or_(lhs, rhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::NotExpression> dataset___expr__not(
-    const std::shared_ptr<ds::Expression>& lhs) {
-  return ds::not_(lhs);
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::IsValidExpression> dataset___expr__is_valid(
-    const std::shared_ptr<ds::Expression>& lhs) {
-  return std::make_shared<ds::IsValidExpression>(lhs->IsValid());
-}
-
-// [[arrow::export]]
-std::shared_ptr<ds::ScalarExpression> dataset___expr__scalar(SEXP x) {
-  switch (TYPEOF(x)) {
-    case NILSXP:
-      return ds::scalar(std::make_shared<arrow::NullScalar>());
-    case LGLSXP:
-      return ds::scalar(Rf_asLogical(x));
-    case REALSXP:
-      if (Rf_inherits(x, "Date")) {
-        return std::make_shared<ds::ScalarExpression>(
-            std::make_shared<arrow::Date32Scalar>(REAL(x)[0]));
-      } else if (Rf_inherits(x, "POSIXct")) {
-        return std::make_shared<ds::ScalarExpression>(
-            std::make_shared<arrow::TimestampScalar>(
-                REAL(x)[0], arrow::timestamp(arrow::TimeUnit::SECOND)));
-      } else if (Rf_inherits(x, "integer64")) {
-        int64_t value = *reinterpret_cast<int64_t*>(REAL(x));
-        return ds::scalar(value);
-      } else if (Rf_inherits(x, "difftime")) {
-        int multiplier = 0;
-        // TODO: shared with TimeConverter<> in array_from_vector.cpp
-        std::string unit(CHAR(STRING_ELT(Rf_getAttrib(x, arrow::r::symbols::units), 0)));
-        if (unit == "secs") {
-          multiplier = 1;
-        } else if (unit == "mins") {
-          multiplier = 60;
-        } else if (unit == "hours") {
-          multiplier = 3600;
-        } else if (unit == "days") {
-          multiplier = 86400;
-        } else if (unit == "weeks") {
-          multiplier = 604800;
-        } else {
-          Rcpp::stop("unknown difftime unit");
-        }
-        return ds::scalar(std::make_shared<arrow::Time32Scalar>(
-            static_cast<int>(REAL(x)[0] * multiplier),
-            arrow::time32(arrow::TimeUnit::SECOND)));
-      }
-      return ds::scalar(Rf_asReal(x));
-    case INTSXP:
-      if (Rf_inherits(x, "factor")) {
-        // TODO: This does not use the actual value, just the levels
-        auto type = arrow::r::InferArrowTypeFromFactor(x);
-        return ds::scalar(std::make_shared<arrow::DictionaryScalar>(type));
-      }
-      return ds::scalar(Rf_asInteger(x));
-    case STRSXP:
-      return ds::scalar(CHAR(STRING_ELT(x, 0)));
-    default:
-      Rcpp::stop(
-          tfm::format("R object of type %s not supported", Rf_type2char(TYPEOF(x))));
+std::shared_ptr<compute::Expression> compute___expr__call(std::string func_name,
+                                                          cpp11::list argument_list,
+                                                          cpp11::list options) {
+  std::vector<compute::Expression> arguments;
+  for (SEXP argument : argument_list) {
+    auto argument_ptr = cpp11::as_cpp<std::shared_ptr<compute::Expression>>(argument);
+    arguments.push_back(*argument_ptr);
   }
 
-  return nullptr;
+  auto options_ptr = make_compute_options(func_name, options);
+
+  return std::make_shared<compute::Expression>(
+      compute::call(std::move(func_name), std::move(arguments), std::move(options_ptr)));
 }
 
 // [[arrow::export]]
-std::string dataset___expr__ToString(const std::shared_ptr<ds::Expression>& x) {
+bool compute___expr__is_field_ref(const std::shared_ptr<compute::Expression>& x) {
+  return x->field_ref() != nullptr;
+}
+
+// [[arrow::export]]
+std::string compute___expr__get_field_ref_name(
+    const std::shared_ptr<compute::Expression>& x) {
+  if (auto field_ref = x->field_ref()) {
+    // Exclude nested field refs because we only use this to determine if we have simple
+    // field refs
+    if (!field_ref->IsNested()) {
+      return *field_ref->name();
+    }
+  }
+  return "";
+}
+
+// [[arrow::export]]
+std::vector<std::string> compute___expr__field_names_in_expression(
+    const std::shared_ptr<compute::Expression>& x) {
+  std::vector<std::string> names;
+  for (const auto& ref : compute::FieldsInExpression(*x)) {
+    if (ref.IsNested()) {
+      // Slight hack: this isn't the field's "name", but it's good enough
+      // for my current purposes. A nested field ref doesn't have a name property.
+      // Alternatively, we could skip nested refs like in get_field_ref_name
+      names.push_back(ref.ToString());
+    } else {
+      names.push_back(*ref.name());
+    }
+  }
+  return names;
+}
+
+// [[arrow::export]]
+std::shared_ptr<compute::Expression> compute___expr__field_ref(std::string name) {
+  return std::make_shared<compute::Expression>(compute::field_ref(std::move(name)));
+}
+
+// [[arrow::export]]
+std::shared_ptr<compute::Expression> compute___expr__nested_field_ref(
+    const std::shared_ptr<compute::Expression>& x, std::string name) {
+  if (auto field_ref = x->field_ref()) {
+    std::vector<arrow::FieldRef> ref_vec;
+    if (field_ref->IsNested()) {
+      ref_vec = *field_ref->nested_refs();
+    } else {
+      // There's just one
+      ref_vec.push_back(*field_ref);
+    }
+    // Add the new ref
+    ref_vec.push_back(arrow::FieldRef(std::move(name)));
+    return std::make_shared<compute::Expression>(
+        compute::field_ref(arrow::FieldRef{std::move(ref_vec)}));
+  } else {
+    cpp11::stop("'x' must be a FieldRef Expression");
+  }
+}
+
+// [[arrow::export]]
+std::shared_ptr<compute::Expression> compute___expr__scalar(
+    const std::shared_ptr<arrow::Scalar>& x) {
+  return std::make_shared<compute::Expression>(compute::literal(std::move(x)));
+}
+
+// [[arrow::export]]
+std::string compute___expr__ToString(const std::shared_ptr<compute::Expression>& x) {
   return x->ToString();
 }
 
-#endif
+// [[arrow::export]]
+std::shared_ptr<arrow::DataType> compute___expr__type(
+    const std::shared_ptr<compute::Expression>& x,
+    const std::shared_ptr<arrow::Schema>& schema) {
+  auto bound = ValueOrStop(x->Bind(*schema));
+  return bound.type()->GetSharedPtr();
+}
+
+// [[arrow::export]]
+arrow::Type::type compute___expr__type_id(const std::shared_ptr<compute::Expression>& x,
+                                          const std::shared_ptr<arrow::Schema>& schema) {
+  auto bound = ValueOrStop(x->Bind(*schema));
+  return bound.type()->id();
+}

@@ -20,15 +20,16 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Apache.Arrow.Memory;
 
 namespace Apache.Arrow.Ipc
 {
-    public class ArrowFileWriter: ArrowStreamWriter
+    public class ArrowFileWriter : ArrowStreamWriter
     {
         private long _currentRecordBatchOffset = -1;
+        private long _currentDictionaryOffset = -1;
 
-        private bool HasWrittenHeader { get; set; }
-
+        private List<Block> DictionaryBlocks { get; set; }
         private List<Block> RecordBatchBlocks { get; }
 
         public ArrowFileWriter(Stream stream, Schema schema)
@@ -37,12 +38,17 @@ namespace Apache.Arrow.Ipc
         }
 
         public ArrowFileWriter(Stream stream, Schema schema, bool leaveOpen)
-            : this(stream, schema, leaveOpen, options: null)
+            : this(stream, schema, leaveOpen, options: null, allocator: null)
         {
         }
 
         public ArrowFileWriter(Stream stream, Schema schema, bool leaveOpen, IpcOptions options)
-            : base(stream, schema, leaveOpen, options)
+            : this(stream, schema, leaveOpen, options, allocator: null)
+        {
+        }
+
+        public ArrowFileWriter(Stream stream, Schema schema, bool leaveOpen, IpcOptions options, MemoryAllocator allocator)
+            : base(stream, schema, leaveOpen, options, allocator)
         {
             if (!stream.CanWrite)
             {
@@ -56,20 +62,23 @@ namespace Apache.Arrow.Ipc
                 throw new ArgumentException("stream must be seekable", nameof(stream));
             }
 
-            HasWrittenHeader = false;
-
             RecordBatchBlocks = new List<Block>();
+        }
+
+        public override void WriteRecordBatch(RecordBatch recordBatch)
+        {
+            // TODO: Compare record batch schema
+
+            WriteStart();
+
+            WriteRecordBatchInternal(recordBatch);
         }
 
         public override async Task WriteRecordBatchAsync(RecordBatch recordBatch, CancellationToken cancellationToken = default)
         {
             // TODO: Compare record batch schema
 
-            if (!HasWrittenHeader)
-            {
-                await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
-                HasWrittenHeader = true;
-            }
+            await WriteStartAsync(cancellationToken).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -104,6 +113,41 @@ namespace Apache.Arrow.Ipc
             _currentRecordBatchOffset = -1;
         }
 
+        private protected override void StartingWritingDictionary()
+        {
+            if (DictionaryBlocks == null) { DictionaryBlocks = new List<Block>(); }
+            _currentDictionaryOffset = BaseStream.Position;
+        }
+
+        private protected override void FinishedWritingDictionary(long bodyLength, long metadataLength)
+        {
+            // Dictionaries only appear after a Schema is written, so the dictionary offsets must
+            // always be greater than 0.
+            Debug.Assert(_currentDictionaryOffset > 0, "_currentDictionaryOffset must be positive.");
+
+            int metadataLengthInt = checked((int)metadataLength);
+
+            Debug.Assert(BitUtility.IsMultipleOf8(_currentDictionaryOffset));
+            Debug.Assert(BitUtility.IsMultipleOf8(metadataLengthInt));
+            Debug.Assert(BitUtility.IsMultipleOf8(bodyLength));
+
+            var block = new Block(
+                offset: _currentDictionaryOffset,
+                length: bodyLength,
+                metadataLength: metadataLengthInt);
+
+            DictionaryBlocks.Add(block);
+
+            _currentDictionaryOffset = -1;
+        }
+
+        private protected override void WriteEndInternal()
+        {
+            base.WriteEndInternal();
+
+            WriteFooter(Schema);
+        }
+
         private protected override async ValueTask WriteEndInternalAsync(CancellationToken cancellationToken)
         {
             await base.WriteEndInternalAsync(cancellationToken);
@@ -111,7 +155,15 @@ namespace Apache.Arrow.Ipc
             await WriteFooterAsync(Schema, cancellationToken);
         }
 
-        private async Task WriteHeaderAsync(CancellationToken cancellationToken)
+        private protected override void WriteStartInternal()
+        {
+            // Write magic number and empty padding up to the 8-byte boundary
+
+            WriteMagic();
+            WritePadding(CalculatePadding(ArrowFileConstants.Magic.Length));
+        }
+
+        private protected async override ValueTask WriteStartInternalAsync(CancellationToken cancellationToken)
         {
             // Write magic number and empty padding up to the 8-byte boundary
 
@@ -120,38 +172,114 @@ namespace Apache.Arrow.Ipc
                 .ConfigureAwait(false);
         }
 
-        private async Task WriteFooterAsync(Schema schema, CancellationToken cancellationToken)
+        private void WriteFooter(Schema schema)
         {
             Builder.Clear();
 
-            var offset = BaseStream.Position;
+            long offset = BaseStream.Position;
 
             // Serialize the schema
 
-            var schemaOffset = SerializeSchema(schema);
+            Google.FlatBuffers.Offset<Flatbuf.Schema> schemaOffset = SerializeSchema(schema);
 
             // Serialize all record batches
 
             Flatbuf.Footer.StartRecordBatchesVector(Builder, RecordBatchBlocks.Count);
 
-            foreach (var recordBatch in RecordBatchBlocks)
+            // flatbuffer struct vectors have to be created in reverse order
+            for (int i = RecordBatchBlocks.Count - 1; i >= 0; i--)
             {
+                Block recordBatch = RecordBatchBlocks[i];
                 Flatbuf.Block.CreateBlock(
                     Builder, recordBatch.Offset, recordBatch.MetadataLength, recordBatch.BodyLength);
             }
 
-            var recordBatchesVectorOffset = Builder.EndVector();
+            Google.FlatBuffers.VectorOffset recordBatchesVectorOffset = Builder.EndVector();
 
             // Serialize all dictionaries
-            // NOTE: Currently unsupported.
 
-            Flatbuf.Footer.StartDictionariesVector(Builder, 0);
+            int dictionaryCount = DictionaryBlocks?.Count ?? 0;
+            Flatbuf.Footer.StartDictionariesVector(Builder, dictionaryCount);
 
-            var dictionaryBatchesOffset = Builder.EndVector();
+            for (int i = dictionaryCount - 1; i >= 0; i--)
+            {
+                Block dictionary = DictionaryBlocks[i];
+                Flatbuf.Block.CreateBlock(
+                    Builder, dictionary.Offset, dictionary.MetadataLength, dictionary.BodyLength);
+            }
+
+            Google.FlatBuffers.VectorOffset dictionaryBatchesOffset = Builder.EndVector();
 
             // Serialize and write the footer flatbuffer
 
-            var footerOffset = Flatbuf.Footer.CreateFooter(Builder, CurrentMetadataVersion,
+            Google.FlatBuffers.Offset<Flatbuf.Footer> footerOffset = Flatbuf.Footer.CreateFooter(Builder, CurrentMetadataVersion,
+                schemaOffset, dictionaryBatchesOffset, recordBatchesVectorOffset);
+
+            Builder.Finish(footerOffset.Value);
+
+            WriteFlatBuffer();
+
+            // Write footer length
+
+            using (Buffers.RentReturn(4, out Memory<byte> buffer))
+            {
+                int footerLength;
+                checked
+                {
+                    footerLength = (int)(BaseStream.Position - offset);
+                }
+
+                BinaryPrimitives.WriteInt32LittleEndian(buffer.Span, footerLength);
+
+                BaseStream.Write(buffer);
+            }
+
+            // Write magic
+
+            WriteMagic();
+        }
+
+        private async Task WriteFooterAsync(Schema schema, CancellationToken cancellationToken)
+        {
+            Builder.Clear();
+
+            long offset = BaseStream.Position;
+
+            // Serialize the schema
+
+            Google.FlatBuffers.Offset<Flatbuf.Schema> schemaOffset = SerializeSchema(schema);
+
+            // Serialize all record batches
+
+            Flatbuf.Footer.StartRecordBatchesVector(Builder, RecordBatchBlocks.Count);
+
+            // flatbuffer struct vectors have to be created in reverse order
+            for (int i = RecordBatchBlocks.Count - 1; i >= 0; i--)
+            {
+                Block recordBatch = RecordBatchBlocks[i];
+                Flatbuf.Block.CreateBlock(
+                    Builder, recordBatch.Offset, recordBatch.MetadataLength, recordBatch.BodyLength);
+            }
+
+            Google.FlatBuffers.VectorOffset recordBatchesVectorOffset = Builder.EndVector();
+
+            // Serialize all dictionaries
+
+            int dictionaryCount = DictionaryBlocks?.Count ?? 0;
+            Flatbuf.Footer.StartDictionariesVector(Builder, dictionaryCount);
+
+            for (int i = dictionaryCount - 1; i >= 0; i--)
+            {
+                Block dictionary = DictionaryBlocks[i];
+                Flatbuf.Block.CreateBlock(
+                    Builder, dictionary.Offset, dictionary.MetadataLength, dictionary.BodyLength);
+            }
+
+            Google.FlatBuffers.VectorOffset dictionaryBatchesOffset = Builder.EndVector();
+
+            // Serialize and write the footer flatbuffer
+
+            Google.FlatBuffers.Offset<Flatbuf.Footer> footerOffset = Flatbuf.Footer.CreateFooter(Builder, CurrentMetadataVersion,
                 schemaOffset, dictionaryBatchesOffset, recordBatchesVectorOffset);
 
             Builder.Finish(footerOffset.Value);
@@ -164,7 +292,7 @@ namespace Apache.Arrow.Ipc
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            await Buffers.RentReturnAsync(4, async (buffer) =>
+            using (Buffers.RentReturn(4, out Memory<byte> buffer))
             {
                 int footerLength;
                 checked
@@ -175,11 +303,16 @@ namespace Apache.Arrow.Ipc
                 BinaryPrimitives.WriteInt32LittleEndian(buffer.Span, footerLength);
 
                 await BaseStream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
-            }).ConfigureAwait(false);
+            }
 
             // Write magic
 
             await WriteMagicAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        private void WriteMagic()
+        {
+            BaseStream.Write(ArrowFileConstants.Magic);
         }
 
         private ValueTask WriteMagicAsync(CancellationToken cancellationToken)

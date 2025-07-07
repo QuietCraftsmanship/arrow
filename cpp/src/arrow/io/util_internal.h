@@ -18,19 +18,15 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "arrow/io/interfaces.h"
+#include "arrow/util/thread_pool.h"
+#include "arrow/util/type_fwd.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
-
-namespace internal {
-
-class ThreadPool;
-
-}  // namespace internal
-
 namespace io {
 namespace internal {
 
@@ -49,12 +45,21 @@ ARROW_EXPORT Status ValidateWriteRange(int64_t offset, int64_t size, int64_t fil
 ARROW_EXPORT Status ValidateRange(int64_t offset, int64_t size);
 
 ARROW_EXPORT
-std::vector<ReadRange> CoalesceReadRanges(std::vector<ReadRange> ranges,
-                                          int64_t hole_size_limit,
-                                          int64_t range_size_limit);
+Result<std::vector<ReadRange>> CoalesceReadRanges(std::vector<ReadRange> ranges,
+                                                  int64_t hole_size_limit,
+                                                  int64_t range_size_limit);
 
 ARROW_EXPORT
 ::arrow::internal::ThreadPool* GetIOThreadPool();
+
+template <typename... SubmitArgs>
+auto SubmitIO(IOContext io_context, SubmitArgs&&... submit_args)
+    -> decltype(std::declval<::arrow::internal::Executor*>()->Submit(submit_args...)) {
+  ::arrow::internal::TaskHints hints;
+  hints.external_id = io_context.external_id();
+  return io_context.executor()->Submit(hints, io_context.stop_token(),
+                                       std::forward<SubmitArgs>(submit_args)...);
+}
 
 }  // namespace internal
 }  // namespace io

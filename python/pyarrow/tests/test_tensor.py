@@ -18,8 +18,13 @@
 import os
 import sys
 import pytest
+import warnings
+import weakref
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    pytestmark = pytest.mark.numpy
 import pyarrow as pa
 
 
@@ -65,6 +70,11 @@ def test_tensor_attrs():
     assert tensor.dim_name(0) == 'x'
     assert tensor.dim_name(1) == 'y'
 
+    wr = weakref.ref(tensor)
+    assert wr() is not None
+    del tensor
+    assert wr() is None
+
 
 def test_tensor_base_object():
     tensor = pa.Tensor.from_numpy(np.random.randn(10, 4))
@@ -76,8 +86,10 @@ def test_tensor_base_object():
 @pytest.mark.parametrize('dtype_str,arrow_type', tensor_type_pairs)
 def test_tensor_numpy_roundtrip(dtype_str, arrow_type):
     dtype = np.dtype(dtype_str)
-    data = (100 * np.random.randn(10, 4)).astype(dtype)
-
+    # Casting np.float64 -> uint32 or uint64 throws a RuntimeWarning
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        data = (100 * np.random.randn(10, 4)).astype(dtype)
     tensor = pa.Tensor.from_numpy(data)
     assert tensor.type == arrow_type
 
@@ -94,14 +106,15 @@ def test_tensor_ipc_roundtrip(tmpdir):
     path = os.path.join(str(tmpdir), 'pyarrow-tensor-ipc-roundtrip')
     mmap = pa.create_memory_map(path, 1024)
 
-    pa.write_tensor(tensor, mmap)
+    pa.ipc.write_tensor(tensor, mmap)
 
     mmap.seek(0)
-    result = pa.read_tensor(mmap)
+    result = pa.ipc.read_tensor(mmap)
 
     assert result.equals(tensor)
 
 
+@pytest.mark.gzip
 def test_tensor_ipc_read_from_compressed(tempdir):
     # ARROW-5910
     data = np.random.randn(10, 4)
@@ -110,10 +123,10 @@ def test_tensor_ipc_read_from_compressed(tempdir):
     path = tempdir / 'tensor-compressed-file'
 
     out_stream = pa.output_stream(path, compression='gzip')
-    pa.write_tensor(tensor, out_stream)
+    pa.ipc.write_tensor(tensor, out_stream)
     out_stream.close()
 
-    result = pa.read_tensor(pa.input_stream(path, compression='gzip'))
+    result = pa.ipc.read_tensor(pa.input_stream(path, compression='gzip'))
     assert result.equals(tensor)
 
 
@@ -129,10 +142,10 @@ def test_tensor_ipc_strided(tmpdir):
 
     for tensor in [tensor1, tensor2]:
         mmap.seek(0)
-        pa.write_tensor(tensor, mmap)
+        pa.ipc.write_tensor(tensor, mmap)
 
         mmap.seek(0)
-        result = pa.read_tensor(mmap)
+        result = pa.ipc.read_tensor(mmap)
 
         assert result.equals(tensor)
 
@@ -167,20 +180,24 @@ def test_tensor_hashing():
 def test_tensor_size():
     data = np.random.randn(10, 4)
     tensor = pa.Tensor.from_numpy(data)
-    assert pa.get_tensor_size(tensor) > (data.size * 8)
+    assert pa.ipc.get_tensor_size(tensor) > (data.size * 8)
 
 
 def test_read_tensor(tmpdir):
     # Create and write tensor tensor
     data = np.random.randn(10, 4)
     tensor = pa.Tensor.from_numpy(data)
-    data_size = pa.get_tensor_size(tensor)
+    data_size = pa.ipc.get_tensor_size(tensor)
     path = os.path.join(str(tmpdir), 'pyarrow-tensor-ipc-read-tensor')
     write_mmap = pa.create_memory_map(path, data_size)
-    pa.write_tensor(tensor, write_mmap)
+    pa.ipc.write_tensor(tensor, write_mmap)
+    if sys.platform == 'emscripten':
+        # emscripten doesn't support multiple
+        # memory maps to same file
+        write_mmap.close()
     # Try to read tensor
     read_mmap = pa.memory_map(path, mode='r')
-    array = pa.read_tensor(read_mmap).to_numpy()
+    array = pa.ipc.read_tensor(read_mmap).to_numpy()
     np.testing.assert_equal(data, array)
 
 

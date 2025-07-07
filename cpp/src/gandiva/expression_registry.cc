@@ -17,14 +17,15 @@
 
 #include "gandiva/expression_registry.h"
 
+#include "arrow/util/logging_internal.h"
 #include "gandiva/function_registry.h"
 #include "gandiva/llvm_types.h"
 
 namespace gandiva {
 
-ExpressionRegistry::ExpressionRegistry() {
-  function_registry_.reset(new FunctionRegistry());
-}
+ExpressionRegistry::ExpressionRegistry(
+    std::shared_ptr<FunctionRegistry> function_registry)
+    : function_registry_{function_registry} {}
 
 ExpressionRegistry::~ExpressionRegistry() {}
 
@@ -60,8 +61,8 @@ FunctionSignature ExpressionRegistry::FunctionSignatureIterator::operator*() {
   return *func_sig_it_;
 }
 
-ExpressionRegistry::func_sig_iterator_type ExpressionRegistry::FunctionSignatureIterator::
-operator++(int increment) {
+ExpressionRegistry::func_sig_iterator_type
+ExpressionRegistry::FunctionSignatureIterator::operator++(int increment) {
   ++func_sig_it_;
   // point func_sig_it_ to first signature of next nativefunction if func_sig_it_ is
   // pointing to end
@@ -75,10 +76,9 @@ operator++(int increment) {
   return func_sig_it_;
 }
 
-DataTypeVector ExpressionRegistry::supported_types_ =
-    ExpressionRegistry::InitSupportedTypes();
+static void AddArrowTypesToVector(arrow::Type::type type, DataTypeVector& vector);
 
-DataTypeVector ExpressionRegistry::InitSupportedTypes() {
+static DataTypeVector InitSupportedTypes() {
   DataTypeVector data_type_vector;
   llvm::LLVMContext llvm_context;
   LLVMTypes llvm_types(llvm_context);
@@ -89,8 +89,9 @@ DataTypeVector ExpressionRegistry::InitSupportedTypes() {
   return data_type_vector;
 }
 
-void ExpressionRegistry::AddArrowTypesToVector(arrow::Type::type& type,
-                                               DataTypeVector& vector) {
+DataTypeVector ExpressionRegistry::supported_types_ = InitSupportedTypes();
+
+static void AddArrowTypesToVector(arrow::Type::type type, DataTypeVector& vector) {
   switch (type) {
     case arrow::Type::type::BOOL:
       vector.push_back(arrow::boolean());
@@ -158,11 +159,13 @@ void ExpressionRegistry::AddArrowTypesToVector(arrow::Type::type& type,
       vector.push_back(arrow::null());
       break;
     case arrow::Type::type::DECIMAL:
-      vector.push_back(arrow::decimal(38, 0));
+      vector.push_back(arrow::decimal128(38, 0));
       break;
-    case arrow::Type::type::INTERVAL:
-      vector.push_back(arrow::day_time_interval());
+    case arrow::Type::type::INTERVAL_MONTHS:
       vector.push_back(arrow::month_interval());
+      break;
+    case arrow::Type::type::INTERVAL_DAY_TIME:
+      vector.push_back(arrow::day_time_interval());
       break;
     default:
       // Unsupported types. test ensures that

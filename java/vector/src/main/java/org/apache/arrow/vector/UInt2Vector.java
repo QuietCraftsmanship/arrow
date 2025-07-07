@@ -20,12 +20,12 @@ package org.apache.arrow.vector;
 import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
 
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.UInt2ReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableUInt2Holder;
 import org.apache.arrow.vector.holders.UInt2Holder;
 import org.apache.arrow.vector.types.Types.MinorType;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.TransferPair;
 
@@ -36,7 +36,7 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVector {
+public class UInt2Vector extends BaseFixedWidthVector implements BaseIntVector {
   private static final byte TYPE_WIDTH = 2;
   private final FieldReader reader;
 
@@ -45,11 +45,7 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   public UInt2Vector(String name, FieldType fieldType, BufferAllocator allocator) {
-    this(new Field(name, fieldType, null), allocator);
-  }
-
-  public UInt2Vector(Field field, BufferAllocator allocator) {
-    super(field, allocator, TYPE_WIDTH);
+    super(name, allocator, fieldType, TYPE_WIDTH);
     reader = new UInt2ReaderImpl(UInt2Vector.this);
   }
 
@@ -126,6 +122,22 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
     }
   }
 
+  /** Copies a value and validity bit from the given vector to this one. */
+  public void copyFrom(int fromIndex, int thisIndex, UInt2Vector from) {
+    BitVectorHelper.setValidityBit(validityBuffer, thisIndex, from.isSet(fromIndex));
+    final char value = from.valueBuffer.getChar(fromIndex * TYPE_WIDTH);
+    valueBuffer.setChar(thisIndex * TYPE_WIDTH, value);
+  }
+
+  /**
+   * Same as {@link #copyFrom(int, int, UInt2Vector)} but reallocate buffer if
+   * index is larger than capacity.
+   */
+  public void copyFromSafe(int fromIndex, int thisIndex, UInt2Vector from) {
+    handleSafe(thisIndex);
+    copyFrom(fromIndex, thisIndex, from);
+  }
+
 
   /*----------------------------------------------------------------*
    |                                                                |
@@ -149,7 +161,7 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
    * @param value   value of element
    */
   public void set(int index, int value) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, value);
   }
 
@@ -160,7 +172,7 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
    * @param value   value of element
    */
   public void set(int index, char value) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, value);
   }
 
@@ -176,10 +188,10 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
     if (holder.isSet < 0) {
       throw new IllegalArgumentException();
     } else if (holder.isSet > 0) {
-      BitVectorHelper.setBit(validityBuffer, index);
+      BitVectorHelper.setValidityBitToOne(validityBuffer, index);
       setValue(index, holder.value);
     } else {
-      BitVectorHelper.unsetBit(validityBuffer, index);
+      BitVectorHelper.setValidityBit(validityBuffer, index, 0);
     }
   }
 
@@ -190,7 +202,7 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
    * @param holder  data holder for value of element
    */
   public void set(int index, UInt2Holder holder) {
-    BitVectorHelper.setBit(validityBuffer, index);
+    BitVectorHelper.setValidityBitToOne(validityBuffer, index);
     setValue(index, holder.value);
   }
 
@@ -247,6 +259,18 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   /**
+   * Set the element at the given index to null.
+   *
+   * @param index   position of element
+   */
+  public void setNull(int index) {
+    handleSafe(index);
+    // not really needed to set the bit to 0 as long as
+    // the buffer always starts from 0.
+    BitVectorHelper.setValidityBit(validityBuffer, index, 0);
+  }
+
+  /**
    * Sets the given index to value is isSet is positive, otherwise sets
    * the position as invalid/null.
    */
@@ -254,7 +278,7 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
     if (isSet > 0) {
       set(index, value);
     } else {
-      BitVectorHelper.unsetBit(validityBuffer, index);
+      BitVectorHelper.setValidityBit(validityBuffer, index, 0);
     }
   }
 
@@ -286,18 +310,9 @@ public final class UInt2Vector extends BaseFixedWidthVector implements BaseIntVe
   }
 
   @Override
-  public void setWithPossibleTruncate(int index, long value) {
-    this.setSafe(index, (int) value);
-  }
-
-  @Override
-  public void setUnsafeWithPossibleTruncate(int index, long value) {
-    this.set(index, (int) value);
-  }
-
-  @Override
-  public long getValueAsLong(int index) {
-    return this.get(index);
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Character.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
   }
 
   private class TransferImpl implements TransferPair {

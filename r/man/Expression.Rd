@@ -2,36 +2,23 @@
 % Please edit documentation in R/expression.R
 \name{Expression}
 \alias{Expression}
-\alias{FieldExpression}
-\alias{ScalarExpression}
-\alias{ComparisonExpression}
-\alias{InExpression}
-\alias{AndExpression}
-\alias{OrExpression}
-\alias{NotExpression}
-\alias{IsValidExpression}
 \title{Arrow expressions}
 \description{
 \code{Expression}s are used to define filter logic for passing to a \link{Dataset}
-\link{Scanner}. \code{FieldExpression}s refer to columns in the \code{Dataset} and are
-compared to \code{ScalarExpression}s using \code{ComparisonExpression}s.
-\code{ComparisonExpression}s may be combined with \code{AndExpression} or
-\code{OrExpression} and negated with \code{NotExpression}. \code{IsValidExpression} is
-essentially \code{is.na()} for \code{Expression}s.
+\link{Scanner}.
+
+\code{Expression$scalar(x)} constructs an \code{Expression} which always evaluates to
+the provided scalar (length-1) R value.
+
+\code{Expression$field_ref(name)} is used to construct an \code{Expression} which
+evaluates to the named column in the \code{Dataset} against which it is evaluated.
+
+\code{Expression$create(function_name, ..., options)} builds a function-call
+\code{Expression} containing one or more \code{Expression}s. Anything in \code{...} that
+is not already an expression will be wrapped in \code{Expression$scalar()}.
+
+\code{Expression$op(FUN, ...)} is for logical and arithmetic operators. Scalar
+inputs in \code{...} will be attempted to be cast to the common type of the
+\code{Expression}s in the call so that the types of the columns in the \code{Dataset}
+are preserved and not unnecessarily upcast, which may be expensive.
 }
-\section{Factory}{
-
-\code{FieldExpression$create(name)} takes a string name as input. This string should
-refer to a column in a \code{Dataset} at the time it is evaluated, but you can
-construct a \code{FieldExpression} independently of any \code{Dataset}.
-
-\code{ScalarExpression$create(x)} takes a scalar (length-1) R value as input.
-
-\code{ComparisonExpression$create(OP, e1, e2)} takes a string operator name
-(e.g. "==", "!=", ">", etc.) and two \code{Expression} objects.
-
-\code{AndExpression$create(e1, e2)} and \code{OrExpression$create(e1, e2)} take
-two \code{Expression} objects, while \code{NotExpression$create(e1)} and
-\code{IsValidExpression$create(e1)} take a single \code{Expression}.
-}
-

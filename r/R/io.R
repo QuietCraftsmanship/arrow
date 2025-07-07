@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include arrow-package.R
+#' @include arrow-object.R
 #' @include enums.R
 #' @include buffer.R
 
 # OutputStream ------------------------------------------------------------
 
-Writable <- R6Class("Writable", inherit = ArrowObject,
+Writable <- R6Class("Writable",
+  inherit = ArrowObject,
   public = list(
     write = function(x) io___Writable__write(self, buffer(x))
   )
@@ -55,7 +56,8 @@ Writable <- R6Class("Writable", inherit = ArrowObject,
 #'
 #' @rdname OutputStream
 #' @name OutputStream
-OutputStream <- R6Class("OutputStream", inherit = Writable,
+OutputStream <- R6Class("OutputStream",
+  inherit = Writable,
   public = list(
     close = function() io___OutputStream__Close(self),
     tell = function() io___OutputStream__Tell(self)
@@ -68,31 +70,33 @@ OutputStream <- R6Class("OutputStream", inherit = Writable,
 #' @export
 FileOutputStream <- R6Class("FileOutputStream", inherit = OutputStream)
 FileOutputStream$create <- function(path) {
-  shared_ptr(FileOutputStream, io___FileOutputStream__Open(clean_path_abs(path)))
+  io___FileOutputStream__Open(clean_path_abs(path))
 }
 
 #' @usage NULL
 #' @format NULL
 #' @rdname OutputStream
 #' @export
-BufferOutputStream <- R6Class("BufferOutputStream", inherit = OutputStream,
+BufferOutputStream <- R6Class("BufferOutputStream",
+  inherit = OutputStream,
   public = list(
     capacity = function() io___BufferOutputStream__capacity(self),
-    finish = function() shared_ptr(Buffer, io___BufferOutputStream__Finish(self)),
+    finish = function() io___BufferOutputStream__Finish(self),
     write = function(bytes) io___BufferOutputStream__Write(self, bytes),
     tell = function() io___BufferOutputStream__Tell(self)
   )
 )
 BufferOutputStream$create <- function(initial_capacity = 0L) {
-  shared_ptr(BufferOutputStream, io___BufferOutputStream__Create(initial_capacity))
+  io___BufferOutputStream__Create(initial_capacity)
 }
 
 # InputStream -------------------------------------------------------------
 
 
-Readable <- R6Class("Readable", inherit = ArrowObject,
+Readable <- R6Class("Readable",
+  inherit = ArrowObject,
   public = list(
-    Read = function(nbytes) shared_ptr(Buffer, io___Readable__Read(self, nbytes))
+    Read = function(nbytes) io___Readable__Read(self, nbytes)
   )
 )
 
@@ -129,7 +133,8 @@ Readable <- R6Class("Readable", inherit = ArrowObject,
 #'
 #' @rdname InputStream
 #' @name InputStream
-InputStream <- R6Class("InputStream", inherit = Readable,
+InputStream <- R6Class("InputStream",
+  inherit = Readable,
   public = list(
     close = function() io___InputStream__Close(self)
   )
@@ -139,26 +144,28 @@ InputStream <- R6Class("InputStream", inherit = Readable,
 #' @format NULL
 #' @rdname InputStream
 #' @export
-RandomAccessFile <- R6Class("RandomAccessFile", inherit = InputStream,
+RandomAccessFile <- R6Class("RandomAccessFile",
+  inherit = InputStream,
   public = list(
     GetSize = function() io___RandomAccessFile__GetSize(self),
     supports_zero_copy = function() io___RandomAccessFile__supports_zero_copy(self),
     seek = function(position) io___RandomAccessFile__Seek(self, position),
     tell = function() io___RandomAccessFile__Tell(self),
-
     Read = function(nbytes = NULL) {
       if (is.null(nbytes)) {
-        shared_ptr(Buffer, io___RandomAccessFile__Read0(self))
+        io___RandomAccessFile__Read0(self)
       } else {
-        shared_ptr(Buffer, io___Readable__Read(self, nbytes))
+        io___Readable__Read(self, nbytes)
       }
     },
-
     ReadAt = function(position, nbytes = NULL) {
       if (is.null(nbytes)) {
         nbytes <- self$GetSize() - position
       }
-      shared_ptr(Buffer, io___RandomAccessFile__ReadAt(self, position, nbytes))
+      io___RandomAccessFile__ReadAt(self, position, nbytes)
+    },
+    ReadMetadata = function() {
+      as.list(io___RandomAccessFile__ReadMetadata(self))
     }
   )
 )
@@ -167,7 +174,8 @@ RandomAccessFile <- R6Class("RandomAccessFile", inherit = InputStream,
 #' @format NULL
 #' @rdname InputStream
 #' @export
-MemoryMappedFile <- R6Class("MemoryMappedFile", inherit = RandomAccessFile,
+MemoryMappedFile <- R6Class("MemoryMappedFile",
+  inherit = RandomAccessFile,
   public = list(
     Resize = function(size) io___MemoryMappedFile__Resize(self, size)
   )
@@ -179,7 +187,7 @@ MemoryMappedFile <- R6Class("MemoryMappedFile", inherit = RandomAccessFile,
 #' @export
 ReadableFile <- R6Class("ReadableFile", inherit = RandomAccessFile)
 ReadableFile$create <- function(path) {
-  shared_ptr(ReadableFile, io___ReadableFile__Open(clean_path_abs(path)))
+  io___ReadableFile__Open(clean_path_abs(path))
 }
 
 #' @usage NULL
@@ -189,8 +197,9 @@ ReadableFile$create <- function(path) {
 BufferReader <- R6Class("BufferReader", inherit = RandomAccessFile)
 BufferReader$create <- function(x) {
   x <- buffer(x)
-  shared_ptr(BufferReader, io___BufferReader__initialize(x))
+  io___BufferReader__initialize(x)
 }
+
 
 #' Create a new read/write memory mapped file of a given size
 #'
@@ -202,7 +211,7 @@ BufferReader$create <- function(x) {
 #' @export
 mmap_create <- function(path, size) {
   path <- clean_path_abs(path)
-  shared_ptr(MemoryMappedFile, io___MemoryMappedFile__Create(path, size))
+  io___MemoryMappedFile__Create(path, size)
 }
 
 #' Open a memory mapped file
@@ -214,25 +223,102 @@ mmap_create <- function(path, size) {
 mmap_open <- function(path, mode = c("read", "write", "readwrite")) {
   mode <- match(match.arg(mode), c("read", "write", "readwrite")) - 1L
   path <- clean_path_abs(path)
-  shared_ptr(MemoryMappedFile, io___MemoryMappedFile__Open(path, mode))
+  io___MemoryMappedFile__Open(path, mode)
 }
 
 #' Handle a range of possible input sources
 #' @param file A character file name, `raw` vector, or an Arrow input stream
 #' @param mmap Logical: whether to memory-map the file (default `TRUE`)
+#' @param random_access Logical: whether the result must be a RandomAccessFile
 #' @return An `InputStream` or a subclass of one.
 #' @keywords internal
-make_readable_file <- function(file, mmap = TRUE) {
-  if (is.character(file)) {
-    assert_that(length(file) == 1L)
-    if (isTRUE(mmap)) {
+#' @importFrom utils download.file
+make_readable_file <- function(file, mmap = TRUE, random_access = TRUE) {
+  if (inherits(file, "SubTreeFileSystem")) {
+    filesystem <- file$base_fs
+    # SubTreeFileSystem adds a slash to base_path, but filesystems will reject
+    # file names with trailing slashes, so we need to remove it here.
+    path <- sub("/$", "", file$base_path)
+    file <- filesystem$OpenInputFile(path)
+  } else if (is.string(file)) {
+    # if this is a HTTP URL, we need a local copy to pass to FileSystem$from_uri
+    if (random_access && is_http_url(file)) {
+      tf <- tempfile()
+      download.file(file, tf, quiet = TRUE, mode = "wb")
+      file <- tf
+      on.exit(unlink(tf))
+    }
+
+    if (is_http_url(file)) {
+      file <- MakeRConnectionInputStream(url(file, open = "rb"))
+    } else if (is_url(file)) {
+      fs_and_path <- FileSystem$from_uri(file)
+      file <- fs_and_path$fs$OpenInputFile(fs_and_path$path)
+    } else if (isTRUE(mmap)) {
       file <- mmap_open(file)
     } else {
       file <- ReadableFile$create(file)
     }
   } else if (inherits(file, c("raw", "Buffer"))) {
     file <- BufferReader$create(file)
+  } else if (inherits(file, "connection")) {
+    if (!isOpen(file)) {
+      open(file, "rb")
+    }
+
+    # Try to create a RandomAccessFile first because some readers need this
+    # (e.g., feather, parquet) but fall back on an InputStream for the readers
+    # that don't (e.g., IPC, CSV)
+    file <- tryCatch(
+      MakeRConnectionRandomAccessFile(file),
+      error = function(e) MakeRConnectionInputStream(file)
+    )
   }
   assert_is(file, "InputStream")
   file
+}
+
+make_output_stream <- function(x) {
+  if (inherits(x, "connection")) {
+    if (!isOpen(x)) {
+      open(x, "wb")
+    }
+
+    return(MakeRConnectionOutputStream(x))
+  }
+
+  if (inherits(x, "SubTreeFileSystem")) {
+    filesystem <- x$base_fs
+    # SubTreeFileSystem adds a slash to base_path, but filesystems will reject
+    # file names with trailing slashes, so we need to remove it here.
+    path <- sub("/$", "", x$base_path)
+    filesystem$OpenOutputStream(path)
+  } else if (is_url(x)) {
+    fs_and_path <- FileSystem$from_uri(x)
+    fs_and_path$fs$OpenOutputStream(fs_and_path$path)
+  } else {
+    assert_that(is.string(x))
+    FileOutputStream$create(x)
+  }
+}
+
+detect_compression <- function(path) {
+  if (inherits(path, "SubTreeFileSystem")) {
+    path <- path$base_path
+  }
+  if (!is.string(path)) {
+    return("uncompressed")
+  }
+
+  # Remove any trailing slashes, which SubTreeFileSystem may add
+  path <- sub("/$", "", path)
+
+  switch(tools::file_ext(path),
+    bz2 = "bz2",
+    gz = "gzip",
+    lz4 = "lz4_frame",
+    zst = "zstd",
+    snappy = "snappy",
+    "uncompressed"
+  )
 }

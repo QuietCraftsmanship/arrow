@@ -26,11 +26,15 @@ fi
 
 dask=$1
 
-if [ "${dask}" = "master" ]; then
-  pip install https://github.com/dask/dask/archive/master.tar.gz#egg=dask[dataframe]
+if [ "${dask}" = "upstream_devel" ]; then
+  pip install "dask[dataframe] @ git+https://github.com/dask/dask.git"
+  pip install -U git+https://github.com/dask-contrib/dask-expr.git
 elif [ "${dask}" = "latest" ]; then
-  conda install -q dask
+  pip install dask[dataframe]
 else
-  conda install -q dask=${dask}
+  pip install dask[dataframe]==${dask}
 fi
-conda clean --all
+
+# additional dependencies needed for dask's s3 tests
+# Moto 5 results in timeouts in s3 tests: https://github.com/dask/dask/issues/10869
+pip install "moto[server]<5" flask requests

@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-#' @include arrow-package.R
+#' @include arrow-object.R
 
-#' @title class arrow::Message
+#' @title Message class
 #'
 #' @usage NULL
 #' @format NULL
@@ -29,7 +29,8 @@
 #'
 #' @rdname Message
 #' @name Message
-Message <- R6Class("Message", inherit = ArrowObject,
+Message <- R6Class("Message",
+  inherit = ArrowObject,
   public = list(
     Equals = function(other, ...) {
       inherits(other, "Message") && ipc___Message__Equals(self, other)
@@ -39,12 +40,12 @@ Message <- R6Class("Message", inherit = ArrowObject,
   ),
   active = list(
     type = function() ipc___Message__type(self),
-    metadata = function() shared_ptr(Buffer, ipc___Message__metadata(self)),
-    body = function() shared_ptr(Buffer, ipc___Message__body(self))
+    metadata = function() ipc___Message__metadata(self),
+    body = function() ipc___Message__body(self)
   )
 )
 
-#' @title class arrow::MessageReader
+#' @title MessageReader class
 #'
 #' @usage NULL
 #' @format NULL
@@ -57,9 +58,10 @@ Message <- R6Class("Message", inherit = ArrowObject,
 #' @rdname MessageReader
 #' @name MessageReader
 #' @export
-MessageReader <- R6Class("MessageReader", inherit = ArrowObject,
+MessageReader <- R6Class("MessageReader",
+  inherit = ArrowObject,
   public = list(
-    ReadNextMessage = function() unique_ptr(Message, ipc___MessageReader__ReadNextMessage(self))
+    ReadNextMessage = function() ipc___MessageReader__ReadNextMessage(self)
   )
 )
 
@@ -67,7 +69,7 @@ MessageReader$create <- function(stream) {
   if (!inherits(stream, "InputStream")) {
     stream <- BufferReader$create(stream)
   }
-  unique_ptr(MessageReader, ipc___MessageReader__Open(stream))
+  ipc___MessageReader__Open(stream)
 }
 
 #' Read a Message from a stream
@@ -86,7 +88,7 @@ read_message.default <- function(stream) {
 
 #' @export
 read_message.InputStream <- function(stream) {
-  unique_ptr(Message, ipc___ReadMessage(stream) )
+  ipc___ReadMessage(stream)
 }
 
 #' @export

@@ -17,8 +17,12 @@
 
 import pytest
 import sys
+import weakref
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    pytestmark = pytest.mark.numpy
 import pyarrow as pa
 
 try:
@@ -72,6 +76,11 @@ def test_sparse_tensor_attrs(sparse_tensor_type):
     assert sparse_tensor.dim_names == dim_names
     assert sparse_tensor.non_zero_length == 6
 
+    wr = weakref.ref(sparse_tensor)
+    assert wr() is not None
+    del sparse_tensor
+    assert wr() is None
+
 
 def test_sparse_coo_tensor_base_object():
     expected_data = np.array([[8, 2, 5, 3, 4, 6]]).T
@@ -88,6 +97,7 @@ def test_sparse_coo_tensor_base_object():
     sparse_tensor = pa.SparseCOOTensor.from_dense_numpy(array)
     n = sys.getrefcount(sparse_tensor)
     result_data, result_coords = sparse_tensor.to_numpy()
+    assert sparse_tensor.has_canonical_format
     assert sys.getrefcount(sparse_tensor) == n + 2
 
     sparse_tensor = None
@@ -394,24 +404,38 @@ def test_sparse_coo_tensor_scipy_roundtrip(dtype_str, arrow_type):
     shape = (4, 6)
     dim_names = ('x', 'y')
 
-    sparse_array = coo_matrix((data, (row, col)), shape=shape)
-    sparse_tensor = pa.SparseCOOTensor.from_scipy(sparse_array,
+    # non-canonical sparse coo matrix
+    scipy_matrix = coo_matrix((data, (row, col)), shape=shape)
+    sparse_tensor = pa.SparseCOOTensor.from_scipy(scipy_matrix,
                                                   dim_names=dim_names)
-    out_sparse_array = sparse_tensor.to_scipy()
+    out_scipy_matrix = sparse_tensor.to_scipy()
 
+    assert not scipy_matrix.has_canonical_format
+    assert not sparse_tensor.has_canonical_format
+    assert not out_scipy_matrix.has_canonical_format
     assert sparse_tensor.type == arrow_type
     assert sparse_tensor.dim_names == dim_names
-    assert sparse_array.dtype == out_sparse_array.dtype
-    assert np.array_equal(sparse_array.data, out_sparse_array.data)
-    assert np.array_equal(sparse_array.row, out_sparse_array.row)
-    assert np.array_equal(sparse_array.col, out_sparse_array.col)
+    assert scipy_matrix.dtype == out_scipy_matrix.dtype
+    assert np.array_equal(scipy_matrix.data, out_scipy_matrix.data)
+    assert np.array_equal(scipy_matrix.row, out_scipy_matrix.row)
+    assert np.array_equal(scipy_matrix.col, out_scipy_matrix.col)
 
     if dtype_str == 'f2':
         dense_array = \
-            sparse_array.astype(np.float32).toarray().astype(np.float16)
+            scipy_matrix.astype(np.float32).toarray().astype(np.float16)
     else:
-        dense_array = sparse_array.toarray()
+        dense_array = scipy_matrix.toarray()
     assert np.array_equal(dense_array, sparse_tensor.to_tensor().to_numpy())
+
+    # canonical sparse coo matrix
+    scipy_matrix.sum_duplicates()
+    sparse_tensor = pa.SparseCOOTensor.from_scipy(scipy_matrix,
+                                                  dim_names=dim_names)
+    out_scipy_matrix = sparse_tensor.to_scipy()
+
+    assert scipy_matrix.has_canonical_format
+    assert sparse_tensor.has_canonical_format
+    assert out_scipy_matrix.has_canonical_format
 
 
 @pytest.mark.skipif(not csr_matrix, reason="requires scipy")

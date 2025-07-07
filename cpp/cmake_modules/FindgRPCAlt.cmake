@@ -11,109 +11,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-unset(GRPC_ALT_VERSION)
-if(gRPC_ROOT)
-  find_library(GRPC_GPR_LIB gpr
-               PATHS ${gRPC_ROOT}
-               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-               NO_DEFAULT_PATH)
-  find_library(GRPC_GRPC_LIB grpc
-               PATHS ${gRPC_ROOT}
-               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-               NO_DEFAULT_PATH)
-  find_library(GRPC_GRPCPP_LIB grpc++
-               PATHS ${gRPC_ROOT}
-               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-               NO_DEFAULT_PATH)
-  find_library(GRPC_ADDRESS_SORTING_LIB address_sorting
-               PATHS ${gRPC_ROOT}
-               PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-               NO_DEFAULT_PATH)
-  find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin NO_DEFAULT_PATH
-               PATHS ${gRPC_ROOT}
-               PATH_SUFFIXES "bin")
-  find_path(GRPC_INCLUDE_DIR
-            NAMES grpc/grpc.h
-            PATHS ${gRPC_ROOT}
-            NO_DEFAULT_PATH
-            PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES})
-else()
-  pkg_check_modules(GRPC_PC grpc++)
-  if(GRPC_PC_FOUND)
-    set(GRPC_ALT_VERSION "${GRPC_PC_VERSION}")
-    set(GRPC_INCLUDE_DIR "${GRPC_PC_INCLUDEDIR}")
-    list(APPEND GRPC_PC_LIBRARY_DIRS "${GRPC_PC_LIBDIR}")
-    message(STATUS "${GRPC_PC_LIBRARY_DIRS}")
+if(gRPCAlt_FOUND)
+  return()
+endif()
 
-    find_library(GRPC_GPR_LIB gpr
-                 PATHS ${GRPC_PC_LIBRARY_DIRS}
-                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-                 NO_DEFAULT_PATH)
-    find_library(GRPC_GRPC_LIB grpc
-                 PATHS ${GRPC_PC_LIBRARY_DIRS}
-                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-                 NO_DEFAULT_PATH)
-    find_library(GRPC_GRPCPP_LIB grpc++
-                 PATHS ${GRPC_PC_LIBRARY_DIRS}
-                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-                 NO_DEFAULT_PATH)
-    find_library(GRPC_ADDRESS_SORTING_LIB address_sorting
-                 PATHS ${GRPC_PC_LIBRARY_DIRS}
-                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES}
-                 NO_DEFAULT_PATH)
-    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin
-                 HINTS ${GRPC_PC_PREFIX}
-                 NO_DEFAULT_PATH
-                 PATH_SUFFIXES "bin")
+set(find_package_args)
+if(gRPCAlt_FIND_VERSION)
+  list(APPEND find_package_args ${gRPCAlt_FIND_VERSION})
+endif()
+if(gRPCAlt_FIND_QUIETLY)
+  list(APPEND find_package_args QUIET)
+endif()
+find_package(gRPC ${find_package_args})
+if(gRPC_FOUND)
+  set(gRPCAlt_FOUND TRUE)
+  return()
+endif()
+
+find_package(PkgConfig QUIET)
+pkg_check_modules(GRPCPP_PC grpc++)
+if(GRPCPP_PC_FOUND)
+  set(gRPCAlt_VERSION "${GRPCPP_PC_VERSION}")
+  set(GRPCPP_INCLUDE_DIRECTORIES ${GRPCPP_PC_INCLUDEDIR})
+  # gRPC's pkg-config file neglects to specify pthreads.
+  find_package(Threads REQUIRED)
+  if(ARROW_GRPC_USE_SHARED)
+    set(GRPCPP_LINK_LIBRARIES ${GRPCPP_PC_LINK_LIBRARIES})
+    set(GRPCPP_LINK_OPTIONS ${GRPCPP_PC_LDFLAGS_OTHER})
+    set(GRPCPP_COMPILE_OPTIONS ${GRPCPP_PC_CFLAGS_OTHER})
   else()
-    find_library(GRPC_GPR_LIB gpr PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
-    find_library(GRPC_GRPC_LIB grpc PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
-    find_library(GRPC_GRPCPP_LIB grpc++ PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
-    find_library(GRPC_ADDRESS_SORTING_LIB address_sorting
-                 PATH_SUFFIXES ${LIB_PATH_SUFFIXES})
-    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin PATH_SUFFIXES "bin")
-    find_path(GRPC_INCLUDE_DIR NAMES grpc/grpc.h PATH_SUFFIXES ${INCLUDE_PATH_SUFFIXES})
+    set(GRPCPP_LINK_LIBRARIES)
+    foreach(GRPCPP_LIBRARY_NAME ${GRPCPP_PC_STATIC_LIBRARIES})
+      find_library(GRPCPP_LIBRARY_${GRPCPP_LIBRARY_NAME}
+                   NAMES "${CMAKE_STATIC_LIBRARY_PREFIX}${GRPCPP_LIBRARY_NAME}${CMAKE_STATIC_LIBRARY_SUFFIX}"
+                   HINTS ${GRPCPP_PC_STATIC_LIBRARY_DIRS})
+      list(APPEND GRPCPP_LINK_LIBRARIES "${GRPCPP_LIBRARY_${GRPCPP_LIBRARY_NAME}}")
+    endforeach()
+    set(GRPCPP_LINK_OPTIONS ${GRPCPP_PC_STATIC_LDFLAGS_OTHER})
+    set(GRPCPP_COMPILE_OPTIONS ${GRPCPP_PC_STATIC_CFLAGS_OTHER})
   endif()
+  list(APPEND GRPCPP_LINK_LIBRARIES Threads::Threads)
+  list(GET GRPCPP_LINK_LIBRARIES 0 GRPCPP_IMPORTED_LOCATION)
+  list(REMOVE_AT GRPCPP_LINK_LIBRARIES 0)
+  find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin
+               HINTS ${GRPCPP_PC_PREFIX}
+               NO_DEFAULT_PATH
+               PATH_SUFFIXES "bin")
 endif()
-
-set(GRPC_ALT_FIND_PACKAGE_ARGS
-    gRPCAlt
-    REQUIRED_VARS
-    GRPC_INCLUDE_DIR
-    GRPC_GPR_LIB
-    GRPC_GRPC_LIB
-    GRPC_GRPCPP_LIB
-    GRPC_CPP_PLUGIN)
-if(GRPC_ALT_VERSION)
-  list(APPEND GRPC_ALT_FIND_PACKAGE_ARGS VERSION_VAR GRPC_ALT_VERSION)
+set(gRPCAlt_FIND_PACKAGE_ARGS gRPCAlt REQUIRED_VARS GRPCPP_IMPORTED_LOCATION
+                              GRPC_CPP_PLUGIN)
+if(gRPCAlt_VERSION)
+  list(APPEND gRPCAlt_FIND_PACKAGE_ARGS VERSION_VAR gRPCAlt_VERSION)
 endif()
-find_package_handle_standard_args(${GRPC_ALT_FIND_PACKAGE_ARGS})
+find_package_handle_standard_args(${gRPCAlt_FIND_PACKAGE_ARGS})
 
 if(gRPCAlt_FOUND)
-  add_library(gRPC::gpr UNKNOWN IMPORTED)
-  set_target_properties(gRPC::gpr
-                        PROPERTIES IMPORTED_LOCATION "${GRPC_GPR_LIB}"
-                                   INTERFACE_INCLUDE_DIRECTORIES "${GRPC_INCLUDE_DIR}")
-
-  add_library(gRPC::grpc UNKNOWN IMPORTED)
-  set_target_properties(gRPC::grpc
-                        PROPERTIES IMPORTED_LOCATION "${GRPC_GRPC_LIB}"
-                                   INTERFACE_INCLUDE_DIRECTORIES "${GRPC_INCLUDE_DIR}")
+  # gRPC does not expose the reflection library via pkg-config, but it should be alongside the main library
+  get_filename_component(GRPCPP_IMPORTED_DIRECTORY ${GRPCPP_IMPORTED_LOCATION} DIRECTORY)
+  if(ARROW_GRPC_USE_SHARED)
+    set(GRPCPP_REFLECTION_LIB_NAME
+        "${CMAKE_SHARED_LIBRARY_PREFIX}grpc++_reflection${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  else()
+    set(GRPCPP_REFLECTION_LIB_NAME
+        "${CMAKE_STATIC_LIBRARY_PREFIX}grpc++_reflection${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  endif()
+  find_library(GRPCPP_REFLECTION_IMPORTED_LOCATION
+               NAMES grpc++_reflection ${GRPCPP_REFLECTION_LIB_NAME}
+               PATHS ${GRPCPP_IMPORTED_DIRECTORY}
+               NO_DEFAULT_PATH)
 
   add_library(gRPC::grpc++ UNKNOWN IMPORTED)
   set_target_properties(gRPC::grpc++
-                        PROPERTIES IMPORTED_LOCATION "${GRPC_GRPCPP_LIB}"
-                                   INTERFACE_INCLUDE_DIRECTORIES "${GRPC_INCLUDE_DIR}")
+                        PROPERTIES IMPORTED_LOCATION "${GRPCPP_IMPORTED_LOCATION}"
+                                   INTERFACE_COMPILE_OPTIONS "${GRPCPP_COMPILE_OPTIONS}"
+                                   INTERFACE_INCLUDE_DIRECTORIES
+                                   "${GRPCPP_INCLUDE_DIRECTORIES}"
+                                   INTERFACE_LINK_LIBRARIES "${GRPCPP_LINK_LIBRARIES}"
+                                   INTERFACE_LINK_OPTIONS "${GRPCPP_LINK_OPTIONS}")
 
-  if(GRPC_ADDRESS_SORTING_LIB)
-    # Address sorting is optional and not always required.
-    add_library(gRPC::address_sorting UNKNOWN IMPORTED)
-    set_target_properties(gRPC::address_sorting
-                          PROPERTIES IMPORTED_LOCATION "${GRPC_ADDRESS_SORTING_LIB}"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${GRPC_INCLUDE_DIR}")
-  endif()
+  add_library(gRPC::grpc++_reflection UNKNOWN IMPORTED)
+  set_target_properties(gRPC::grpc++_reflection
+                        PROPERTIES IMPORTED_LOCATION
+                                   "${GRPCPP_REFLECTION_IMPORTED_LOCATION}"
+                                   INTERFACE_LINK_LIBRARIES gRPC::grpc++)
 
   add_executable(gRPC::grpc_cpp_plugin IMPORTED)
-  set_target_properties(gRPC::grpc_cpp_plugin
-                        PROPERTIES IMPORTED_LOCATION ${GRPC_CPP_PLUGIN})
+  set_target_properties(gRPC::grpc_cpp_plugin PROPERTIES IMPORTED_LOCATION
+                                                         ${GRPC_CPP_PLUGIN})
 endif()

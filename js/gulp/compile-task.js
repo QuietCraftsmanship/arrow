@@ -15,23 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const { Observable } = require('rxjs');
-const { npmPkgName } = require('./util');
-const { memoizeTask } = require('./memoize-task');
+import { Observable } from 'rxjs';
+import { npmPkgName } from './util.js';
+import { memoizeTask } from './memoize-task.js';
 
-const minifyTask = require('./minify-task');
-const closureTask = require('./closure-task');
-const typescriptTask = require('./typescript-task');
-const { arrowTask, arrowTSTask } = require('./arrow-task');
+import closureTask from './closure-task.js';
+import typescriptTask from './typescript-task.js';
+import { arrowTask, arrowTSTask } from './arrow-task.js';
 
 const compileTask = ((cache) => memoizeTask(cache, function compile(target, format, ...args) {
     return target === `src`                    ? Observable.empty()
          : target === npmPkgName               ? arrowTask(target, format, ...args)()
          : target === `ts`                     ? arrowTSTask(target, format, ...args)()
-         : format === `umd` ? target === `es5` ? closureTask(target, format, ...args)()
-                                               : minifyTask(target, format, ...args)()
+         : format === `umd`                    ? closureTask(target, format, ...args)()
                                                : typescriptTask(target, format, ...args)();
 }))({});
 
-module.exports = compileTask;
-module.exports.compileTask = compileTask;
+export default compileTask;

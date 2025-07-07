@@ -31,23 +31,22 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/array.h"
-#include "arrow/buffer.h"
-#include "arrow/builder.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/buffer_builder.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/type.h"
+#include "arrow/type_fwd.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_util.h"
-#include "arrow/util/checked_cast.h"
+#include "arrow/util/bitmap_builders.h"
+#include "arrow/util/endian.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/string_view.h"
+#include "arrow/util/ubsan.h"
 
 #define XXH_INLINE_ALL
-#define XXH_PRIVATE_API
-#define XXH_NAMESPACE arrow_hashing_
 
-#include "arrow/vendored/xxhash.h"
+#include "arrow/vendored/xxhash.h"  // IWYU pragma: keep
 
 namespace arrow {
 namespace internal {
@@ -63,6 +62,23 @@ typedef uint64_t hash_t;
 
 template <uint64_t AlgNum>
 inline hash_t ComputeStringHash(const void* data, int64_t length);
+
+/// \brief A hash function for bitmaps that can handle offsets and lengths in
+/// terms of number of bits. The hash only depends on the bits actually hashed.
+///
+/// It's the caller's responsibility to ensure that bits_offset + num_bits are
+/// readable from the bitmap.
+///
+/// \pre bits_offset >= 0
+/// \pre num_bits >= 0
+/// \pre (bits_offset + num_bits + 7) / 8 <= readable length in bytes from bitmap
+///
+/// \param bitmap The pointer to the bitmap.
+/// \param seed The seed for the hash function (useful when chaining hash functions).
+/// \param bits_offset The offset in bits relative to the start of the bitmap.
+/// \param num_bits The number of bits after the offset to be hashed.
+ARROW_EXPORT hash_t ComputeBitmapHash(const uint8_t* bitmap, hash_t seed,
+                                      int64_t bits_offset, int64_t num_bits);
 
 template <typename Scalar, uint64_t AlgNum>
 struct ScalarHelperBase {
@@ -98,17 +114,17 @@ struct ScalarHelper<Scalar, AlgNum, enable_if_t<std::is_integral<Scalar>::value>
     // then byte-swapping (which is a single CPU instruction) allows the
     // combined high and low bits to participate in the initial hash table index.
     auto h = static_cast<hash_t>(value);
-    return BitUtil::ByteSwap(multipliers[AlgNum] * h);
+    return bit_util::ByteSwap(multipliers[AlgNum] * h);
   }
 };
 
 template <typename Scalar, uint64_t AlgNum>
 struct ScalarHelper<Scalar, AlgNum,
-                    enable_if_t<std::is_same<util::string_view, Scalar>::value>>
+                    enable_if_t<std::is_same<std::string_view, Scalar>::value>>
     : public ScalarHelperBase<Scalar, AlgNum> {
-  // ScalarHelper specialization for util::string_view
+  // ScalarHelper specialization for std::string_view
 
-  static hash_t ComputeHash(const util::string_view& value) {
+  static hash_t ComputeHash(std::string_view value) {
     return ComputeStringHash<AlgNum>(value.data(), static_cast<int64_t>(value.size()));
   }
 };
@@ -166,7 +182,7 @@ hash_t ComputeStringHash(const void* data, int64_t length) {
   }
 
 #if XXH3_SECRET_SIZE_MIN != 136
-#error XXH3_SECRET_SIZE_MIN changed, please fix kXxh3Secrets
+#  error XXH3_SECRET_SIZE_MIN changed, please fix kXxh3Secrets
 #endif
 
   // XXH3_64bits_withSeed generates a secret based on the seed, which is too slow.
@@ -210,14 +226,14 @@ class HashTable {
   };
 
   HashTable(MemoryPool* pool, uint64_t capacity) : entries_builder_(pool) {
-    DCHECK_NE(pool, nullptr);
+    ARROW_DCHECK_NE(pool, nullptr);
     // Minimum of 32 elements
     capacity = std::max<uint64_t>(capacity, 32UL);
-    capacity_ = BitUtil::NextPower2(capacity);
+    capacity_ = bit_util::NextPower2(capacity);
     capacity_mask_ = capacity_ - 1;
     size_ = 0;
 
-    DCHECK_OK(UpsizeBuffer(capacity_));
+    ARROW_DCHECK_OK(UpsizeBuffer(capacity_));
   }
 
   // Lookup with non-linear probing
@@ -330,8 +346,7 @@ class HashTable {
 
     // Stash old entries and seal builder, effectively resetting the Buffer
     const Entry* old_entries = entries_;
-    std::shared_ptr<Buffer> previous;
-    RETURN_NOT_OK(entries_builder_.Finish(&previous));
+    ARROW_ASSIGN_OR_RAISE(auto previous, entries_builder_.FinishWithLength(capacity_));
     // Allocate new buffer
     RETURN_NOT_OK(UpsizeBuffer(new_capacity));
 
@@ -462,6 +477,13 @@ class ScalarMemoTable : public MemoTable {
         out_data[index] = entry->payload.value;
       }
     });
+    // Zero-initialize the null entry
+    if (null_index_ != kKeyNotFound) {
+      int32_t index = null_index_ - start;
+      if (index >= 0) {
+        out_data[index] = Scalar{};
+      }
+    }
   }
 
   void CopyValues(Scalar* out_data) const { CopyValues(0, out_data); }
@@ -479,6 +501,20 @@ class ScalarMemoTable : public MemoTable {
 
   hash_t ComputeHash(const Scalar& value) const {
     return ScalarHelper<Scalar, 0>::ComputeHash(value);
+  }
+
+ public:
+  // defined here so that `HashTableType` is visible
+  // Merge entries from `other_table` into `this->hash_table_`.
+  Status MergeTable(const ScalarMemoTable& other_table) {
+    const HashTableType& other_hashtable = other_table.hash_table_;
+
+    other_hashtable.VisitEntries([this](const HashTableEntry* other_entry) {
+      int32_t unused;
+      ARROW_DCHECK_OK(this->GetOrInsert(other_entry->payload.value, &unused));
+    });
+    // TODO: ARROW-17074 - implement proper error handling
+    return Status::OK();
   }
 };
 
@@ -526,7 +562,7 @@ class SmallScalarMemoTable : public MemoTable {
       memo_index = static_cast<int32_t>(index_to_value_.size());
       index_to_value_.push_back(value);
       value_to_index_[value_index] = memo_index;
-      DCHECK_LT(memo_index, cardinality + 1);
+      ARROW_DCHECK_LT(memo_index, cardinality + 1);
       on_not_found(memo_index);
     } else {
       on_found(memo_index);
@@ -563,10 +599,19 @@ class SmallScalarMemoTable : public MemoTable {
   // (which is also 1 + the largest memo index)
   int32_t size() const override { return static_cast<int32_t>(index_to_value_.size()); }
 
+  // Merge entries from `other_table` into `this`.
+  Status MergeTable(const SmallScalarMemoTable& other_table) {
+    for (const Scalar& other_val : other_table.index_to_value_) {
+      int32_t unused;
+      RETURN_NOT_OK(this->GetOrInsert(other_val, &unused));
+    }
+    return Status::OK();
+  }
+
   // Copy values starting from index `start` into `out_data`
   void CopyValues(int32_t start, Scalar* out_data) const {
-    DCHECK_GE(start, 0);
-    DCHECK_LE(static_cast<size_t>(start), index_to_value_.size());
+    ARROW_DCHECK_GE(start, 0);
+    ARROW_DCHECK_LE(static_cast<size_t>(start), index_to_value_.size());
     int64_t offset = start * static_cast<int32_t>(sizeof(Scalar));
     memcpy(out_data, index_to_value_.data() + offset, (size() - start) * sizeof(Scalar));
   }
@@ -599,8 +644,8 @@ class BinaryMemoTable : public MemoTable {
                            int64_t values_size = -1)
       : hash_table_(pool, static_cast<uint64_t>(entries)), binary_builder_(pool) {
     const int64_t data_size = (values_size < 0) ? entries * 4 : values_size;
-    DCHECK_OK(binary_builder_.Resize(entries));
-    DCHECK_OK(binary_builder_.ReserveData(data_size));
+    ARROW_DCHECK_OK(binary_builder_.Resize(entries));
+    ARROW_DCHECK_OK(binary_builder_.ReserveData(data_size));
   }
 
   int32_t Get(const void* data, builder_offset_type length) const {
@@ -613,7 +658,7 @@ class BinaryMemoTable : public MemoTable {
     }
   }
 
-  int32_t Get(const util::string_view& value) const {
+  int32_t Get(std::string_view value) const {
     return Get(value.data(), static_cast<builder_offset_type>(value.length()));
   }
 
@@ -641,8 +686,8 @@ class BinaryMemoTable : public MemoTable {
   }
 
   template <typename Func1, typename Func2>
-  Status GetOrInsert(const util::string_view& value, Func1&& on_found,
-                     Func2&& on_not_found, int32_t* out_memo_index) {
+  Status GetOrInsert(std::string_view value, Func1&& on_found, Func2&& on_not_found,
+                     int32_t* out_memo_index) {
     return GetOrInsert(value.data(), static_cast<builder_offset_type>(value.length()),
                        std::forward<Func1>(on_found), std::forward<Func2>(on_not_found),
                        out_memo_index);
@@ -654,7 +699,7 @@ class BinaryMemoTable : public MemoTable {
         data, length, [](int32_t i) {}, [](int32_t i) {}, out_memo_index);
   }
 
-  Status GetOrInsert(const util::string_view& value, int32_t* out_memo_index) {
+  Status GetOrInsert(std::string_view value, int32_t* out_memo_index) {
     return GetOrInsert(value.data(), static_cast<builder_offset_type>(value.length()),
                        out_memo_index);
   }
@@ -666,7 +711,7 @@ class BinaryMemoTable : public MemoTable {
     int32_t memo_index = GetNull();
     if (memo_index == kKeyNotFound) {
       memo_index = null_index_ = size();
-      DCHECK_OK(binary_builder_.AppendNull());
+      ARROW_DCHECK_OK(binary_builder_.AppendNull());
       on_not_found(memo_index);
     } else {
       on_found(memo_index);
@@ -689,10 +734,11 @@ class BinaryMemoTable : public MemoTable {
   // Copy (n + 1) offsets starting from index `start` into `out_data`
   template <class Offset>
   void CopyOffsets(int32_t start, Offset* out_data) const {
-    DCHECK_LE(start, size());
+    ARROW_DCHECK_LE(start, size());
 
     const builder_offset_type* offsets = binary_builder_.offsets_data();
-    const builder_offset_type delta = offsets[start];
+    const builder_offset_type delta =
+        start < binary_builder_.length() ? offsets[start] : 0;
     for (int32_t i = start; i < size(); ++i) {
       const builder_offset_type adjusted_offset = offsets[i] - delta;
       Offset cast_offset = static_cast<Offset>(adjusted_offset);
@@ -717,7 +763,7 @@ class BinaryMemoTable : public MemoTable {
 
   // Same as above, but check output size in debug mode
   void CopyValues(int32_t start, int64_t out_size, uint8_t* out_data) const {
-    DCHECK_LE(start, size());
+    ARROW_DCHECK_LE(start, size());
 
     // The absolute byte offset of `start` value in the binary buffer.
     const builder_offset_type offset = binary_builder_.offset(start);
@@ -775,6 +821,8 @@ class BinaryMemoTable : public MemoTable {
     if (left_size > 0) {
       memcpy(out_data, in_data + left_offset, left_size);
     }
+    // Zero-initialize the null entry
+    memset(out_data + left_size, 0, width_size);
 
     auto right_size = values_size() - static_cast<size_t>(null_data_offset);
     if (right_size > 0) {
@@ -786,13 +834,21 @@ class BinaryMemoTable : public MemoTable {
   }
 
   // Visit the stored values in insertion order.
-  // The visitor function should have the signature `void(util::string_view)`
-  // or `void(const util::string_view&)`.
+  // The visitor function should have the signature `void(std::string_view)`
+  // or `void(const std::string_view&)`.
   template <typename VisitFunc>
   void VisitValues(int32_t start, VisitFunc&& visit) const {
     for (int32_t i = start; i < size(); ++i) {
       visit(binary_builder_.GetView(i));
     }
+  }
+
+  // Visit the stored value at a specific index in insertion order.
+  // The visitor function should have the signature `void(std::string_view)`
+  // or `void(const std::string_view&)`.
+  template <typename VisitFunc>
+  void VisitValue(int32_t idx, VisitFunc&& visit) const {
+    visit(binary_builder_.GetView(idx));
   }
 
  protected:
@@ -809,12 +865,21 @@ class BinaryMemoTable : public MemoTable {
 
   std::pair<const HashTableEntry*, bool> Lookup(hash_t h, const void* data,
                                                 builder_offset_type length) const {
-    auto cmp_func = [=](const Payload* payload) {
-      util::string_view lhs = binary_builder_.GetView(payload->memo_index);
-      util::string_view rhs(static_cast<const char*>(data), length);
+    auto cmp_func = [&](const Payload* payload) {
+      std::string_view lhs = binary_builder_.GetView(payload->memo_index);
+      std::string_view rhs(static_cast<const char*>(data), length);
       return lhs == rhs;
     };
     return hash_table_.Lookup(h, cmp_func);
+  }
+
+ public:
+  Status MergeTable(const BinaryMemoTable& other_table) {
+    other_table.VisitValues(0, [this](std::string_view other_value) {
+      int32_t unused;
+      ARROW_DCHECK_OK(this->GetOrInsert(other_value, &unused));
+    });
+    return Status::OK();
   }
 };
 
@@ -845,6 +910,11 @@ struct HashTraits<T, enable_if_t<has_string_view<T>::value &&
 };
 
 template <typename T>
+struct HashTraits<T, enable_if_decimal<T>> {
+  using MemoTableType = BinaryMemoTable<BinaryBuilder>;
+};
+
+template <typename T>
 struct HashTraits<T, enable_if_t<std::is_base_of<LargeBinaryType, T>::value>> {
   using MemoTableType = BinaryMemoTable<LargeBinaryBuilder>;
 };
@@ -868,6 +938,15 @@ static inline Status ComputeNullBitmap(MemoryPool* pool, const MemoTableType& me
 
   return Status::OK();
 }
+
+struct StringViewHash {
+  // std::hash compatible hasher for use with std::unordered_*
+  // (the std::hash specialization provided by nonstd constructs std::string
+  // temporaries then invokes std::hash<std::string> against those)
+  hash_t operator()(std::string_view value) const {
+    return ComputeStringHash<0>(value.data(), static_cast<int64_t>(value.size()));
+  }
+};
 
 }  // namespace internal
 }  // namespace arrow

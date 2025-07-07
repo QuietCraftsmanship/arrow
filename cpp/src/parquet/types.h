@@ -20,22 +20,21 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
-
-#include "arrow/util/int_util.h"
-#include "arrow/util/string_view.h"
+#include <string_view>
 
 #include "parquet/platform.h"
+#include "parquet/type_fwd.h"
+#include "parquet/windows_fixup.h"  // for OPTIONAL
 
-namespace arrow {
-namespace util {
+namespace arrow::util {
 
 class Codec;
 
-}  // namespace util
-}  // namespace arrow
+}  // namespace arrow::util
 
 namespace parquet {
 
@@ -71,7 +70,7 @@ struct Type {
 // Mirrors parquet::ConvertedType
 struct ConvertedType {
   enum type {
-    NONE,
+    NONE,  // Not a real converted type, but means no converted type is specified
     UTF8,
     MAP,
     MAP_KEY_VALUE,
@@ -94,9 +93,12 @@ struct ConvertedType {
     JSON,
     BSON,
     INTERVAL,
+    // DEPRECATED INVALID ConvertedType for all-null data.
+    // Only useful for reading legacy files written out by interim Parquet C++ releases.
+    // For writing, always emit LogicalType::Null instead.
+    // See PARQUET-1990.
     NA = 25,
-    // Should always be last element.
-    UNDEFINED = 26
+    UNDEFINED = 26  // Not a real converted type; should always be last element
   };
 };
 
@@ -140,7 +142,7 @@ class PARQUET_EXPORT LogicalType {
  public:
   struct Type {
     enum type {
-      UNKNOWN = 0,
+      UNDEFINED = 0,  // Not a real logical type
       STRING = 1,
       MAP,
       LIST,
@@ -151,11 +153,12 @@ class PARQUET_EXPORT LogicalType {
       TIMESTAMP,
       INTERVAL,
       INT,
-      NIL,  // Thrift NullType
+      NIL,  // Thrift NullType: annotates data that is always null
       JSON,
       BSON,
       UUID,
-      NONE
+      FLOAT16,
+      NONE  // Not a real logical type; should always be last element
     };
   };
 
@@ -199,12 +202,19 @@ class PARQUET_EXPORT LogicalType {
 
   static std::shared_ptr<const LogicalType> Interval();
   static std::shared_ptr<const LogicalType> Int(int bit_width, bool is_signed);
+
+  /// \brief Create a logical type for data that's always null
+  ///
+  /// Any physical type can be annotated with this logical type.
   static std::shared_ptr<const LogicalType> Null();
+
   static std::shared_ptr<const LogicalType> JSON();
   static std::shared_ptr<const LogicalType> BSON();
   static std::shared_ptr<const LogicalType> UUID();
+  static std::shared_ptr<const LogicalType> Float16();
+
+  /// \brief Create a placeholder for when no logical type is specified
   static std::shared_ptr<const LogicalType> None();
-  static std::shared_ptr<const LogicalType> Unknown();
 
   /// \brief Return true if this logical type is consistent with the given underlying
   /// physical type.
@@ -255,6 +265,7 @@ class PARQUET_EXPORT LogicalType {
   bool is_JSON() const;
   bool is_BSON() const;
   bool is_UUID() const;
+  bool is_float16() const;
   bool is_none() const;
   /// \brief Return true if this logical type is of a known type.
   bool is_valid() const;
@@ -425,6 +436,16 @@ class PARQUET_EXPORT UUIDLogicalType : public LogicalType {
   UUIDLogicalType() = default;
 };
 
+/// \brief Allowed for physical type FIXED_LEN_BYTE_ARRAY with length 2,
+/// must encode raw FLOAT16 bytes.
+class PARQUET_EXPORT Float16LogicalType : public LogicalType {
+ public:
+  static std::shared_ptr<const LogicalType> Make();
+
+ private:
+  Float16LogicalType() = default;
+};
+
 /// \brief Allowed for any physical type.
 class PARQUET_EXPORT NoLogicalType : public LogicalType {
  public:
@@ -434,13 +455,13 @@ class PARQUET_EXPORT NoLogicalType : public LogicalType {
   NoLogicalType() = default;
 };
 
-/// \brief Allowed for any type.
-class PARQUET_EXPORT UnknownLogicalType : public LogicalType {
+// Internal API, for unrecognized logical types
+class PARQUET_EXPORT UndefinedLogicalType : public LogicalType {
  public:
   static std::shared_ptr<const LogicalType> Make();
 
  private:
-  UnknownLogicalType() = default;
+  UndefinedLogicalType() = default;
 };
 
 // Data encodings. Mirrors parquet::Encoding
@@ -461,12 +482,25 @@ struct Encoding {
   };
 };
 
+// Exposed data encodings. It is the encoding of the data read from the file,
+// rather than the encoding of the data in the file. E.g., the data encoded as
+// RLE_DICTIONARY in the file can be read as dictionary indices by RLE
+// decoding, in which case the data read from the file is DICTIONARY encoded.
+enum class ExposedEncoding {
+  NO_ENCODING = 0,  // data is not encoded, i.e. already decoded during reading
+  DICTIONARY = 1
+};
+
 /// \brief Return true if Parquet supports indicated compression type
 PARQUET_EXPORT
 bool IsCodecSupported(Compression::type codec);
 
 PARQUET_EXPORT
 std::unique_ptr<Codec> GetCodec(Compression::type codec);
+
+PARQUET_EXPORT
+std::unique_ptr<Codec> GetCodec(Compression::type codec,
+                                const CodecOptions& codec_options);
 
 PARQUET_EXPORT
 std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level);
@@ -498,6 +532,8 @@ struct PageType {
   };
 };
 
+bool PageCanUseChecksum(PageType::type pageType);
+
 class ColumnOrder {
  public:
   enum type { UNDEFINED, TYPE_DEFINED_ORDER };
@@ -513,15 +549,52 @@ class ColumnOrder {
   ColumnOrder::type column_order_;
 };
 
+/// \brief BoundaryOrder is a proxy around format::BoundaryOrder.
+struct BoundaryOrder {
+  enum type {
+    Unordered = 0,
+    Ascending = 1,
+    Descending = 2,
+    // Should always be last element
+    UNDEFINED = 3
+  };
+};
+
+/// \brief SortingColumn is a proxy around format::SortingColumn.
+struct PARQUET_EXPORT SortingColumn {
+  // The column index (in this row group)
+  int32_t column_idx;
+
+  // If true, indicates this column is sorted in descending order.
+  bool descending;
+
+  // If true, nulls will come before non-null values, otherwise, nulls go at the end.
+  bool nulls_first;
+};
+
+inline bool operator==(const SortingColumn& left, const SortingColumn& right) {
+  return left.nulls_first == right.nulls_first && left.descending == right.descending &&
+         left.column_idx == right.column_idx;
+}
+
+inline bool operator!=(const SortingColumn& left, const SortingColumn& right) {
+  return !(left == right);
+}
+
 // ----------------------------------------------------------------------
 
 struct ByteArray {
   ByteArray() : len(0), ptr(NULLPTR) {}
   ByteArray(uint32_t len, const uint8_t* ptr) : len(len), ptr(ptr) {}
 
-  ByteArray(::arrow::util::string_view view)  // NOLINT implicit conversion
+  ByteArray(::std::string_view view)  // NOLINT implicit conversion
       : ByteArray(static_cast<uint32_t>(view.size()),
                   reinterpret_cast<const uint8_t*>(view.data())) {}
+
+  explicit operator std::string_view() const {
+    return std::string_view{reinterpret_cast<const char*>(ptr), len};
+  }
+
   uint32_t len;
   const uint8_t* ptr;
 };
@@ -573,15 +646,46 @@ static inline void Int96SetNanoSeconds(parquet::Int96& i96, int64_t nanoseconds)
   std::memcpy(&i96.value, &nanoseconds, sizeof(nanoseconds));
 }
 
-static inline int64_t Int96GetNanoSeconds(const parquet::Int96& i96) {
+struct DecodedInt96 {
+  uint64_t days_since_epoch;
+  uint64_t nanoseconds;
+};
+
+static inline DecodedInt96 DecodeInt96Timestamp(const parquet::Int96& i96) {
   // We do the computations in the unsigned domain to avoid unsigned behaviour
   // on overflow.
-  uint64_t days_since_epoch =
-      i96.value[2] - static_cast<uint64_t>(kJulianToUnixEpochDays);
-  uint64_t nanoseconds = 0;
+  DecodedInt96 result;
+  result.days_since_epoch = i96.value[2] - static_cast<uint64_t>(kJulianToUnixEpochDays);
+  result.nanoseconds = 0;
 
-  memcpy(&nanoseconds, &i96.value, sizeof(uint64_t));
-  return static_cast<int64_t>(days_since_epoch * kNanosecondsPerDay + nanoseconds);
+  memcpy(&result.nanoseconds, &i96.value, sizeof(uint64_t));
+  return result;
+}
+
+static inline int64_t Int96GetNanoSeconds(const parquet::Int96& i96) {
+  const auto decoded = DecodeInt96Timestamp(i96);
+  return static_cast<int64_t>(decoded.days_since_epoch * kNanosecondsPerDay +
+                              decoded.nanoseconds);
+}
+
+static inline int64_t Int96GetMicroSeconds(const parquet::Int96& i96) {
+  const auto decoded = DecodeInt96Timestamp(i96);
+  uint64_t microseconds = decoded.nanoseconds / static_cast<uint64_t>(1000);
+  return static_cast<int64_t>(decoded.days_since_epoch * kMicrosecondsPerDay +
+                              microseconds);
+}
+
+static inline int64_t Int96GetMilliSeconds(const parquet::Int96& i96) {
+  const auto decoded = DecodeInt96Timestamp(i96);
+  uint64_t milliseconds = decoded.nanoseconds / static_cast<uint64_t>(1000000);
+  return static_cast<int64_t>(decoded.days_since_epoch * kMillisecondsPerDay +
+                              milliseconds);
+}
+
+static inline int64_t Int96GetSeconds(const parquet::Int96& i96) {
+  const auto decoded = DecodeInt96Timestamp(i96);
+  uint64_t seconds = decoded.nanoseconds / static_cast<uint64_t>(1000000000);
+  return static_cast<int64_t>(decoded.days_since_epoch * kSecondsPerDay + seconds);
 }
 
 static inline std::string Int96ToString(const Int96& a) {
@@ -620,7 +724,8 @@ struct type_traits<Type::INT64> {
   using value_type = int64_t;
 
   static constexpr int value_byte_size = 8;
-  static constexpr const char* printf_code = "ld";
+  static constexpr const char* printf_code =
+      (sizeof(long) == 64) ? "ld" : "lld";  // NOLINT: runtime/int
 };
 
 template <>
@@ -691,8 +796,10 @@ PARQUET_EXPORT std::string ConvertedTypeToString(ConvertedType::type t);
 
 PARQUET_EXPORT std::string TypeToString(Type::type t);
 
+PARQUET_EXPORT std::string TypeToString(Type::type t, int type_length);
+
 PARQUET_EXPORT std::string FormatStatValue(Type::type parquet_type,
-                                           ::arrow::util::string_view val);
+                                           ::std::string_view val);
 
 PARQUET_EXPORT int GetTypeByteSize(Type::type t);
 
@@ -704,10 +811,10 @@ PARQUET_EXPORT SortOrder::type GetSortOrder(ConvertedType::type converted,
 PARQUET_EXPORT SortOrder::type GetSortOrder(
     const std::shared_ptr<const LogicalType>& logical_type, Type::type primitive);
 
-namespace internal {
+// PLAIN_DICTIONARY is deprecated but used to be used as a dictionary index
+// encoding.
+constexpr bool IsDictionaryIndexEncoding(Encoding::type e) {
+  return e == Encoding::RLE_DICTIONARY || e == Encoding::PLAIN_DICTIONARY;
+}
 
-PARQUET_EXPORT
-int32_t DecimalSize(int32_t precision);
-
-}  // namespace internal
 }  // namespace parquet

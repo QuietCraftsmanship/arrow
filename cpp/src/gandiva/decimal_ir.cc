@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "arrow/status.h"
+#include "arrow/util/logging_internal.h"
 #include "gandiva/decimal_ir.h"
 #include "gandiva/decimal_type_util.h"
 
@@ -76,16 +77,25 @@ void DecimalIR::AddGlobals(Engine* engine) {
   auto globalScaleMultipliers = new llvm::GlobalVariable(
       *engine->module(), array_type, true /*constant*/,
       llvm::GlobalValue::LinkOnceAnyLinkage, initializer, kScaleMultipliersName);
-  globalScaleMultipliers->setAlignment(16);
+  globalScaleMultipliers->setAlignment(LLVM_ALIGN(16));
 }
+
+#if LLVM_VERSION_MAJOR < 20
+namespace {
+inline llvm::Function* getOrInsertDeclaration(llvm::Module* M, llvm::Intrinsic::ID id,
+                                              llvm::ArrayRef<llvm::Type*> Tys) {
+  return llvm::Intrinsic::getDeclaration(M, id, Tys);
+}
+}  // namespace
+#endif
 
 // Lookup intrinsic functions
 void DecimalIR::InitializeIntrinsics() {
-  sadd_with_overflow_fn_ = llvm::Intrinsic::getDeclaration(
+  sadd_with_overflow_fn_ = getOrInsertDeclaration(
       module(), llvm::Intrinsic::sadd_with_overflow, types()->i128_type());
   DCHECK_NE(sadd_with_overflow_fn_, nullptr);
 
-  smul_with_overflow_fn_ = llvm::Intrinsic::getDeclaration(
+  smul_with_overflow_fn_ = getOrInsertDeclaration(
       module(), llvm::Intrinsic::smul_with_overflow, types()->i128_type());
   DCHECK_NE(smul_with_overflow_fn_, nullptr);
 
@@ -96,8 +106,9 @@ void DecimalIR::InitializeIntrinsics() {
 // CPP:  return kScaleMultipliers[scale]
 llvm::Value* DecimalIR::GetScaleMultiplier(llvm::Value* scale) {
   auto const_array = module()->getGlobalVariable(kScaleMultipliersName);
-  auto ptr = ir_builder()->CreateGEP(const_array, {types()->i32_constant(0), scale});
-  return ir_builder()->CreateLoad(ptr);
+  auto ptr = ir_builder()->CreateGEP(const_array->getValueType(), const_array,
+                                     {types()->i32_constant(0), scale});
+  return ir_builder()->CreateLoad(types()->i128_type(), ptr);
 }
 
 // CPP:  x <= y ? y : x
@@ -248,8 +259,8 @@ llvm::Value* DecimalIR::AddLarge(const ValueFull& x, const ValueFull& y,
   ir_builder()->CreateCall(module()->getFunction("add_large_decimal128_decimal128"),
                            args);
 
-  auto out_high = ir_builder()->CreateLoad(out_high_ptr);
-  auto out_low = ir_builder()->CreateLoad(out_low_ptr);
+  auto out_high = ir_builder()->CreateLoad(types()->i64_type(), out_high_ptr);
+  auto out_low = ir_builder()->CreateLoad(types()->i64_type(), out_low_ptr);
   auto sum = ValueSplit(out_high, out_low).AsInt128(this);
   ADD_TRACE_128("AddLarge : sum", sum);
   return sum;
@@ -445,8 +456,8 @@ llvm::Value* DecimalIR::CallDecimalFunction(const std::string& function_name,
     // Make call to pre-compiled IR function.
     ir_builder()->CreateCall(module()->getFunction(function_name), dis_assembled_args);
 
-    auto out_high = ir_builder()->CreateLoad(out_high_ptr);
-    auto out_low = ir_builder()->CreateLoad(out_low_ptr);
+    auto out_high = ir_builder()->CreateLoad(i64, out_high_ptr);
+    auto out_low = ir_builder()->CreateLoad(i64, out_low_ptr);
     result = ValueSplit(out_high, out_low).AsInt128(this);
   } else {
     DCHECK_NE(return_type, types()->void_type());
@@ -540,7 +551,7 @@ llvm::Value* DecimalIR::ValueWithOverflow::AsStruct(DecimalIR* decimal_ir) const
 void DecimalIR::AddTrace(const std::string& fmt, std::vector<llvm::Value*> args) {
   DCHECK(enable_ir_traces_);
 
-  auto ir_str = ir_builder()->CreateGlobalStringPtr(fmt);
+  auto ir_str = CreateGlobalStringPtr(fmt);
   args.insert(args.begin(), ir_str);
   ir_builder()->CreateCall(module()->getFunction("printf"), args, "trace");
 }

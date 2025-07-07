@@ -17,138 +17,163 @@
 
 #pragma once
 
-#include <memory>
-#include <vector>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
 
-#include "arrow/array.h"
+#include "arrow/array/util.h"
 #include "arrow/buffer.h"
-#include "arrow/compute/kernel.h"
-#include "arrow/status.h"
-#include "arrow/util/visibility.h"
+#include "arrow/compute/kernels/codegen_internal.h"
+#include "arrow/compute/type_fwd.h"
+#include "arrow/util/bit_run_reader.h"
+#include "arrow/util/bitmap_ops.h"
+#include "arrow/util/math_constants.h"
 
 namespace arrow {
+
+using internal::CountAndSetBits;
+using internal::CountSetBits;
+
 namespace compute {
 
-class FunctionContext;
+class ScalarFunction;
 
-// \brief Make a copy of the buffers into a destination array without carrying
-// the type.
-static inline void ZeroCopyData(const ArrayData& input, ArrayData* output) {
-  output->length = input.length;
-  output->SetNullCount(input.null_count);
-  output->buffers = input.buffers;
-  output->offset = input.offset;
-  output->child_data = input.child_data;
+namespace internal {
+
+template <typename T>
+using maybe_make_unsigned =
+    typename std::conditional<std::is_integral<T>::value && !std::is_same<T, bool>::value,
+                              std::make_unsigned<T>, std::common_type<T>>::type;
+
+template <typename T, typename Unsigned = typename maybe_make_unsigned<T>::type>
+constexpr Unsigned to_unsigned(T signed_) {
+  return static_cast<Unsigned>(signed_);
 }
 
-namespace detail {
+// Return (min, max) of a numerical array, ignore nulls.
+// For empty array, return the maximal number limit as 'min', and minimal limit as 'max'.
+template <typename T>
+ARROW_NOINLINE std::pair<T, T> GetMinMax(const ArraySpan& data) {
+  T min = std::numeric_limits<T>::max();
+  T max = std::numeric_limits<T>::lowest();
 
-/// \brief Invoke the kernel on value using the ctx and store results in outputs.
-///
-/// \param[in,out] ctx The function context to use when invoking the kernel.
-/// \param[in,out] kernel The kernel to execute.
-/// \param[in] value The input value to execute the kernel with.
-/// \param[out] outputs One ArrayData datum for each ArrayData available in value.
-ARROW_EXPORT
-Status InvokeUnaryArrayKernel(FunctionContext* ctx, UnaryKernel* kernel,
-                              const Datum& value, std::vector<Datum>* outputs);
+  const T* values = data.GetValues<T>(1);
+  arrow::internal::VisitSetBitRunsVoid(data.buffers[0].data, data.offset, data.length,
+                                       [&](int64_t pos, int64_t len) {
+                                         for (int64_t i = 0; i < len; ++i) {
+                                           min = std::min(min, values[pos + i]);
+                                           max = std::max(max, values[pos + i]);
+                                         }
+                                       });
 
-ARROW_EXPORT
-Status InvokeBinaryArrayKernel(FunctionContext* ctx, BinaryKernel* kernel,
-                               const Datum& left, const Datum& right,
-                               std::vector<Datum>* outputs);
-ARROW_EXPORT
-Status InvokeBinaryArrayKernel(FunctionContext* ctx, BinaryKernel* kernel,
-                               const Datum& left, const Datum& right, Datum* output);
+  return std::make_pair(min, max);
+}
 
-/// \brief Assign validity bitmap to output, copying bitmap if necessary, but
-/// zero-copy otherwise, so that the same value slots are valid/not-null in the
-/// output (sliced arrays).
-///
-/// \param[in] ctx the kernel FunctionContext
-/// \param[in] input the input array
-/// \param[out] output the output array.  Must have length set correctly.
-ARROW_EXPORT
-Status PropagateNulls(FunctionContext* ctx, const ArrayData& input, ArrayData* output);
+template <typename T>
+std::pair<T, T> GetMinMax(const ChunkedArray& arr) {
+  T min = std::numeric_limits<T>::max();
+  T max = std::numeric_limits<T>::lowest();
 
-/// \brief Assign validity bitmap to output, copying and computing the
-/// intersection bitmap if necessary, but zero-copy if possible, so that the
-/// same value slots are valid/not-null in the output (sliced arrays).
-///
-/// \param[in] ctx the kernel FunctionContext
-/// \param[in] left the left input array
-/// \param[in] right the right input array
-/// \param[out] output the output array.  Must have length set correctly.
-ARROW_EXPORT
-Status PropagateNulls(FunctionContext* ctx, const ArrayData& left, const ArrayData& right,
-                      ArrayData* output);
+  for (const auto& chunk : arr.chunks()) {
+    T local_min, local_max;
+    std::tie(local_min, local_max) = GetMinMax<T>(*chunk->data());
+    min = std::min(min, local_min);
+    max = std::max(max, local_max);
+  }
 
-/// \brief Set validity bitmap in output with all null values.
-///
-/// \param[in] ctx the kernel FunctionContext
-/// \param[in] input the input array
-/// \param[out] output the output array.  Must have length and buffer set correctly.
-ARROW_EXPORT
-Status SetAllNulls(FunctionContext* ctx, const ArrayData& input, ArrayData* output);
+  return std::make_pair(min, max);
+}
 
-/// \brief Assign validity bitmap to output, taking the intersection of left and right
-/// null bitmaps if necessary, but zero-copy otherwise.
-///
-/// \param[in] ctx the kernel FunctionContext
-/// \param[in] left the left operand
-/// \param[in] right the right operand
-/// \param[out] output the output array. Must have length set correctly.
-ARROW_EXPORT
-Status AssignNullIntersection(FunctionContext* ctx, const ArrayData& left,
-                              const ArrayData& right, ArrayData* output);
+// Count value occurrences of an array, ignore nulls.
+// 'counts' must be zeroed and with enough size.
+template <typename T>
+ARROW_NOINLINE int64_t CountValues(const ArraySpan& data, T min, uint64_t* counts) {
+  const int64_t n = data.length - data.GetNullCount();
+  if (n > 0) {
+    const T* values = data.GetValues<T>(1);
+    arrow::internal::VisitSetBitRunsVoid(data.buffers[0].data, data.offset, data.length,
+                                         [&](int64_t pos, int64_t len) {
+                                           for (int64_t i = 0; i < len; ++i) {
+                                             ++counts[values[pos + i] - min];
+                                           }
+                                         });
+  }
+  return n;
+}
 
-ARROW_EXPORT
-Datum WrapArraysLike(const Datum& value, std::shared_ptr<DataType> type,
-                     const std::vector<std::shared_ptr<Array>>& arrays);
+template <typename T>
+int64_t CountValues(const ChunkedArray& values, T min, uint64_t* counts) {
+  int64_t n = 0;
+  for (const auto& array : values.chunks()) {
+    n += CountValues<T>(*array->data(), min, counts);
+  }
+  return n;
+}
 
-ARROW_EXPORT
-Datum WrapDatumsLike(const Datum& value, std::shared_ptr<DataType> type,
-                     const std::vector<Datum>& datums);
+// Copy numerical array values to a buffer, ignore nulls.
+template <typename T>
+ARROW_NOINLINE int64_t CopyNonNullValues(const ArraySpan& data, T* out) {
+  const int64_t n = data.length - data.GetNullCount();
+  if (n > 0) {
+    int64_t index = 0;
+    const T* values = data.GetValues<T>(1);
+    arrow::internal::VisitSetBitRunsVoid(
+        data.buffers[0].data, data.offset, data.length, [&](int64_t pos, int64_t len) {
+          memcpy(out + index, values + pos, len * sizeof(T));
+          index += len;
+        });
+  }
+  return n;
+}
 
-/// \brief Kernel used to preallocate outputs for primitive types. This
-/// does not include allocations for the validity bitmap (PropagateNulls
-/// should be used for that).
-class ARROW_EXPORT PrimitiveAllocatingUnaryKernel : public UnaryKernel {
- public:
-  // \brief Construct with a delegate that must live longer
-  // then this object.
-  explicit PrimitiveAllocatingUnaryKernel(UnaryKernel* delegate);
-  /// \brief Allocates ArrayData with the necessary data buffers allocated and
-  /// then written into by the delegate kernel
-  Status Call(FunctionContext* ctx, const Datum& input, Datum* out) override;
+template <typename T>
+int64_t CopyNonNullValues(const ChunkedArray& arr, T* out) {
+  int64_t n = 0;
+  for (const auto& chunk : arr.chunks()) {
+    n += CopyNonNullValues(*chunk->data(), out + n);
+  }
+  return n;
+}
 
-  std::shared_ptr<DataType> out_type() const override;
+ExecValue GetExecValue(const Datum& value);
 
- private:
-  UnaryKernel* delegate_;
-};
+int64_t GetTrueCount(const ArraySpan& mask);
 
-/// \brief Kernel used to preallocate outputs for primitive types.
-class ARROW_EXPORT PrimitiveAllocatingBinaryKernel : public BinaryKernel {
- public:
-  // \brief Construct with a kernel to delegate operations to.
-  //
-  // Ownership is not taken of the delegate kernel, it must outlive
-  // the life time of this object.
-  explicit PrimitiveAllocatingBinaryKernel(BinaryKernel* delegate);
+template <template <typename... Args> class KernelGenerator, typename Op>
+ArrayKernelExec GenerateArithmeticFloatingPoint(detail::GetTypeId get_id) {
+  switch (get_id.id) {
+    case Type::FLOAT:
+      return KernelGenerator<FloatType, FloatType, Op>::Exec;
+    case Type::DOUBLE:
+      return KernelGenerator<DoubleType, DoubleType, Op>::Exec;
+    default:
+      ARROW_DCHECK(false);
+      return nullptr;
+  }
+}
 
-  /// \brief Sets out to be of type ArrayData with the necessary
-  /// data buffers prepopulated.
-  Status Call(FunctionContext* ctx, const Datum& left, const Datum& right,
-              Datum* out) override;
+// A scalar kernel that ignores (assumed all-null) inputs and returns null.
+void AddNullExec(ScalarFunction* func);
 
-  std::shared_ptr<DataType> out_type() const override;
+inline Result<std::shared_ptr<Buffer>> GetOrCopyNullBitmapBuffer(
+    const ArraySpan& in_array, MemoryPool* pool) {
+  if (in_array.buffers[0].data == nullptr) {
+    return nullptr;
+  }
 
- private:
-  BinaryKernel* delegate_;
-};
+  if (in_array.offset == 0) {
+    return in_array.GetBuffer(0);
+  }
 
-}  // namespace detail
+  if (in_array.offset % 8 == 0) {
+    return SliceBuffer(in_array.GetBuffer(0), /*offset=*/in_array.offset / 8);
+  }
 
+  // If a non-zero offset, we need to shift the bitmap
+  return arrow::internal::CopyBitmap(pool, in_array.buffers[0].data, in_array.offset,
+                                     in_array.length);
+}
+
+}  // namespace internal
 }  // namespace compute
 }  // namespace arrow

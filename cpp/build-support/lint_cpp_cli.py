@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -31,6 +31,7 @@ _STRIP_COMMENT_REGEX = re.compile('(.+)?(?=//)')
 _NULLPTR_REGEX = re.compile(r'.*\bnullptr\b.*')
 _RETURN_NOT_OK_REGEX = re.compile(r'.*\sRETURN_NOT_OK.*')
 _ASSIGN_OR_RAISE_REGEX = re.compile(r'.*\sASSIGN_OR_RAISE.*')
+_DCHECK_REGEX = re.compile(r'.*\sDCHECK.*')
 
 
 def _paths(paths):
@@ -54,14 +55,12 @@ def lint_file(path):
         (lambda x: re.match(_RETURN_NOT_OK_REGEX, x),
          'Use ARROW_RETURN_NOT_OK in header files', _paths('''\
          arrow/status.h
-         test
-         arrow/util/hash.h
          arrow/python/util''')),
         (lambda x: re.match(_ASSIGN_OR_RAISE_REGEX, x),
-         'Use ARROW_ASSIGN_OR_RAISE in header files', _paths('''\
-         arrow/result_internal.h
-         test
-         '''))
+         'Use ARROW_ASSIGN_OR_RAISE in header files', []),
+        (lambda x: re.match(_DCHECK_REGEX, x),
+         'Use ARROW_DCHECK in header files', _paths('''\
+         arrow/util/logging.h'''))
 
     ]
 

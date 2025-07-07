@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:18.04
+FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND noninteractive
 
@@ -26,16 +26,21 @@ RUN \
   apt update ${quiet} && \
   apt install -y -V ${quiet} \
     apt-utils \
-    createrepo \
+    createrepo-c \
     devscripts \
     gpg \
+    locales \
     openssh-server \
+    rake \
     rpm \
     ruby \
-    rake \
     sudo && \
   apt clean && \
   rm -rf /var/lib/apt/lists/*
+
+RUN gem install apt-dists-merge -v ">= 1.0.2"
+
+RUN locale-gen en_US.UTF-8
 
 RUN mkdir -p /run/sshd
 RUN echo "StreamLocalBindUnlink yes" >> /etc/ssh/sshd_config

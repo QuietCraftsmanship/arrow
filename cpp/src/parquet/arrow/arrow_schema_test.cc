@@ -18,6 +18,8 @@
 #include <memory>
 #include <vector>
 
+#include "gmock/gmock-matchers.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 #include "parquet/arrow/reader.h"
@@ -25,12 +27,18 @@
 #include "parquet/arrow/schema.h"
 #include "parquet/file_reader.h"
 #include "parquet/schema.h"
+#include "parquet/schema_internal.h"
 #include "parquet/test_util.h"
+#include "parquet/thrift_internal.h"
 
-#include "arrow/api.h"
+#include "arrow/array.h"
+#include "arrow/extension/json.h"
+#include "arrow/ipc/writer.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/type.h"
+#include "arrow/util/base64.h"
+#include "arrow/util/key_value_metadata.h"
 
-using arrow::ArrayFromVector;
 using arrow::Field;
 using arrow::TimeUnit;
 
@@ -38,13 +46,15 @@ using ParquetType = parquet::Type;
 using parquet::ConvertedType;
 using parquet::LogicalType;
 using parquet::Repetition;
+using parquet::format::SchemaElement;
+using parquet::internal::LevelInfo;
 using parquet::schema::GroupNode;
 using parquet::schema::NodePtr;
 using parquet::schema::PrimitiveNode;
 
-namespace parquet {
+using ::testing::ElementsAre;
 
-namespace arrow {
+namespace parquet::arrow {
 
 const auto BOOL = ::arrow::boolean();
 const auto UINT8 = ::arrow::uint8();
@@ -70,17 +80,17 @@ class TestConvertParquetSchema : public ::testing::Test {
       auto result_field = result_schema_->field(i);
       auto expected_field = expected_schema->field(i);
       EXPECT_TRUE(result_field->Equals(expected_field, check_metadata))
-          << "Field " << i << "\n  result: " << result_field->ToString()
-          << "\n  expected: " << expected_field->ToString();
+          << "Field " << i << "\n  result: " << result_field->ToString(check_metadata)
+          << "\n  expected: " << expected_field->ToString(check_metadata);
     }
   }
 
   ::arrow::Status ConvertSchema(
       const std::vector<NodePtr>& nodes,
-      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = nullptr) {
+      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = nullptr,
+      ArrowReaderProperties props = ArrowReaderProperties()) {
     NodePtr schema = GroupNode::Make("schema", Repetition::REPEATED, nodes);
     descr_.Init(schema);
-    ArrowReaderProperties props;
     return FromParquetSchema(&descr_, props, key_value_metadata, &result_schema_);
   }
 
@@ -109,13 +119,13 @@ TEST_F(TestConvertParquetSchema, ParquetFlatPrimitives) {
                                                ParquetType::INT64,
                                                ConvertedType::TIMESTAMP_MILLIS));
   arrow_fields.push_back(
-      ::arrow::field("timestamp", ::arrow::timestamp(TimeUnit::MILLI), false));
+      ::arrow::field("timestamp", ::arrow::timestamp(TimeUnit::MILLI, "UTC"), false));
 
   parquet_fields.push_back(PrimitiveNode::Make("timestamp[us]", Repetition::REQUIRED,
                                                ParquetType::INT64,
                                                ConvertedType::TIMESTAMP_MICROS));
   arrow_fields.push_back(
-      ::arrow::field("timestamp[us]", ::arrow::timestamp(TimeUnit::MICRO), false));
+      ::arrow::field("timestamp[us]", ::arrow::timestamp(TimeUnit::MICRO, "UTC"), false));
 
   parquet_fields.push_back(PrimitiveNode::Make("date", Repetition::REQUIRED,
                                                ParquetType::INT32, ConvertedType::DATE));
@@ -175,11 +185,11 @@ TEST_F(TestConvertParquetSchema, ParquetAnnotatedFields) {
       {"string", LogicalType::String(), ParquetType::BYTE_ARRAY, -1, ::arrow::utf8()},
       {"enum", LogicalType::Enum(), ParquetType::BYTE_ARRAY, -1, ::arrow::binary()},
       {"decimal(8, 2)", LogicalType::Decimal(8, 2), ParquetType::INT32, -1,
-       ::arrow::decimal(8, 2)},
+       ::arrow::decimal128(8, 2)},
       {"decimal(16, 4)", LogicalType::Decimal(16, 4), ParquetType::INT64, -1,
-       ::arrow::decimal(16, 4)},
+       ::arrow::decimal128(16, 4)},
       {"decimal(32, 8)", LogicalType::Decimal(32, 8), ParquetType::FIXED_LEN_BYTE_ARRAY,
-       16, ::arrow::decimal(32, 8)},
+       16, ::arrow::decimal128(32, 8)},
       {"date", LogicalType::Date(), ParquetType::INT32, -1, ::arrow::date32()},
       {"time(ms)", LogicalType::Time(true, LogicalType::TimeUnit::MILLIS),
        ParquetType::INT32, -1, ::arrow::time32(::arrow::TimeUnit::MILLI)},
@@ -224,12 +234,14 @@ TEST_F(TestConvertParquetSchema, ParquetAnnotatedFields) {
        ::arrow::uint64()},
       {"int(64, true)", LogicalType::Int(64, true), ParquetType::INT64, -1,
        ::arrow::int64()},
-      {"json", LogicalType::JSON(), ParquetType::BYTE_ARRAY, -1, ::arrow::binary()},
+      {"json", LogicalType::JSON(), ParquetType::BYTE_ARRAY, -1, ::arrow::utf8()},
       {"bson", LogicalType::BSON(), ParquetType::BYTE_ARRAY, -1, ::arrow::binary()},
       {"interval", LogicalType::Interval(), ParquetType::FIXED_LEN_BYTE_ARRAY, 12,
        ::arrow::fixed_size_binary(12)},
       {"uuid", LogicalType::UUID(), ParquetType::FIXED_LEN_BYTE_ARRAY, 16,
        ::arrow::fixed_size_binary(16)},
+      {"float16", LogicalType::Float16(), ParquetType::FIXED_LEN_BYTE_ARRAY, 2,
+       ::arrow::float16()},
       {"none", LogicalType::None(), ParquetType::BOOLEAN, -1, ::arrow::boolean()},
       {"none", LogicalType::None(), ParquetType::INT32, -1, ::arrow::int32()},
       {"none", LogicalType::None(), ParquetType::INT64, -1, ::arrow::int64()},
@@ -340,6 +352,78 @@ TEST_F(TestConvertParquetSchema, ParquetFlatDecimals) {
   ASSERT_OK(ConvertSchema(parquet_fields));
 
   ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
+}
+
+TEST_F(TestConvertParquetSchema, ParquetMaps) {
+  std::vector<NodePtr> parquet_fields;
+  std::vector<std::shared_ptr<Field>> arrow_fields;
+
+  // MAP encoding example taken from parquet-format/LogicalTypes.md
+
+  // Two column map.
+  {
+    auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                                   ConvertedType::UTF8);
+    auto value = PrimitiveNode::Make("value", Repetition::OPTIONAL,
+                                     ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
+
+    auto list = GroupNode::Make("key_value", Repetition::REPEATED, {key, value});
+    parquet_fields.push_back(
+        GroupNode::Make("my_map", Repetition::REQUIRED, {list}, LogicalType::Map()));
+    auto arrow_key = ::arrow::field("key", UTF8, /*nullable=*/false);
+    auto arrow_value = ::arrow::field("value", UTF8, /*nullable=*/true);
+    auto arrow_map = std::make_shared<::arrow::MapType>(
+        ::arrow::field("my_map", ::arrow::struct_({arrow_key, arrow_value}),
+                       /*nullable=*/false),
+        /*nullable=*/false);
+
+    arrow_fields.push_back(::arrow::field("my_map", arrow_map, /*nullable=*/false));
+  }
+  // Single column map (i.e. set) gets converted to list of struct.
+  {
+    auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                                   ConvertedType::UTF8);
+
+    auto list = GroupNode::Make("key_value", Repetition::REPEATED, {key});
+    parquet_fields.push_back(
+        GroupNode::Make("my_set", Repetition::REQUIRED, {list}, LogicalType::Map()));
+    auto arrow_list = ::arrow::list({::arrow::field("key", UTF8, /*nullable=*/false)});
+    arrow_fields.push_back(::arrow::field("my_set", arrow_list, false));
+  }
+  // Two column map with non-standard field names.
+  {
+    auto key = PrimitiveNode::Make("int_key", Repetition::REQUIRED, ParquetType::INT32,
+                                   ConvertedType::INT_32);
+    auto value = PrimitiveNode::Make("str_value", Repetition::OPTIONAL,
+                                     ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
+
+    auto list = GroupNode::Make("items", Repetition::REPEATED, {key, value});
+    parquet_fields.push_back(
+        GroupNode::Make("items", Repetition::REQUIRED, {list}, LogicalType::Map()));
+    auto arrow_value = ::arrow::field("str_value", UTF8, /*nullable=*/true);
+    auto arrow_key = ::arrow::field("int_key", INT32, /*nullable=*/false);
+    auto arrow_map = std::make_shared<::arrow::MapType>(
+        ::arrow::field("items", ::arrow::struct_({arrow_key, arrow_value}), false),
+        false);
+
+    arrow_fields.push_back(::arrow::field("items", arrow_map, false));
+  }
+
+  auto arrow_schema = ::arrow::schema(arrow_fields);
+  ASSERT_OK(ConvertSchema(parquet_fields));
+
+  ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
+  for (int i = 0; i < arrow_schema->num_fields(); ++i) {
+    auto result_field = result_schema_->field(i);
+    auto expected_field = arrow_schema->field(i);
+    if (expected_field->type()->id() == ::arrow::Type::MAP) {
+      EXPECT_TRUE(
+          expected_field->type()->field(0)->Equals(result_field->type()->field(0)))
+          << "Map's struct in field " << i
+          << "\n result: " << result_field->type()->field(0)->ToString() << " "
+          << "\n expected: " << expected_field->type()->field(0)->ToString() << "\n";
+    }
+  }
 }
 
 TEST_F(TestConvertParquetSchema, ParquetLists) {
@@ -518,6 +602,58 @@ TEST_F(TestConvertParquetSchema, ParquetLists) {
     arrow_fields.push_back(::arrow::field("name", arrow_list, false));
   }
 
+  // Two-level encoding List<List<Integer>>:
+  // optional group my_list (LIST) {
+  //   repeated group array (LIST) {
+  //     repeated int32 array;
+  //   }
+  // }
+  {
+    auto inner_array =
+        PrimitiveNode::Make("array", Repetition::REPEATED, ParquetType::INT32);
+    auto outer_array = GroupNode::Make("array", Repetition::REPEATED, {inner_array},
+                                       ConvertedType::LIST);
+    parquet_fields.push_back(GroupNode::Make("my_list", Repetition::OPTIONAL,
+                                             {outer_array}, ConvertedType::LIST));
+    auto arrow_inner_array = ::arrow::field("array", INT32, /*nullable=*/false);
+    auto arrow_outer_array =
+        ::arrow::field("array", ::arrow::list(arrow_inner_array), /*nullable=*/false);
+    auto arrow_list = ::arrow::list(arrow_outer_array);
+    arrow_fields.push_back(::arrow::field("my_list", arrow_list, true));
+  }
+
+  // List<Map<String, String>> in three-level list encoding:
+  // optional group my_list (LIST) {
+  //   repeated group list {
+  //     required group element (MAP) {
+  //       repeated group key_value {
+  //         required binary key (STRING);
+  //         optional binary value (STRING);
+  //       }
+  //     }
+  //   }
+  // }
+  {
+    auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                                   ConvertedType::UTF8);
+    auto value = PrimitiveNode::Make("value", Repetition::OPTIONAL,
+                                     ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
+    auto key_value = GroupNode::Make("key_value", Repetition::REPEATED, {key, value});
+    auto element =
+        GroupNode::Make("element", Repetition::REQUIRED, {key_value}, ConvertedType::MAP);
+    auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
+    parquet_fields.push_back(
+        GroupNode::Make("my_list", Repetition::OPTIONAL, {list}, ConvertedType::LIST));
+
+    auto arrow_key = ::arrow::field("key", UTF8, /*nullable=*/false);
+    auto arrow_value = ::arrow::field("value", UTF8, /*nullable=*/true);
+    auto arrow_element = ::arrow::field(
+        "element", std::make_shared<::arrow::MapType>(arrow_key, arrow_value),
+        /*nullable=*/false);
+    auto arrow_list = ::arrow::list(arrow_element);
+    arrow_fields.push_back(::arrow::field("my_list", arrow_list, /*nullable=*/true));
+  }
+
   auto arrow_schema = ::arrow::schema(arrow_fields);
   ASSERT_OK(ConvertSchema(parquet_fields));
 
@@ -604,6 +740,29 @@ TEST_F(TestConvertParquetSchema, ParquetNestedSchema2) {
   ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
 }
 
+TEST_F(TestConvertParquetSchema, ParquetUndefinedType) {
+  std::vector<NodePtr> parquet_fields;
+
+  // Make a node and intentionally modify it such that it comes back
+  // as UndefinedLogicalType::Make()
+  NodePtr node = PrimitiveNode::Make("undefined", Repetition::OPTIONAL,
+                                     StringLogicalType::Make(), Type::BYTE_ARRAY);
+
+  format::SchemaElement string_intermediary;
+  node->ToParquet(&string_intermediary);
+
+  string_intermediary.logicalType.__isset.STRING = false;
+  node = PrimitiveNode::FromParquet(&string_intermediary);
+  parquet_fields.push_back(std::move(node));
+
+  // With default options, the field should be interpreted according to its physical type
+  ASSERT_OK(ConvertSchema(parquet_fields, nullptr));
+
+  auto arrow_schema = ::arrow::schema({{"undefined", BINARY}});
+
+  ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
+}
+
 TEST_F(TestConvertParquetSchema, ParquetRepeatedNestedSchema) {
   std::vector<NodePtr> parquet_fields;
   std::vector<std::shared_ptr<Field>> arrow_fields;
@@ -642,6 +801,174 @@ TEST_F(TestConvertParquetSchema, ParquetRepeatedNestedSchema) {
   ASSERT_OK(ConvertSchema(parquet_fields));
 
   ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
+}
+
+TEST_F(TestConvertParquetSchema, IllegalParquetNestedSchema) {
+  // List<Map<String, String>> in two-level list encoding:
+  //
+  // optional group my_list (LIST) {
+  //   repeated group array (MAP) {
+  //     repeated group key_value {
+  //       required binary key (STRING);
+  //       optional binary value (STRING);
+  //     }
+  //   }
+  // }
+  {
+    auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                                   ConvertedType::UTF8);
+    auto value = PrimitiveNode::Make("value", Repetition::OPTIONAL,
+                                     ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
+    auto key_value = GroupNode::Make("key_value", Repetition::REPEATED, {key, value});
+    auto array =
+        GroupNode::Make("array", Repetition::REPEATED, {key_value}, ConvertedType::MAP);
+    std::vector<NodePtr> parquet_fields;
+    parquet_fields.push_back(
+        GroupNode::Make("my_list", Repetition::OPTIONAL, {array}, ConvertedType::LIST));
+
+    EXPECT_RAISES_WITH_MESSAGE_THAT(
+        Invalid,
+        testing::HasSubstr("Group with one repeated child must be LIST-annotated."),
+        ConvertSchema(parquet_fields));
+  }
+
+  // List<List<String>>: outer list is two-level encoding, inner list is three-level
+  //
+  // optional group my_list (LIST) {
+  //   repeated group array (LIST) {
+  //     repeated group list {
+  //       required binary element (STRING);
+  //     }
+  //   }
+  // }
+  {
+    auto element = PrimitiveNode::Make("element", Repetition::REQUIRED,
+                                       ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
+    auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
+    auto array =
+        GroupNode::Make("array", Repetition::REPEATED, {list}, ConvertedType::LIST);
+    std::vector<NodePtr> parquet_fields;
+    parquet_fields.push_back(
+        GroupNode::Make("my_list", Repetition::OPTIONAL, {array}, ConvertedType::LIST));
+
+    EXPECT_RAISES_WITH_MESSAGE_THAT(
+        Invalid, testing::HasSubstr("LIST-annotated groups must not be repeated."),
+        ConvertSchema(parquet_fields));
+  }
+  // List<List<>>: outer list is two-level encoding, inner list is empty.
+  //
+  // optional group my_list (LIST) {
+  //   repeated group array (LIST) {
+  //     repeated group list {
+  //     }
+  //   }
+  // }
+  {
+    auto list = GroupNode::Make("list", Repetition::REPEATED, {});
+    auto array =
+        GroupNode::Make("array", Repetition::REPEATED, {list}, ConvertedType::LIST);
+    std::vector<NodePtr> parquet_fields;
+    parquet_fields.push_back(
+        GroupNode::Make("my_list", Repetition::OPTIONAL, {array}, ConvertedType::LIST));
+
+    EXPECT_RAISES_WITH_MESSAGE_THAT(
+        Invalid,
+        testing::HasSubstr("LIST-annotated groups must have at least one child."),
+        ConvertSchema(parquet_fields));
+  }
+}
+
+Status ArrowSchemaToParquetMetadata(std::shared_ptr<::arrow::Schema>& arrow_schema,
+                                    std::shared_ptr<KeyValueMetadata>& metadata) {
+  ARROW_ASSIGN_OR_RAISE(
+      std::shared_ptr<Buffer> serialized,
+      ::arrow::ipc::SerializeSchema(*arrow_schema, ::arrow::default_memory_pool()));
+  std::string schema_as_string = serialized->ToString();
+  std::string schema_base64 = ::arrow::util::base64_encode(schema_as_string);
+  metadata = ::arrow::key_value_metadata({"ARROW:schema"}, {schema_base64});
+  return Status::OK();
+}
+
+TEST_F(TestConvertParquetSchema, ParquetSchemaArrowExtensions) {
+  std::vector<NodePtr> parquet_fields;
+  parquet_fields.push_back(PrimitiveNode::Make(
+      "json_1", Repetition::OPTIONAL, ParquetType::BYTE_ARRAY, ConvertedType::JSON));
+  parquet_fields.push_back(PrimitiveNode::Make(
+      "json_2", Repetition::OPTIONAL, ParquetType::BYTE_ARRAY, ConvertedType::JSON));
+
+  {
+    // Parquet file does not contain Arrow schema.
+    // By default, both fields should be treated as utf8() fields in Arrow.
+    auto arrow_schema = ::arrow::schema(
+        {::arrow::field("json_1", UTF8, true), ::arrow::field("json_2", UTF8, true)});
+    std::shared_ptr<KeyValueMetadata> metadata{};
+    ASSERT_OK(ConvertSchema(parquet_fields, metadata));
+    CheckFlatSchema(arrow_schema);
+  }
+
+  {
+    // Parquet file does not contain Arrow schema.
+    // If Arrow extensions are enabled, fields will be interpreted as json(utf8())
+    // extension fields.
+    ArrowReaderProperties props;
+    props.set_arrow_extensions_enabled(true);
+    auto arrow_schema = ::arrow::schema(
+        {::arrow::field("json_1", ::arrow::extension::json(), true),
+         ::arrow::field("json_2", ::arrow::extension::json(::arrow::utf8()), true)});
+    std::shared_ptr<KeyValueMetadata> metadata{};
+    ASSERT_OK(ConvertSchema(parquet_fields, metadata, props));
+    CheckFlatSchema(arrow_schema);
+
+    // If original data was e.g. json(large_utf8()) it will be interpreted as json(utf8())
+    // in absence of Arrow schema.
+    arrow_schema = ::arrow::schema(
+        {::arrow::field("json_1", ::arrow::extension::json(), true),
+         ::arrow::field("json_2", ::arrow::extension::json(::arrow::large_utf8()),
+                        true)});
+    metadata = std::shared_ptr<KeyValueMetadata>{};
+    ASSERT_OK(ConvertSchema(parquet_fields, metadata, props));
+    EXPECT_TRUE(result_schema_->field(1)->type()->Equals(
+        ::arrow::extension::json(::arrow::utf8())));
+    EXPECT_FALSE(
+        result_schema_->field(1)->type()->Equals(arrow_schema->field(1)->type()));
+  }
+
+  {
+    // Parquet file contains Arrow schema.
+    // json_1 and json_2 will be interpreted as json(utf8()) and json(large_utf8())
+    // fields even though extensions are not enabled.
+    ArrowReaderProperties props;
+    props.set_arrow_extensions_enabled(false);
+    std::shared_ptr<KeyValueMetadata> field_metadata =
+        ::arrow::key_value_metadata({"foo", "bar"}, {"biz", "baz"});
+    auto arrow_schema = ::arrow::schema(
+        {::arrow::field("json_1", ::arrow::extension::json(), true, field_metadata),
+         ::arrow::field("json_2", ::arrow::extension::json(::arrow::large_utf8()),
+                        true)});
+
+    std::shared_ptr<KeyValueMetadata> metadata;
+    ASSERT_OK(ArrowSchemaToParquetMetadata(arrow_schema, metadata));
+    ASSERT_OK(ConvertSchema(parquet_fields, metadata, props));
+    CheckFlatSchema(arrow_schema, true /* check_metadata */);
+  }
+
+  {
+    // Parquet file contains Arrow schema. Extensions are enabled.
+    // json_1 and json_2 will be interpreted as json(utf8()) and json(large_utf8()).
+    ArrowReaderProperties props;
+    props.set_arrow_extensions_enabled(true);
+    std::shared_ptr<KeyValueMetadata> field_metadata =
+        ::arrow::key_value_metadata({"foo", "bar"}, {"biz", "baz"});
+    auto arrow_schema = ::arrow::schema(
+        {::arrow::field("json_1", ::arrow::extension::json(), true, field_metadata),
+         ::arrow::field("json_2", ::arrow::extension::json(::arrow::large_utf8()),
+                        true)});
+
+    std::shared_ptr<KeyValueMetadata> metadata;
+    ASSERT_OK(ArrowSchemaToParquetMetadata(arrow_schema, metadata));
+    ASSERT_OK(ConvertSchema(parquet_fields, metadata, props));
+    CheckFlatSchema(arrow_schema, true /* check_metadata */);
+  }
 }
 
 class TestConvertArrowSchema : public ::testing::Test {
@@ -756,8 +1083,7 @@ TEST_F(TestConvertArrowSchema, ArrowFields) {
       {"int8", ::arrow::int8(), LogicalType::Int(8, true), ParquetType::INT32, -1},
       {"uint16", ::arrow::uint16(), LogicalType::Int(16, false), ParquetType::INT32, -1},
       {"int16", ::arrow::int16(), LogicalType::Int(16, true), ParquetType::INT32, -1},
-      {"uint32", ::arrow::uint32(), LogicalType::None(), ParquetType::INT64,
-       -1},  // Parquet 1.0
+      {"uint32", ::arrow::uint32(), LogicalType::Int(32, false), ParquetType::INT32, -1},
       {"int32", ::arrow::int32(), LogicalType::None(), ParquetType::INT32, -1},
       {"uint64", ::arrow::uint64(), LogicalType::Int(64, false), ParquetType::INT64, -1},
       {"int64", ::arrow::int64(), LogicalType::None(), ParquetType::INT64, -1},
@@ -766,14 +1092,16 @@ TEST_F(TestConvertArrowSchema, ArrowFields) {
       {"utf8", ::arrow::utf8(), LogicalType::String(), ParquetType::BYTE_ARRAY, -1},
       {"large_utf8", ::arrow::large_utf8(), LogicalType::String(),
        ParquetType::BYTE_ARRAY, -1},
-      {"decimal(1, 0)", ::arrow::decimal(1, 0), LogicalType::Decimal(1, 0),
+      {"decimal(1, 0)", ::arrow::decimal128(1, 0), LogicalType::Decimal(1, 0),
        ParquetType::FIXED_LEN_BYTE_ARRAY, 1},
-      {"decimal(8, 2)", ::arrow::decimal(8, 2), LogicalType::Decimal(8, 2),
+      {"decimal(8, 2)", ::arrow::decimal128(8, 2), LogicalType::Decimal(8, 2),
        ParquetType::FIXED_LEN_BYTE_ARRAY, 4},
-      {"decimal(16, 4)", ::arrow::decimal(16, 4), LogicalType::Decimal(16, 4),
+      {"decimal(16, 4)", ::arrow::decimal128(16, 4), LogicalType::Decimal(16, 4),
        ParquetType::FIXED_LEN_BYTE_ARRAY, 7},
-      {"decimal(32, 8)", ::arrow::decimal(32, 8), LogicalType::Decimal(32, 8),
+      {"decimal(32, 8)", ::arrow::decimal128(32, 8), LogicalType::Decimal(32, 8),
        ParquetType::FIXED_LEN_BYTE_ARRAY, 14},
+      {"float16", ::arrow::float16(), LogicalType::Float16(),
+       ParquetType::FIXED_LEN_BYTE_ARRAY, 2},
       {"time32", ::arrow::time32(::arrow::TimeUnit::MILLI),
        LogicalType::Time(true, LogicalType::TimeUnit::MILLIS), ParquetType::INT32, -1},
       {"time64(microsecond)", ::arrow::time64(::arrow::TimeUnit::MICRO),
@@ -790,9 +1118,8 @@ TEST_F(TestConvertArrowSchema, ArrowFields) {
                               /*is_from_converted_type=*/false,
                               /*force_set_converted_type=*/true),
        ParquetType::INT64, -1},
-      // Parquet v1, values converted to microseconds
       {"timestamp(nanosecond)", ::arrow::timestamp(::arrow::TimeUnit::NANO),
-       LogicalType::Timestamp(false, LogicalType::TimeUnit::MICROS,
+       LogicalType::Timestamp(false, LogicalType::TimeUnit::NANOS,
                               /*is_from_converted_type=*/false,
                               /*force_set_converted_type=*/true),
        ParquetType::INT64, -1},
@@ -803,7 +1130,7 @@ TEST_F(TestConvertArrowSchema, ArrowFields) {
        LogicalType::Timestamp(true, LogicalType::TimeUnit::MICROS), ParquetType::INT64,
        -1},
       {"timestamp(nanosecond, UTC)", ::arrow::timestamp(::arrow::TimeUnit::NANO, "UTC"),
-       LogicalType::Timestamp(true, LogicalType::TimeUnit::MICROS), ParquetType::INT64,
+       LogicalType::Timestamp(true, LogicalType::TimeUnit::NANOS), ParquetType::INT64,
        -1},
       {"timestamp(millisecond, CET)", ::arrow::timestamp(::arrow::TimeUnit::MILLI, "CET"),
        LogicalType::Timestamp(true, LogicalType::TimeUnit::MILLIS), ParquetType::INT64,
@@ -812,9 +1139,8 @@ TEST_F(TestConvertArrowSchema, ArrowFields) {
        LogicalType::Timestamp(true, LogicalType::TimeUnit::MICROS), ParquetType::INT64,
        -1},
       {"timestamp(nanosecond, CET)", ::arrow::timestamp(::arrow::TimeUnit::NANO, "CET"),
-       LogicalType::Timestamp(true, LogicalType::TimeUnit::MICROS), ParquetType::INT64,
-       -1},
-      {"null", ::arrow::null(), LogicalType::Null(), ParquetType::INT32, -1}};
+       LogicalType::Timestamp(true, LogicalType::TimeUnit::NANOS), ParquetType::INT64,
+       -1}};
 
   std::vector<std::shared_ptr<Field>> arrow_fields;
   std::vector<NodePtr> parquet_fields;
@@ -838,7 +1164,8 @@ TEST_F(TestConvertArrowSchema, ArrowNonconvertibleFields) {
   };
 
   std::vector<FieldConstructionArguments> cases = {
-      {"float16", ::arrow::float16()},
+      {"run_end_encoded",
+       ::arrow::run_end_encoded(::arrow::int32(), ::arrow::list(::arrow::int8()))},
   };
 
   for (const FieldConstructionArguments& c : cases) {
@@ -910,7 +1237,7 @@ TEST_F(TestConvertArrowSchema, ParquetLists) {
   //   }
   // }
   {
-    auto element = PrimitiveNode::Make("string", Repetition::OPTIONAL,
+    auto element = PrimitiveNode::Make("element", Repetition::OPTIONAL,
                                        ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
     auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
     parquet_fields.push_back(
@@ -927,7 +1254,7 @@ TEST_F(TestConvertArrowSchema, ParquetLists) {
   //   }
   // }
   {
-    auto element = PrimitiveNode::Make("string", Repetition::REQUIRED,
+    auto element = PrimitiveNode::Make("element", Repetition::REQUIRED,
                                        ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
     auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
     parquet_fields.push_back(
@@ -946,12 +1273,13 @@ TEST_F(TestConvertArrowSchema, ParquetMaps) {
   std::vector<NodePtr> parquet_fields;
   std::vector<std::shared_ptr<Field>> arrow_fields;
 
-  //  optional group my_map (MAP) {
-  //      repeated group key_value {
-  //          required binary key (UTF8);
-  //          optional binary value (UTF8);
-  //	}
-  //  }
+  // // Map<String, String> (map and map values nullable)
+  // optional group my_map (MAP) {
+  //   repeated group key_value {
+  //     required binary key (UTF8);
+  //     optional binary value (UTF8);
+  //   }
+  // }
   {
     auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
                                    ConvertedType::UTF8);
@@ -967,12 +1295,13 @@ TEST_F(TestConvertArrowSchema, ParquetMaps) {
     arrow_fields.push_back(::arrow::field("my_map", arrow_map, /*nullable=*/true));
   }
 
-  //  required group my_map (MAP) {
-  //      repeated group key_value {
-  //          required binary key (UTF8);
-  //          required binary value (UTF8);
-  //	}
-  //  }
+  // // Map<String, String> (non-nullable)
+  // required group my_map (MAP) {
+  //   repeated group key_value {
+  //     required binary key (UTF8);
+  //     required binary value (UTF8);
+  //   }
+  // }
   {
     auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
                                    ConvertedType::UTF8);
@@ -999,14 +1328,14 @@ TEST_F(TestConvertArrowSchema, ParquetOtherLists) {
 
   // parquet_arrow will always generate 3-level LIST encodings
 
-  // // List<String> (list non-null, elements nullable)
+  // // LargeList<String> (list-like non-null, elements nullable)
   // required group my_list (LIST) {
   //   repeated group list {
   //     optional binary element (UTF8);
   //   }
   // }
   {
-    auto element = PrimitiveNode::Make("string", Repetition::OPTIONAL,
+    auto element = PrimitiveNode::Make("element", Repetition::OPTIONAL,
                                        ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
     auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
     parquet_fields.push_back(
@@ -1015,8 +1344,14 @@ TEST_F(TestConvertArrowSchema, ParquetOtherLists) {
     auto arrow_list = ::arrow::large_list(arrow_element);
     arrow_fields.push_back(::arrow::field("my_list", arrow_list, false));
   }
+  // // FixedSizeList[10]<String> (list-like non-null, elements nullable)
+  // required group my_list (LIST) {
+  //   repeated group list {
+  //     optional binary element (UTF8);
+  //   }
+  // }
   {
-    auto element = PrimitiveNode::Make("string", Repetition::OPTIONAL,
+    auto element = PrimitiveNode::Make("element", Repetition::OPTIONAL,
                                        ParquetType::BYTE_ARRAY, ConvertedType::UTF8);
     auto list = GroupNode::Make("list", Repetition::REPEATED, {element});
     parquet_fields.push_back(
@@ -1106,8 +1441,191 @@ TEST_F(TestConvertArrowSchema, ParquetFlatDecimals) {
   ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(parquet_fields));
 }
 
+class TestConvertRoundTrip : public ::testing::Test {
+ public:
+  ::arrow::Status RoundTripSchema(
+      const std::vector<std::shared_ptr<Field>>& fields,
+      std::shared_ptr<::parquet::ArrowWriterProperties> arrow_properties =
+          ::parquet::default_arrow_writer_properties()) {
+    arrow_schema_ = ::arrow::schema(fields);
+    std::shared_ptr<::parquet::WriterProperties> properties =
+        ::parquet::default_writer_properties();
+    RETURN_NOT_OK(ToParquetSchema(arrow_schema_.get(), *properties.get(),
+                                  *arrow_properties, &parquet_schema_));
+    ::parquet::schema::ToParquet(parquet_schema_->group_node(), &parquet_format_schema_);
+    auto parquet_schema = ::parquet::schema::FromParquet(parquet_format_schema_);
+    return FromParquetSchema(parquet_schema.get(), &result_schema_);
+  }
+
+ protected:
+  std::shared_ptr<::arrow::Schema> arrow_schema_;
+  std::shared_ptr<SchemaDescriptor> parquet_schema_;
+  std::vector<SchemaElement> parquet_format_schema_;
+  std::shared_ptr<::arrow::Schema> result_schema_;
+};
+
+int GetFieldId(const ::arrow::Field& field) {
+  if (field.metadata() == nullptr) {
+    return -1;
+  }
+  auto maybe_field = field.metadata()->Get("PARQUET:field_id");
+  if (!maybe_field.ok()) {
+    return -1;
+  }
+  return std::stoi(maybe_field.ValueOrDie());
+}
+
+void GetFieldIdsDfs(const ::arrow::FieldVector& fields, std::vector<int>* field_ids) {
+  for (const auto& field : fields) {
+    field_ids->push_back(GetFieldId(*field));
+    GetFieldIdsDfs(field->type()->fields(), field_ids);
+  }
+}
+
+std::vector<int> GetFieldIdsDfs(const ::arrow::FieldVector& fields) {
+  std::vector<int> field_ids;
+  GetFieldIdsDfs(fields, &field_ids);
+  return field_ids;
+}
+
+std::vector<int> GetParquetFieldIdsHelper(const parquet::schema::Node* node) {
+  std::vector<int> field_ids;
+  field_ids.push_back(node->field_id());
+  if (node->is_group()) {
+    const GroupNode* group_node = static_cast<const GroupNode*>(node);
+    for (int i = 0; i < group_node->field_count(); i++) {
+      for (auto id : GetParquetFieldIdsHelper(group_node->field(i).get())) {
+        field_ids.push_back(id);
+      }
+    }
+  }
+  return field_ids;
+}
+
+std::vector<int> GetParquetFieldIds(std::shared_ptr<SchemaDescriptor> parquet_schema) {
+  return GetParquetFieldIdsHelper(
+      static_cast<const parquet::schema::Node*>(parquet_schema->group_node()));
+}
+
+std::vector<int> GetThriftFieldIds(
+    const std::vector<SchemaElement>& parquet_format_schema) {
+  std::vector<int> field_ids;
+  for (const auto& element : parquet_format_schema) {
+    field_ids.push_back(element.field_id);
+  }
+  return field_ids;
+}
+
+TEST_F(TestConvertRoundTrip, FieldIdMissingIfNotSpecified) {
+  std::vector<std::shared_ptr<Field>> arrow_fields;
+  arrow_fields.push_back(::arrow::field("simple", ::arrow::int32(), false));
+  /// { "nested": { "outer": { "inner" }, "sibling" } }
+  arrow_fields.push_back(::arrow::field(
+      "nested",
+      ::arrow::struct_({::arrow::field("outer", ::arrow::struct_({::arrow::field(
+                                                    "inner", ::arrow::utf8())})),
+                        ::arrow::field("sibling", ::arrow::date32())}),
+      false));
+
+  ASSERT_OK(RoundTripSchema(arrow_fields));
+  auto field_ids = GetFieldIdsDfs(result_schema_->fields());
+  for (int actual_id : field_ids) {
+    ASSERT_EQ(actual_id, -1);
+  }
+  auto parquet_field_ids = GetParquetFieldIds(parquet_schema_);
+  for (int actual_id : parquet_field_ids) {
+    ASSERT_EQ(actual_id, -1);
+  }
+  // In our unit test a "not set" thrift field has a value of 0
+  auto thrift_field_ids = GetThriftFieldIds(parquet_format_schema_);
+  for (int actual_id : thrift_field_ids) {
+    ASSERT_EQ(actual_id, 0);
+  }
+}
+
+std::shared_ptr<::arrow::KeyValueMetadata> FieldIdMetadata(int field_id) {
+  return ::arrow::key_value_metadata({"PARQUET:field_id"}, {std::to_string(field_id)});
+}
+
+TEST_F(TestConvertRoundTrip, FieldIdPreserveExisting) {
+  std::vector<std::shared_ptr<Field>> arrow_fields;
+  arrow_fields.push_back(
+      ::arrow::field("simple", ::arrow::int32(), /*nullable=*/true, FieldIdMetadata(2)));
+  /// { "nested": { "outer": { "inner" }, "sibling" }
+  arrow_fields.push_back(::arrow::field(
+      "nested",
+      ::arrow::struct_({::arrow::field("outer", ::arrow::struct_({::arrow::field(
+                                                    "inner", ::arrow::utf8())})),
+                        ::arrow::field("sibling", ::arrow::date32(), /*nullable=*/true,
+                                       FieldIdMetadata(17))}),
+      false));
+
+  ASSERT_OK(RoundTripSchema(arrow_fields));
+  auto field_ids = GetFieldIdsDfs(result_schema_->fields());
+  auto expected_field_ids = std::vector<int>{2, -1, -1, -1, 17};
+  ASSERT_EQ(field_ids, expected_field_ids);
+
+  // Parquet has a field id for the schema itself
+  expected_field_ids = std::vector<int>{-1, 2, -1, -1, -1, 17};
+  auto parquet_ids = GetParquetFieldIds(parquet_schema_);
+  ASSERT_EQ(parquet_ids, expected_field_ids);
+
+  // In our unit test a "not set" thrift field has a value of 0
+  expected_field_ids = std::vector<int>{0, 2, 0, 0, 0, 17};
+  auto thrift_field_ids = GetThriftFieldIds(parquet_format_schema_);
+  ASSERT_EQ(thrift_field_ids, expected_field_ids);
+}
+
+TEST_F(TestConvertRoundTrip, FieldIdPreserveAllColumnTypes) {
+  std::vector<std::shared_ptr<Field>> arrow_fields;
+  arrow_fields.push_back(::arrow::field("c1", INT32, true, FieldIdMetadata(2)));
+  arrow_fields.push_back(::arrow::field("c2", DOUBLE, true, FieldIdMetadata(4)));
+  arrow_fields.push_back(::arrow::field("c3", DECIMAL_8_4, true, FieldIdMetadata(6)));
+  arrow_fields.push_back(::arrow::field("c4", UTF8, true, FieldIdMetadata(8)));
+
+  auto inner_struct =
+      ::arrow::struct_({::arrow::field("c5_1_1", UTF8, true, FieldIdMetadata(14))});
+  arrow_fields.push_back(::arrow::field(
+      "c5",
+      ::arrow::struct_({::arrow::field("c5_1", inner_struct, true, FieldIdMetadata(12)),
+                        ::arrow::field("c5_2", INT64, true, FieldIdMetadata(16))}),
+      true, FieldIdMetadata(10)));
+
+  auto list_element = ::arrow::field("c6_1", UTF8, true, FieldIdMetadata(20));
+  arrow_fields.push_back(::arrow::field("c6", ::arrow::list(std::move(list_element)),
+                                        true, FieldIdMetadata(18)));
+
+  auto map_key = ::arrow::field("c7_1", UTF8, false, FieldIdMetadata(24));
+  auto map_value = ::arrow::field("c7_2", UTF8, true, FieldIdMetadata(26));
+  arrow_fields.push_back(::arrow::field(
+      "c7", std::make_shared<::arrow::MapType>(std::move(map_key), std::move(map_value)),
+      true, FieldIdMetadata(22)));
+
+  ASSERT_OK(RoundTripSchema(arrow_fields));
+  auto field_ids = GetFieldIdsDfs(result_schema_->fields());
+  // c7 field is an arrow map type which is in fact list<struct<key_field, value_field>>
+  // and the middle struct type does not have field-id.
+  auto expected_field_ids =
+      std::vector<int>{2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, -1, 24, 26};
+  ASSERT_EQ(field_ids, expected_field_ids);
+
+  // Parquet has a field id for the schema itself.
+  // c6 field is a three-level list type where the middle level does not have field-id
+  // c7 field is a map type which in turn is a three-level list type, too.
+  expected_field_ids =
+      std::vector<int>{-1, 2, 4, 6, 8, 10, 12, 14, 16, 18, -1, 20, 22, -1, 24, 26};
+  auto parquet_ids = GetParquetFieldIds(parquet_schema_);
+  ASSERT_EQ(parquet_ids, expected_field_ids);
+
+  // In our unit test a "not set" thrift field has a value of 0
+  expected_field_ids =
+      std::vector<int>{0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 0, 20, 22, 0, 24, 26};
+  auto thrift_field_ids = GetThriftFieldIds(parquet_format_schema_);
+  ASSERT_EQ(thrift_field_ids, expected_field_ids);
+}
+
 TEST(InvalidSchema, ParquetNegativeDecimalScale) {
-  const auto& type = ::arrow::decimal(23, -2);
+  const auto& type = ::arrow::decimal128(23, -2);
   const auto& field = ::arrow::field("f0", type);
   const auto& arrow_schema = ::arrow::schema({field});
   std::shared_ptr<::parquet::WriterProperties> properties =
@@ -1115,6 +1633,16 @@ TEST(InvalidSchema, ParquetNegativeDecimalScale) {
   std::shared_ptr<SchemaDescriptor> result_schema;
 
   ASSERT_RAISES(IOError,
+                ToParquetSchema(arrow_schema.get(), *properties.get(), &result_schema));
+}
+
+TEST(InvalidSchema, NonNullableNullType) {
+  const auto& field = ::arrow::field("f0", ::arrow::null(), /*nullable=*/false);
+  const auto& arrow_schema = ::arrow::schema({field});
+  std::shared_ptr<::parquet::WriterProperties> properties =
+      ::parquet::default_writer_properties();
+  std::shared_ptr<SchemaDescriptor> result_schema;
+  ASSERT_RAISES(Invalid,
                 ToParquetSchema(arrow_schema.get(), *properties.get(), &result_schema));
 }
 
@@ -1131,5 +1659,388 @@ TEST(TestFromParquetSchema, CorruptMetadata) {
   ASSERT_RAISES(IOError, FromParquetSchema(parquet_schema, props, &arrow_schema));
 }
 
-}  // namespace arrow
-}  // namespace parquet
+TEST(TestFromParquetSchema, UndefinedLogicalType) {
+  // Arrow GH-45522
+  auto path = test::get_data_file("unknown-logical-type.parquet");
+
+  std::unique_ptr<parquet::ParquetFileReader> reader =
+      parquet::ParquetFileReader::OpenFile(path);
+  const auto parquet_schema = reader->metadata()->schema();
+  std::shared_ptr<::arrow::Schema> arrow_schema;
+
+  // The underlying physical type is used for conversion to the Arrow type
+  ASSERT_OK(FromParquetSchema(parquet_schema, &arrow_schema));
+  ASSERT_EQ(*arrow_schema->field(1),
+            *::arrow::field("column with unknown type", ::arrow::binary()));
+}
+
+//
+// Test LevelInfo computation from a Parquet schema
+// (for Parquet -> Arrow reading).
+//
+
+::arrow::Result<std::deque<LevelInfo>> RootToTreeLeafLevels(
+    const SchemaManifest& manifest, int column_number) {
+  std::deque<LevelInfo> out;
+  const SchemaField* field = nullptr;
+  RETURN_NOT_OK(manifest.GetColumnField(column_number, &field));
+  while (field != nullptr) {
+    out.push_front(field->level_info);
+    field = manifest.GetParent(field);
+  }
+  return out;
+}
+
+class TestLevels : public ::testing::Test {
+ public:
+  virtual void SetUp() {}
+
+  ::arrow::Status MaybeSetParquetSchema(const NodePtr& column) {
+    descriptor_.reset(new SchemaDescriptor());
+    manifest_.reset(new SchemaManifest());
+    descriptor_->Init(GroupNode::Make("root", Repetition::REQUIRED, {column}));
+    return SchemaManifest::Make(descriptor_.get(),
+                                std::shared_ptr<const ::arrow::KeyValueMetadata>(),
+                                ArrowReaderProperties(), manifest_.get());
+  }
+  void SetParquetSchema(const NodePtr& column) {
+    ASSERT_OK(MaybeSetParquetSchema(column));
+  }
+
+ protected:
+  std::unique_ptr<SchemaDescriptor> descriptor_;
+  std::unique_ptr<SchemaManifest> manifest_;
+};
+
+TEST_F(TestLevels, TestPrimitive) {
+  SetParquetSchema(
+      PrimitiveNode::Make("node_name", Repetition::REQUIRED, ParquetType::BOOLEAN));
+  ASSERT_OK_AND_ASSIGN(std::deque<LevelInfo> levels,
+                       RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(levels, ElementsAre(LevelInfo{/*null_slot_usage=*/1,
+                                            /*def_level=*/0, /*rep_level=*/0,
+                                            /*ancestor_list_def_level*/ 0}));
+  SetParquetSchema(
+      PrimitiveNode::Make("node_name", Repetition::OPTIONAL, ParquetType::BOOLEAN));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(levels, ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1,
+                                            /*rep_level=*/0,
+                                            /*ancestor_list_def_level*/ 0}));
+
+  // Arrow schema: list(bool not null) not null
+  SetParquetSchema(
+      PrimitiveNode::Make("node_name", Repetition::REPEATED, ParquetType::BOOLEAN));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},  // List Field
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1}));  //  primitive field
+}
+
+TEST_F(TestLevels, TestMaps) {
+  // Two column map.
+  auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                                 ConvertedType::UTF8);
+  auto value = PrimitiveNode::Make("value", Repetition::OPTIONAL, ParquetType::BYTE_ARRAY,
+                                   ConvertedType::UTF8);
+
+  auto list = GroupNode::Make("key_value", Repetition::REPEATED, {key, value});
+  SetParquetSchema(
+      GroupNode::Make("my_map", Repetition::OPTIONAL, {list}, LogicalType::Map()));
+  ASSERT_OK_AND_ASSIGN(std::deque<LevelInfo> levels,
+                       RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2}));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/1));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2}));
+
+  // single column map.
+  key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
+                            ConvertedType::UTF8);
+
+  list = GroupNode::Make("key_value", Repetition::REPEATED, {key});
+  SetParquetSchema(
+      GroupNode::Make("my_set", Repetition::REQUIRED, {list}, LogicalType::Map()));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1}));
+}
+
+TEST_F(TestLevels, TestSimpleGroups) {
+  // Arrow schema: struct(child: struct(inner: boolean not null))
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::OPTIONAL,
+      {GroupNode::Make(
+          "child", Repetition::OPTIONAL,
+          {PrimitiveNode::Make("inner", Repetition::REQUIRED, ParquetType::BOOLEAN)})}));
+  ASSERT_OK_AND_ASSIGN(std::deque<LevelInfo> levels,
+                       RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0}));
+
+  // Arrow schema: struct(child: struct(inner: boolean ))
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::OPTIONAL,
+      {GroupNode::Make(
+          "child", Repetition::OPTIONAL,
+          {PrimitiveNode::Make("inner", Repetition::OPTIONAL, ParquetType::BOOLEAN)})}));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0}));
+
+  // Arrow schema: struct(child: struct(inner: boolean)) not null
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::REQUIRED,
+      {GroupNode::Make(
+          "child", Repetition::OPTIONAL,
+          {PrimitiveNode::Make("inner", Repetition::OPTIONAL, ParquetType::BOOLEAN)})}));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/0, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/0,
+                            /*ancestor_list_def_level*/ 0}));
+}
+
+TEST_F(TestLevels, TestRepeatedGroups) {
+  // Arrow schema: list(bool)
+  SetParquetSchema(GroupNode::Make(
+      "child_list", Repetition::OPTIONAL,
+      {GroupNode::Make(
+          "list", Repetition::REPEATED,
+          {PrimitiveNode::Make("element", Repetition::OPTIONAL, ParquetType::BOOLEAN)})},
+      LogicalType::List()));
+
+  ASSERT_OK_AND_ASSIGN(std::deque<LevelInfo> levels,
+                       RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2}));
+
+  // Arrow schema: list(bool) not null
+  SetParquetSchema(GroupNode::Make(
+      "child_list", Repetition::REQUIRED,
+      {GroupNode::Make(
+          "list", Repetition::REPEATED,
+          {PrimitiveNode::Make("element", Repetition::OPTIONAL, ParquetType::BOOLEAN)})},
+      LogicalType::List()));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1}));
+
+  // Arrow schema: list(bool not null)
+  SetParquetSchema(GroupNode::Make(
+      "child_list", Repetition::OPTIONAL,
+      {GroupNode::Make(
+          "list", Repetition::REPEATED,
+          {PrimitiveNode::Make("element", Repetition::REQUIRED, ParquetType::BOOLEAN)})},
+      LogicalType::List()));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 2}));
+
+  // Arrow schema: list(bool not null) not null
+  SetParquetSchema(GroupNode::Make(
+      "child_list", Repetition::REQUIRED,
+      {GroupNode::Make(
+          "list", Repetition::REPEATED,
+          {PrimitiveNode::Make("element", Repetition::REQUIRED, ParquetType::BOOLEAN)})},
+      LogicalType::List()));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1}));
+
+  // Arrow schema: list(struct(child: struct(list(bool not null) not null)) non null) not
+  // null
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::REPEATED,
+      {GroupNode::Make(
+          "child", Repetition::OPTIONAL,
+          {PrimitiveNode::Make("inner", Repetition::REPEATED, ParquetType::BOOLEAN)})}));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1},
+
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/2, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1},  // optional child struct
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 1},  // repeated field
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3}));  // inner field
+
+  // Arrow schema: list(struct(child_list: list(struct(f0: bool f1: bool))) not null) not
+  // null
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::REPEATED,
+      {GroupNode::Make(
+          "child_list", Repetition::OPTIONAL,
+          {GroupNode::Make(
+              "list", Repetition::REPEATED,
+              {GroupNode::Make(
+                  "element", Repetition::OPTIONAL,
+                  {PrimitiveNode::Make("f0", Repetition::OPTIONAL, ParquetType::BOOLEAN),
+                   PrimitiveNode::Make("f1", Repetition::REQUIRED,
+                                       ParquetType::BOOLEAN)})})},
+          LogicalType::List())}));
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},  // parent list
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1},  // parent struct
+
+                  // Def_level=2 is handled together with def_level=3
+                  // When decoding.  Def_level=2 indicates present but empty
+                  // list.  def_level=3 indicates a present element in the
+                  // list.
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 1},  // list field
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/4, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3},  // inner struct field
+
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/5, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3}));  // f0 bool field
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/1));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},  // parent list
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1},  // parent struct
+                  // Def_level=2 is handled together with def_level=3
+                  // When decoding.  Def_level=2 indicate present but empty
+                  // list.  def_level=3 indicates a present element in the
+                  // list.
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 1},  // list field
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/4, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3},  // inner struct field
+
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/4, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3}));  // f1 bool field
+
+  // Arrow schema: list(struct(child_list: list(bool not null)) not null) not null
+  // Legacy 2-level encoding (required for backwards compatibility.  See
+  // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#nested-types
+  // for definitions).
+  SetParquetSchema(GroupNode::Make(
+      "parent", Repetition::REPEATED,
+      {GroupNode::Make(
+          "child_list", Repetition::OPTIONAL,
+          {PrimitiveNode::Make("bool", Repetition::REPEATED, ParquetType::BOOLEAN)},
+          LogicalType::List())}));
+
+  ASSERT_OK_AND_ASSIGN(levels, RootToTreeLeafLevels(*manifest_, /*column_number=*/0));
+  EXPECT_THAT(
+      levels,
+      ElementsAre(LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 0},  // parent list
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/1, /*rep_level=*/1,
+                            /*ancestor_list_def_level*/ 1},  // parent struct
+
+                  // Def_level=2 is handled together with def_level=3
+                  // When decoding.  Def_level=2 indicate present but empty
+                  // list.  def_level=3 indicates a present element in the
+                  // list.
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 1},  // list field
+                  LevelInfo{/*null_slot_usage=*/1, /*def_level=*/3, /*rep_level=*/2,
+                            /*ancestor_list_def_level*/ 3}));  // inner bool
+}
+
+TEST_F(TestLevels, ListErrors) {
+  {
+    ::arrow::Status error = MaybeSetParquetSchema(GroupNode::Make(
+        "child_list", Repetition::REPEATED,
+        {GroupNode::Make("list", Repetition::REPEATED,
+                         {PrimitiveNode::Make("element", Repetition::REQUIRED,
+                                              ParquetType::BOOLEAN)})},
+        LogicalType::List()));
+    ASSERT_RAISES(Invalid, error);
+    std::string expected("LIST-annotated groups must not be repeated.");
+    EXPECT_EQ(error.message().substr(0, expected.size()), expected);
+  }
+  {
+    ::arrow::Status error = MaybeSetParquetSchema(GroupNode::Make(
+        "child_list", Repetition::OPTIONAL,
+        {PrimitiveNode::Make("f1", Repetition::REPEATED, ParquetType::BOOLEAN),
+         PrimitiveNode::Make("f2", Repetition::REPEATED, ParquetType::BOOLEAN)},
+        LogicalType::List()));
+    ASSERT_RAISES(Invalid, error);
+    std::string expected("LIST-annotated groups must have a single child.");
+    EXPECT_EQ(error.message().substr(0, expected.size()), expected);
+  }
+
+  {
+    ::arrow::Status error = MaybeSetParquetSchema(GroupNode::Make(
+        "child_list", Repetition::OPTIONAL,
+        {PrimitiveNode::Make("f1", Repetition::OPTIONAL, ParquetType::BOOLEAN)},
+        LogicalType::List()));
+    ASSERT_RAISES(Invalid, error);
+    std::string expected(
+        "Non-repeated nodes in a LIST-annotated group are not supported.");
+    EXPECT_EQ(error.message().substr(0, expected.size()), expected);
+  }
+}
+
+}  // namespace parquet::arrow

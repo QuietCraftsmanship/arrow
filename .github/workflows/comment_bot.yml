@@ -24,34 +24,52 @@ on:
       - created
       - edited
 
-jobs:
+permissions:
+  contents: read
 
-  listen:
+jobs:
+  crossbow:
     name: Listen!
+    if: startsWith(github.event.comment.body, '@github-actions crossbow')
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - name: Checkout Arrow
-        uses: actions/checkout@v2
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4.0.0
         with:
           path: arrow
-      # because libgit2 is a dependency of crossbow so prefer conda
-      - name: Setup Conda
-        uses: s-weigand/setup-conda@v1
+          # fetch the tags for version number generation
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
         with:
-          update-conda: true
-          python-version: 3.7
-          conda-channels: conda-forge
-      - name: Instal Archery and Crossbow dependencies
-        run: |
-          conda install -y --file arrow/ci/conda_env_crossbow.txt pygithub
-          pip install -e arrow/dev/archery
-      - name: Handle Github comment event
+          python-version: 3.12
+      - name: Install Archery and Crossbow dependencies
+        run: pip install -e arrow/dev/archery[bot]
+      - name: Handle GitHub comment event
         env:
           ARROW_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CROSSBOW_GITHUB_TOKEN: ${{ secrets.CROSSBOW_GITHUB_TOKEN }}
         run: |
-          archery trigger-bot \
+          archery --debug trigger-bot \
             --event-name ${{ github.event_name }} \
             --event-payload ${{ github.event_path }}
 
-
+  issue_assign:
+    name: "Assign issue"
+    permissions:
+      issues: write
+    if: github.event.comment.body == 'take'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.issue.number,
+                assignees: context.payload.comment.user.login
+            });

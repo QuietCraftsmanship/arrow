@@ -15,8 +15,9 @@ takes the following arguments:
 \itemize{
 \item \code{file} A character file name, raw vector, or Arrow file connection object
 (e.g. \code{RandomAccessFile}).
-\item \code{props} Optional \link{ParquetReaderProperties}
+\item \code{props} Optional \link{ParquetArrowReaderProperties}
 \item \code{mmap} Logical: whether to memory-map the file (default \code{TRUE})
+\item \code{reader_props} Optional \link{ParquetReaderProperties}
 \item \code{...} Additional arguments, currently ignored
 }
 }
@@ -24,22 +25,36 @@ takes the following arguments:
 \section{Methods}{
 
 \itemize{
-\item \verb{$ReadTable(col_select)}: get an \code{arrow::Table} from the file, possibly
-with columns filtered by a character vector of column names or a
-\code{tidyselect} specification.
+\item \verb{$ReadTable(column_indices)}: get an \code{arrow::Table} from the file. The optional
+\verb{column_indices=} argument is a 0-based integer vector indicating which columns to retain.
+\item \verb{$ReadRowGroup(i, column_indices)}: get an \code{arrow::Table} by reading the \code{i}th row group (0-based).
+The optional \verb{column_indices=} argument is a 0-based integer vector indicating which columns to retain.
+\item \verb{$ReadRowGroups(row_groups, column_indices)}: get an \code{arrow::Table} by reading several row
+groups (0-based integers).
+The optional \verb{column_indices=} argument is a 0-based integer vector indicating which columns to retain.
 \item \verb{$GetSchema()}: get the \code{arrow::Schema} of the data in the file
+\item \verb{$ReadColumn(i)}: read the \code{i}th column (0-based) as a \link{ChunkedArray}.
+}
+}
+
+\section{Active bindings}{
+
+\itemize{
+\item \verb{$num_rows}: number of rows.
+\item \verb{$num_columns}: number of columns.
+\item \verb{$num_row_groups}: number of row groups.
 }
 }
 
 \examples{
-\donttest{
-f <- system.file("v0.7.1.parquet", package="arrow")
+\dontshow{if (arrow_with_parquet()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
+f <- system.file("v0.7.1.parquet", package = "arrow")
 pq <- ParquetFileReader$create(f)
 pq$GetSchema()
 if (codec_is_available("snappy")) {
   # This file has compressed data columns
-  tab <- pq$ReadTable(starts_with("c"))
+  tab <- pq$ReadTable()
   tab$schema
 }
-}
+\dontshow{\}) # examplesIf}
 }

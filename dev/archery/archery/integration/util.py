@@ -17,9 +17,8 @@
 
 import contextlib
 import io
-import os
+import random
 import socket
-import string
 import subprocess
 import sys
 import threading
@@ -32,17 +31,11 @@ def guid():
     return uuid.uuid4().hex
 
 
-RANDS_CHARS = np.array(list(string.ascii_letters + string.digits),
-                       dtype=(np.str_, 1))
-
 # SKIP categories
-SKIP_ARROW = 'arrow'
+SKIP_C_ARRAY = 'c_array'
+SKIP_C_SCHEMA = 'c_schema'
 SKIP_FLIGHT = 'flight'
-
-ARROW_ROOT_DEFAULT = os.environ.get(
-    'ARROW_ROOT',
-    os.path.abspath(__file__).rsplit("/", 5)[0]
-)
+SKIP_IPC = 'ipc'
 
 
 class _Printer:
@@ -100,14 +93,26 @@ printer = _Printer()
 log = printer.print
 
 
-def rands(nchars):
-    """
-    Generate one random byte string.
+_RAND_CHARS = np.array(list("abcdefghijklmnop123456Ârrôwµ£°€矢"), dtype="U")
 
-    See `rands_array` if you want to create an array of random strings.
 
+def random_utf8(nchars):
     """
-    return ''.join(np.random.choice(RANDS_CHARS, nchars))
+    Generate one random UTF8 string.
+    """
+    return ''.join(np.random.choice(_RAND_CHARS, nchars))
+
+
+def random_bytes(nbytes):
+    """
+    Generate one random binary string.
+    """
+    # NOTE getrandbits(0) fails
+    if nbytes > 0:
+        return random.getrandbits(nbytes * 8).to_bytes(nbytes,
+                                                       byteorder='little')
+    else:
+        return b""
 
 
 def tobytes(o):
@@ -122,12 +127,13 @@ def frombytes(o):
     return o
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, **kwargs):
     if isinstance(cmd, str):
         cmd = cmd.split(' ')
 
     try:
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        kwargs.update(stderr=subprocess.STDOUT)
+        output = subprocess.check_output(cmd, **kwargs)
     except subprocess.CalledProcessError as e:
         # this avoids hiding the stdout / stderr of failed processes
         sio = io.StringIO()

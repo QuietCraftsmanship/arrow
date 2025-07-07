@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -20,106 +20,211 @@
 set -exu
 
 if [ $# -lt 2 ]; then
-  echo "Usage: $0 X.Y.Z IS_RC"
-  echo "       $0 X.Y.Z IS_RC BINTRAY_REPOSITORY"
-  echo " e.g.: $0 0.13.0 yes           # Verify 0.13.0 RC"
-  echo " e.g.: $0 0.13.0 no            # Verify 0.13.0"
-  echo " e.g.: $0 0.13.0 yes kou/arrow # Verify 0.13.0 RC at https://bintray.com/kou/arrow"
+  echo "Usage: $0 VERSION rc"
+  echo "       $0 VERSION release"
+  echo "       $0 VERSION local"
+  echo " e.g.: $0 0.13.0 rc                # Verify 0.13.0 RC"
+  echo " e.g.: $0 0.13.0 release           # Verify 0.13.0"
+  echo " e.g.: $0 0.13.0-dev20210203 local # Verify 0.13.0-dev20210203 on local"
   exit 1
 fi
 
 VERSION="$1"
-IS_RC="$2"
-BINTRAY_REPOSITORY="${3:-apache/arrow}"
+TYPE="$2"
 
-deb_version="${VERSION}-1"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOP_SOURCE_DIR="${SOURCE_DIR}/../.."
+local_prefix="${TOP_SOURCE_DIR}/dev/tasks/linux-packages"
+
+
+echo "::group::Prepare repository"
 
 export DEBIAN_FRONTEND=noninteractive
 
+retry()
+{
+  local n_retries=0
+  local max_n_retries=3
+  while ! "$@"; do
+    n_retries=$((n_retries + 1))
+    if [ ${n_retries} -eq ${max_n_retries} ]; then
+      echo "Failed: $@"
+      return 1
+    fi
+    echo "Retry: $@"
+  done
+}
+
+APT_INSTALL="retry apt install -y -V --no-install-recommends"
+
 apt update
-apt install -y -V \
+${APT_INSTALL} \
+  base-files \
+  ca-certificates \
   curl \
   lsb-release
 
 code_name="$(lsb_release --codename --short)"
 distribution="$(lsb_release --id --short | tr 'A-Z' 'a-z')"
-bintray_base_url="https://dl.bintray.com/${BINTRAY_REPOSITORY}/${distribution}"
-if [ "${IS_RC}" = "yes" ]; then
-  bintray_base_url="${bintray_base_url}-rc"
+production_repository_base_url="https://repo1.maven.org/maven2/org/apache/arrow/${distribution}"
+staging_repository_base_url="https://repository.apache.org/content/repositories/staging/org/apache/arrow/${distribution}"
+repository_base_url="${production_repository_base_url}"
+if [ "${TYPE}" = "rc" ]; then
+  repository_base_url="${staging_repository_base_url}"
 fi
 
-have_flight=yes
-have_gandiva=yes
-have_plasma=yes
-case "${distribution}-${code_name}-$(arch)" in
-  debian-stretch-*)
+workaround_missing_packages=()
+case "${distribution}-${code_name}" in
+  debian-*)
     sed \
       -i"" \
       -e "s/ main$/ main contrib non-free/g" \
-      /etc/apt/sources.list
-    cat <<APT_LINE > /etc/apt/sources.list.d/backports.list
-deb http://deb.debian.org/debian ${code_name}-backports main
-APT_LINE
-    ;;
-  debian-buster-*)
-    sed \
-      -i"" \
-      -e "s/ main$/ main contrib non-free/g" \
-      /etc/apt/sources.list
-    ;;
-  ubuntu-xenial-x86_64)
-    have_flight=no
-    ;;
-  ubuntu-xenial-aarch64)
-    have_flight=no
-    have_gandiva=no
-    have_plasma=no
-    ;;
-  ubuntu-bionic-aarch64)
-    have_plasma=no
+      /etc/apt/sources.list.d/debian.sources
     ;;
 esac
 
-keyring_archive_base_name="apache-arrow-archive-keyring-latest-${code_name}.deb"
-curl \
-  --output "${keyring_archive_base_name}" \
-  "${bintray_base_url}/${keyring_archive_base_name}"
-apt install -y -V "./${keyring_archive_base_name}"
-if [ "${BINTRAY_REPOSITORY}" = "apache/arrow" ]; then
-  if [ "${IS_RC}" = "yes" ]; then
-    sed \
-      -i"" \
-      -e "s,^URIs: \\(.*\\)/,URIs: \\1-rc/,g" \
-      /etc/apt/sources.list.d/apache-arrow.sources
-  fi
+if [ "${TYPE}" = "local" ]; then
+  case "${VERSION}" in
+    *-dev*)
+      package_version="$(echo "${VERSION}" | sed -e 's/-dev\(.*\)$/~dev\1/g')"
+      ;;
+    *-rc*)
+      package_version="$(echo "${VERSION}" | sed -e 's/-rc.*$//g')"
+      ;;
+    *)
+      package_version="${VERSION}"
+      ;;
+  esac
+  package_version+="-1"
+  apt_source_path="${local_prefix}/apt/repositories"
+  apt_source_path+="/${distribution}/pool/${code_name}/main"
+  apt_source_path+="/a/apache-arrow-apt-source"
+  apt_source_path+="/apache-arrow-apt-source_${package_version}_all.deb"
+  ${APT_INSTALL} "${apt_source_path}"
 else
+  package_version="${VERSION}-1"
+  apt_source_base_name="apache-arrow-apt-source-latest-${code_name}.deb"
+  curl \
+    --output "${apt_source_base_name}" \
+    "${repository_base_url}/${apt_source_base_name}"
+  ${APT_INSTALL} "./${apt_source_base_name}"
+fi
+
+if [ "${TYPE}" = "local" ]; then
   sed \
     -i"" \
-    -e "s,^URIs: .*,URIs: ${bintray_base_url}/,g" \
+    -e "s,^URIs: .*$,URIs: file://${local_prefix}/apt/repositories/${distribution},g" \
     /etc/apt/sources.list.d/apache-arrow.sources
+  keys="${local_prefix}/KEYS"
+  if [ -f "${keys}" ]; then
+    gpg \
+      --no-default-keyring \
+      --keyring /tmp/apache-arrow-apt-source.kbx \
+      --import "${keys}"
+    gpg \
+      --no-default-keyring \
+      --keyring /tmp/apache-arrow-apt-source.kbx \
+      --armor \
+      --export > /usr/share/keyrings/apache-arrow-apt-source.asc
+  fi
+else
+  case "${TYPE}" in
+    rc)
+      sed \
+        -i"" \
+        -e "s,^URIs: ${production_repository_base_url},URIs: ${staging_repository_base_url},g" \
+        /etc/apt/sources.list.d/apache-arrow.sources
+      ;;
+  esac
 fi
 
 apt update
 
-apt install -y -V libarrow-glib-dev=${deb_version}
-apt install -y -V libarrow-glib-doc=${deb_version}
+echo "::endgroup::"
 
-if [ "${have_flight}" = "yes" ]; then
-  apt install -y -V libarrow-flight-dev=${deb_version}
-fi
 
-apt install -y -V libarrow-python-dev=${deb_version}
+echo "::group::Test Apache Arrow C++"
+${APT_INSTALL} libarrow-dev=${package_version}
+required_packages=()
+required_packages+=(cmake)
+required_packages+=(g++)
+required_packages+=(git)
+required_packages+=(make)
+required_packages+=(pkg-config)
+required_packages+=(${workaround_missing_packages[@]})
+${APT_INSTALL} ${required_packages[@]}
+mkdir -p build
+cp -a "${TOP_SOURCE_DIR}/cpp/examples/minimal_build" build/
+pushd build/minimal_build
+cmake .
+make -j$(nproc)
+./arrow-example
+c++ -o arrow-example example.cc $(pkg-config --cflags --libs arrow) -std=c++17
+./arrow-example
+popd
+echo "::endgroup::"
 
-if [ "${have_plasma}" = "yes" ]; then
-  apt install -y -V libplasma-glib-dev=${deb_version}
-  apt install -y -V libplasma-glib-doc=${deb_version}
-  apt install -y -V plasma-store-server=${deb_version}
-fi
+<<<<<<< HEAD
+
+echo "::group::Test Apache Arrow GLib"
+export G_DEBUG=fatal-warnings
+=======
+apt install -y -V libplasma-glib-dev=${deb_version}
+# apt install -y -V libplasma-glib-doc=${deb_version}
+apt install -y -V plasma-store-server=${deb_version}
 
 if [ "${have_gandiva}" = "yes" ]; then
   apt install -y -V libgandiva-glib-dev=${deb_version}
-  apt install -y -V libgandiva-glib-doc=${deb_version}
+  # apt install -y -V libgandiva-glib-doc=${deb_version}
 fi
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 
-apt install -y -V libparquet-glib-dev=${deb_version}
-apt install -y -V libparquet-glib-doc=${deb_version}
+${APT_INSTALL} libarrow-glib-dev=${package_version}
+${APT_INSTALL} libarrow-glib-doc=${package_version}
+
+${APT_INSTALL} valac
+cp -a "${TOP_SOURCE_DIR}/c_glib/example/vala" build/
+pushd build/vala
+valac --pkg arrow-glib --pkg posix build.vala
+./build
+popd
+
+
+${APT_INSTALL} ruby-dev rubygems-integration
+MAKEFLAGS="-j$(nproc)" gem install gobject-introspection
+ruby -r gi -e "p GI.load('Arrow')"
+echo "::endgroup::"
+
+
+echo "::group::Test Apache Arrow Dataset"
+${APT_INSTALL} libarrow-dataset-glib-dev=${package_version}
+${APT_INSTALL} libarrow-dataset-glib-doc=${package_version}
+ruby -r gi -e "p GI.load('ArrowDataset')"
+echo "::endgroup::"
+
+
+echo "::group::Test Apache Arrow Flight"
+${APT_INSTALL} libarrow-flight-glib-dev=${package_version}
+${APT_INSTALL} libarrow-flight-glib-doc=${package_version}
+ruby -r gi -e "p GI.load('ArrowFlight')"
+echo "::endgroup::"
+
+echo "::group::Test Apache Arrow Flight SQL"
+${APT_INSTALL} libarrow-flight-sql-glib-dev=${package_version}
+${APT_INSTALL} libarrow-flight-sql-glib-doc=${package_version}
+ruby -r gi -e "p GI.load('ArrowFlightSQL')"
+echo "::endgroup::"
+
+
+echo "::group::Test Gandiva"
+${APT_INSTALL} libgandiva-glib-dev=${package_version}
+${APT_INSTALL} libgandiva-glib-doc=${package_version}
+ruby -r gi -e "p GI.load('Gandiva')"
+echo "::endgroup::"
+
+
+echo "::group::Test Apache Parquet"
+${APT_INSTALL} libparquet-glib-dev=${package_version}
+${APT_INSTALL} libparquet-glib-doc=${package_version}
+ruby -r gi -e "p GI.load('Parquet')"
+echo "::endgroup::"

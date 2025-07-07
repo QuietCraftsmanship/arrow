@@ -18,12 +18,18 @@
 thirdparty/*.tar*
 CMakeFiles/
 CMakeCache.txt
+CMakeUserPresets.json
 CTestTestfile.cmake
 Makefile
 cmake_install.cmake
 build/
 *-build/
 Testing/
+build-support/boost_*
+vcpkg_installed/
+
+# Build directories created by Clion
+cmake-build-*/
 
 #########################################
 # Editor temporary/working/backup files #
@@ -37,3 +43,9 @@ Testing/
 *.kdev4
 *.log
 *.swp
+
+# meson subprojects - wrap files need to be kept to let meson download
+# dependencies as needed, but dependencies themselves should not be versioned
+/subprojects/*
+!/subprojects/packagefiles
+!/subprojects/*.wrap

@@ -15,10 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-brew "autoconf-archive"
 brew "gobject-introspection"
-brew "gtk-doc"
-brew "libtool"
-brew "lua"
-brew "luarocks"
 brew "meson"
+brew "vala"

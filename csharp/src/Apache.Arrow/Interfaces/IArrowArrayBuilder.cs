@@ -26,7 +26,7 @@ namespace Apache.Arrow
 
     public interface IArrowArrayBuilder<out TArray> : IArrowArrayBuilder
         where TArray : IArrowArray
-    { 
+    {
         TArray Build(MemoryAllocator allocator);
     }
 
@@ -37,6 +37,7 @@ namespace Apache.Arrow
         TBuilder Reserve(int capacity);
         TBuilder Resize(int length);
         TBuilder Clear();
+        TBuilder AppendNull();
     }
 
 

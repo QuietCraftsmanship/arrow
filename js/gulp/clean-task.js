@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const del = require('del');
-const { Observable } = require('rxjs');
-const { targetDir } = require('./util');
-const memoizeTask = require('./memoize-task');
+import { deleteAsync as del } from 'del';
+import { targetDir } from './util.js';
+import memoizeTask from './memoize-task.js';
+import { catchError } from 'rxjs/operators';
+import { from as ObservableFrom, EMPTY as ObservableEmpty } from 'rxjs';
 
-const cleanTask = ((cache) => memoizeTask(cache, function clean(target, format) {
+export const cleanTask = ((cache) => memoizeTask(cache, function clean(target, format) {
     const dir = targetDir(target, format);
-    return Observable.from(del(dir))
-        .catch((e) => Observable.empty());
+    return ObservableFrom(del(dir))
+        .pipe(catchError((e) => ObservableEmpty()));
 }))({});
 
-module.exports = cleanTask;
-module.exports.cleanTask = cleanTask;
+export default cleanTask;

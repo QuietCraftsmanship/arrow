@@ -25,45 +25,57 @@ namespace Apache.Arrow
     public class Column
     {
         public Field Field { get;  }
-        private readonly ChunkedArray _columnArrays;
-        public ChunkedArray Data => _columnArrays;
+        public ChunkedArray Data { get; }
 
         public Column(Field field, IList<Array> arrays)
+            : this(field, new ChunkedArray(arrays), doValidation: true)
         {
-            _columnArrays = new ChunkedArray(arrays);
+        }
+
+        public Column(Field field, IList<IArrowArray> arrays)
+            : this(field, new ChunkedArray(arrays), doValidation: true)
+        {
+        }
+
+        private Column(Field field, ChunkedArray data, bool doValidation = false)
+        {
+            Data = data;
             Field = field;
-            if (!ValidateArrayDataTypes())
+            if (doValidation && !ValidateArrayDataTypes())
             {
-                throw new ArgumentException($"{Field.DataType} must match {_columnArrays.DataType}");
+                throw new ArgumentException($"{Field.DataType} must match {Data.DataType}");
             }
         }
 
-        private Column(Field field, ChunkedArray arrays)
-        {
-            Field = field;
-            _columnArrays = arrays;
-        }
-
-        public long Length => _columnArrays.Length;
-        public long NullCount => _columnArrays.NullCount;
+        public long Length => Data.Length;
+        public long NullCount => Data.NullCount;
         public string Name => Field.Name;
         public IArrowType Type => Field.DataType;
 
         public Column Slice(int offset, int length)
         {
-            return new Column(Field, _columnArrays.Slice(offset, length));
+            return new Column(Field, Data.Slice(offset, length));
         }
 
         public Column Slice(int offset)
         {
-            return new Column(Field, _columnArrays.Slice(offset));
+            return new Column(Field, Data.Slice(offset));
         }
 
         private bool ValidateArrayDataTypes()
         {
-            for (int i = 0; i < _columnArrays.ArrayCount; i++)
+            var dataTypeComparer = new ArrayDataTypeComparer(Field.DataType);
+
+            for (int i = 0; i < Data.ArrayCount; i++)
             {
-                if (_columnArrays.Array(i).Data.DataType != Field.DataType)
+                if (Data.ArrowArray(i).Data.DataType.TypeId != Field.DataType.TypeId)
+                {
+                    return false;
+                }
+
+                Data.ArrowArray(i).Data.DataType.Accept(dataTypeComparer);
+
+                if (!dataTypeComparer.DataTypeMatch)
                 {
                     return false;
                 }

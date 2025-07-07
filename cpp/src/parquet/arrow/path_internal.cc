@@ -66,7 +66,7 @@
 // 3.  In order to keep repetition/definition level populated the algorithm is lazy
 //     in assigning repetition levels. The algorithm tracks whether it is currently
 //     in the middle of a list by comparing the lengths of repetition/definition levels.
-//     If it is currently in the middle of a list the the number of repetition levels
+//     If it is currently in the middle of a list the number of repetition levels
 //     populated will be greater than definition levels (the start of a List requires
 //     adding the first element). If there are equal numbers of definition and repetition
 //     levels populated this indicates a list is waiting to be started and the next list
@@ -89,6 +89,7 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "arrow/array.h"
@@ -98,24 +99,22 @@
 #include "arrow/memory_pool.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
+#include "arrow/util/bit_run_reader.h"
 #include "arrow/util/bit_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/bitmap_visit.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/make_unique.h"
-#include "arrow/util/variant.h"
-#include "arrow/visitor_inline.h"
+#include "arrow/visit_array_inline.h"
 
 #include "parquet/properties.h"
 
-namespace parquet {
-namespace arrow {
+namespace parquet::arrow {
 
 namespace {
 
 using ::arrow::Array;
 using ::arrow::Status;
 using ::arrow::TypedBufferBuilder;
-using ::arrow::util::holds_alternative;
 
 constexpr static int16_t kLevelNotSet = -1;
 
@@ -142,7 +141,7 @@ int64_t LazyNullCount(const Array& array) { return array.data()->null_count.load
 bool LazyNoNulls(const Array& array) {
   int64_t null_count = LazyNullCount(array);
   return null_count == 0 ||
-         // kUnkownNullCount comparison is needed to account
+         // kUnknownNullCount comparison is needed to account
          // for null arrays.
          (null_count == ::arrow::kUnknownNullCount &&
           array.null_bitmap_data() == nullptr);
@@ -201,7 +200,7 @@ struct PathWriteContext {
 
   // Incorporates |range| into visited elements. If the |range| is contiguous
   // with the last range, extend the last range, otherwise add |range| separately
-  // tot he list.
+  // to the list.
   void RecordPostListVisit(const ElementRange& range) {
     if (!visited_elements.empty() && range.start == visited_elements.back().end) {
       visited_elements.back().end = range.end;
@@ -273,7 +272,8 @@ struct AllPresentTerminalNode {
 /// Node for handling the case when the leaf-array is nullable
 /// and contains null elements.
 struct NullableTerminalNode {
-  NullableTerminalNode();
+  NullableTerminalNode() = default;
+
   NullableTerminalNode(const uint8_t* bitmap, int64_t element_offset,
                        int16_t def_level_if_present)
       : bitmap_(bitmap),
@@ -312,7 +312,7 @@ struct NullableTerminalNode {
 // at least one other node).
 //
 // Type parameters:
-//    |RangeSelector| - A strategy for determine the the range of the child node to
+//    |RangeSelector| - A strategy for determine the range of the child node to
 //    process.
 //       this varies depending on the type of list (int32_t* offsets, int64_t* offsets of
 //       fixed.
@@ -332,25 +332,25 @@ class ListPathNode {
     if (range->Empty()) {
       return kDone;
     }
-
     // Find the first non-empty list (skipping a run of empties).
-    int64_t start = range->start;
-    // Retrieves the range of elements that this list contains.
-    // Uses the strategy pattern to distinguish between the different
-    // lists that are supported in Arrow (fixed size, normal and "large").
-    *child_range = selector_.GetRange(range->start);
-    while (child_range->Empty() && !range->Empty()) {
-      ++range->start;
+    int64_t empty_elements = 0;
+    do {
+      // Retrieve the range of elements that this list contains.
       *child_range = selector_.GetRange(range->start);
-    }
-    // Loops post-condition:
+      if (!child_range->Empty()) {
+        break;
+      }
+      ++empty_elements;
+      ++range->start;
+    } while (!range->Empty());
+
+    // Post condition:
     //   * range is either empty (we are done processing at this node)
     //     or start corresponds a non-empty list.
     //   * If range is non-empty child_range contains
     //     the bounds of non-empty list.
 
     // Handle any skipped over empty lists.
-    int64_t empty_elements = range->start - start;
     if (empty_elements > 0) {
       RETURN_IF_ERROR(FillRepLevels(empty_elements, prev_rep_level_, context));
       RETURN_IF_ERROR(context->AppendDefLevels(empty_elements, def_level_if_empty_));
@@ -412,7 +412,8 @@ class ListPathNode {
       // of the function).
       RETURN_IF_ERROR(context->AppendRepLevel(prev_rep_level_));
       RETURN_IF_ERROR(context->AppendRepLevels(size_check.Size() - 1, rep_level_));
-      DCHECK_EQ(size_check.start, child_range->end);
+      DCHECK_EQ(size_check.start, child_range->end)
+          << size_check.start << " != " << child_range->end;
       child_range->end = size_check.end;
       ++range->start;
     }
@@ -463,8 +464,8 @@ class NullableNode {
 
   void SetRepLevelIfNull(int16_t rep_level) { rep_level_if_null_ = rep_level; }
 
-  ::arrow::internal::BitmapReader MakeReader(const ElementRange& range) {
-    return ::arrow::internal::BitmapReader(null_bitmap_, entry_offset_ + range.start,
+  ::arrow::internal::BitRunReader MakeReader(const ElementRange& range) {
+    return ::arrow::internal::BitRunReader(null_bitmap_, entry_offset_ + range.start,
                                            range.Size());
   }
 
@@ -477,25 +478,20 @@ class NullableNode {
       valid_bits_reader_ = MakeReader(*range);
     }
     child_range->start = range->start;
-    while (!range->Empty() && !valid_bits_reader_.IsSet()) {
-      ++range->start;
-      valid_bits_reader_.Next();
-    }
-    int64_t null_count = range->start - child_range->start;
-    if (null_count > 0) {
-      RETURN_IF_ERROR(FillRepLevels(null_count, rep_level_if_null_, context));
-      RETURN_IF_ERROR(context->AppendDefLevels(null_count, def_level_if_null_));
+    ::arrow::internal::BitRun run = valid_bits_reader_.NextRun();
+    if (!run.set) {
+      range->start += run.length;
+      RETURN_IF_ERROR(FillRepLevels(run.length, rep_level_if_null_, context));
+      RETURN_IF_ERROR(context->AppendDefLevels(run.length, def_level_if_null_));
+      run = valid_bits_reader_.NextRun();
     }
     if (range->Empty()) {
       new_range_ = true;
       return kDone;
     }
     child_range->end = child_range->start = range->start;
+    child_range->end += run.length;
 
-    while (child_range->end != range->end && valid_bits_reader_.IsSet()) {
-      ++child_range->end;
-      valid_bits_reader_.Next();
-    }
     DCHECK(!child_range->Empty());
     range->start += child_range->Size();
     new_range_ = false;
@@ -504,7 +500,7 @@ class NullableNode {
 
   const uint8_t* null_bitmap_;
   int64_t entry_offset_;
-  ::arrow::internal::BitmapReader valid_bits_reader_;
+  ::arrow::internal::BitRunReader valid_bits_reader_;
   int16_t def_level_if_null_;
   int16_t rep_level_if_null_;
 
@@ -521,14 +517,16 @@ struct PathInfo {
   // The vectors are expected to the same length info.
 
   // Note index order matters here.
-  using Node = ::arrow::util::variant<NullableTerminalNode, ListNode, LargeListNode,
-                                      FixedSizeListNode, NullableNode,
-                                      AllPresentTerminalNode, AllNullsTerminalNode>;
+  using Node =
+      std::variant<NullableTerminalNode, ListNode, LargeListNode, FixedSizeListNode,
+                   NullableNode, AllPresentTerminalNode, AllNullsTerminalNode>;
+
   std::vector<Node> path;
   std::shared_ptr<Array> primitive_array;
   int16_t max_def_level = 0;
   int16_t max_rep_level = 0;
-  bool has_dictionary;
+  bool has_dictionary = false;
+  bool leaf_is_nullable = false;
 };
 
 /// Contains logic for writing a single leaf node to parquet.
@@ -544,6 +542,7 @@ Status WritePath(ElementRange root_range, PathInfo* path_info,
   std::vector<ElementRange> stack(path_info->path.size());
   MultipathLevelBuilderResult builder_result;
   builder_result.leaf_array = path_info->primitive_array;
+  builder_result.leaf_is_nullable = path_info->leaf_is_nullable;
 
   if (path_info->max_def_level == 0) {
     // This case only occurs when there are no nullable or repeated
@@ -577,38 +576,32 @@ Status WritePath(ElementRange root_range, PathInfo* path_info,
   while (stack_position >= stack_base) {
     PathInfo::Node& node = path_info->path[stack_position - stack_base];
     struct {
-      IterationResult operator()(
-          NullableNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(NullableNode& node) {
         return node.Run(stack_position, stack_position + 1, context);
       }
-      IterationResult operator()(ListNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(ListNode& node) {
         return node.Run(stack_position, stack_position + 1, context);
       }
-      IterationResult operator()(
-          NullableTerminalNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(NullableTerminalNode& node) {
         return node.Run(*stack_position, context);
       }
-      IterationResult operator()(
-          FixedSizeListNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(FixedSizeListNode& node) {
         return node.Run(stack_position, stack_position + 1, context);
       }
-      IterationResult operator()(
-          AllPresentTerminalNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(AllPresentTerminalNode& node) {
         return node.Run(*stack_position, context);
       }
-      IterationResult operator()(
-          AllNullsTerminalNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(AllNullsTerminalNode& node) {
         return node.Run(*stack_position, context);
       }
-      IterationResult operator()(
-          LargeListNode& node) {  // NOLINT google-runtime-references
+      IterationResult operator()(LargeListNode& node) {
         return node.Run(stack_position, stack_position + 1, context);
       }
       ElementRange* stack_position;
       PathWriteContext* context;
     } visitor = {stack_position, &context};
 
-    IterationResult result = ::arrow::util::visit(visitor, node);
+    IterationResult result = std::visit(visitor, node);
 
     if (ARROW_PREDICT_FALSE(result == kError)) {
       DCHECK(!context.last_status.ok());
@@ -645,47 +638,39 @@ struct FixupVisitor {
   int16_t rep_level_if_null = kLevelNotSet;
 
   template <typename T>
-  void HandleListNode(T* arg) {
-    if (arg->rep_level() == max_rep_level) {
-      arg->SetLast();
+  void HandleListNode(T& arg) {
+    if (arg.rep_level() == max_rep_level) {
+      arg.SetLast();
       // after the last list node we don't need to fill
       // rep levels on null.
       rep_level_if_null = kLevelNotSet;
     } else {
-      rep_level_if_null = arg->rep_level();
+      rep_level_if_null = arg.rep_level();
     }
   }
-  void operator()(ListNode& node) {  // NOLINT google-runtime-references
-    HandleListNode(&node);
-  }
-  void operator()(LargeListNode& node) {  // NOLINT google-runtime-references
-    HandleListNode(&node);
-  }
-  void operator()(FixedSizeListNode& node) {  // NOLINT google-runtime-references
-    HandleListNode(&node);
-  }
+  void operator()(ListNode& node) { HandleListNode(node); }
+  void operator()(LargeListNode& node) { HandleListNode(node); }
+  void operator()(FixedSizeListNode& node) { HandleListNode(node); }
 
   // For non-list intermediate nodes.
   template <typename T>
-  void HandleIntermediateNode(T* arg) {
+  void HandleIntermediateNode(T& arg) {
     if (rep_level_if_null != kLevelNotSet) {
-      arg->SetRepLevelIfNull(rep_level_if_null);
+      arg.SetRepLevelIfNull(rep_level_if_null);
     }
   }
 
-  void operator()(NullableNode& arg) {  // NOLINT google-runtime-references
-    HandleIntermediateNode(&arg);
-  }
+  void operator()(NullableNode& arg) { HandleIntermediateNode(arg); }
 
-  void operator()(AllNullsTerminalNode& arg) {  // NOLINT google-runtime-references
+  void operator()(AllNullsTerminalNode& arg) {
     // Even though no processing happens past this point we
     // still need to adjust it if a list occurred after an
     // all null array.
-    HandleIntermediateNode(&arg);
+    HandleIntermediateNode(arg);
   }
 
-  void operator()(NullableTerminalNode& arg) {}    // NOLINT google-runtime-references
-  void operator()(AllPresentTerminalNode& arg) {}  // NOLINT google-runtime-references
+  void operator()(NullableTerminalNode&) {}
+  void operator()(AllPresentTerminalNode&) {}
 };
 
 PathInfo Fixup(PathInfo info) {
@@ -700,7 +685,7 @@ PathInfo Fixup(PathInfo info) {
     visitor.rep_level_if_null = 0;
   }
   for (size_t x = 0; x < info.path.size(); x++) {
-    ::arrow::util::visit(visitor, info.path[x]);
+    std::visit(visitor, info.path[x]);
   }
   return info;
 }
@@ -710,6 +695,7 @@ class PathBuilder {
   explicit PathBuilder(bool start_nullable) : nullable_in_parent_(start_nullable) {}
   template <typename T>
   void AddTerminalInfo(const T& array) {
+    info_.leaf_is_nullable = nullable_in_parent_;
     if (nullable_in_parent_) {
       info_.max_def_level++;
     }
@@ -718,12 +704,12 @@ class PathBuilder {
     // traversing the null bitmap twice (once here and once when calculating
     // rep/def levels).
     if (LazyNoNulls(array)) {
-      info_.path.push_back(AllPresentTerminalNode{info_.max_def_level});
+      info_.path.emplace_back(AllPresentTerminalNode{info_.max_def_level});
     } else if (LazyNullCount(array) == array.length()) {
-      info_.path.push_back(AllNullsTerminalNode(info_.max_def_level - 1));
+      info_.path.emplace_back(AllNullsTerminalNode(info_.max_def_level - 1));
     } else {
-      info_.path.push_back(NullableTerminalNode(array.null_bitmap_data(), array.offset(),
-                                                info_.max_def_level));
+      info_.path.emplace_back(NullableTerminalNode(array.null_bitmap_data(),
+                                                   array.offset(), info_.max_def_level));
     }
     info_.primitive_array = std::make_shared<T>(array.data());
     paths_.push_back(Fixup(info_));
@@ -749,7 +735,7 @@ class PathBuilder {
     ListPathNode<VarRangeSelector<typename T::offset_type>> node(
         VarRangeSelector<typename T::offset_type>{array.raw_value_offsets()},
         info_.max_rep_level, info_.max_def_level - 1);
-    info_.path.push_back(node);
+    info_.path.emplace_back(std::move(node));
     nullable_in_parent_ = array.list_type()->value_field()->nullable();
     return VisitInline(*array.values());
   }
@@ -757,7 +743,7 @@ class PathBuilder {
   Status Visit(const ::arrow::DictionaryArray& array) {
     // Only currently handle DictionaryArray where the dictionary is a
     // primitive type
-    if (array.dict_type()->value_type()->num_children() > 0) {
+    if (array.dict_type()->value_type()->num_fields() > 0) {
       return Status::NotImplemented(
           "Writing DictionaryArray with nested dictionary "
           "type not yet supported");
@@ -789,11 +775,12 @@ class PathBuilder {
       return;
     }
     if (LazyNullCount(array) == array.length()) {
-      info_.path.push_back(AllNullsTerminalNode(info_.max_def_level - 1));
+      info_.path.emplace_back(AllNullsTerminalNode(info_.max_def_level - 1));
       return;
     }
-    info_.path.push_back(NullableNode(array.null_bitmap_data(), array.offset(),
-                                      /* def_level_if_null = */ info_.max_def_level - 1));
+    info_.path.emplace_back(
+        NullableNode(array.null_bitmap_data(), array.offset(),
+                     /* def_level_if_null = */ info_.max_def_level - 1));
   }
 
   Status VisitInline(const Array& array);
@@ -806,7 +793,7 @@ class PathBuilder {
     MaybeAddNullable(array);
     PathInfo info_backup = info_;
     for (int x = 0; x < array.num_fields(); x++) {
-      nullable_in_parent_ = array.type()->child(x)->nullable();
+      nullable_in_parent_ = array.type()->field(x)->nullable();
       RETURN_NOT_OK(VisitInline(*array.field(x)));
       info_ = info_backup;
     }
@@ -816,13 +803,17 @@ class PathBuilder {
   Status Visit(const ::arrow::FixedSizeListArray& array) {
     MaybeAddNullable(array);
     int32_t list_size = array.list_type()->list_size();
-    if (list_size == 0) {
-      info_.max_def_level++;
-    }
+    // Technically we could encode fixed size lists with two level encodings
+    // but since we always use 3 level encoding we increment def levels as
+    // well.
+    info_.max_def_level++;
     info_.max_rep_level++;
-    info_.path.push_back(FixedSizeListNode(FixedSizedRangeSelector{list_size},
-                                           info_.max_rep_level, info_.max_def_level));
+    info_.path.emplace_back(FixedSizeListNode(FixedSizedRangeSelector{list_size},
+                                              info_.max_rep_level, info_.max_def_level));
     nullable_in_parent_ = array.list_type()->value_field()->nullable();
+    if (array.offset() > 0) {
+      return VisitInline(*array.values()->Slice(array.value_offset(0)));
+    }
     return VisitInline(*array.values());
   }
 
@@ -836,8 +827,11 @@ class PathBuilder {
                                   " not supported yet");                   \
   }
 
-  // Union types aren't supported in Parquet.
+  // Types not yet supported in Parquet.
   NOT_IMPLEMENTED_VISIT(Union)
+  NOT_IMPLEMENTED_VISIT(RunEndEncoded);
+  NOT_IMPLEMENTED_VISIT(ListView);
+  NOT_IMPLEMENTED_VISIT(LargeListView);
 
 #undef NOT_IMPLEMENTED_VISIT
   std::vector<PathInfo>& paths() { return paths_; }
@@ -869,8 +863,13 @@ class MultipathLevelBuilderImpl : public MultipathLevelBuilder {
 
   ::arrow::Status Write(int leaf_index, ArrowWriteContext* context,
                         CallbackFunction write_leaf_callback) override {
-    DCHECK_GE(leaf_index, 0);
-    DCHECK_LT(leaf_index, GetLeafCount());
+    if (ARROW_PREDICT_FALSE(leaf_index < 0 || leaf_index >= GetLeafCount())) {
+      return Status::Invalid("Column index out of bounds (got ", leaf_index,
+                             ", should be "
+                             "between 0 and ",
+                             GetLeafCount(), ")");
+    }
+
     return WritePath(root_range_, &path_builder_->paths()[leaf_index], context,
                      std::move(write_leaf_callback));
   }
@@ -885,10 +884,10 @@ class MultipathLevelBuilderImpl : public MultipathLevelBuilder {
 // static
 ::arrow::Result<std::unique_ptr<MultipathLevelBuilder>> MultipathLevelBuilder::Make(
     const ::arrow::Array& array, bool array_field_nullable) {
-  auto constructor = ::arrow::internal::make_unique<PathBuilder>(array_field_nullable);
+  auto constructor = std::make_unique<PathBuilder>(array_field_nullable);
   RETURN_NOT_OK(VisitArrayInline(array, constructor.get()));
-  return ::arrow::internal::make_unique<MultipathLevelBuilderImpl>(
-      array.data(), std::move(constructor));
+  return std::make_unique<MultipathLevelBuilderImpl>(array.data(),
+                                                     std::move(constructor));
 }
 
 // static
@@ -897,13 +896,10 @@ Status MultipathLevelBuilder::Write(const Array& array, bool array_field_nullabl
                                     MultipathLevelBuilder::CallbackFunction callback) {
   ARROW_ASSIGN_OR_RAISE(std::unique_ptr<MultipathLevelBuilder> builder,
                         MultipathLevelBuilder::Make(array, array_field_nullable));
-  PathBuilder constructor(array_field_nullable);
-  RETURN_NOT_OK(VisitArrayInline(array, &constructor));
   for (int leaf_idx = 0; leaf_idx < builder->GetLeafCount(); leaf_idx++) {
     RETURN_NOT_OK(builder->Write(leaf_idx, context, callback));
   }
   return Status::OK();
 }
 
-}  // namespace arrow
-}  // namespace parquet
+}  // namespace parquet::arrow

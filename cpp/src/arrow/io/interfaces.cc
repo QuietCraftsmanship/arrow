@@ -24,34 +24,62 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <typeinfo>
 #include <utility>
 
 #include "arrow/buffer.h"
 #include "arrow/io/concurrency.h"
+#include "arrow/io/type_fwd.h"
 #include "arrow/io/util_internal.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/future.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/iterator.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/string_view.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/thread_pool.h"
 
 namespace arrow {
 
+using internal::checked_pointer_cast;
+using internal::Executor;
+using internal::TaskHints;
 using internal::ThreadPool;
 
 namespace io {
 
+IOContext::IOContext(MemoryPool* pool, StopToken stop_token)
+    : IOContext(pool, internal::GetIOThreadPool(), std::move(stop_token)) {}
+
+const IOContext& default_io_context() {
+  // Avoid using a global variable because of initialization order issues (ARROW-18383)
+  static IOContext g_default_io_context{};
+  return g_default_io_context;
+}
+
+int GetIOThreadPoolCapacity() { return internal::GetIOThreadPool()->GetCapacity(); }
+
+Status SetIOThreadPoolCapacity(int threads) {
+  return internal::GetIOThreadPool()->SetCapacity(threads);
+}
+
 FileInterface::~FileInterface() = default;
 
+Future<> FileInterface::CloseAsync() {
+  return DeferNotOk(default_io_context().executor()->Submit(
+      [self = shared_from_this()]() { return self->Close(); }));
+}
+
 Status FileInterface::Abort() { return Close(); }
+
+namespace {
 
 class InputStreamBlockIterator {
  public:
   InputStreamBlockIterator(std::shared_ptr<InputStream> stream, int64_t block_size)
-      : stream_(stream), block_size_(block_size) {}
+      : stream_(std::move(stream)), block_size_(block_size) {}
 
   Result<std::shared_ptr<Buffer>> Next() {
     if (done_) {
@@ -75,13 +103,34 @@ class InputStreamBlockIterator {
   bool done_ = false;
 };
 
+}  // namespace
+
+const IOContext& Readable::io_context() const { return default_io_context(); }
+
 Status InputStream::Advance(int64_t nbytes) { return Read(nbytes).status(); }
 
-Result<util::string_view> InputStream::Peek(int64_t ARROW_ARG_UNUSED(nbytes)) {
+Result<std::string_view> InputStream::Peek(int64_t ARROW_ARG_UNUSED(nbytes)) {
   return Status::NotImplemented("Peek not implemented");
 }
 
 bool InputStream::supports_zero_copy() const { return false; }
+
+Result<std::shared_ptr<const KeyValueMetadata>> InputStream::ReadMetadata() {
+  return std::shared_ptr<const KeyValueMetadata>{};
+}
+
+// Default ReadMetadataAsync() implementation: simply issue the read on the context's
+// executor
+Future<std::shared_ptr<const KeyValueMetadata>> InputStream::ReadMetadataAsync(
+    const IOContext& ctx) {
+  std::shared_ptr<InputStream> self =
+      std::dynamic_pointer_cast<InputStream>(shared_from_this());
+  return DeferNotOk(internal::SubmitIO(ctx, [self] { return self->ReadMetadata(); }));
+}
+
+Future<std::shared_ptr<const KeyValueMetadata>> InputStream::ReadMetadataAsync() {
+  return ReadMetadataAsync(io_context());
+}
 
 Result<Iterator<std::shared_ptr<Buffer>>> MakeInputStreamIterator(
     std::shared_ptr<InputStream> stream, int64_t block_size) {
@@ -92,14 +141,13 @@ Result<Iterator<std::shared_ptr<Buffer>>> MakeInputStreamIterator(
   return Iterator<std::shared_ptr<Buffer>>(InputStreamBlockIterator(stream, block_size));
 }
 
-struct RandomAccessFile::RandomAccessFileImpl {
+struct RandomAccessFile::Impl {
   std::mutex lock_;
 };
 
 RandomAccessFile::~RandomAccessFile() = default;
 
-RandomAccessFile::RandomAccessFile()
-    : interface_impl_(new RandomAccessFile::RandomAccessFileImpl()) {}
+RandomAccessFile::RandomAccessFile() : interface_impl_(new Impl()) {}
 
 Result<int64_t> RandomAccessFile::ReadAt(int64_t position, int64_t nbytes, void* out) {
   std::lock_guard<std::mutex> lock(interface_impl_->lock_);
@@ -114,21 +162,41 @@ Result<std::shared_ptr<Buffer>> RandomAccessFile::ReadAt(int64_t position,
   return Read(nbytes);
 }
 
-// Default ReadAsync() implementation: simply issue the read on one of the IO threads
-Future<std::shared_ptr<Buffer>> RandomAccessFile::ReadAsync(int64_t position,
+// Default ReadAsync() implementation: simply issue the read on the context's executor
+Future<std::shared_ptr<Buffer>> RandomAccessFile::ReadAsync(const IOContext& ctx,
+                                                            int64_t position,
                                                             int64_t nbytes) {
-  auto pool = internal::GetIOThreadPool();
-  auto self = shared_from_this();
-  auto maybe_fut =
-      pool->Submit([self, position, nbytes] { return self->ReadAt(position, nbytes); });
-  if (!maybe_fut.ok()) {
-    return Future<std::shared_ptr<Buffer>>::MakeFinished(maybe_fut.status());
-  }
-  return *std::move(maybe_fut);
+  auto self = std::dynamic_pointer_cast<RandomAccessFile>(shared_from_this());
+  return DeferNotOk(internal::SubmitIO(
+      ctx, [self, position, nbytes] { return self->ReadAt(position, nbytes); }));
 }
 
-Status Writable::Write(const std::string& data) {
-  return Write(data.c_str(), static_cast<int64_t>(data.size()));
+Future<std::shared_ptr<Buffer>> RandomAccessFile::ReadAsync(int64_t position,
+                                                            int64_t nbytes) {
+  return ReadAsync(io_context(), position, nbytes);
+}
+
+std::vector<Future<std::shared_ptr<Buffer>>> RandomAccessFile::ReadManyAsync(
+    const IOContext& ctx, const std::vector<ReadRange>& ranges) {
+  std::vector<Future<std::shared_ptr<Buffer>>> ret;
+  for (auto r : ranges) {
+    ret.push_back(this->ReadAsync(ctx, r.offset, r.length));
+  }
+  return ret;
+}
+
+std::vector<Future<std::shared_ptr<Buffer>>> RandomAccessFile::ReadManyAsync(
+    const std::vector<ReadRange>& ranges) {
+  return ReadManyAsync(io_context(), ranges);
+}
+
+// Default WillNeed() implementation: no-op
+Status RandomAccessFile::WillNeed(const std::vector<ReadRange>& ranges) {
+  return Status::OK();
+}
+
+Status Writable::Write(std::string_view data) {
+  return Write(data.data(), static_cast<int64_t>(data.size()));
 }
 
 Status Writable::Write(const std::shared_ptr<Buffer>& data) {
@@ -196,8 +264,14 @@ class FileSegmentReader
   int64_t nbytes_;
 };
 
-std::shared_ptr<InputStream> RandomAccessFile::GetStream(
+Result<std::shared_ptr<InputStream>> RandomAccessFile::GetStream(
     std::shared_ptr<RandomAccessFile> file, int64_t file_offset, int64_t nbytes) {
+  if (file_offset < 0) {
+    return Status::Invalid("file_offset should be a positive value, got: ", file_offset);
+  }
+  if (nbytes < 0) {
+    return Status::Invalid("nbytes should be a positive value, got: ", nbytes);
+  }
   return std::make_shared<FileSegmentReader>(std::move(file), file_offset, nbytes);
 }
 
@@ -245,7 +319,7 @@ Status ValidateWriteRange(int64_t offset, int64_t size, int64_t file_size) {
 
 Status ValidateRange(int64_t offset, int64_t size) {
   if (offset < 0 || size < 0) {
-    return Status::Invalid("Invalid IO (offset = ", offset, ", size = ", size, ")");
+    return Status::Invalid("Invalid IO range (offset = ", offset, ", size = ", size, ")");
   }
   return Status::OK();
 }
@@ -307,13 +381,38 @@ void SharedExclusiveChecker::UnlockExclusive() {}
 
 #endif
 
-static std::shared_ptr<ThreadPool> MakeIOThreadPool() {
-  auto maybe_pool = ThreadPool::MakeEternal(/*threads=*/8);
+// -----------------------------------------------------------------------
+// Global IO thread pool
+
+namespace {
+
+constexpr int kDefaultNumIoThreads = 8;
+
+std::shared_ptr<ThreadPool> MakeIOThreadPool() {
+  int threads = 0;
+  auto maybe_env_var = ::arrow::internal::GetEnvVar("ARROW_IO_THREADS");
+  if (maybe_env_var.ok()) {
+    auto str = *std::move(maybe_env_var);
+    if (!str.empty()) {
+      try {
+        threads = std::stoi(str);
+      } catch (...) {
+      }
+      if (threads <= 0) {
+        ARROW_LOG(WARNING)
+            << "ARROW_IO_THREADS does not contain a valid number of threads "
+               "(should be an integer > 0)";
+      }
+    }
+  }
+  auto maybe_pool = ThreadPool::MakeEternal(threads > 0 ? threads : kDefaultNumIoThreads);
   if (!maybe_pool.ok()) {
     maybe_pool.status().Abort("Failed to create global IO thread pool");
   }
   return *std::move(maybe_pool);
 }
+
+}  // namespace
 
 ThreadPool* GetIOThreadPool() {
   static std::shared_ptr<ThreadPool> pool = MakeIOThreadPool();
@@ -326,51 +425,78 @@ ThreadPool* GetIOThreadPool() {
 namespace {
 
 struct ReadRangeCombiner {
-  std::vector<ReadRange> Coalesce(std::vector<ReadRange> ranges) {
-    if (ranges.size() == 0) {
+  Result<std::vector<ReadRange>> Coalesce(std::vector<ReadRange> ranges) {
+    if (ranges.empty()) {
       return ranges;
     }
 
     // Remove zero-sized ranges
     auto end = std::remove_if(ranges.begin(), ranges.end(),
                               [](const ReadRange& range) { return range.length == 0; });
-    ranges.resize(end - ranges.begin());
     // Sort in position order
-    std::sort(ranges.begin(), ranges.end(),
+    std::sort(ranges.begin(), end,
               [](const ReadRange& a, const ReadRange& b) { return a.offset < b.offset; });
+    // Remove ranges that overlap 100%
+    end = std::unique(ranges.begin(), end,
+                      [](const ReadRange& left, const ReadRange& right) {
+                        return right.offset >= left.offset &&
+                               right.offset + right.length <= left.offset + left.length;
+                      });
+    ranges.resize(end - ranges.begin());
+
+    // Skip further processing if ranges is empty after removing zero-sized ranges.
+    if (ranges.empty()) {
+      return ranges;
+    }
 
 #ifndef NDEBUG
     for (size_t i = 0; i < ranges.size() - 1; ++i) {
       const auto& left = ranges[i];
       const auto& right = ranges[i + 1];
       DCHECK_LE(left.offset, right.offset);
-      DCHECK_LE(left.offset + left.length, right.offset) << "Some read ranges overlap";
+      if (left.offset + left.length > right.offset) {
+        return Status::IOError("Some read ranges overlap");
+      }
     }
 #endif
 
     std::vector<ReadRange> coalesced;
 
-    // Find some subsets of ranges that we may want to coalesce
-    auto start = ranges.begin(), prev = start, next = prev;
+    auto itr = ranges.begin();
+    // Ensure ranges is not empty.
+    DCHECK_LE(itr, ranges.end());
+    // Start of the current coalesced range and end (exclusive) of previous range.
+    // Both are initialized with the start of first range which is a placeholder value.
+    int64_t coalesced_start = itr->offset;
+    int64_t prev_range_end = coalesced_start;
 
-    while (++next != ranges.end()) {
-      if (next->offset - prev->offset - prev->length > hole_size_limit_) {
-        // Distance between consecutive ranges is too large, coalesce this subset
-        // and start a new one
-        if (next - start > 1) {
-          CoalesceUntilLargeEnough(start, next, &coalesced);
-        } else {
-          coalesced.push_back(*start);
+    for (; itr < ranges.end(); ++itr) {
+      const int64_t current_range_start = itr->offset;
+      const int64_t current_range_end = current_range_start + itr->length;
+      // We don't expect to have 0 sized ranges.
+      DCHECK_LT(current_range_start, current_range_end);
+
+      // At this point, the coalesced range is [coalesced_start, prev_range_end).
+      // Stop coalescing if:
+      //   - coalesced range is too large, or
+      //   - distance (hole/gap) between consecutive ranges is too large.
+      if (current_range_end - coalesced_start > range_size_limit_ ||
+          current_range_start - prev_range_end > hole_size_limit_) {
+        DCHECK_LE(coalesced_start, prev_range_end);
+        // Append the coalesced range only if coalesced range size > 0.
+        if (prev_range_end > coalesced_start) {
+          coalesced.push_back({coalesced_start, prev_range_end - coalesced_start});
         }
-        start = next;
+        // Start a new coalesced range.
+        coalesced_start = current_range_start;
       }
-      prev = next;
+
+      // Update the prev_range_end with the current range.
+      prev_range_end = current_range_end;
     }
-    // Coalesce last subset
-    if (next - start > 1) {
-      CoalesceUntilLargeEnough(start, next, &coalesced);
-    } else {
-      coalesced.push_back(*start);
+    // Append the coalesced range only if coalesced range size > 0.
+    if (prev_range_end > coalesced_start) {
+      coalesced.push_back({coalesced_start, prev_range_end - coalesced_start});
     }
 
     DCHECK_EQ(coalesced.front().offset, ranges.front().offset);
@@ -379,47 +505,15 @@ struct ReadRangeCombiner {
     return coalesced;
   }
 
-  // Coalesce consecutive pairs of ranges, but only if the resulting range size
-  // would not exceed range_size_limit.
-  template <typename ReadRangeIterator>
-  void CoalesceUntilLargeEnough(ReadRangeIterator begin, ReadRangeIterator end,
-                                std::vector<ReadRange>* out) {
-    std::list<ReadRange> todo;
-    std::copy(begin, end, std::back_inserter(todo));
-
-    // Iterate over consecutive pairs
-    auto prev = todo.begin(), next = prev;
-    while (++next != todo.end()) {
-      DCHECK_GE(next->offset, prev->offset);
-      if (CanCoalesce(*prev, *next)) {
-        next->length = (next->offset - prev->offset) + next->length;
-        next->offset = prev->offset;
-        todo.erase(prev);  // Keep `next` valid
-      }
-      prev = next;
-    }
-
-    const auto out_size = out->size();
-    out->resize(out_size + todo.size());
-    std::copy(todo.begin(), todo.end(), &(*out)[out_size]);
-  }
-
-  bool CanCoalesce(const ReadRange& left, const ReadRange& right) {
-    DCHECK_LE(left.offset, right.offset);
-    // Ensured by the subset-finding in Coalesce()
-    DCHECK_LE(right.offset - left.offset - left.length, hole_size_limit_);
-    return left.length + right.length <= range_size_limit_;
-  }
-
   const int64_t hole_size_limit_;
   const int64_t range_size_limit_;
 };
 
 };  // namespace
 
-std::vector<ReadRange> CoalesceReadRanges(std::vector<ReadRange> ranges,
-                                          int64_t hole_size_limit,
-                                          int64_t range_size_limit) {
+Result<std::vector<ReadRange>> CoalesceReadRanges(std::vector<ReadRange> ranges,
+                                                  int64_t hole_size_limit,
+                                                  int64_t range_size_limit) {
   DCHECK_GT(range_size_limit, hole_size_limit);
 
   ReadRangeCombiner combiner{hole_size_limit, range_size_limit};

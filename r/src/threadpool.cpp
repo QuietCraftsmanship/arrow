@@ -17,8 +17,7 @@
 
 #include "./arrow_types.h"
 
-#if defined(ARROW_R_WITH_ARROW)
-
+#include <arrow/io/type_fwd.h>
 #include <arrow/util/parallel.h>
 
 //' View and manage the capacity of the global thread pool
@@ -45,7 +44,13 @@ int GetCpuThreadPoolCapacity() { return arrow::GetCpuThreadPoolCapacity(); }
 //' @export
 // [[arrow::export]]
 void SetCpuThreadPoolCapacity(int threads) {
-  STOP_IF_NOT_OK(arrow::SetCpuThreadPoolCapacity(threads));
+  StopIfNotOk(arrow::SetCpuThreadPoolCapacity(threads));
 }
 
-#endif
+// [[arrow::export]]
+int GetIOThreadPoolCapacity() { return arrow::io::GetIOThreadPoolCapacity(); }
+
+// [[arrow::export]]
+void SetIOThreadPoolCapacity(int threads) {
+  StopIfNotOk(arrow::io::SetIOThreadPoolCapacity(threads));
+}

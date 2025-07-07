@@ -15,14 +15,15 @@
 
 using Apache.Arrow.Types;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 
 namespace Apache.Arrow
 {
-    public class TimestampArray: PrimitiveArray<long>
+    public class TimestampArray : PrimitiveArray<long>, IReadOnlyList<DateTimeOffset?>, ICollection<DateTimeOffset?>
     {
-        private static readonly DateTimeOffset Epoch = new DateTimeOffset(1970, 1, 1, 0, 0, 0, 0, TimeSpan.Zero);
+        private static readonly DateTimeOffset s_epoch = new DateTimeOffset(1970, 1, 1, 0, 0, 0, 0, TimeSpan.Zero);
 
         public class Builder: PrimitiveArrayBuilder<DateTimeOffset, long, TimestampArray, Builder>
         {
@@ -70,15 +71,15 @@ namespace Apache.Arrow
                 // - Compute time span between epoch and specified time
                 // - Compute time divisions per tick
 
-                var timeSpan = value - Epoch;
-                var ticks = timeSpan.Ticks;
+                TimeSpan timeSpan = value - s_epoch;
+                long ticks = timeSpan.Ticks;
 
                 switch (DataType.Unit)
                 {
                     case TimeUnit.Nanosecond:
-                        return ticks / 100;
+                        return checked(ticks * 100);
                     case TimeUnit.Microsecond:
-                        return ticks / TimeSpan.TicksPerMillisecond / 1000;
+                        return ticks / 10;
                     case TimeUnit.Millisecond:
                         return ticks / TimeSpan.TicksPerMillisecond;
                     case TimeUnit.Second:
@@ -109,17 +110,17 @@ namespace Apache.Arrow
         public DateTimeOffset GetTimestampUnchecked(int index)
         {
             var type = (TimestampType) Data.DataType;
-            var value = Values[index];
+            long value = Values[index];
 
             long ticks;
 
             switch (type.Unit)
             {
                 case TimeUnit.Nanosecond:
-                    ticks = value * 100;
+                    ticks = value / 100;
                     break;
                 case TimeUnit.Microsecond:
-                    ticks = value * TimeSpan.TicksPerMillisecond * 1000;
+                    ticks = value * 10;
                     break;
                 case TimeUnit.Millisecond:
                     ticks = value * TimeSpan.TicksPerMillisecond;
@@ -132,7 +133,7 @@ namespace Apache.Arrow
                         $"Unsupported timestamp unit <{type.Unit}>");
             }
 
-            return new DateTimeOffset(Epoch.Ticks + ticks, TimeSpan.Zero);
+            return new DateTimeOffset(s_epoch.Ticks + ticks, TimeSpan.Zero);
         }
 
         public DateTimeOffset? GetTimestamp(int index)
@@ -145,5 +146,41 @@ namespace Apache.Arrow
             return GetTimestampUnchecked(index);
         }
 
+        int IReadOnlyCollection<DateTimeOffset?>.Count => Length;
+
+        DateTimeOffset? IReadOnlyList<DateTimeOffset?>.this[int index] => GetTimestamp(index);
+
+        IEnumerator<DateTimeOffset?> IEnumerable<DateTimeOffset?>.GetEnumerator()
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                yield return GetTimestamp(index);
+            };
+        }
+
+        int ICollection<DateTimeOffset?>.Count => Length;
+        bool ICollection<DateTimeOffset?>.IsReadOnly => true;
+        void ICollection<DateTimeOffset?>.Add(DateTimeOffset? item) => throw new NotSupportedException("Collection is read-only.");
+        bool ICollection<DateTimeOffset?>.Remove(DateTimeOffset? item) => throw new NotSupportedException("Collection is read-only.");
+        void ICollection<DateTimeOffset?>.Clear() => throw new NotSupportedException("Collection is read-only.");
+
+        bool ICollection<DateTimeOffset?>.Contains(DateTimeOffset? item)
+        {
+            for (int index = 0; index < Length; index++)
+            {
+                if (GetTimestamp(index).Equals(item))
+                    return true;
+            }
+
+            return false;
+        }
+
+        void ICollection<DateTimeOffset?>.CopyTo(DateTimeOffset?[] array, int arrayIndex)
+        {
+            for (int srcIndex = 0, destIndex = arrayIndex; srcIndex < Length; srcIndex++, destIndex++)
+            {
+                array[destIndex] = GetTimestamp(srcIndex);
+            }
+        }
     }
 }

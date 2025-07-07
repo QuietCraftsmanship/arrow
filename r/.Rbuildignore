@@ -9,6 +9,7 @@ Dockerfile
 .*\.tar\.gz
 ^windows
 ^libarrow
+^revdep
 clang_format.sh
 ^cran-comments\.md$
 ^arrow_.*.tar.gz$
@@ -19,6 +20,14 @@ clang_format.sh
 ^Makefile$
 ^.*\.orig$
 ^.*\.cmd$
-^autobrew$
-^apache-arrow.rb$
 ^.*\.Rhistory$
+^extra-tests
+STYLE.md
+^.lintr
+^.styler_excludes.R
+^cheatsheet$
+^revdep$
+^vignettes$
+^PACKAGING\.md$
+^inst/__pycache__$
+^bootstrap.R$

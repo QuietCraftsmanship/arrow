@@ -16,9 +16,108 @@
 // under the License.
 
 import {
-    Int32, Dictionary, DateUnit, util,
-    Data, Vector, Utf8Vector, DateVector, DictionaryVector,
-} from '../../Arrow';
+    Bool, DateDay, DateMillisecond, Dictionary, Float64, Int32, List, makeVector, Struct, Utf8, LargeUtf8, util, Vector, vectorFromArray, makeData, FixedSizeList, Field,
+} from 'apache-arrow';
+
+describe(`makeVectorFromArray`, () => {
+    describe(`works with null values`, () => {
+        const values = [1, 2, 3, 4, null, 5];
+        const vector = vectorFromArray(values);
+        basicVectorTests(vector, values, []);
+        test(`toArray returns typed array for numbers`, () => {
+            expect(vector.toArray()).toEqual(Float64Array.from(values.map(n => n === null ? 0 : n)));
+        });
+        test(`toJSON retains null`, () => {
+            expect(vector.toJSON()).toEqual(values);
+        });
+    });
+});
+
+describe(`basic vector methods`, () => {
+    test(`not nullable`, () => {
+        const vector = makeVector([makeData({ data: new Int32Array([1, 2, 3]), nullCount: -1, type: new Int32() })]);
+        expect(vector.nullable).toBe(false);
+        expect(vector.nullCount).toBe(0);
+    });
+
+    test(`nullable`, () => {
+        const vector = makeVector([makeData({ data: new Int32Array([1, 2, 3]), nullCount: 0, type: new Int32() })]);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(0);
+        expect(vector.isValid(0)).toBe(true);
+
+        // set a value to null
+        vector.set(0, null);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(1);
+        expect(vector.isValid(0)).toBe(false);
+
+        // set the same value to null which should not change anything
+        vector.set(0, null);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(1);
+
+        // set a different value to null
+        vector.set(1, null);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(2);
+
+        // set first value to non-null
+        vector.set(0, 1);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(1);
+
+        // set last null to non-null
+        vector.set(1, 2);
+        expect(vector.nullable).toBe(true);
+        expect(vector.nullCount).toBe(0);
+    });
+});
+
+describe(`StructVector`, () => {
+    test(`makeVectorFromArray`, () => {
+        const values: { a?: number; b?: string | null; c?: boolean | null }[] = [
+            { a: 1, b: null },
+            { a: 4, b: 'foo', c: null },
+            { a: 7, b: 'bar', c: true },
+            { a: 10, b: 'baz', c: true },
+        ];
+        const vector = vectorFromArray(values);
+
+        expect(vector.numChildren).toBe(3);
+        expect(vector).toHaveLength(4);
+        expect(vector.type.children[0].type).toBeInstanceOf(Float64);
+        expect(vector.type.children[1].type).toBeInstanceOf(Dictionary);
+        expect(vector.type.children[2].type).toBeInstanceOf(Bool);
+    });
+
+
+    const values: { a?: number; b?: string; c?: boolean }[] = [
+        { a: 1, b: 'foo', c: true },
+        { a: 4, b: 'foo', c: false },
+        { a: 7, b: 'bar', c: true },
+        { a: 10, b: 'baz', c: true },
+    ];
+    const vector = vectorFromArray(values);
+
+    test(`has list struct`, () => {
+        expect(vector.type).toBeInstanceOf(Struct);
+
+        expect(vector.type.children[0].type).toBeInstanceOf(Float64);
+        expect(vector.type.children[1].type).toBeInstanceOf(Dictionary);
+        expect(vector.type.children[2].type).toBeInstanceOf(Bool);
+
+        expect(vector.type.children[0].nullable).toBeTruthy();
+        expect(vector.type.children[1].nullable).toBeTruthy();
+        expect(vector.type.children[2].nullable).toBeTruthy();
+    });
+
+    test(`get value`, () => {
+        for (const [i, value] of values.entries()) {
+            expect(vector.get(i)!.toJSON()).toEqual(value);
+        }
+    });
+});
 
 describe(`DateVector`, () => {
     const extras = [
@@ -31,8 +130,8 @@ describe(`DateVector`, () => {
             new Date(1988, 3, 25, 4, 5, 6),
             new Date(1987, 2, 24, 7, 8, 9),
             new Date(2018, 4, 12, 17, 30, 0)
-        ];
-        const vector = DateVector.from(values);
+        ].map(v => v.getTime());
+        const vector = vectorFromArray(values, new DateMillisecond);
         basicVectorTests(vector, values, extras);
     });
     describe(`unit = DAY`, () => {
@@ -42,54 +141,152 @@ describe(`DateVector`, () => {
             new Date(Date.UTC(1988, 3, 25)),
             new Date(Date.UTC(1987, 2, 24)),
             new Date(Date.UTC(2018, 4, 12))
-        ];
-        const vector = DateVector.from(values, DateUnit.DAY);
+        ].map(v => v.getTime());
+        const vector = vectorFromArray(values, new DateDay);
+
         basicVectorTests(vector, values, extras);
     });
 });
 
 describe(`DictionaryVector`, () => {
-
     const dictionary = ['foo', 'bar', 'baz'];
     const extras = ['abc', '123']; // values to search for that should NOT be found
-    const dictionary_vec = Utf8Vector.from(dictionary);
+    const dictionary_vec = vectorFromArray(dictionary, new Utf8).memoize();
 
-    const indices = Array.from({length: 50}, () => Math.random() * 3 | 0);
-    const validity = Array.from({ length: indices.length }, () => Math.random() > 0.2 ? true : false);
+    const indices = Array.from({ length: 50 }, () => Math.trunc(Math.random() * 3));
+    const validity = Array.from({ length: indices.length }, () => Math.random() > 0.2);
 
     describe(`index with nullCount == 0`, () => {
-
-        const values = Array.from(indices).map((d) => dictionary[d]);
-        const vector = DictionaryVector.from(dictionary_vec, new Int32(), indices);
+        const values = indices.map((d) => dictionary[d]);
+        const vector = makeVector({
+            data: indices,
+            dictionary: dictionary_vec,
+            type: new Dictionary(dictionary_vec.type, new Int32)
+        });
 
         basicVectorTests(vector, values, extras);
 
         describe(`sliced`, () => {
-            basicVectorTests(vector.slice(10, 20), values.slice(10,20), extras);
+            basicVectorTests(vector.slice(10, 20), values.slice(10, 20), extras);
         });
     });
 
     describe(`index with nullCount > 0`, () => {
-
         const nullBitmap = util.packBools(validity);
         const nullCount = validity.reduce((acc, d) => acc + (d ? 0 : 1), 0);
-        const values = Array.from(indices).map((d, i) => validity[i] ? dictionary[d] : null);
-        const type = new Dictionary(dictionary_vec.type, new Int32(), null, null);
-        const vector = Vector.new(Data.Dictionary(type, 0, indices.length, nullCount, nullBitmap, indices, dictionary_vec));
+        const values = indices.map((d, i) => validity[i] ? dictionary[d] : null);
+
+        const vector = makeVector({
+            data: indices,
+            nullCount,
+            nullBitmap,
+            dictionary: dictionary_vec,
+            type: new Dictionary(dictionary_vec.type, new Int32)
+        });
 
         basicVectorTests(vector, values, ['abc', '123']);
         describe(`sliced`, () => {
-            basicVectorTests(vector.slice(10, 20), values.slice(10,20), extras);
+            basicVectorTests(vector.slice(10, 20), values.slice(10, 20), extras);
+        });
+    });
+
+    describe(`vectorFromArray`, () => {
+        const values = ['foo', 'bar', 'baz', 'foo', 'bar'];
+
+        const vector = vectorFromArray(values);
+
+        test(`has dictionary type`, () => {
+            expect(vector.type).toBeInstanceOf(Dictionary);
+        });
+
+        test(`has memoized dictionary`, () => {
+            expect(vector.isMemoized).toBe(true);
+            const unmemoized = vector.unmemoize();
+            expect(unmemoized.isMemoized).toBe(false);
+        });
+
+        basicVectorTests(vector, values, ['abc', '123']);
+        describe(`sliced`, () => {
+            basicVectorTests(vector.slice(1, 3), values.slice(1, 3), ['foo', 'abc']);
         });
     });
 });
 
 describe(`Utf8Vector`, () => {
     const values = ['foo', 'bar', 'baz', 'foo bar', 'bar'];
-    const vector = Utf8Vector.from(values);
+    const vector = vectorFromArray(values, new Utf8);
+
+    test(`has utf8 type`, () => {
+        expect(vector.type).toBeInstanceOf(Utf8);
+    });
+
+    test(`is not memoized`, () => {
+        expect(vector.isMemoized).toBe(false);
+        const memoizedVector = vector.memoize();
+        expect(memoizedVector.isMemoized).toBe(true);
+        const unMemoizedVector = vector.unmemoize();
+        expect(unMemoizedVector.isMemoized).toBe(false);
+    });
+
     basicVectorTests(vector, values, ['abc', '123']);
     describe(`sliced`, () => {
-        basicVectorTests(vector.slice(1,3), values.slice(1,3), ['foo', 'abc']);
+        basicVectorTests(vector.slice(1, 3), values.slice(1, 3), ['foo', 'abc']);
+    });
+});
+
+describe(`LargeUtf8Vector`, () => {
+    const values = ['foo', 'bar', 'baz', 'foo bar', 'bar'];
+    const vector = vectorFromArray(values, new LargeUtf8);
+
+    test(`has largeUtf8 type`, () => {
+        expect(vector.type).toBeInstanceOf(LargeUtf8);
+    });
+
+    test(`is not memoized`, () => {
+        expect(vector.isMemoized).toBe(false);
+        const memoizedVector = vector.memoize();
+        expect(memoizedVector.isMemoized).toBe(true);
+        const unMemoizedVector = vector.unmemoize();
+        expect(unMemoizedVector.isMemoized).toBe(false);
+    });
+
+    basicVectorTests(vector, values, ['abc', '123']);
+    describe(`sliced`, () => {
+        basicVectorTests(vector.slice(1, 3), values.slice(1, 3), ['foo', 'abc']);
+    });
+});
+
+describe(`ListVector`, () => {
+    const values = [[1, 2], [1, 2, 3]];
+    const vector = vectorFromArray(values);
+
+    test(`has list type`, () => {
+        expect(vector.type).toBeInstanceOf(List);
+    });
+
+    test(`get value`, () => {
+        for (let i = 0; i < values.length; i++) {
+            expect(vector.get(i)!.toJSON()).toEqual(values[i]);
+            expect(vector.at(i)!.toJSON()).toEqual(values.at(i));
+            expect(vector.at(-i)!.toJSON()).toEqual(values.at(-i));
+        }
+    });
+});
+
+describe(`toArray()`, () => {
+    test(`when some data blobs have been padded`, () => {
+        const d1 = vectorFromArray([...new Array(16).keys()]);
+        const d2 = vectorFromArray([...new Array(10).keys()]);
+
+        // Padding has been added
+        expect(d2.length).toBeLessThan(d2.data[0].buffers[1].length);
+
+        const vector = new Vector([d1, d2]);
+
+        // This used to crash with "RangeError: offset is out of bounds"
+        // https://issues.apache.org/jira/browse/ARROW-18247
+        const array = vector.toArray();
+        expect(array).toHaveLength(26);
     });
 });
 
@@ -102,21 +299,22 @@ function basicVectorTests(vector: Vector, values: any[], extras: any[]) {
     const n = values.length;
 
     test(`gets expected values`, () => {
-        let i = -1;
-        while (++i < n) {
+        for (let i = 0; i < values.length; i++) {
             expect(vector.get(i)).toEqual(values[i]);
+            expect(vector.at(i)).toEqual(values.at(i));
+            expect(vector.at(-i)).toEqual(values.at(-i));
         }
     });
     test(`iterates expected values`, () => {
         expect.hasAssertions();
         let i = -1;
-        for (let v of vector) {
+        for (const v of vector) {
             expect(++i).toBeLessThan(n);
             expect(v).toEqual(values[i]);
         }
     });
     test(`indexOf returns expected values`, () => {
-        let testValues = values.concat(extras);
+        const testValues = values.concat(extras);
 
         for (const value of testValues) {
             const actual = vector.indexOf(value);
@@ -125,3 +323,40 @@ function basicVectorTests(vector: Vector, values: any[], extras: any[]) {
         }
     });
 }
+
+// GH-45862: Make sure vectorFromArray produces the correct result for
+// FixedSizeList with null slots
+describe(`vecorFromArray() with FixedSizeList<T> and null slots`, () => {
+    test(`correct child length with null slot first`, () => {
+        let vector = vectorFromArray(
+            [null, [1, 2, 3]],
+            new FixedSizeList(3, new Field('item', new Int32())),
+        );
+        let child = vector.getChildAt(0);
+
+        expect(child).toHaveLength(6);
+        expect(child?.nullCount).toBe(3);
+    });
+
+    test(`correct child length with null slot last`, () => {
+        let vector = vectorFromArray(
+            [[1, 2, 3], null],
+            new FixedSizeList(3, new Field('item', new Int32())),
+        );
+        let child = vector.getChildAt(0);
+
+        expect(child).toHaveLength(6);
+        expect(child?.nullCount).toBe(3);
+    });
+
+    test(`correct child length with null in the middle`, () => {
+        let vector = vectorFromArray(
+            [[1, 2, 3], null, [7, 8, 9]],
+            new FixedSizeList(3, new Field('item', new Int32())),
+        );
+        let child = vector.getChildAt(0);
+
+        expect(child).toHaveLength(9);
+        expect(child?.nullCount).toBe(3);
+    });
+});

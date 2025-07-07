@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "gandiva/decimal_type_util.h"
+#include "gandiva/function_registry_common.h"
 #include "gandiva/gandiva_aliases.h"
 #include "gandiva/node.h"
 
@@ -52,8 +53,8 @@ NodePtr TreeExprBuilder::MakeBinaryLiteral(const std::string& value) {
 }
 
 NodePtr TreeExprBuilder::MakeDecimalLiteral(const DecimalScalar128& value) {
-  return std::make_shared<LiteralNode>(arrow::decimal(value.precision(), value.scale()),
-                                       LiteralHolder(value), false);
+  return std::make_shared<LiteralNode>(
+      arrow::decimal128(value.precision(), value.scale()), LiteralHolder(value), false);
 }
 
 NodePtr TreeExprBuilder::MakeNull(DataTypePtr data_type) {
@@ -70,10 +71,7 @@ NodePtr TreeExprBuilder::MakeNull(DataTypePtr data_type) {
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((int8_t)0), true);
     case arrow::Type::INT16:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((int16_t)0), true);
-    case arrow::Type::INT32:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((int32_t)0), true);
-    case arrow::Type::INT64:
-      return std::make_shared<LiteralNode>(data_type, LiteralHolder((int64_t)0), true);
     case arrow::Type::UINT8:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((uint8_t)0), true);
     case arrow::Type::UINT16:
@@ -91,22 +89,17 @@ NodePtr TreeExprBuilder::MakeNull(DataTypePtr data_type) {
     case arrow::Type::STRING:
     case arrow::Type::BINARY:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder(empty), true);
-    case arrow::Type::DATE64:
-      return std::make_shared<LiteralNode>(data_type, LiteralHolder((int64_t)0), true);
+    case arrow::Type::INT32:
+    case arrow::Type::DATE32:
     case arrow::Type::TIME32:
+    case arrow::Type::INTERVAL_MONTHS:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((int32_t)0), true);
+    case arrow::Type::INT64:
+    case arrow::Type::DATE64:
     case arrow::Type::TIME64:
-      return std::make_shared<LiteralNode>(data_type, LiteralHolder((int64_t)0), true);
     case arrow::Type::TIMESTAMP:
+    case arrow::Type::INTERVAL_DAY_TIME:
       return std::make_shared<LiteralNode>(data_type, LiteralHolder((int64_t)0), true);
-    case arrow::Type::INTERVAL: {
-      std::shared_ptr<arrow::IntervalType> interval_type =
-          arrow::internal::checked_pointer_cast<arrow::IntervalType>(data_type);
-      if (interval_type->interval_type() == arrow::IntervalType::type::MONTHS) {
-        return std::make_shared<LiteralNode>(data_type, LiteralHolder((int32_t)0), true);
-      }
-      return std::make_shared<LiteralNode>(data_type, LiteralHolder((int64_t)0), true);
-    }
     case arrow::Type::DECIMAL: {
       std::shared_ptr<arrow::DecimalType> decimal_type =
           arrow::internal::checked_pointer_cast<arrow::DecimalType>(data_type);
@@ -198,20 +191,34 @@ ConditionPtr TreeExprBuilder::MakeCondition(const std::string& function,
   return ConditionPtr(new Condition(func_node));
 }
 
-#define MAKE_IN(NAME, ctype)                                        \
-  NodePtr TreeExprBuilder::MakeInExpression##NAME(                  \
-      NodePtr node, const std::unordered_set<ctype>& values) {      \
-    return std::make_shared<InExpressionNode<ctype>>(node, values); \
+NodePtr TreeExprBuilder::MakeInExpressionDecimal(
+    NodePtr node, std::unordered_set<gandiva::DecimalScalar128>& constants) {
+  int32_t precision = 0;
+  int32_t scale = 0;
+  if (!constants.empty()) {
+    precision = constants.begin()->precision();
+    scale = constants.begin()->scale();
+  }
+  return std::make_shared<InExpressionNode<gandiva::DecimalScalar128>>(node, constants,
+                                                                       precision, scale);
+}
+
+#define MAKE_IN(NAME, ctype, type)                                        \
+  NodePtr TreeExprBuilder::MakeInExpression##NAME(                        \
+      NodePtr node, const std::unordered_set<ctype>& values) {            \
+    return std::make_shared<InExpressionNode<ctype>>(node, values, type); \
   }
 
-MAKE_IN(Int32, int32_t);
-MAKE_IN(Int64, int64_t);
-MAKE_IN(Date32, int32_t);
-MAKE_IN(Date64, int64_t);
-MAKE_IN(TimeStamp, int64_t);
-MAKE_IN(Time32, int32_t);
-MAKE_IN(Time64, int64_t);
-MAKE_IN(String, std::string);
-MAKE_IN(Binary, std::string);
+MAKE_IN(Int32, int32_t, int32());
+MAKE_IN(Int64, int64_t, int64());
+MAKE_IN(Date32, int32_t, date32());
+MAKE_IN(Date64, int64_t, date64());
+MAKE_IN(TimeStamp, int64_t, timestamp());
+MAKE_IN(Time32, int32_t, time32());
+MAKE_IN(Time64, int64_t, time64());
+MAKE_IN(Float, float, float32());
+MAKE_IN(Double, double, float64());
+MAKE_IN(String, std::string, utf8());
+MAKE_IN(Binary, std::string, binary());
 
 }  // namespace gandiva

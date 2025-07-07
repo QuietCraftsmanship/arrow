@@ -40,7 +40,7 @@ class LocalBitMapsHolder {
   uint8_t** GetLocalBitMapArray() const { return local_bitmaps_array_.get(); }
 
   uint8_t* GetLocalBitMap(int idx) const {
-    DCHECK(idx <= GetNumLocalBitMaps());
+    ARROW_DCHECK(idx <= GetNumLocalBitMaps());
     return local_bitmaps_array_.get()[idx];
   }
 
@@ -48,7 +48,7 @@ class LocalBitMapsHolder {
   /// number of records in the current batch.
   int64_t num_records_;
 
-  /// A container of 'local_bitmaps_', each sized to accomodate 'num_records'.
+  /// A container of 'local_bitmaps_', each sized to accommodate 'num_records'.
   std::vector<std::unique_ptr<uint8_t[]>> local_bitmaps_vec_;
 
   /// An array of the local bitmaps.

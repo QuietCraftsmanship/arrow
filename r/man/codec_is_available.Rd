@@ -8,7 +8,7 @@ codec_is_available(type)
 }
 \arguments{
 \item{type}{A string, one of "uncompressed", "snappy", "gzip", "brotli",
-"zstd", "lz4", "lzo", or "bz2", case insensitive.}
+"zstd", "lz4", "lzo", or "bz2", case-insensitive.}
 }
 \value{
 Logical: is \code{type} available?
@@ -17,4 +17,7 @@ Logical: is \code{type} available?
 Support for compression libraries depends on the build-time settings of
 the Arrow C++ library. This function lets you know which are available for
 use.
+}
+\examples{
+codec_is_available("gzip")
 }

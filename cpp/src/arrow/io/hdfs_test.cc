@@ -28,8 +28,6 @@
 
 #include <gtest/gtest.h>
 
-#include <boost/filesystem.hpp>  // NOLINT
-
 #include "arrow/buffer.h"
 #include "arrow/io/hdfs.h"
 #include "arrow/io/hdfs_internal.h"
@@ -37,6 +35,11 @@
 #include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
+
+// boost/filesystem.hpp should be included after
+// arrow/util/windows_compatibility.h because boost/filesystem.hpp
+// includes windows.h implicitly.
+#include <boost/filesystem.hpp>  // NOLINT
 
 namespace arrow {
 namespace io {
@@ -136,10 +139,9 @@ class TestHadoopFileSystem : public ::testing::Test {
   std::shared_ptr<HadoopFileSystem> client_;
 };
 
-#define SKIP_IF_NO_DRIVER()                                  \
-  if (!this->loaded_driver_) {                               \
-    std::cout << "Driver not loaded, skipping" << std::endl; \
-    return;                                                  \
+#define SKIP_IF_NO_DRIVER()                        \
+  if (!this->loaded_driver_) {                     \
+    GTEST_SKIP() << "Driver not loaded, skipping"; \
   }
 
 TEST_F(TestHadoopFileSystem, ConnectsAgain) {
@@ -358,8 +360,7 @@ TEST_F(TestHadoopFileSystem, LargeFile) {
 
   ASSERT_FALSE(file->closed());
 
-  std::shared_ptr<Buffer> buffer;
-  ASSERT_OK(AllocateBuffer(nullptr, size, &buffer));
+  ASSERT_OK_AND_ASSIGN(auto buffer, AllocateBuffer(size));
 
   ASSERT_OK_AND_EQ(size, file->Read(size, buffer->mutable_data()));
   ASSERT_EQ(0, std::memcmp(buffer->data(), data.data(), size));
@@ -368,8 +369,7 @@ TEST_F(TestHadoopFileSystem, LargeFile) {
   std::shared_ptr<HdfsReadableFile> file2;
   ASSERT_OK(this->client_->OpenReadable(path, 1 << 18, &file2));
 
-  std::shared_ptr<Buffer> buffer2;
-  ASSERT_OK(AllocateBuffer(nullptr, size, &buffer2));
+  ASSERT_OK_AND_ASSIGN(auto buffer2, AllocateBuffer(size));
 
   ASSERT_OK_AND_EQ(size, file2->Read(size, buffer2->mutable_data()));
   ASSERT_EQ(0, std::memcmp(buffer2->data(), data.data(), size));

@@ -15,23 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const {
-    targetDir,
-    tsconfigName,
-    observableFromStreams,
-    shouldRunInChildProcess,
-    spawnGulpCommandInChildProcess,
-} = require('./util');
+import { targetDir, tsconfigName, observableFromStreams, shouldRunInChildProcess, spawnGulpCommandInChildProcess } from './util.js';
 
-const gulp = require('gulp');
-const path = require('path');
-const ts = require(`gulp-typescript`);
-const sourcemaps = require('gulp-sourcemaps');
-const { memoizeTask } = require('./memoize-task');
-const { Observable, ReplaySubject } = require('rxjs');
+import gulp from 'gulp';
+import path from 'node:path';
+import tsc from 'typescript';
+import ts from 'gulp-typescript';
+import * as fs from 'node:fs/promises';
+import sourcemaps from 'gulp-sourcemaps';
+import { memoizeTask } from './memoize-task.js';
+import { ReplaySubject, forkJoin as ObservableForkJoin, defer as ObservableDefer } from 'rxjs';
+import { mergeWith, takeLast, share, concat } from 'rxjs/operators';
 
-const typescriptTask = ((cache) => memoizeTask(cache, function typescript(target, format) {
-
+export const typescriptTask = ((cache) => memoizeTask(cache, function typescript(target, format) {
     if (shouldRunInChildProcess(target, format)) {
         return spawnGulpCommandInChildProcess('compile', target, format);
     }
@@ -39,31 +35,40 @@ const typescriptTask = ((cache) => memoizeTask(cache, function typescript(target
     const out = targetDir(target, format);
     const tsconfigPath = path.join(`tsconfig`, `tsconfig.${tsconfigName(target, format)}.json`);
     return compileTypescript(out, tsconfigPath)
-        .merge(compileBinFiles(target, format)).takeLast(1)
-        .publish(new ReplaySubject()).refCount();
+        .pipe(mergeWith(compileBinFiles(target, format)))
+        .pipe(takeLast(1))
+        .pipe(share({ connector: () => new ReplaySubject(), resetOnError: false, resetOnComplete: false, resetOnRefCountZero: false }))
 }))({});
 
-function compileBinFiles(target, format) {
+export default typescriptTask;
+
+export function compileBinFiles(target, format) {
     const out = targetDir(target, format);
     const tsconfigPath = path.join(`tsconfig`, `tsconfig.${tsconfigName('bin', 'cjs')}.json`);
-    return compileTypescript(path.join(out, 'bin'), tsconfigPath, { target });
+    const tsconfigOverrides = format === 'esm' ? { target, module: 'ES2015' } : { target };
+    return compileTypescript(out, tsconfigPath, tsconfigOverrides, false)
+      .pipe(takeLast(1))
+      .pipe(concat(ObservableDefer(() => {
+        return fs.chmod(path.join(out, 'bin', 'arrow2csv.js'), 0o755);
+      })));
 }
 
-function compileTypescript(out, tsconfigPath, tsconfigOverrides) {
-    const tsProject = ts.createProject(tsconfigPath, { typescript: require(`typescript`), ...tsconfigOverrides });
+function compileTypescript(out, tsconfigPath, tsconfigOverrides, writeSourcemaps = true) {
+    const tsProject = ts.createProject(tsconfigPath, { typescript: tsc, ...tsconfigOverrides });
     const { stream: { js, dts } } = observableFromStreams(
-      tsProject.src(), sourcemaps.init(),
-      tsProject(ts.reporter.defaultReporter())
+        tsProject.src(), sourcemaps.init(),
+        tsProject(ts.reporter.defaultReporter())
     );
-    const writeDTypes = observableFromStreams(dts, gulp.dest(out));
-    const mapFile = tsProject.options.module === 5 ? esmMapFile : cjsMapFile;
-    const writeJS = observableFromStreams(js, sourcemaps.write('./', { mapFile }), gulp.dest(out));
-    return Observable.forkJoin(writeDTypes, writeJS);
+    const writeSources = observableFromStreams(tsProject.src(), gulp.dest(path.join(out, 'src')));
+    const writeDTypes = observableFromStreams(dts, sourcemaps.write('./', { includeContent: false, sourceRoot: './src' }), gulp.dest(out));
+    const writeJSArgs = writeSourcemaps ? [
+        js,
+        sourcemaps.write('./', { includeContent: false, sourceRoot: './src' }),
+        gulp.dest(out)
+      ] : [
+        js,
+        gulp.dest(out)
+      ];
+    const writeJS = observableFromStreams(...writeJSArgs);
+    return ObservableForkJoin([writeSources, writeDTypes, writeJS]);
 }
-
-function cjsMapFile(mapFilePath) { return mapFilePath; }
-function esmMapFile(mapFilePath) { return mapFilePath.replace('.js.map', '.mjs.map'); }
-
-module.exports = typescriptTask;
-module.exports.typescriptTask = typescriptTask;
-module.exports.compileBinFiles = compileBinFiles;

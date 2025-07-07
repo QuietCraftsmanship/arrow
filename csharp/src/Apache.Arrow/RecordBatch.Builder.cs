@@ -42,14 +42,39 @@ namespace Apache.Arrow
             public UInt16Array UInt16(Action<UInt16Array.Builder> action) => Build<UInt16Array, UInt16Array.Builder>(new UInt16Array.Builder(), action);
             public UInt32Array UInt32(Action<UInt32Array.Builder> action) => Build<UInt32Array, UInt32Array.Builder>(new UInt32Array.Builder(), action);
             public UInt64Array UInt64(Action<UInt64Array.Builder> action) => Build<UInt64Array, UInt64Array.Builder>(new UInt64Array.Builder(), action);
+#if NET5_0_OR_GREATER
+            public HalfFloatArray HalfFloat(Action<HalfFloatArray.Builder> action) => Build<HalfFloatArray, HalfFloatArray.Builder>(new HalfFloatArray.Builder(), action);
+#endif
             public FloatArray Float(Action<FloatArray.Builder> action) => Build<FloatArray, FloatArray.Builder>(new FloatArray.Builder(), action);
             public DoubleArray Double(Action<DoubleArray.Builder> action) => Build<DoubleArray, DoubleArray.Builder>(new DoubleArray.Builder(), action);
+            public Decimal32Array Decimal32(Decimal32Type type, Action<Decimal32Array.Builder> action) =>
+                Build<Decimal32Array, Decimal32Array.Builder>(
+                    new Decimal32Array.Builder(type), action);
+            public Decimal64Array Decimal64(Decimal64Type type, Action<Decimal64Array.Builder> action) =>
+                Build<Decimal64Array, Decimal64Array.Builder>(
+                    new Decimal64Array.Builder(type), action);
+            public Decimal128Array Decimal128(Decimal128Type type, Action<Decimal128Array.Builder> action) =>
+                Build<Decimal128Array, Decimal128Array.Builder>(
+                    new Decimal128Array.Builder(type), action);
+            public Decimal256Array Decimal256(Decimal256Type type, Action<Decimal256Array.Builder> action) =>
+                Build<Decimal256Array, Decimal256Array.Builder>(
+                    new Decimal256Array.Builder(type), action);
             public Date32Array Date32(Action<Date32Array.Builder> action) => Build<Date32Array, Date32Array.Builder>(new Date32Array.Builder(), action);
             public Date64Array Date64(Action<Date64Array.Builder> action) => Build<Date64Array, Date64Array.Builder>(new Date64Array.Builder(), action);
+            public Time32Array Time32(Action<Time32Array.Builder> action) => Build<Time32Array, Time32Array.Builder>(new Time32Array.Builder(), action);
+            public Time32Array Time32(Time32Type type, Action<Time32Array.Builder> action) =>
+                Build<Time32Array, Time32Array.Builder>(
+                    new Time32Array.Builder(type), action);
+            public Time64Array Time64(Action<Time64Array.Builder> action) => Build<Time64Array, Time64Array.Builder>(new Time64Array.Builder(), action);
+            public Time64Array Time64(Time64Type type, Action<Time64Array.Builder> action) =>
+                Build<Time64Array, Time64Array.Builder>(
+                    new Time64Array.Builder(type), action);
+            public DurationArray Duration(DurationType type, Action<DurationArray.Builder> action) =>
+                Build<DurationArray, DurationArray.Builder>(new DurationArray.Builder(type), action);
             public BinaryArray Binary(Action<BinaryArray.Builder> action) => Build<BinaryArray, BinaryArray.Builder>(new BinaryArray.Builder(), action);
             public StringArray String(Action<StringArray.Builder> action) => Build<StringArray, StringArray.Builder>(new StringArray.Builder(), action);
             public TimestampArray Timestamp(Action<TimestampArray.Builder> action) => Build<TimestampArray, TimestampArray.Builder>(new TimestampArray.Builder(), action);
-            public TimestampArray Timestamp(TimestampType type, Action<TimestampArray.Builder> action) => 
+            public TimestampArray Timestamp(TimestampType type, Action<TimestampArray.Builder> action) =>
                 Build<TimestampArray, TimestampArray.Builder>(
                     new TimestampArray.Builder(type), action);
             public TimestampArray Timestamp(TimeUnit unit, TimeZoneInfo timezone, Action<TimestampArray.Builder> action) =>
@@ -88,8 +113,8 @@ namespace Apache.Arrow
 
             public RecordBatch Build()
             {
-                var schema = _schemaBuilder.Build();
-                var length = _arrays.Max(x => x.Length);
+                Schema schema = _schemaBuilder.Build();
+                int length = _arrays.Max(x => x.Length);
 
                 // each array has its own memoryOwner, so the RecordBatch itself doesn't
                 // have a memoryOwner
@@ -108,12 +133,12 @@ namespace Apache.Arrow
 
             public Builder Append(RecordBatch batch)
             {
-                foreach (var field in batch.Schema.Fields)
+                foreach (Field field in batch.Schema.FieldsList)
                 {
-                    _schemaBuilder.Field(field.Value);
+                    _schemaBuilder.Field(field);
                 }
 
-                foreach (var array in batch.Arrays)
+                foreach (IArrowArray array in batch.Arrays)
                 {
                     _arrays.Add(array);
                 }
@@ -124,8 +149,8 @@ namespace Apache.Arrow
             public Builder Append<TArray>(string name, bool nullable, IArrowArrayBuilder<TArray> builder)
                 where TArray: IArrowArray
             {
-                return builder == null 
-                    ? this 
+                return builder == null
+                    ? this
                     : Append(name, nullable, builder.Build(_allocator));
             }
 
@@ -150,13 +175,12 @@ namespace Apache.Arrow
             {
                 if (action == null) return this;
 
-                var array = action(_arrayBuilder);
+                TArray array = action(_arrayBuilder);
 
                 Append(name, nullable, array);
 
                 return this;
             }
-
         }
     }
 }

@@ -21,6 +21,8 @@
 #include <memory>
 #include <string>
 
+#include <cuda.h>
+
 #include "arrow/device.h"
 #include "arrow/result.h"
 #include "arrow/util/visibility.h"
@@ -43,9 +45,6 @@ class ARROW_EXPORT CudaDeviceManager {
  public:
   static Result<CudaDeviceManager*> Instance();
 
-  ARROW_DEPRECATED("Use Instance()")
-  static Status GetInstance(CudaDeviceManager** manager);
-
   /// \brief Get a CudaDevice instance for a particular device
   /// \param[in] device_number the CUDA device number
   Result<std::shared_ptr<CudaDevice>> GetDevice(int device_number);
@@ -55,39 +54,17 @@ class ARROW_EXPORT CudaDeviceManager {
   /// \return cached context
   Result<std::shared_ptr<CudaContext>> GetContext(int device_number);
 
-  /// \brief Get the CUDA driver context for a particular device
-  /// \param[in] device_number the CUDA device number
-  /// \param[out] out cached context
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status GetContext(int device_number, std::shared_ptr<CudaContext>* out);
-
   /// \brief Get the shared CUDA driver context for a particular device
   /// \param[in] device_number the CUDA device number
   /// \param[in] handle CUDA context handle created by another library
   /// \return shared context
   Result<std::shared_ptr<CudaContext>> GetSharedContext(int device_number, void* handle);
 
-  /// \brief Get the shared CUDA driver context for a particular device
-  /// \param[in] device_number the CUDA device number
-  /// \param[in] handle CUDA context handle created by another library
-  /// \param[out] out shared context
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status GetSharedContext(int device_number, void* handle,
-                          std::shared_ptr<CudaContext>* out);
-
   /// \brief Allocate host memory with fast access to given GPU device
   /// \param[in] device_number the CUDA device number
   /// \param[in] nbytes number of bytes
   /// \return Host buffer or Status
   Result<std::shared_ptr<CudaHostBuffer>> AllocateHost(int device_number, int64_t nbytes);
-
-  /// \brief Allocate host memory with fast access to given GPU device
-  /// \param[in] device_number the CUDA device number
-  /// \param[in] nbytes number of bytes
-  /// \param[out] out the allocated buffer
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status AllocateHost(int device_number, int64_t nbytes,
-                      std::shared_ptr<CudaHostBuffer>* out);
 
   /// \brief Free host memory
   ///
@@ -101,7 +78,7 @@ class ARROW_EXPORT CudaDeviceManager {
   static std::unique_ptr<CudaDeviceManager> instance_;
 
   class Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 
   friend class CudaContext;
   friend class CudaDevice;
@@ -117,6 +94,10 @@ class ARROW_EXPORT CudaDevice : public Device {
   std::string ToString() const override;
   bool Equals(const Device&) const override;
   std::shared_ptr<MemoryManager> default_memory_manager() override;
+  DeviceAllocationType device_type() const override {
+    return DeviceAllocationType::kCUDA;
+  }
+  int64_t device_id() const override { return device_number(); }
 
   /// \brief Return a CudaDevice instance for a particular device
   /// \param[in] device_number the CUDA device number
@@ -161,6 +142,90 @@ class ARROW_EXPORT CudaDevice : public Device {
   /// \param[in] size The buffer size in bytes
   Result<std::shared_ptr<CudaHostBuffer>> AllocateHostBuffer(int64_t size);
 
+  /// \brief EXPERIMENTAL: Wrapper for CUstreams
+  ///
+  /// Does not *own* the CUstream object which must be separately constructed
+  /// and freed using cuStreamCreate and cuStreamDestroy (or equivalent).
+  /// Default construction will use the cuda default stream, and does not allow
+  /// construction from literal 0 or nullptr.
+  class ARROW_EXPORT Stream : public Device::Stream {
+   public:
+    ~Stream() = default;
+
+    [[nodiscard]] inline CUstream value() const noexcept {
+      if (!stream_) {
+        return CUstream{};
+      }
+      return *reinterpret_cast<CUstream*>(stream_.get());
+    }
+    operator CUstream() const noexcept { return value(); }
+
+    const void* get_raw() const noexcept override { return stream_.get(); }
+    Status WaitEvent(const Device::SyncEvent&) override;
+    Status Synchronize() const override;
+
+   protected:
+    friend class CudaDevice;
+
+    explicit Stream(std::shared_ptr<CudaContext> ctx, CUstream* st,
+                    Device::Stream::release_fn_t release_fn)
+        : Device::Stream(reinterpret_cast<void*>(st), release_fn),
+          context_{std::move(ctx)} {}
+
+    // disable construction from literal 0
+    explicit Stream(std::shared_ptr<CudaContext>, int,
+                    Device::Stream::release_fn_t) = delete;  // Prevent cast from 0
+    explicit Stream(std::shared_ptr<CudaContext>, std::nullptr_t,
+                    Device::Stream::release_fn_t) = delete;  // Prevent cast from nullptr
+
+   private:
+    std::shared_ptr<CudaContext> context_;
+  };
+
+  Result<std::shared_ptr<Device::Stream>> MakeStream() override { return MakeStream(0); }
+
+  /// \brief Create a CUstream wrapper in the current context
+  Result<std::shared_ptr<Device::Stream>> MakeStream(unsigned int flags) override;
+
+  /// @brief Wrap a pointer to an existing stream
+  ///
+  /// @param device_stream passed in stream (should be a CUstream*)
+  /// @param release_fn destructor to free the stream. `nullptr` may be passed
+  ///        to indicate there is no destruction/freeing necessary.
+  Result<std::shared_ptr<Device::Stream>> WrapStream(
+      void* device_stream, Stream::release_fn_t release_fn) override;
+
+  class ARROW_EXPORT SyncEvent : public Device::SyncEvent {
+   public:
+    [[nodiscard]] CUevent value() const {
+      if (sync_event_) {
+        return *static_cast<CUevent*>(sync_event_.get());
+      }
+      return CUevent{};
+    }
+    operator CUevent() const noexcept { return value(); }
+
+    /// @brief Block until the sync event is marked completed
+    Status Wait() override;
+
+    /// @brief Record the wrapped event on the stream
+    ///
+    /// Once the stream completes the tasks previously added to it,
+    /// it will trigger the event.
+    Status Record(const Device::Stream&) override;
+
+   protected:
+    friend class CudaMemoryManager;
+
+    explicit SyncEvent(std::shared_ptr<CudaContext> ctx, CUevent* ev,
+                       Device::SyncEvent::release_fn_t release_ev)
+        : Device::SyncEvent(reinterpret_cast<void*>(ev), release_ev),
+          context_{std::move(ctx)} {}
+
+   private:
+    std::shared_ptr<CudaContext> context_;
+  };
+
  protected:
   struct Impl;
 
@@ -171,7 +236,7 @@ class ARROW_EXPORT CudaDevice : public Device {
   /// \endcond
 
   explicit CudaDevice(Impl);
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 /// \brief Return whether a device instance is a CudaDevice
@@ -192,13 +257,27 @@ class ARROW_EXPORT CudaMemoryManager : public MemoryManager {
   Result<std::shared_ptr<io::OutputStream>> GetBufferWriter(
       std::shared_ptr<Buffer> buf) override;
 
-  Result<std::shared_ptr<Buffer>> AllocateBuffer(int64_t size) override;
+  Result<std::unique_ptr<Buffer>> AllocateBuffer(int64_t size) override;
 
   /// \brief The CudaDevice instance tied to this MemoryManager
   ///
   /// This is a useful shorthand returning a concrete-typed pointer, avoiding
   /// having to cast the `device()` result.
   std::shared_ptr<CudaDevice> cuda_device() const;
+
+  /// \brief Creates a wrapped CUevent.
+  ///
+  /// Will call cuEventCreate and it will call cuEventDestroy internally
+  /// when the event is destructed.
+  Result<std::shared_ptr<Device::SyncEvent>> MakeDeviceSyncEvent() override;
+
+  /// \brief Wraps an existing event into a sync event.
+  ///
+  /// @param sync_event the event to wrap, must be a CUevent*
+  /// @param release_sync_event a function to call during destruction, `nullptr` or
+  ///        a no-op function can be passed to indicate ownership is maintained externally
+  Result<std::shared_ptr<Device::SyncEvent>> WrapDeviceSyncEvent(
+      void* sync_event, Device::SyncEvent::release_fn_t release_sync_event) override;
 
  protected:
   using MemoryManager::MemoryManager;
@@ -210,6 +289,10 @@ class ARROW_EXPORT CudaMemoryManager : public MemoryManager {
   Result<std::shared_ptr<Buffer>> CopyBufferTo(
       const std::shared_ptr<Buffer>& buf,
       const std::shared_ptr<MemoryManager>& to) override;
+  Result<std::unique_ptr<Buffer>> CopyNonOwnedFrom(
+      const Buffer& buf, const std::shared_ptr<MemoryManager>& from) override;
+  Result<std::unique_ptr<Buffer>> CopyNonOwnedTo(
+      const Buffer& buf, const std::shared_ptr<MemoryManager>& to) override;
   Result<std::shared_ptr<Buffer>> ViewBufferFrom(
       const std::shared_ptr<Buffer>& buf,
       const std::shared_ptr<MemoryManager>& from) override;
@@ -242,14 +325,7 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
   /// \brief Allocate CUDA memory on GPU device for this context
   /// \param[in] nbytes number of bytes
   /// \return the allocated buffer
-  Result<std::shared_ptr<CudaBuffer>> Allocate(int64_t nbytes);
-
-  /// \brief Allocate CUDA memory on GPU device for this context
-  /// \param[in] nbytes number of bytes
-  /// \param[out] out the allocated buffer
-  /// \return Status
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status Allocate(int64_t nbytes, std::shared_ptr<CudaBuffer>* out);
+  Result<std::unique_ptr<CudaBuffer>> Allocate(int64_t nbytes);
 
   /// \brief Release CUDA memory on GPU device for this context
   /// \param[in] device_ptr the buffer address
@@ -267,30 +343,10 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
   /// context that this CudaContext instance holds.
   Result<std::shared_ptr<CudaBuffer>> View(uint8_t* data, int64_t nbytes);
 
-  /// \brief Create a view of CUDA memory on GPU device of this context
-  /// \param[in] data the starting device address
-  /// \param[in] nbytes number of bytes
-  /// \param[out] out the view buffer
-  /// \return Status
-  ///
-  /// \note The caller is responsible for allocating and freeing the
-  /// memory as well as ensuring that the memory belongs to the CUDA
-  /// context that this CudaContext instance holds.
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status View(uint8_t* data, int64_t nbytes, std::shared_ptr<CudaBuffer>* out);
-
   /// \brief Open existing CUDA IPC memory handle
   /// \param[in] ipc_handle opaque pointer to CUipcMemHandle (driver API)
   /// \return a CudaBuffer referencing the IPC segment
   Result<std::shared_ptr<CudaBuffer>> OpenIpcBuffer(const CudaIpcMemHandle& ipc_handle);
-
-  /// \brief Open existing CUDA IPC memory handle
-  /// \param[in] ipc_handle opaque pointer to CUipcMemHandle (driver API)
-  /// \param[out] out a CudaBuffer referencing the IPC segment
-  /// \return Status
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status OpenIpcBuffer(const CudaIpcMemHandle& ipc_handle,
-                       std::shared_ptr<CudaBuffer>* out);
 
   /// \brief Close memory mapped with IPC buffer
   /// \param[in] buffer a CudaBuffer referencing
@@ -328,25 +384,11 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
   Result<uintptr_t> GetDeviceAddress(uint8_t* addr);
   Result<uintptr_t> GetDeviceAddress(uintptr_t addr);
 
-  /// \brief Return the device address that is reachable from kernels
-  /// running in the context
-  /// \param[in] addr device or host memory address
-  /// \param[out] devaddr the device address
-  /// \return Status
-  ///
-  /// The device address is defined as a memory address accessible by
-  /// device. While it is often a device memory address, it can be
-  /// also a host memory address, for instance, when the memory is
-  /// allocated as host memory (using cudaMallocHost or cudaHostAlloc)
-  /// or as managed memory (using cudaMallocManaged) or the host
-  /// memory is page-locked (using cudaHostRegister).
-  ARROW_DEPRECATED("Use Result-returning version")
-  Status GetDeviceAddress(uint8_t* addr, uint8_t** devaddr);
-
  private:
   CudaContext();
 
-  Result<std::shared_ptr<CudaIpcMemHandle>> ExportIpcBuffer(void* data, int64_t size);
+  Result<std::shared_ptr<CudaIpcMemHandle>> ExportIpcBuffer(const void* data,
+                                                            int64_t size);
   Status CopyHostToDevice(void* dst, const void* src, int64_t nbytes);
   Status CopyHostToDevice(uintptr_t dst, const void* src, int64_t nbytes);
   Status CopyDeviceToHost(void* dst, const void* src, int64_t nbytes);
@@ -359,7 +401,7 @@ class ARROW_EXPORT CudaContext : public std::enable_shared_from_this<CudaContext
                                    uintptr_t dst, uintptr_t src, int64_t nbytes);
 
   class Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 
   friend class CudaBuffer;
   friend class CudaBufferReader;

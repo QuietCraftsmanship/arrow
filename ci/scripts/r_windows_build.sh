@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -17,32 +17,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -x
+set -ex
 
 : ${ARROW_HOME:=$(pwd)}
 # Make sure it is absolute and exported
 export ARROW_HOME="$(cd "${ARROW_HOME}" && pwd)"
 
-# ccache may be broken on MinGW.
-# pacman --sync --noconfirm ccache
+pacman --noconfirm -Syy
 
-wget https://raw.githubusercontent.com/r-windows/rtools-backports/master/pacman.conf
-cp -f pacman.conf /etc/pacman.conf
+RWINLIB_LIB_DIR="lib"
+: ${MINGW_ARCH:="mingw32 mingw64 ucrt64"}
 
-pacman --noconfirm -Scc
-pacman --noconfirm -Syyu
-pacman --noconfirm --needed -S git base-devel binutils zip
-
-# Install core build stuff
-pacman --noconfirm --needed -S mingw-w64-{i686,x86_64}-{toolchain,crt,winpthreads,gcc,libtre,pkg-config,xz}
-
-# Force static linking
-rm -f /mingw32/lib/*.dll.a
-rm -f /mingw64/lib/*.dll.a
-export PKG_CONFIG="/${MINGW_PREFIX}/bin/pkg-config --static"
+export MINGW_ARCH
 
 cp $ARROW_HOME/ci/scripts/PKGBUILD .
-export PKGEXT='.pkg.tar.xz' # pacman default changed to .zst in 2020, but keep the old ext for compat
 printenv
 makepkg-mingw --noconfirm --noprogressbar --skippgpcheck --nocheck --syncdeps --cleanbuild
 
@@ -51,42 +39,51 @@ DST_DIR="arrow-$VERSION"
 
 # Collect the build artifacts and make the shape of zip file that rwinlib expects
 ls
-mkdir build
-cp mingw* build
+mkdir -p build
+mv mingw* build
 cd build
 
 # This may vary by system/CI provider
-MSYS_LIB_DIR="D:/a/_temp/msys/msys64"
+MSYS_LIB_DIR="/c/rtools40"
 
-ls $MSYS_LIB_DIR/mingw64/lib/
-ls $MSYS_LIB_DIR/mingw32/lib/
-
-# Untar the two builds we made
-ls | xargs -n 1 tar -xJf
-mkdir $DST_DIR
+# Untar the builds we made
+ls *.xz | xargs -n 1 tar -xJf
+mkdir -p $DST_DIR
 # Grab the headers from one, either one is fine
-mv mingw64/include $DST_DIR
+# (if we're building twice to combine old and new toolchains, this may already exist)
+if [ ! -d $DST_DIR/include ]; then
+  mv $(echo $MINGW_ARCH | cut -d ' ' -f 1)/include $DST_DIR
+fi
 
-# Make the rest of the directory structure
-# lib-4.9.3 is for libraries compiled with gcc 4.9 (Rtools 3.5)
-mkdir -p $DST_DIR/lib-4.9.3/x64
-mkdir -p $DST_DIR/lib-4.9.3/i386
-# lib is for the new gcc 8 toolchain (Rtools 4.0)
-mkdir -p $DST_DIR/lib/x64
-mkdir -p $DST_DIR/lib/i386
+# mingw64 -> x64
+# mingw32 -> i386
+# ucrt64 -> x64-ucrt
 
-# Move the 64-bit versions of libarrow into the expected location
-mv mingw64/lib/*.a $DST_DIR/lib-4.9.3/x64
+if [ -d mingw64/lib/ ]; then
+  ls $MSYS_LIB_DIR/mingw64/lib/
+  # Make the rest of the directory structure
+  mkdir -p $DST_DIR/lib/x64
+  # Move the 64-bit versions of libarrow into the expected location
+  mv mingw64/lib/*.a $DST_DIR/lib/x64
+  # These are from https://dl.bintray.com/rtools/mingw{32,64}/
+  cp $MSYS_LIB_DIR/mingw64/lib/lib{snappy,zstd,lz4,brotli*,bz2,crypto,curl,ss*,utf8proc,re2,nghttp2}.a $DST_DIR/lib/x64
+fi
+
 # Same for the 32-bit versions
-mv mingw32/lib/*.a $DST_DIR/lib-4.9.3/i386
+if [ -d mingw32/lib/ ]; then
+  ls $MSYS_LIB_DIR/mingw32/lib/
+  mkdir -p $DST_DIR/lib/i386
+  mv mingw32/lib/*.a $DST_DIR/lib/i386
+  cp $MSYS_LIB_DIR/mingw32/lib/lib{snappy,zstd,lz4,brotli*,bz2,crypto,curl,ss*,utf8proc,re2,nghttp2}.a $DST_DIR/lib/i386
+fi
 
-# These are from https://dl.bintray.com/rtools/backports/
-cp $MSYS_LIB_DIR/mingw64/lib/lib{thrift,snappy}.a $DST_DIR/lib-4.9.3/x64
-cp $MSYS_LIB_DIR/mingw32/lib/lib{thrift,snappy}.a $DST_DIR/lib-4.9.3/i386
-
-# These are from https://dl.bintray.com/rtools/mingw{32,64}/
-cp $MSYS_LIB_DIR/mingw64/lib/lib{zstd,lz4,crypto}.a $DST_DIR/lib/x64
-cp $MSYS_LIB_DIR/mingw32/lib/lib{zstd,lz4,crypto}.a $DST_DIR/lib/i386
+# Do the same also for ucrt64
+if [ -d ucrt64/lib/ ]; then
+  ls $MSYS_LIB_DIR/ucrt64/lib/
+  mkdir -p $DST_DIR/lib/x64-ucrt
+  mv ucrt64/lib/*.a $DST_DIR/lib/x64-ucrt
+  cp $MSYS_LIB_DIR/ucrt64/lib/lib{snappy,zstd,lz4,brotli*,bz2,crypto,curl,ss*,utf8proc,re2,nghttp2}.a $DST_DIR/lib/x64-ucrt
+fi
 
 # Create build artifact
 zip -r ${DST_DIR}.zip $DST_DIR

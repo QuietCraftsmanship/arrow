@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using System;
-
 namespace Apache.Arrow.Types
 {
     public sealed class ListType : NestedType
@@ -22,9 +20,9 @@ namespace Apache.Arrow.Types
         public override ArrowTypeId TypeId => ArrowTypeId.List;
         public override string Name => "list";
 
-        public Field ValueField => Children[0];
+        public Field ValueField => Fields[0];
 
-        public IArrowType ValueDataType => Children[0].DataType;
+        public IArrowType ValueDataType => Fields[0].DataType;
 
         public ListType(Field valueField)
            : base(valueField) { }

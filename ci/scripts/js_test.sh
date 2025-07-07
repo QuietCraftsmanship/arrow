@@ -20,10 +20,12 @@
 set -ex
 
 source_dir=${1}/js
+build_dir=${2}/js
 
-pushd ${source_dir}
+pushd ${build_dir}
 
-npm run lint
-npm run test
+yarn lint
+yarn test
+yarn test:bundle
 
 popd

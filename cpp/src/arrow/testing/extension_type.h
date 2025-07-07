@@ -19,21 +19,22 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "arrow/extension_type.h"
+#include "arrow/testing/visibility.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/visibility.h"
 
 namespace arrow {
 
-class ARROW_EXPORT UUIDArray : public ExtensionArray {
+class ARROW_TESTING_EXPORT ExampleUuidArray : public ExtensionArray {
  public:
   using ExtensionArray::ExtensionArray;
 };
 
-class ARROW_EXPORT UUIDType : public ExtensionType {
+class ARROW_TESTING_EXPORT ExampleUuidType : public ExtensionType {
  public:
-  UUIDType() : ExtensionType(fixed_size_binary(16)) {}
+  ExampleUuidType() : ExtensionType(fixed_size_binary(16)) {}
 
   std::string extension_name() const override { return "uuid"; }
 
@@ -41,19 +42,29 @@ class ARROW_EXPORT UUIDType : public ExtensionType {
 
   std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
 
-  Status Deserialize(std::shared_ptr<DataType> storage_type,
-                     const std::string& serialized,
-                     std::shared_ptr<DataType>* out) const override;
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
 
-  std::string Serialize() const override { return "uuid-type-unique-code"; }
+  std::string Serialize() const override { return "uuid-serialized"; }
 };
 
-class ARROW_EXPORT SmallintArray : public ExtensionArray {
+class ARROW_TESTING_EXPORT SmallintArray : public ExtensionArray {
  public:
   using ExtensionArray::ExtensionArray;
 };
 
-class ARROW_EXPORT SmallintType : public ExtensionType {
+class ARROW_TESTING_EXPORT TinyintArray : public ExtensionArray {
+ public:
+  using ExtensionArray::ExtensionArray;
+};
+
+class ARROW_TESTING_EXPORT ListExtensionArray : public ExtensionArray {
+ public:
+  using ExtensionArray::ExtensionArray;
+};
+
+class ARROW_TESTING_EXPORT SmallintType : public ExtensionType {
  public:
   SmallintType() : ExtensionType(int16()) {}
 
@@ -63,23 +74,157 @@ class ARROW_EXPORT SmallintType : public ExtensionType {
 
   std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
 
-  Status Deserialize(std::shared_ptr<DataType> storage_type,
-                     const std::string& serialized,
-                     std::shared_ptr<DataType>* out) const override;
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
 
   std::string Serialize() const override { return "smallint"; }
 };
 
-ARROW_EXPORT
+class ARROW_TESTING_EXPORT TinyintType : public ExtensionType {
+ public:
+  TinyintType() : ExtensionType(int8()) {}
+
+  std::string extension_name() const override { return "tinyint"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override;
+
+  std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
+
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
+
+  std::string Serialize() const override { return "tinyint"; }
+};
+
+class ARROW_TESTING_EXPORT ListExtensionType : public ExtensionType {
+ public:
+  ListExtensionType() : ExtensionType(list(int32())) {}
+
+  std::string extension_name() const override { return "list-ext"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override;
+
+  std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
+
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
+
+  std::string Serialize() const override { return "list-ext"; }
+};
+
+class ARROW_TESTING_EXPORT DictExtensionType : public ExtensionType {
+ public:
+  DictExtensionType() : ExtensionType(dictionary(int8(), utf8())) {}
+
+  std::string extension_name() const override { return "dict-extension"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override;
+
+  std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
+
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
+
+  std::string Serialize() const override { return "dict-extension-serialized"; }
+};
+
+// A minimal extension type that does not error when passed blank extension information
+class ARROW_TESTING_EXPORT MetadataOptionalExtensionType : public ExtensionType {
+ public:
+  MetadataOptionalExtensionType() : ExtensionType(null()) {}
+  std::string extension_name() const override { return "metadata.optional"; }
+  std::string Serialize() const override { return ""; }
+  std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override {
+    return nullptr;
+  }
+  bool ExtensionEquals(const ExtensionType& other) const override {
+    return other.extension_name() == extension_name();
+  }
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized_data) const override {
+    return std::make_shared<MetadataOptionalExtensionType>();
+  }
+};
+
+class ARROW_TESTING_EXPORT Complex128Array : public ExtensionArray {
+ public:
+  using ExtensionArray::ExtensionArray;
+};
+
+class ARROW_TESTING_EXPORT Complex128Type : public ExtensionType {
+ public:
+  Complex128Type()
+      : ExtensionType(struct_({::arrow::field("real", float64(), /*nullable=*/false),
+                               ::arrow::field("imag", float64(), /*nullable=*/false)})) {}
+
+  std::string extension_name() const override { return "complex128"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override;
+
+  std::shared_ptr<Array> MakeArray(std::shared_ptr<ArrayData> data) const override;
+
+  Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override;
+
+  std::string Serialize() const override { return "complex128-serialized"; }
+};
+
+ARROW_TESTING_EXPORT
 std::shared_ptr<DataType> uuid();
 
-ARROW_EXPORT
+ARROW_TESTING_EXPORT
 std::shared_ptr<DataType> smallint();
 
-ARROW_EXPORT
-std::shared_ptr<Array> ExampleUUID();
+ARROW_TESTING_EXPORT
+std::shared_ptr<DataType> tinyint();
 
-ARROW_EXPORT
+ARROW_TESTING_EXPORT
+std::shared_ptr<DataType> list_extension_type();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<DataType> dict_extension_type();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<DataType> complex128();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<Array> ExampleUuid();
+
+ARROW_TESTING_EXPORT
 std::shared_ptr<Array> ExampleSmallint();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<Array> ExampleTinyint();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<Array> ExampleDictExtension();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<Array> ExampleComplex128();
+
+ARROW_TESTING_EXPORT
+std::shared_ptr<Array> MakeComplex128(const std::shared_ptr<Array>& real,
+                                      const std::shared_ptr<Array>& imag);
+
+// A RAII class that registers an extension type on construction
+// and unregisters it on destruction.
+class ARROW_TESTING_EXPORT ExtensionTypeGuard {
+ public:
+  explicit ExtensionTypeGuard(const std::shared_ptr<DataType>& type);
+  explicit ExtensionTypeGuard(const DataTypeVector& types);
+  ~ExtensionTypeGuard();
+  ARROW_DEFAULT_MOVE_AND_ASSIGN(ExtensionTypeGuard);
+
+ protected:
+  ARROW_DISALLOW_COPY_AND_ASSIGN(ExtensionTypeGuard);
+
+  std::vector<std::string> extension_names_;
+};
 
 }  // namespace arrow

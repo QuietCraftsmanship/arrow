@@ -20,14 +20,33 @@ set -ex
 
 : ${R_BIN:=R}
 source_dir=${1}/r
-with_docs=${2:-false}
+build_dir=${2}
 
-pushd ${source_dir}
+: ${BUILD_DOCS_R:=OFF}
 
-${R_BIN} CMD INSTALL .
+# https://github.com/apache/arrow/issues/41429
+# TODO: We want to out-of-source build. This is a workaround. We copy
+# all needed files to the build directory from the source directory
+# and build in the build directory.
+rm -rf ${build_dir}/r
+cp -aL ${source_dir} ${build_dir}/r
+pushd ${build_dir}/r
 
-if [ "${with_docs}" == "true" ]; then
+# build first so that any stray compiled files in r/src are ignored
+${R_BIN} CMD build .
+if [ -x "$(command -v sudo)" ]; then
+  SUDO=sudo
+else
+  SUDO=
+fi
+${SUDO} \
+  env \
+    PKG_CONFIG_PATH=${ARROW_HOME}/lib/pkgconfig:${PKG_CONFIG_PATH} \
+      ${R_BIN} CMD INSTALL ${INSTALL_ARGS} arrow*.tar.gz
+
+if [ "${BUILD_DOCS_R}" == "ON" ]; then
   ${R_BIN} -e "pkgdown::build_site(install = FALSE)"
+  rsync -a docs/ ${build_dir}/docs/r
 fi
 
 popd

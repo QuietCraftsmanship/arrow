@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from contextlib import contextmanager
+from enum import EnumMeta
 import inspect
 import tokenize
-from contextlib import contextmanager
 
 try:
     from numpydoc.validate import Docstring, validate
@@ -26,12 +27,33 @@ except ImportError:
 else:
     have_numpydoc = True
 
-from ..utils.command import Command, default_bin
+from ..compat import _get_module
+from ..utils.logger import logger
+from ..utils.command import Command, capture_stdout, default_bin
+
+
+class PythonCommand(Command):
+    def __init__(self, python_bin=None):
+        self.bin = default_bin(python_bin, "python")
 
 
 class Flake8(Command):
     def __init__(self, flake8_bin=None):
         self.bin = default_bin(flake8_bin, "flake8")
+
+
+class CythonLint(Command):
+    def __init__(self, cython_lint_bin=None):
+        self.bin = default_bin(cython_lint_bin, "cython-lint")
+
+
+class Autopep8(Command):
+    def __init__(self, autopep8_bin=None):
+        self.bin = default_bin(autopep8_bin, "autopep8")
+
+    @capture_stdout()
+    def run_captured(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
 
 
 def _tokenize_signature(s):
@@ -70,7 +92,7 @@ def _convert_typehint(tokens):
 
 def inspect_signature(obj):
     """
-    Custom signature inspection primarly for cython generated callables.
+    Custom signature inspection primarily for cython generated callables.
 
     Cython puts the signatures to the first line of the docstrings, which we
     can reuse to parse the python signature from, but some gymnastics are
@@ -91,13 +113,16 @@ def inspect_signature(obj):
 
 
 class NumpyDoc:
+    IGNORE_VALIDATION_ERRORS_FOR_TYPE = {
+        # Enum function signatures should never be documented
+        EnumMeta: ["PR01"]
+    }
 
     def __init__(self, symbols=None):
         if not have_numpydoc:
             raise RuntimeError(
-                'Numpydoc is not available, install the development version '
-                'with command: pip install '
-                'git+https://github.com/numpy/numpydoc'
+                'Numpydoc is not available, install with command: '
+                'pip install numpydoc==1.1.0'
             )
         self.symbols = set(symbols or {'pyarrow'})
 
@@ -109,8 +134,11 @@ class NumpyDoc:
 
         Parameters
         ----------
+        fn : callable
+            A function to apply on all traversed objects.
         obj : Any
-        from_package : string, default 'pyarrow'
+            The object to start from.
+        from_package : string
             Predicate to only consider objects from this package.
         """
         todo = [obj]
@@ -130,10 +158,20 @@ class NumpyDoc:
                     continue
 
                 member = getattr(obj, name)
-                module = getattr(member, '__module__', None)
-                if not (module and module.startswith(from_package)):
+                module = _get_module(member)
+                if module is None or not module.startswith(from_package):
                     continue
-
+                # Is it a Cython-generated method? If so, try to detect
+                # whether it only has a implicitly-generated docstring,
+                # and no user-defined docstring following it.
+                # The generated docstring would lack description of method
+                # parameters and therefore fail Numpydoc validation.
+                if hasattr(member, '__objclass__'):
+                    doc = getattr(member, '__doc__', None)
+                    # The Cython-generated docstring would be a one-liner,
+                    # such as "ReadOptions.equals(self, ReadOptions other)".
+                    if (doc and '\n' not in doc and f'.{name}(' in doc):
+                        continue
                 todo.append(member)
 
     @contextmanager
@@ -178,18 +216,27 @@ class NumpyDoc:
             Docstring._load_obj = orig_load_obj
             inspect.signature = orig_signature
 
-    def validate(self, from_package='', rules_blacklist=None,
-                 rules_whitelist=None):
+    def validate(self, from_package='', allow_rules=None,
+                 disallow_rules=None):
         results = []
 
         def callback(obj):
-            result = validate(obj)
+            try:
+                result = validate(obj)
+            except OSError as e:
+                symbol = f"{_get_module(obj, default='')}.{obj.__name__}"
+                logger.warning(f"Unable to validate `{symbol}` due to `{e}`")
+                return
 
             errors = []
             for errcode, errmsg in result.get('errors', []):
-                if rules_whitelist and errcode not in rules_whitelist:
+                if allow_rules and errcode not in allow_rules:
                     continue
-                if rules_blacklist and errcode in rules_blacklist:
+                if disallow_rules and errcode in disallow_rules:
+                    continue
+                if any(isinstance(obj, obj_type) and errcode in errcode_list
+                       for obj_type, errcode_list
+                       in NumpyDoc.IGNORE_VALIDATION_ERRORS_FOR_TYPE.items()):
                     continue
                 errors.append((errcode, errmsg))
 
