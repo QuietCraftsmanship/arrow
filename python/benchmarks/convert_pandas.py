@@ -17,9 +17,9 @@
 
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
 
 import pyarrow as pa
+from pyarrow.tests.util import rands
 
 
 class PandasConversionsBase(object):
@@ -60,7 +60,7 @@ class ToPandasStrings(object):
 
     def setup(self, uniqueness, total):
         nunique = int(total * uniqueness)
-        unique_values = [tm.rands(self.string_length) for i in range(nunique)]
+        unique_values = [rands(self.string_length) for i in range(nunique)]
         values = unique_values * (total // nunique)
         self.arr = pa.array(values, type=pa.string())
         self.table = pa.Table.from_arrays([self.arr], ['f0'])
@@ -72,21 +72,30 @@ class ToPandasStrings(object):
         self.arr.to_pandas(deduplicate_objects=False)
 
 
-class ZeroCopyPandasRead(object):
+class SerializeDeserializePandas(object):
 
     def setup(self):
-        # Transpose to make column-major
-        values = np.random.randn(10, 100000)
+        # 10 million length
+        n = 10000000
+        self.df = pd.DataFrame({'data': np.random.randn(n)})
+        self.serialized = pa.serialize_pandas(self.df)
 
-        df = pd.DataFrame(values.T)
-        ctx = pa.default_serialization_context()
+    def time_serialize_pandas(self):
+        pa.serialize_pandas(self.df)
 
-        self.serialized = ctx.serialize(df)
-        self.as_buffer = self.serialized.to_buffer()
-        self.as_components = self.serialized.to_components()
+    def time_deserialize_pandas(self):
+        pa.deserialize_pandas(self.serialized)
 
-    def time_deserialize_from_buffer(self):
-        pa.deserialize(self.as_buffer)
 
-    def time_deserialize_from_components(self):
-        pa.deserialize_components(self.as_components)
+class TableFromPandasMicroperformance(object):
+    # ARROW-4629
+
+    def setup(self):
+        ser = pd.Series(range(10000))
+        df = pd.DataFrame({col: ser.copy(deep=True) for col in range(100)})
+        # Simulate a real dataset by converting some columns to strings
+        self.df = df.astype({col: str for col in range(50)})
+
+    def time_Table_from_pandas(self):
+        for _ in range(50):
+            pa.Table.from_pandas(self.df, nthreads=1)

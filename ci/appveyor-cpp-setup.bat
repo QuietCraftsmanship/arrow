@@ -17,38 +17,86 @@
 
 @echo on
 
-conda update -y -q conda
+@rem
+@rem The miniconda install on AppVeyor is very outdated, use Mambaforge instead
+@rem
+
+appveyor DownloadFile https://github.com/conda-forge/miniforge/releases/download/24.9.2-0/Mambaforge-Windows-x86_64.exe || exit /B
+start /wait "" Mambaforge-Windows-x86_64.exe /InstallationType=JustMe /RegisterPython=0 /S /D=C:\Mambaforge
+set "PATH=C:\Mambaforge\scripts;C:\Mambaforge\condabin;%PATH%"
+
+@rem
+@rem Avoid picking up AppVeyor-installed OpenSSL (linker errors with gRPC)
+@rem XXX Perhaps there is a smarter way of solving this issue?
+@rem
+rd /s /q C:\OpenSSL-Win32
+rd /s /q C:\OpenSSL-Win64
+rd /s /q C:\OpenSSL-v11-Win32
+rd /s /q C:\OpenSSL-v11-Win64
+rd /s /q C:\OpenSSL-v111-Win32
+rd /s /q C:\OpenSSL-v111-Win64
+rd /s /q C:\OpenSSL-v30-Win32
+rd /s /q C:\OpenSSL-v30-Win64
+
+@rem
+@rem Configure conda
+@rem
 conda config --set auto_update_conda false
-conda info -a
-
-conda config --set show_channel_urls True
-
+conda config --set show_channel_urls true
+conda config --set always_yes true
 @rem Help with SSL timeouts to S3
 conda config --set remote_connect_timeout_secs 12
 
-conda info -a
+conda info -a || exit /B
 
-if "%GENERATOR%"=="Ninja" set need_vcvarsall=1
+@rem
+@rem Create conda environment
+@rem
 
-if defined need_vcvarsall (
-    @rem Select desired compiler version
-    if "%APPVEYOR_BUILD_WORKER_IMAGE%" == "Visual Studio 2017" (
-        call "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
-    ) else (
-        call "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\vcvarsall.bat" amd64
-    )
+set CONDA_PACKAGES=
+
+if "%ARROW_BUILD_GANDIVA%" == "ON" (
+  @rem Install llvmdev in the toolchain if building gandiva.dll
+  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_gandiva_win.txt
+)
+@rem Install pre-built "toolchain" packages for faster builds
+set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_cpp.txt
+@rem Arrow conda environment
+conda create -n arrow ^
+  --file=ci\conda_env_python.txt ^
+  %CONDA_PACKAGES%  ^
+  "ccache" ^
+  "cmake" ^
+  "ninja" ^
+  "nomkl" ^
+  "pandas" ^
+  "python=%PYTHON%" ^
+  || exit /B
+conda list -n arrow
+
+@rem
+@rem Configure compiler
+@rem
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
+set CC=cl.exe
+set CXX=cl.exe
+
+@rem
+@rem Download Minio somewhere on PATH, for unit tests
+@rem
+if "%ARROW_S3%" == "ON" (
+  appveyor DownloadFile https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-20T14-49-07Z -FileName C:\Windows\Minio.exe || exit /B
 )
 
-if "%GENERATOR%"=="Ninja" conda install -y -q ninja
-
-if "%USE_CLCACHE%" == "true" (
-    @rem Use clcache for faster builds
-    pip install -q git+https://github.com/frerich/clcache.git
-    @rem Limit cache size to 500 MB
-    clcache -M 500000000
-    clcache -c
-    clcache -s
-    set CLCACHE_SERVER=1
-    set CLCACHE_HARDLINK=1
-    powershell.exe -Command "Start-Process clcache-server"
-)
+@rem
+@rem Download IANA Timezone Database for unit tests
+@rem
+@rem (Doc section: Download timezone database)
+curl https://data.iana.org/time-zones/releases/tzdata2021e.tar.gz --output tzdata.tar.gz
+mkdir tzdata
+tar --extract --file tzdata.tar.gz --directory tzdata
+move tzdata %USERPROFILE%\Downloads\tzdata
+@rem Also need Windows timezone mapping
+curl https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml ^
+  --output %USERPROFILE%\Downloads\tzdata\windowsZones.xml
+@rem (Doc section: Download timezone database)

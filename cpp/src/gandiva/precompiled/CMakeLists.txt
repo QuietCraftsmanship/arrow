@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-project(gandiva)
-
 set(PRECOMPILED_SRCS
     arithmetic_ops.cc
     bitmap.cc
@@ -29,84 +27,60 @@ set(PRECOMPILED_SRCS
     time.cc
     timestamp_arithmetic.cc
     ../../arrow/util/basic_decimal.cc)
-
-if(MSVC)
-  # clang pretends to be a particular version of MSVC. Version 1900 is
-  # Visual Studio 2015, and the standard library uses C++14 features,
-  # so we have to use that -std version to get the IR compilation to
-  # work
-  set(PLATFORM_CLANG_OPTIONS -std=c++14 -fms-compatibility -fms-compatibility-version=19)
-else()
-  set(PLATFORM_CLANG_OPTIONS -std=c++11)
-endif()
-
-# Create bitcode for each of the source files.
-foreach(SRC_FILE ${PRECOMPILED_SRCS})
-  get_filename_component(SRC_BASE ${SRC_FILE} NAME_WE)
-  get_filename_component(ABSOLUTE_SRC ${SRC_FILE} ABSOLUTE)
-  set(BC_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SRC_BASE}.bc)
-  add_custom_command(
-    OUTPUT ${BC_FILE}
-    COMMAND ${CLANG_EXECUTABLE}
-            ${PLATFORM_CLANG_OPTIONS}
-            -DGANDIVA_IR
-            -DNDEBUG # DCHECK macros not implemented in precompiled code
-            -DARROW_STATIC # Do not set __declspec(dllimport) on MSVC on Arrow symbols
-            -DGANDIVA_STATIC # Do not set __declspec(dllimport) on MSVC on Gandiva symbols
-            -fno-use-cxa-atexit # Workaround for unresolved __dso_handle
-            -emit-llvm
-            -O3
-            -c
-            ${ABSOLUTE_SRC}
-            -o
-            ${BC_FILE}
-            ${ARROW_GANDIVA_PC_CXX_FLAGS}
-            -I${CMAKE_SOURCE_DIR}/src
-    DEPENDS ${SRC_FILE})
-  list(APPEND BC_FILES ${BC_FILE})
+set(GANDIVA_PRECOMPILED_BC_FILES)
+foreach(SOURCE ${PRECOMPILED_SRCS})
+  gandiva_add_bitcode(${SOURCE})
+  get_filename_component(SOURCE_BASE ${SOURCE} NAME_WE)
+  list(APPEND GANDIVA_PRECOMPILED_BC_FILES ${CMAKE_CURRENT_BINARY_DIR}/${SOURCE_BASE}.bc)
 endforeach()
 
 # link all of the bitcode files into a single bitcode file.
-add_custom_command(OUTPUT ${GANDIVA_BC_OUTPUT_PATH}
-                   COMMAND ${LLVM_LINK_EXECUTABLE} -o ${GANDIVA_BC_OUTPUT_PATH}
-                           ${BC_FILES}
-                   DEPENDS ${BC_FILES})
+add_custom_command(OUTPUT ${GANDIVA_PRECOMPILED_BC_PATH}
+                   COMMAND ${LLVM_LINK_EXECUTABLE} -o ${GANDIVA_PRECOMPILED_BC_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_FILES}
+                   DEPENDS ${GANDIVA_PRECOMPILED_BC_FILES})
 
-add_custom_target(precompiled ALL DEPENDS ${GANDIVA_BC_OUTPUT_PATH})
+# turn the bitcode file into a C++ static data variable.
+add_custom_command(OUTPUT ${GANDIVA_PRECOMPILED_CC_PATH}
+                   COMMAND ${PYTHON_EXECUTABLE}
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../make_precompiled_bitcode.py"
+                           ${GANDIVA_PRECOMPILED_CC_IN_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_PATH} ${GANDIVA_PRECOMPILED_CC_PATH}
+                   DEPENDS ${GANDIVA_PRECOMPILED_CC_IN_PATH}
+                           ${GANDIVA_PRECOMPILED_BC_PATH})
 
-function(add_precompiled_unit_test REL_TEST_NAME)
-  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
-
-  set(TEST_NAME "gandiva-precompiled-${TEST_NAME}")
-
-  add_executable(${TEST_NAME} ${REL_TEST_NAME} ${ARGN})
-  target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(${TEST_NAME} PRIVATE ${ARROW_TEST_LINK_LIBS} ${RE2_LIBRARY})
-  target_compile_definitions(${TEST_NAME}
-                             PRIVATE
-                             GANDIVA_UNIT_TEST=1
-                             ARROW_STATIC
-                             GANDIVA_STATIC)
-  set(TEST_PATH "${EXECUTABLE_OUTPUT_PATH}/${TEST_NAME}")
-  add_test(${TEST_NAME} ${TEST_PATH})
-  set_property(TEST ${TEST_NAME} APPEND PROPERTY LABELS "unittest;gandiva-tests")
-  add_dependencies(gandiva-tests ${TEST_NAME})
-endfunction(add_precompiled_unit_test REL_TEST_NAME)
+add_custom_target(precompiled ALL DEPENDS ${GANDIVA_PRECOMPILED_BC_PATH}
+                                          ${GANDIVA_PRECOMPILED_CC_PATH})
 
 # testing
-if(ARROW_BUILD_TESTS)
-  add_precompiled_unit_test(bitmap_test.cc bitmap.cc)
-  add_precompiled_unit_test(epoch_time_point_test.cc)
-  add_precompiled_unit_test(time_test.cc
-                            time.cc
-                            timestamp_arithmetic.cc
-                            ../context_helper.cc
-                            ../cast_time.cc
-                            ../../arrow/vendored/datetime/tz.cpp)
-  add_precompiled_unit_test(hash_test.cc hash.cc)
-  add_precompiled_unit_test(string_ops_test.cc string_ops.cc ../context_helper.cc)
-  add_precompiled_unit_test(arithmetic_ops_test.cc arithmetic_ops.cc ../context_helper.cc)
-  add_precompiled_unit_test(extended_math_ops_test.cc extended_math_ops.cc
-                            ../context_helper.cc)
-  add_precompiled_unit_test(decimal_ops_test.cc decimal_ops.cc ../decimal_type_util.cc)
-endif()
+add_gandiva_test(precompiled-test
+                 SOURCES
+                 ../context_helper.cc
+                 bitmap_test.cc
+                 bitmap.cc
+                 epoch_time_point_test.cc
+                 time_test.cc
+                 time.cc
+                 timestamp_arithmetic.cc
+                 ../cast_time.cc
+                 ../../arrow/vendored/datetime.cpp
+                 hash_test.cc
+                 hash.cc
+                 string_ops_test.cc
+                 string_ops.cc
+                 arithmetic_ops_test.cc
+                 arithmetic_ops.cc
+                 extended_math_ops_test.cc
+                 extended_math_ops.cc
+                 decimal_ops_test.cc
+                 decimal_ops.cc
+                 ../decimal_type_util.cc
+                 ../decimal_xlarge.cc
+                 EXTRA_INCLUDES
+                 ${CMAKE_SOURCE_DIR}/src
+                 EXTRA_LINK_LIBS
+                 Boost::headers
+                 DEFINITIONS
+                 GANDIVA_UNIT_TEST=1
+                 ARROW_STATIC
+                 GANDIVA_STATIC)

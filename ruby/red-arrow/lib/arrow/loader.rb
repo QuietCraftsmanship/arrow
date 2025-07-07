@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-require "arrow/block-closable"
+require_relative "block-closable"
 
 module Arrow
   class Loader < GObjectIntrospection::Loader
@@ -28,55 +28,48 @@ module Arrow
     private
     def post_load(repository, namespace)
       require_libraries
+      require_extension_library
+      gc_guard
+      self.class.start_callback_dispatch_thread
     end
 
     def require_libraries
-      require "arrow/array"
-      require "arrow/array-builder"
-      require "arrow/chunked-array"
-      require "arrow/column"
-      require "arrow/compression-type"
-      require "arrow/csv-loader"
-      require "arrow/csv-read-options"
-      require "arrow/data-type"
-      require "arrow/date32-array"
-      require "arrow/date32-array-builder"
-      require "arrow/date64-array"
-      require "arrow/date64-array-builder"
-      require "arrow/decimal128-array-builder"
-      require "arrow/decimal128-data-type"
-      require "arrow/dense-union-data-type"
-      require "arrow/dictionary-data-type"
-      require "arrow/field"
-      require "arrow/file-output-stream"
-      require "arrow/list-array-builder"
-      require "arrow/list-data-type"
-      require "arrow/path-extension"
-      require "arrow/record"
-      require "arrow/record-batch"
-      require "arrow/record-batch-builder"
-      require "arrow/record-batch-file-reader"
-      require "arrow/record-batch-stream-reader"
-      require "arrow/rolling-window"
-      require "arrow/schema"
-      require "arrow/slicer"
-      require "arrow/sparse-union-data-type"
-      require "arrow/struct-array"
-      require "arrow/struct-array-builder"
-      require "arrow/struct-data-type"
-      require "arrow/table"
-      require "arrow/table-formatter"
-      require "arrow/table-list-formatter"
-      require "arrow/table-table-formatter"
-      require "arrow/table-loader"
-      require "arrow/table-saver"
-      require "arrow/tensor"
-      require "arrow/time32-data-type"
-      require "arrow/time64-data-type"
-      require "arrow/timestamp-array"
-      require "arrow/timestamp-array-builder"
-      require "arrow/timestamp-data-type"
-      require "arrow/writable"
+      require_relative "libraries"
+    end
+
+    def require_extension_library
+      require "arrow.so"
+    end
+
+    def gc_guard
+      require_relative "constructor-arguments-gc-guardable"
+
+      [
+        @base_module::BinaryScalar,
+        @base_module::Buffer,
+        @base_module::DenseUnionScalar,
+        @base_module::FixedSizeBinaryScalar,
+        @base_module::LargeBinaryScalar,
+        @base_module::LargeListScalar,
+        @base_module::LargeStringScalar,
+        @base_module::ListScalar,
+        @base_module::MapScalar,
+        @base_module::SparseUnionScalar,
+        @base_module::StringScalar,
+        @base_module::StructScalar,
+      ].each do |klass|
+        klass.prepend(ConstructorArgumentsGCGuardable)
+      end
+    end
+
+    def rubyish_class_name(info)
+      name = info.name
+      case name
+      when "StreamListener"
+        "StreamListenerRaw"
+      else
+        super
+      end
     end
 
     def load_object_info(info)
@@ -89,6 +82,14 @@ module Arrow
     end
 
     def load_method_info(info, klass, method_name)
+      case klass.name
+      when /Array\z/
+        case method_name
+        when "values"
+          method_name = "values_raw"
+        end
+      end
+
       case klass.name
       when /Builder\z/
         case method_name
@@ -105,14 +106,44 @@ module Arrow
           method_name = "get_value"
         end
         super(info, klass, method_name)
-      when "Arrow::TimestampArray", "Arrow::Date32Array", "Arrow::Date64Array"
+      when "Arrow::Date32Array",
+           "Arrow::Date64Array",
+           "Arrow::Decimal128Array",
+           "Arrow::Decimal256Array",
+           "Arrow::HalfFloatArray",
+           "Arrow::Time32Array",
+           "Arrow::Time64Array",
+           "Arrow::TimestampArray"
         case method_name
         when "get_value"
           method_name = "get_raw_value"
         end
         super(info, klass, method_name)
+      when "Arrow::Decimal128", "Arrow::Decimal256"
+        case method_name
+        when "copy"
+          method_name = "dup"
+        end
+        super(info, klass, method_name)
+      when "Arrow::BooleanScalar"
+        case method_name
+        when "value?"
+          method_name = "value"
+        end
+        super(info, klass, method_name)
       else
         super
+      end
+    end
+
+    def prepare_function_info_lock_gvl(function_info, klass)
+      super
+      case klass.name
+      when "Arrow::RecordBatchFileReader"
+        case function_info.name
+        when "new"
+          function_info.lock_gvl_default = false
+        end
       end
     end
   end

@@ -15,8 +15,11 @@ Testing/
 # Generated sources
 *.c
 *.cpp
+pyarrow/lib.h
 pyarrow/*_api.h
+pyarrow/_cuda.h
 pyarrow/_generated_version.py
+cython_debug
 
 # Bundled headers
 pyarrow/include
@@ -25,12 +28,12 @@ pyarrow/include
 build
 # setup.py dist directory
 dist
-# Egg metadata
-*.egg-info
 # Coverage
 .coverage
 coverage.xml
 htmlcov
+# Hypothesis test framework
+.hypothesis/
 # Cache
 .cache
 
@@ -38,8 +41,7 @@ htmlcov
 .asv
 pyarrow/_table_api.h
 
-# manylinux1 temporary files
+# manylinux temporary files
 manylinux1/arrow
-
-# plasma store
-pyarrow/plasma_store_server
+nm_arrow.log
+visible_symbols.log

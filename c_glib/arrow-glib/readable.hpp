@@ -32,8 +32,9 @@ struct _GArrowReadableInterface
 {
   GTypeInterface parent_iface;
 
-  GArrowBuffer *(*new_raw)(std::shared_ptr<arrow::Buffer> *arrow_buffer);
+  GArrowBuffer *(*buffer_new_raw)(std::shared_ptr<arrow::Buffer> *arrow_buffer);
   std::shared_ptr<arrow::io::Readable> (*get_raw)(GArrowReadable *file);
 };
 
-std::shared_ptr<arrow::io::Readable> garrow_readable_get_raw(GArrowReadable *readable);
+std::shared_ptr<arrow::io::Readable>
+garrow_readable_get_raw(GArrowReadable *readable);

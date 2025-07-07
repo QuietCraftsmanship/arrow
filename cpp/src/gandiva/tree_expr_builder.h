@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EXPR_TREE_BUILDER_H
-#define GANDIVA_EXPR_TREE_BUILDER_H
+#pragma once
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -98,11 +98,22 @@ class GANDIVA_EXPORT TreeExprBuilder {
   static NodePtr MakeInExpressionInt64(NodePtr node,
                                        const std::unordered_set<int64_t>& constants);
 
+  static NodePtr MakeInExpressionDecimal(
+      NodePtr node, std::unordered_set<gandiva::DecimalScalar128>& constants);
+
   static NodePtr MakeInExpressionString(NodePtr node,
                                         const std::unordered_set<std::string>& constants);
 
   static NodePtr MakeInExpressionBinary(NodePtr node,
                                         const std::unordered_set<std::string>& constants);
+
+  /// \brief creates an in expression for float
+  static NodePtr MakeInExpressionFloat(NodePtr node,
+                                       const std::unordered_set<float>& constants);
+
+  /// \brief creates an in expression for double
+  static NodePtr MakeInExpressionDouble(NodePtr node,
+                                        const std::unordered_set<double>& constants);
 
   /// \brief Date as s/millis since epoch.
   static NodePtr MakeInExpressionDate32(NodePtr node,
@@ -126,5 +137,3 @@ class GANDIVA_EXPORT TreeExprBuilder {
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_EXPR_TREE_BUILDER_H

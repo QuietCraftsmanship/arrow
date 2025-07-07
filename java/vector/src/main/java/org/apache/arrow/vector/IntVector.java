@@ -17,6 +17,8 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.complex.impl.IntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
@@ -33,7 +35,15 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class IntVector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class IntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 4;
   private final FieldReader reader;
 
@@ -97,7 +107,7 @@ public class IntVector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public int get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getInt(index * TYPE_WIDTH);
@@ -339,6 +349,31 @@ public class IntVector extends BaseFixedWidthVector {
   @Override
   public TransferPair makeTransferPair(ValueVector to) {
     return new TransferImpl((IntVector) to);
+  }
+
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, (int) value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, (int) value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

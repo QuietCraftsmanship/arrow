@@ -34,11 +34,7 @@
 #include <vector>
 #endif
 
-namespace arrow
-{
-namespace util
-{
-namespace date
+namespace arrow_vendored::date
 {
 
 namespace detail
@@ -249,7 +245,7 @@ struct zonelet
     sys_seconds                        until_utc_;
     local_seconds                      until_std_;
     local_seconds                      until_loc_;
-    std::chrono::minutes               initial_save_{};
+    std::chrono::minutes               initial_save_{0};
     std::string                        initial_abbrev_;
     std::pair<const Rule*, date::year> first_rule_{nullptr, date::year::min()};
     std::pair<const Rule*, date::year> last_rule_{nullptr, date::year::max()};
@@ -293,11 +289,8 @@ struct transition
     std::ostream&
     operator<<(std::ostream& os, const transition& t)
     {
-        using namespace date;
-        using namespace std::chrono;
-        using date::operator<<;
-        os << t.timepoint << "Z ";
-        if (t.info->offset >= seconds{0})
+        date::operator<<(os, t.timepoint) << "Z ";
+        if (t.info->offset >= std::chrono::seconds{0})
             os << '+';
         os << make_time(t.info->offset);
         if (t.info->is_dst > 0)
@@ -313,9 +306,7 @@ struct transition
 
 }  // namespace detail
 
-}  // namespace date
-}  // namespace util
-}  // namespace arrow
+}  // namespace arrow_vendored::date
 
 #if defined(_MSC_VER) && (_MSC_VER < 1900)
 #include "tz.h"

@@ -22,9 +22,40 @@ from pyarrow.lib cimport *
 
 
 def get_array_length(obj):
-    # Just an example function accessing both the pyarrow Cython API
+    # An example function accessing both the pyarrow Cython API
     # and the Arrow C++ API
     cdef shared_ptr[CArray] arr = pyarrow_unwrap_array(obj)
     if arr.get() == NULL:
         raise TypeError("not an array")
     return arr.get().length()
+
+
+def make_null_array(length):
+    # An example function that returns a PyArrow object without PyArrow
+    # being imported explicitly at the Python level.
+    cdef shared_ptr[CArray] null_array
+    null_array.reset(new CNullArray(length))
+    return pyarrow_wrap_array(null_array)
+
+
+def cast_scalar(scalar, to_type):
+    cdef:
+        shared_ptr[CScalar] c_scalar
+        shared_ptr[CDataType] c_type
+        CCastOptions cast_options
+        CDatum c_datum
+        CResult[CDatum] c_cast_result
+
+    c_scalar = pyarrow_unwrap_scalar(scalar)
+    if c_scalar.get() == NULL:
+        raise TypeError("not a scalar")
+    c_type = pyarrow_unwrap_data_type(to_type)
+    if c_type.get() == NULL:
+        raise TypeError("not a type")
+
+    c_datum = CDatum(c_scalar)
+    cast_options = CCastOptions()
+    cast_options.to_type = c_type
+    c_cast_result = Cast(c_datum, cast_options)
+    c_datum = GetResultValue(c_cast_result)
+    return pyarrow_wrap_scalar(c_datum.scalar())

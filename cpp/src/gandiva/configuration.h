@@ -21,13 +21,10 @@
 #include <string>
 
 #include "arrow/status.h"
-
+#include "gandiva/function_registry.h"
 #include "gandiva/visibility.h"
 
 namespace gandiva {
-
-GANDIVA_EXPORT
-extern const char kByteCodeFilePath[];
 
 class ConfigurationBuilder;
 /// \brief runtime config for gandiva
@@ -38,17 +35,43 @@ class GANDIVA_EXPORT Configuration {
  public:
   friend class ConfigurationBuilder;
 
-  const std::string& byte_code_file_path() const { return byte_code_file_path_; }
+  explicit Configuration(bool optimize,
+                         std::shared_ptr<FunctionRegistry> function_registry =
+                             gandiva::default_function_registry(),
+                         bool dump_ir = false)
+      : optimize_(optimize),
+        target_host_cpu_(true),
+        function_registry_(std::move(function_registry)),
+        dump_ir_(dump_ir) {}
+
+  Configuration() : Configuration(true) {}
 
   std::size_t Hash() const;
   bool operator==(const Configuration& other) const;
   bool operator!=(const Configuration& other) const;
 
- private:
-  explicit Configuration(const std::string& byte_code_file_path)
-      : byte_code_file_path_(byte_code_file_path) {}
+  bool optimize() const { return optimize_; }
+  bool target_host_cpu() const { return target_host_cpu_; }
+  bool dump_ir() const { return dump_ir_; }
+  std::shared_ptr<FunctionRegistry> function_registry() const {
+    return function_registry_;
+  }
 
-  const std::string byte_code_file_path_;
+  void set_optimize(bool optimize) { optimize_ = optimize; }
+  void set_dump_ir(bool dump_ir) { dump_ir_ = dump_ir; }
+  void target_host_cpu(bool target_host_cpu) { target_host_cpu_ = target_host_cpu; }
+  void set_function_registry(std::shared_ptr<FunctionRegistry> function_registry) {
+    function_registry_ = std::move(function_registry);
+  }
+
+ private:
+  bool optimize_;        /* optimise the generated llvm IR */
+  bool target_host_cpu_; /* set the mcpu flag to host cpu while compiling llvm ir */
+  std::shared_ptr<FunctionRegistry>
+      function_registry_; /* function registry that may contain external functions */
+  // flag indicating if IR dumping is needed, defaults to false, and turning it on will
+  // negatively affect performance
+  bool dump_ir_ = false;
 };
 
 /// \brief configuration builder for gandiva
@@ -57,15 +80,26 @@ class GANDIVA_EXPORT Configuration {
 /// to override specific values and build a custom instance
 class GANDIVA_EXPORT ConfigurationBuilder {
  public:
-  ConfigurationBuilder() : byte_code_file_path_(kByteCodeFilePath) {}
-
-  ConfigurationBuilder& set_byte_code_file_path(const std::string& byte_code_file_path) {
-    byte_code_file_path_ = byte_code_file_path;
-    return *this;
+  std::shared_ptr<Configuration> build() {
+    std::shared_ptr<Configuration> configuration(new Configuration());
+    return configuration;
   }
 
-  std::shared_ptr<Configuration> build() {
-    std::shared_ptr<Configuration> configuration(new Configuration(byte_code_file_path_));
+  std::shared_ptr<Configuration> build(bool optimize) {
+    std::shared_ptr<Configuration> configuration(new Configuration(optimize));
+    return configuration;
+  }
+
+  std::shared_ptr<Configuration> build_with_ir_dumping(bool dump_ir) {
+    std::shared_ptr<Configuration> configuration(
+        new Configuration(true, gandiva::default_function_registry(), dump_ir));
+    return configuration;
+  }
+
+  std::shared_ptr<Configuration> build(
+      std::shared_ptr<FunctionRegistry> function_registry) {
+    std::shared_ptr<Configuration> configuration(
+        new Configuration(true, std::move(function_registry)));
     return configuration;
   }
 
@@ -74,10 +108,8 @@ class GANDIVA_EXPORT ConfigurationBuilder {
   }
 
  private:
-  std::string byte_code_file_path_;
-
   static std::shared_ptr<Configuration> InitDefaultConfig() {
-    std::shared_ptr<Configuration> configuration(new Configuration(kByteCodeFilePath));
+    std::shared_ptr<Configuration> configuration(new Configuration());
     return configuration;
   }
 

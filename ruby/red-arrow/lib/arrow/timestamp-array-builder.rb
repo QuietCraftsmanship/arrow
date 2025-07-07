@@ -17,6 +17,13 @@
 
 module Arrow
   class TimestampArrayBuilder
+    class << self
+      def build(data_type, values)
+        builder = new(data_type)
+        builder.build(values)
+      end
+    end
+
     private
     def unit_id
       @unit_id ||= value_data_type.unit.nick.to_sym
@@ -27,7 +34,7 @@ module Arrow
         value = value.to_time
       end
 
-      if value.is_a?(Time)
+      if value.is_a?(::Time)
         case unit_id
         when :second
           value.to_i

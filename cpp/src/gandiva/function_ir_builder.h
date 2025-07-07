@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_FUNCTION_IR_BUILDER_H
-#define GANDIVA_FUNCTION_IR_BUILDER_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -40,6 +39,9 @@ class FunctionIRBuilder {
   llvm::Module* module() { return engine_->module(); }
   llvm::LLVMContext* context() { return engine_->context(); }
   llvm::IRBuilder<>* ir_builder() { return engine_->ir_builder(); }
+  llvm::Constant* CreateGlobalStringPtr(const std::string& string) {
+    return engine_->CreateGlobalStringPtr(string);
+  }
 
   /// Build an if-else block.
   llvm::Value* BuildIfElse(llvm::Value* condition, llvm::Type* return_type,
@@ -60,5 +62,3 @@ class FunctionIRBuilder {
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_FUNCTION_IR_BUILDER_H

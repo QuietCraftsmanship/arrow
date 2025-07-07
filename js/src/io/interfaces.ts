@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import streamAdapters from './adapters';
+import streamAdapters from './adapters.js';
+
+export type { FileHandle } from 'node:fs/promises';
+import type { ReadableOptions, Readable as StreamReadable } from 'node:stream';
 
 /** @ignore */
 export const ITERATOR_DONE: any = Object.freeze({ done: true, value: void (0) });
 
 /** @ignore */
-export type FileHandle = import('fs').promises.FileHandle;
+export type ArrowJSONLike = { schema: any; batches?: any[]; dictionaries?: any[] };
 /** @ignore */
-export type ArrowJSONLike = { schema: any; batches?: any[]; dictionaries?: any[]; };
-/** @ignore */
-export type ReadableDOMStreamOptions = { type: 'bytes' | undefined, autoAllocateChunkSize?: number, highWaterMark?: number };
+export type ReadableDOMStreamOptions = { type: 'bytes' | undefined; autoAllocateChunkSize?: number; highWaterMark?: number };
 
 /** @ignore */
 export class ArrowJSON {
-    // @ts-ignore
-    constructor(private _json: ArrowJSONLike) {}
+    constructor(private _json: ArrowJSONLike) { }
     public get schema(): any { return this._json['schema']; }
     public get batches(): any[] { return (this._json['batches'] || []) as any[]; }
     public get dictionaries(): any[] { return (this._json['dictionaries'] || []) as any[]; }
@@ -61,46 +61,46 @@ export interface Writable<T> {
 export interface ReadableWritable<TReadable, TWritable> extends Readable<TReadable>, Writable<TWritable> {
     [Symbol.asyncIterator](): AsyncIterableIterator<TReadable>;
     toDOMStream(options?: ReadableDOMStreamOptions): ReadableStream<TReadable>;
-    toNodeStream(options?: import('stream').ReadableOptions): import('stream').Readable;
+    toNodeStream(options?: ReadableOptions): StreamReadable;
 }
 
 /** @ignore */
 export abstract class ReadableInterop<T> {
 
     public abstract toDOMStream(options?: ReadableDOMStreamOptions): ReadableStream<T>;
-    public abstract toNodeStream(options?: import('stream').ReadableOptions): import('stream').Readable;
+    public abstract toNodeStream(options?: ReadableOptions): StreamReadable;
 
     public tee(): [ReadableStream<T>, ReadableStream<T>] {
         return this._getDOMStream().tee();
     }
-    public pipe<R extends NodeJS.WritableStream>(writable: R, options?: { end?: boolean; }) {
+    public pipe<R extends NodeJS.WritableStream>(writable: R, options?: { end?: boolean }) {
         return this._getNodeStream().pipe(writable, options);
     }
-    public pipeTo(writable: WritableStream<T>, options?: PipeOptions) { return this._getDOMStream().pipeTo(writable, options); }
-    public pipeThrough<R extends ReadableStream<any>>(duplex: { writable: WritableStream<T>, readable: R }, options?: PipeOptions) {
+    public pipeTo(writable: WritableStream<T>, options?: StreamPipeOptions) { return this._getDOMStream().pipeTo(writable, options); }
+    public pipeThrough<R extends ReadableStream<any>>(duplex: { writable: WritableStream<T>; readable: R }, options?: StreamPipeOptions) {
         return this._getDOMStream().pipeThrough(duplex, options);
     }
 
-    private _DOMStream?: ReadableStream<T>;
+    protected _DOMStream?: ReadableStream<T>;
     private _getDOMStream() {
         return this._DOMStream || (this._DOMStream = this.toDOMStream());
     }
 
-    private _nodeStream?: import('stream').Readable;
+    protected _nodeStream?: StreamReadable;
     private _getNodeStream() {
         return this._nodeStream || (this._nodeStream = this.toNodeStream());
     }
 }
 
 /** @ignore */
-type Resolution<T> = { resolve: (value?: T | PromiseLike<T>) => void; reject: (reason?: any) => void; };
+type Resolution<T> = { resolve: (value: T | PromiseLike<T>) => void; reject: (reason?: any) => void };
 
 /** @ignore */
 export class AsyncQueue<TReadable = Uint8Array, TWritable = TReadable> extends ReadableInterop<TReadable>
     implements AsyncIterableIterator<TReadable>, ReadableWritable<TReadable, TWritable> {
 
     protected _values: TWritable[] = [];
-    protected _error?: { error: any; };
+    protected _error?: { error: any };
     protected _closedPromise: Promise<void>;
     protected _closedPromiseResolve?: (value?: any) => void;
     protected resolvers: Resolution<IteratorResult<TReadable>>[] = [];
@@ -145,7 +145,7 @@ export class AsyncQueue<TReadable = Uint8Array, TWritable = TReadable> extends R
                 : (this._values as any) as Iterable<TReadable>,
             options);
     }
-    public toNodeStream(options?: import('stream').ReadableOptions) {
+    public toNodeStream(options?: ReadableOptions) {
         return streamAdapters.toNodeStream(
             (this._closedPromiseResolve || this._error)
                 ? (this as AsyncIterable<TReadable>)
@@ -175,6 +175,6 @@ export class AsyncQueue<TReadable = Uint8Array, TWritable = TReadable> extends R
         if (this._closedPromiseResolve) {
             return true;
         }
-        throw new Error(`${this} is closed`);
+        throw new Error(`AsyncQueue is closed`);
     }
 }

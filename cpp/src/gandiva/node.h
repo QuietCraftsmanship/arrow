@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EXPR_NODE_H
-#define GANDIVA_EXPR_NODE_H
+#pragma once
 
 #include <sstream>
 #include <string>
@@ -67,22 +66,32 @@ class GANDIVA_EXPORT LiteralNode : public Node {
 
   std::string ToString() const override {
     std::stringstream ss;
+    if (return_type_ == NULLPTR) {
+      ss << "(const untyped) " << gandiva::ToString(holder_);
+      return ss.str();
+    }
+
     ss << "(const " << return_type()->ToString() << ") ";
     if (is_null()) {
       ss << std::string("null");
       return ss.str();
     }
 
-    ss << holder();
+    if (return_type()->id() == arrow::Type::STRING ||
+        return_type()->id() == arrow::Type::LARGE_STRING) {
+      ss << "'" << gandiva::ToString(holder_) << "'";
+    } else {
+      ss << gandiva::ToString(holder_);
+    }
     // The default formatter prints in decimal can cause a loss in precision. so,
     // print in hex. Can't use hexfloat since gcc 4.9 doesn't support it.
     if (return_type()->id() == arrow::Type::DOUBLE) {
-      double dvalue = holder_.get<double>();
+      double dvalue = std::get<double>(holder_);
       uint64_t bits;
       memcpy(&bits, &dvalue, sizeof(bits));
       ss << " raw(" << std::hex << bits << ")";
     } else if (return_type()->id() == arrow::Type::FLOAT) {
-      float fvalue = holder_.get<float>();
+      float fvalue = std::get<float>(holder_);
       uint32_t bits;
       memcpy(&bits, &fvalue, sizeof(bits));
       ss << " raw(" << std::hex << bits << ")";
@@ -105,7 +114,7 @@ class GANDIVA_EXPORT FieldNode : public Node {
   const FieldPtr& field() const { return field_; }
 
   std::string ToString() const override {
-    return "(" + field()->type()->name() + ") " + field()->name();
+    return "(" + field()->type()->ToString() + ") " + field()->name();
   }
 
  private:
@@ -124,7 +133,9 @@ class GANDIVA_EXPORT FunctionNode : public Node {
 
   std::string ToString() const override {
     std::stringstream ss;
-    ss << descriptor()->return_type()->name() << " " << descriptor()->name() << "(";
+    ss << ((return_type() == NULLPTR) ? "untyped"
+                                      : descriptor()->return_type()->ToString())
+       << " " << descriptor()->name() << "(";
     bool skip_comma = true;
     for (auto& child : children()) {
       if (skip_comma) {
@@ -223,12 +234,18 @@ class GANDIVA_EXPORT BooleanNode : public Node {
 template <typename Type>
 class InExpressionNode : public Node {
  public:
-  InExpressionNode(NodePtr eval_expr, const std::unordered_set<Type>& values)
-      : Node(arrow::boolean()), eval_expr_(eval_expr), values_(values) {}
+  InExpressionNode(NodePtr eval_expr, const std::unordered_set<Type>& values,
+                   DataTypePtr type = NULLPTR)
+      : Node(arrow::boolean()),
+        eval_expr_(std::move(eval_expr)),
+        values_(values),
+        type_(std::move(type)) {}
 
   const NodePtr& eval_expr() const { return eval_expr_; }
 
   const std::unordered_set<Type>& values() const { return values_; }
+
+  const DataTypePtr& type() const { return type_; }
 
   Status Accept(NodeVisitor& visitor) const override { return visitor.Visit(*this); }
 
@@ -251,8 +268,51 @@ class InExpressionNode : public Node {
  private:
   NodePtr eval_expr_;
   std::unordered_set<Type> values_;
+  DataTypePtr type_;
+};
+
+template <>
+class InExpressionNode<gandiva::DecimalScalar128> : public Node {
+ public:
+  InExpressionNode(NodePtr eval_expr,
+                   std::unordered_set<gandiva::DecimalScalar128>& values,
+                   int32_t precision, int32_t scale)
+      : Node(arrow::boolean()),
+        eval_expr_(std::move(eval_expr)),
+        values_(std::move(values)),
+        precision_(precision),
+        scale_(scale) {}
+
+  int32_t get_precision() const { return precision_; }
+
+  int32_t get_scale() const { return scale_; }
+
+  const NodePtr& eval_expr() const { return eval_expr_; }
+
+  const std::unordered_set<gandiva::DecimalScalar128>& values() const { return values_; }
+
+  Status Accept(NodeVisitor& visitor) const override { return visitor.Visit(*this); }
+
+  std::string ToString() const override {
+    std::stringstream ss;
+    ss << eval_expr_->ToString() << " IN (";
+    bool add_comma = false;
+    for (auto& value : values_) {
+      if (add_comma) {
+        ss << ", ";
+      }
+      // add type in the front to differentiate
+      ss << value;
+      add_comma = true;
+    }
+    ss << ")";
+    return ss.str();
+  }
+
+ private:
+  NodePtr eval_expr_;
+  std::unordered_set<gandiva::DecimalScalar128> values_;
+  int32_t precision_, scale_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_EXPR_NODE_H

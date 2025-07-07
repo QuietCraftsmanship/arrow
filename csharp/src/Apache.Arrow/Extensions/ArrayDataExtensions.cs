@@ -26,26 +26,29 @@ namespace Apache.Arrow
             {
                 // TODO: Use localizable string resource
                 throw new ArgumentException(
+                    $"Buffer count <{data.Buffers.Length}> must be at exactly <{count}>",
+                    nameof(data.Buffers.Length));
+            }
+        }
+
+        public static void EnsureVariadicBufferCount(this ArrayData data, int count)
+        {
+            if (data.Buffers.Length < count)
+            {
+                // TODO: Use localizable string resource
+                throw new ArgumentException(
                     $"Buffer count <{data.Buffers.Length}> must be at least <{count}>",
                     nameof(data.Buffers.Length));
             }
         }
 
-        public static void EnsureDataType(this ArrayData data, params ArrowTypeId[] ids)
+        public static void EnsureDataType(this ArrayData data, ArrowTypeId id)
         {
-            var valid = true;
-
-            foreach (var id in ids)
-            {
-                if (data.DataType.TypeId != id)
-                    valid = false;
-            }
-
-            if (!valid)
+            if (data.DataType.TypeId != id)
             {
                 // TODO: Use localizable string resource
                 throw new ArgumentException(
-                    $"Specified array type <{data.DataType.TypeId}> does not match expected type(s) <{string.Join(",", ids)}>",
+                    $"Specified array type <{data.DataType.TypeId}> does not match expected type(s) <{id}>",
                     nameof(data.DataType.TypeId));
             }
         }

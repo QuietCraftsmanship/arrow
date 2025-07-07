@@ -22,14 +22,14 @@
 #include "gandiva/precompiled/time_fields.h"
 
 #ifndef GANDIVA_UNIT_TEST
-#include "gandiva/exported_funcs.h"
-#include "gandiva/gdv_function_stubs.h"
+#  include "gandiva/exported_funcs.h"
+#  include "gandiva/gdv_function_stubs.h"
 
-#include "gandiva/engine.h"
+#  include "gandiva/engine.h"
 
 namespace gandiva {
 
-void ExportedTimeFunctions::AddMappings(Engine* engine) const {
+arrow::Status ExportedTimeFunctions::AddMappings(Engine* engine) const {
   std::vector<llvm::Type*> args;
   auto types = engine->types();
 
@@ -42,6 +42,7 @@ void ExportedTimeFunctions::AddMappings(Engine* engine) const {
   engine->AddGlobalMappingForFunc("gdv_fn_time_with_zone",
                                   types->i32_type() /*return_type*/, args,
                                   reinterpret_cast<void*>(gdv_fn_time_with_zone));
+  return arrow::Status::OK();
 }
 
 }  // namespace gandiva
@@ -52,12 +53,12 @@ extern "C" {
 // TODO : Do input validation or make sure the callers do that ?
 int gdv_fn_time_with_zone(int* time_fields, const char* zone, int zone_len,
                           int64_t* ret_time) {
-  using arrow::util::date::day;
-  using arrow::util::date::local_days;
-  using arrow::util::date::locate_zone;
-  using arrow::util::date::month;
-  using arrow::util::date::time_zone;
-  using arrow::util::date::year;
+  using arrow_vendored::date::day;
+  using arrow_vendored::date::local_days;
+  using arrow_vendored::date::locate_zone;
+  using arrow_vendored::date::month;
+  using arrow_vendored::date::time_zone;
+  using arrow_vendored::date::year;
   using std::chrono::hours;
   using std::chrono::milliseconds;
   using std::chrono::minutes;

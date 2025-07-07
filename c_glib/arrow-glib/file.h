@@ -19,33 +19,31 @@
 
 #pragma once
 
+#include <glib-object.h>
+
 #include <arrow-glib/file-mode.h>
+#include <arrow-glib/version.h>
 
 G_BEGIN_DECLS
 
-#define GARROW_TYPE_FILE                     \
-  (garrow_file_get_type())
-#define GARROW_FILE(obj)                             \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),                    \
-                              GARROW_TYPE_FILE,      \
-                              GArrowFile))
-#define GARROW_IS_FILE(obj)                          \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),                    \
-                              GARROW_TYPE_FILE))
-#define GARROW_FILE_GET_IFACE(obj)                           \
-  (G_TYPE_INSTANCE_GET_INTERFACE((obj),                         \
-                                 GARROW_TYPE_FILE,           \
-                                 GArrowFileInterface))
+#define GARROW_TYPE_FILE (garrow_file_get_type())
+GARROW_AVAILABLE_IN_ALL
+G_DECLARE_INTERFACE(GArrowFile, garrow_file, GARROW, FILE, GObject)
 
-typedef struct _GArrowFile          GArrowFile;
-typedef struct _GArrowFileInterface GArrowFileInterface;
+GARROW_AVAILABLE_IN_ALL
+gboolean
+garrow_file_close(GArrowFile *file, GError **error);
 
-GType garrow_file_get_type(void) G_GNUC_CONST;
+GARROW_AVAILABLE_IN_0_13
+gboolean
+garrow_file_is_closed(GArrowFile *file);
 
-gboolean garrow_file_close(GArrowFile *file,
-                              GError **error);
-gint64 garrow_file_tell(GArrowFile *file,
-                           GError **error);
-GArrowFileMode garrow_file_get_mode(GArrowFile *file);
+GARROW_AVAILABLE_IN_ALL
+gint64
+garrow_file_tell(GArrowFile *file, GError **error);
+
+GARROW_AVAILABLE_IN_ALL
+GArrowFileMode
+garrow_file_get_mode(GArrowFile *file);
 
 G_END_DECLS

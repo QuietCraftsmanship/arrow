@@ -19,23 +19,6 @@
 Two-dimensional Datasets
 ========================
 
-Columns
-=======
-
-.. doxygenclass:: arrow::Column
-   :project: arrow_cpp
-   :members:
-
-Tables
-======
-
-.. doxygenclass:: arrow::Table
-   :project: arrow_cpp
-   :members:
-
-.. doxygenfunction:: arrow::ConcatenateTables
-   :project: arrow_cpp
-
 Record Batches
 ==============
 
@@ -50,3 +33,16 @@ Record Batches
 .. doxygenclass:: arrow::TableBatchReader
    :project: arrow_cpp
    :members:
+
+Tables
+======
+
+.. doxygenclass:: arrow::Table
+   :project: arrow_cpp
+   :members:
+
+.. doxygenfunction:: arrow::ConcatenateTables
+   :project: arrow_cpp
+
+.. doxygenfunction:: arrow::PromoteTableToSchema
+   :project: arrow_cpp

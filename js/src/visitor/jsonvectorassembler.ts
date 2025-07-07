@@ -15,157 +15,172 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { BN } from '../util/bn';
-import { Column } from '../column';
-import { Vector } from '../vector';
-import { Visitor } from '../visitor';
-import { RecordBatch } from '../recordbatch';
-import { Vector as VType } from '../interfaces';
-import { VectorType as BufferType } from '../enum';
-import { UnionMode, DateUnit, TimeUnit } from '../enum';
-import { iterateBits, getBit, getBool } from '../util/bit';
+import { BN } from '../util/bn.js';
+import { Data } from '../data.js';
+import { Field } from '../schema.js';
+import { Vector } from '../vector.js';
+import { Visitor } from '../visitor.js';
+import { BufferType, IntervalUnit } from '../enum.js';
+import { RecordBatch } from '../recordbatch.js';
+import { UnionMode, DateUnit, TimeUnit } from '../enum.js';
+import { BitIterator, getBit, getBool } from '../util/bit.js';
+import { toIntervalDayTimeObjects, toIntervalMonthDayNanoObjects } from '../util/interval.js';
 import {
     DataType,
-    Float, Int, Date_, Interval, Time, Timestamp, Union,
-    Bool, Null, Utf8, Binary, Decimal, FixedSizeBinary, List, FixedSizeList, Map_, Struct,
-} from '../type';
+    Float, Int, Date_, Interval, Time, Timestamp, Union, Duration,
+    Bool, Null, Utf8, LargeUtf8, Binary, LargeBinary, Decimal, FixedSizeBinary, List, FixedSizeList, Map_, Struct, IntArray,
+} from '../type.js';
 
+/** @ignore */
 export interface JSONVectorAssembler extends Visitor {
 
-    visit     <T extends Column>  (node: T  ): object;
-    visitMany <T extends Column>  (cols: T[]): object[];
-    getVisitFn<T extends DataType>(node: Column<T>): (column: Column<T>) => { name: string, count: number, VALIDITY: (0 | 1)[], DATA?: any[], OFFSET?: number[], TYPE?: number[], children?: any[] };
+    visit<T extends DataType>(field: Field, node: Data<T>): Record<string, unknown>;
+    visitMany<T extends DataType>(fields: Field[], nodes: readonly Data<T>[]): Record<string, unknown>[];
+    getVisitFn<T extends DataType>(node: Vector<T> | Data<T>): (data: Data<T>) => { name: string; count: number; VALIDITY: (0 | 1)[]; DATA?: any[]; OFFSET?: number[]; TYPE_ID?: number[]; children?: any[] };
 
-    visitNull                 <T extends Null>            (vector: VType<T>): { };
-    visitBool                 <T extends Bool>            (vector: VType<T>): { DATA: boolean[] };
-    visitInt                  <T extends Int>             (vector: VType<T>): { DATA: (number | string)[]  };
-    visitFloat                <T extends Float>           (vector: VType<T>): { DATA: number[]  };
-    visitUtf8                 <T extends Utf8>            (vector: VType<T>): { DATA: string[], OFFSET: number[] };
-    visitBinary               <T extends Binary>          (vector: VType<T>): { DATA: string[], OFFSET: number[] };
-    visitFixedSizeBinary      <T extends FixedSizeBinary> (vector: VType<T>): { DATA: string[]  };
-    visitDate                 <T extends Date_>           (vector: VType<T>): { DATA: number[]  };
-    visitTimestamp            <T extends Timestamp>       (vector: VType<T>): { DATA: string[]  };
-    visitTime                 <T extends Time>            (vector: VType<T>): { DATA: number[]  };
-    visitDecimal              <T extends Decimal>         (vector: VType<T>): { DATA: string[]  };
-    visitList                 <T extends List>            (vector: VType<T>): { children: any[], OFFSET: number[] };
-    visitStruct               <T extends Struct>          (vector: VType<T>): { children: any[] };
-    visitUnion                <T extends Union>           (vector: VType<T>): { children: any[], TYPE: number[],  };
-    visitInterval             <T extends Interval>        (vector: VType<T>): { DATA: number[]  };
-    visitFixedSizeList        <T extends FixedSizeList>   (vector: VType<T>): { children: any[] };
-    visitMap                  <T extends Map_>            (vector: VType<T>): { children: any[] };
+    visitNull<T extends Null>(data: Data<T>): Record<string, never>;
+    visitBool<T extends Bool>(data: Data<T>): { DATA: boolean[] };
+    visitInt<T extends Int>(data: Data<T>): { DATA: number[] | string[] };
+    visitFloat<T extends Float>(data: Data<T>): { DATA: number[] };
+    visitUtf8<T extends Utf8>(data: Data<T>): { DATA: string[]; OFFSET: number[] };
+    visitLargeUtf8<T extends LargeUtf8>(data: Data<T>): { DATA: string[]; OFFSET: string[] };
+    visitBinary<T extends Binary>(data: Data<T>): { DATA: string[]; OFFSET: number[] };
+    visitLargeBinary<T extends LargeBinary>(data: Data<T>): { DATA: string[]; OFFSET: string[] };
+    visitFixedSizeBinary<T extends FixedSizeBinary>(data: Data<T>): { DATA: string[] };
+    visitDate<T extends Date_>(data: Data<T>): { DATA: number[] };
+    visitTimestamp<T extends Timestamp>(data: Data<T>): { DATA: string[] };
+    visitTime<T extends Time>(data: Data<T>): { DATA: number[] };
+    visitDecimal<T extends Decimal>(data: Data<T>): { DATA: string[] };
+    visitList<T extends List>(data: Data<T>): { children: any[]; OFFSET: number[] };
+    visitStruct<T extends Struct>(data: Data<T>): { children: any[] };
+    visitUnion<T extends Union>(data: Data<T>): { children: any[]; TYPE_ID: number[] };
+    visitInterval<T extends Interval>(data: Data<T>): { DATA: number[] };
+    visitDuration<T extends Duration>(data: Data<T>): { DATA: string[] };
+    visitFixedSizeList<T extends FixedSizeList>(data: Data<T>): { children: any[] };
+    visitMap<T extends Map_>(data: Data<T>): { children: any[] };
 }
 
+/** @ignore */
 export class JSONVectorAssembler extends Visitor {
 
     /** @nocollapse */
-    public static assemble<T extends Column | RecordBatch>(...args: (T | T[])[]) {
-
-        const vectors = args.reduce(function flatten(xs: any[], x: any): any[] {
-            if (Array.isArray(x)) { return x.reduce(flatten, xs); }
-            if (!(x instanceof RecordBatch)) { return [...xs, x]; }
-            return xs.concat(x.schema.fields.map(
-                (f, i) => new Column(f, [x.getChildAt(i)!])));
-        }, []).filter((x: any): x is Column => x instanceof Column);
-
-        return new JSONVectorAssembler().visitMany(vectors);
+    public static assemble<T extends RecordBatch>(...batches: T[]) {
+        const assembler = new JSONVectorAssembler();
+        return batches.map(({ schema, data }) => {
+            return assembler.visitMany(schema.fields, data.children);
+        });
     }
 
-    public visit<T extends Column>(column: T) {
-        const { data, name, length } = column;
+    public visit<T extends DataType>({ name }: Field, data: Data<T>) {
+        const { length } = data;
         const { offset, nullCount, nullBitmap } = data;
-        const type = DataType.isDictionary(column.type) ? column.type.indices : column.type;
+        const type = DataType.isDictionary(data.type) ? data.type.indices : data.type;
         const buffers = Object.assign([], data.buffers, { [BufferType.VALIDITY]: undefined });
         return {
             'name': name,
             'count': length,
-            'VALIDITY': nullCount <= 0
-                ? Array.from({ length }, () => 1)
-                : [...iterateBits(nullBitmap, offset, length, null, getBit)],
-            ...super.visit(Vector.new(data.clone(type, offset, length, 0, buffers)))
+            'VALIDITY': (DataType.isNull(type) || DataType.isUnion(type))
+                ? undefined
+                : nullCount <= 0 ? Array.from({ length }, () => 1)
+                    : [...new BitIterator(nullBitmap, offset, length, null, getBit)],
+            ...super.visit(data.clone(type, offset, length, 0, buffers))
         };
     }
     public visitNull() { return {}; }
-    public visitBool<T extends Bool>({ values, offset, length }: VType<T>) {
-        return { 'DATA': [...iterateBits(values, offset, length, null, getBool)] };
+    public visitBool<T extends Bool>({ values, offset, length }: Data<T>) {
+        return { 'DATA': [...new BitIterator(values, offset, length, null, getBool)] };
     }
-    public visitInt<T extends Int>(vector: VType<T>) {
+    public visitInt<T extends Int>(data: Data<T>) {
         return {
-            'DATA': vector.type.bitWidth < 64
-                ? [...vector.values]
-                : [...bigNumsToStrings(vector.values as (Int32Array | Uint32Array), 2)]
+            'DATA': data.type.bitWidth < 64
+                ? [...data.values]
+                : [...bigNumsToStrings(data.values, 2)]
         };
     }
-    public visitFloat<T extends Float>(vector: VType<T>) {
-        return { 'DATA': [...vector.values] };
+    public visitFloat<T extends Float>(data: Data<T>) {
+        return { 'DATA': [...data.values] };
     }
-    public visitUtf8<T extends Utf8>(vector: VType<T>) {
-        return { 'DATA': [...vector], 'OFFSET': [...vector.valueOffsets] };
+    public visitUtf8<T extends Utf8>(data: Data<T>) {
+        return { 'DATA': [...new Vector([data])], 'OFFSET': [...data.valueOffsets] };
     }
-    public visitBinary<T extends Binary>(vector: VType<T>) {
-        return { 'DATA': [...binaryToString(vector)], OFFSET: [...vector.valueOffsets] };
+    public visitLargeUtf8<T extends LargeUtf8>(data: Data<T>) {
+        return { 'DATA': [...new Vector([data])], 'OFFSET': [...bigNumsToStrings(data.valueOffsets, 2)] };
     }
-    public visitFixedSizeBinary<T extends FixedSizeBinary>(vector: VType<T>) {
-        return { 'DATA': [...binaryToString(vector)] };
+    public visitBinary<T extends Binary>(data: Data<T>) {
+        return { 'DATA': [...binaryToString(new Vector([data]))], 'OFFSET': [...data.valueOffsets] };
     }
-    public visitDate<T extends Date_>(vector: VType<T>) {
+    public visitLargeBinary<T extends LargeBinary>(data: Data<T>) {
+        return { 'DATA': [...binaryToString(new Vector([data]))], 'OFFSET': [...bigNumsToStrings(data.valueOffsets, 2)] };
+    }
+    public visitFixedSizeBinary<T extends FixedSizeBinary>(data: Data<T>) {
+        return { 'DATA': [...binaryToString(new Vector([data]))] };
+    }
+    public visitDate<T extends Date_>(data: Data<T>) {
         return {
-            'DATA': vector.type.unit === DateUnit.DAY
-                ? [...vector.values]
-                : [...bigNumsToStrings(vector.values, 2)]
+            'DATA': data.type.unit === DateUnit.DAY
+                ? [...data.values]
+                : [...bigNumsToStrings(data.values, 2)]
         };
     }
-    public visitTimestamp<T extends Timestamp>(vector: VType<T>) {
-        return { 'DATA': [...bigNumsToStrings(vector.values, 2)] };
+    public visitTimestamp<T extends Timestamp>(data: Data<T>) {
+        return { 'DATA': [...bigNumsToStrings(data.values, 2)] };
     }
-    public visitTime<T extends Time>(vector: VType<T>) {
+    public visitTime<T extends Time>(data: Data<T>) {
         return {
-            'DATA': vector.type.unit < TimeUnit.MICROSECOND
-                ? [...vector.values]
-                : [...bigNumsToStrings(vector.values, 2)]
+            'DATA': data.type.unit < TimeUnit.MICROSECOND
+                ? [...data.values]
+                : [...bigNumsToStrings(data.values, 2)]
         };
     }
-    public visitDecimal<T extends Decimal>(vector: VType<T>) {
-        return { 'DATA': [...bigNumsToStrings(vector.values, 4)] };
+    public visitDecimal<T extends Decimal>(data: Data<T>) {
+        return { 'DATA': [...bigNumsToStrings(data.values, 4)] };
     }
-    public visitList<T extends List>(vector: VType<T>) {
+    public visitList<T extends List>(data: Data<T>) {
         return {
-            'OFFSET': [...vector.valueOffsets],
-            'children': vector.type.children.map((f, i) =>
-                this.visit(new Column(f, [vector.getChildAt(i)!])))
+            'OFFSET': [...data.valueOffsets],
+            'children': this.visitMany(data.type.children, data.children)
         };
     }
-    public visitStruct<T extends Struct>(vector: VType<T>) {
+    public visitStruct<T extends Struct>(data: Data<T>) {
         return {
-            'children': vector.type.children.map((f, i) =>
-                this.visit(new Column(f, [vector.getChildAt(i)!])))
+            'children': this.visitMany(data.type.children, data.children)
         };
     }
-    public visitUnion<T extends Union>(vector: VType<T>) {
+    public visitUnion<T extends Union>(data: Data<T>) {
         return {
-            'TYPE': [...vector.typeIds],
-            'OFFSET': vector.type.mode === UnionMode.Dense ? [...vector.valueOffsets] : undefined,
-            'children': vector.type.children.map((f, i) => this.visit(new Column(f, [vector.getChildAt(i)!])))
+            'TYPE_ID': [...data.typeIds],
+            'OFFSET': data.type.mode === UnionMode.Dense ? [...data.valueOffsets] : undefined,
+            'children': this.visitMany(data.type.children, data.children)
         };
     }
-    public visitInterval<T extends Interval>(vector: VType<T>) {
-        return { 'DATA': [...vector.values] };
+    public visitInterval<T extends Interval>(data: Data<T>) {
+        switch (data.type.unit) {
+            case IntervalUnit.YEAR_MONTH:
+                return { 'DATA': [...data.values] };
+            case IntervalUnit.DAY_TIME:
+                return { 'DATA': toIntervalDayTimeObjects(data.values) };
+            case IntervalUnit.MONTH_DAY_NANO:
+                return { 'DATA': toIntervalMonthDayNanoObjects(data.values, true) };
+        }
     }
-    public visitFixedSizeList<T extends FixedSizeList>(vector: VType<T>) {
+    public visitDuration<T extends Duration>(data: Data<T>) {
+        return { 'DATA': [...bigNumsToStrings(data.values, 2)] };
+    }
+    public visitFixedSizeList<T extends FixedSizeList>(data: Data<T>) {
         return {
-            'children': vector.type.children.map((f, i) =>
-                this.visit(new Column(f, [vector.getChildAt(i)!])))
+            'children': this.visitMany(data.type.children, data.children)
         };
     }
-    public visitMap<T extends Map_>(vector: VType<T>) {
+    public visitMap<T extends Map_>(data: Data<T>) {
         return {
-            'children': vector.type.children.map((f, i) =>
-                this.visit(new Column(f, [vector.getChildAt(i)!])))
+            'OFFSET': [...data.valueOffsets],
+            'children': this.visitMany(data.type.children, data.children)
         };
     }
 }
 
 /** @ignore */
-function* binaryToString(vector: Vector<Binary> | Vector<FixedSizeBinary>) {
+function* binaryToString(vector: Vector<Binary> | Vector<LargeBinary> | Vector<FixedSizeBinary>) {
     for (const octets of vector as Iterable<Uint8Array>) {
         yield octets.reduce((str, byte) => {
             return `${str}${('0' + (byte & 0xFF).toString(16)).slice(-2)}`;
@@ -174,8 +189,9 @@ function* binaryToString(vector: Vector<Binary> | Vector<FixedSizeBinary>) {
 }
 
 /** @ignore */
-function* bigNumsToStrings(values: Uint32Array | Int32Array, stride: number) {
-    for (let i = -1, n = values.length / stride; ++i < n;) {
-        yield `${BN.new(values.subarray((i + 0) * stride, (i + 1) * stride))}`;
+function* bigNumsToStrings(values: BigUint64Array | BigInt64Array | Uint32Array | Int32Array | IntArray, stride: number) {
+    const u32s = new Uint32Array(values.buffer);
+    for (let i = -1, n = u32s.length / stride; ++i < n;) {
+        yield `${BN.new(u32s.subarray((i + 0) * stride, (i + 1) * stride), false)}`;
     }
 }

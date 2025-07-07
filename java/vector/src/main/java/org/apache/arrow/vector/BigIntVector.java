@@ -17,6 +17,8 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.complex.impl.BigIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
@@ -33,7 +35,15 @@ import io.netty.buffer.ArrowBuf;
  * integer values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class BigIntVector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class BigIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 8;
   private final FieldReader reader;
 
@@ -95,7 +105,7 @@ public class BigIntVector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public long get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getLong(index * TYPE_WIDTH);
@@ -337,6 +347,34 @@ public class BigIntVector extends BaseFixedWidthVector {
     return new TransferImpl((BigIntVector) to);
   }
 
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+  }
+
+=======
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
+  public void setEncodedValue(int index, int value) {
+    this.setSafe(index, value);
+  }
+
+<<<<<<< HEAD
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   private class TransferImpl implements TransferPair {
     BigIntVector to;
 

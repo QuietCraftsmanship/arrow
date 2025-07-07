@@ -15,39 +15,63 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_UTIL_KEY_VALUE_METADATA_H
-#define ARROW_UTIL_KEY_VALUE_METADATA_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
 
+/// \brief A container for key-value pair type metadata. Not thread-safe
 class ARROW_EXPORT KeyValueMetadata {
  public:
   KeyValueMetadata();
-  KeyValueMetadata(const std::vector<std::string>& keys,
-                   const std::vector<std::string>& values);
+  KeyValueMetadata(std::vector<std::string> keys, std::vector<std::string> values);
   explicit KeyValueMetadata(const std::unordered_map<std::string, std::string>& map);
-  virtual ~KeyValueMetadata() = default;
+
+  static std::shared_ptr<KeyValueMetadata> Make(std::vector<std::string> keys,
+                                                std::vector<std::string> values);
 
   void ToUnorderedMap(std::unordered_map<std::string, std::string>* out) const;
+  void Append(std::string key, std::string value);
 
-  void Append(const std::string& key, const std::string& value);
+  Result<std::string> Get(std::string_view key) const;
+  bool Contains(std::string_view key) const;
+  // Note that deleting may invalidate known indices
+  Status Delete(std::string_view key);
+  Status Delete(int64_t index);
+  Status DeleteMany(std::vector<int64_t> indices);
+  Status Set(std::string key, std::string value);
 
   void reserve(int64_t n);
-  int64_t size() const;
 
-  std::string key(int64_t i) const;
-  std::string value(int64_t i) const;
+  int64_t size() const;
+  const std::string& key(int64_t i) const;
+  const std::string& value(int64_t i) const;
+  const std::vector<std::string>& keys() const { return keys_; }
+  const std::vector<std::string>& values() const { return values_; }
+
+  std::vector<std::pair<std::string, std::string>> sorted_pairs() const;
+
+  /// \brief Perform linear search for key, returning -1 if not found
+  int FindKey(std::string_view key) const;
 
   std::shared_ptr<KeyValueMetadata> Copy() const;
+
+  /// \brief Return a new KeyValueMetadata by combining the passed metadata
+  /// with this KeyValueMetadata. Colliding keys will be overridden by the
+  /// passed metadata. Assumes keys in both containers are unique
+  std::shared_ptr<KeyValueMetadata> Merge(const KeyValueMetadata& other) const;
 
   bool Equals(const KeyValueMetadata& other) const;
   std::string ToString() const;
@@ -62,9 +86,14 @@ class ARROW_EXPORT KeyValueMetadata {
 /// \brief Create a KeyValueMetadata instance
 ///
 /// \param pairs key-value mapping
-std::shared_ptr<KeyValueMetadata> ARROW_EXPORT
-key_value_metadata(const std::unordered_map<std::string, std::string>& pairs);
+ARROW_EXPORT std::shared_ptr<KeyValueMetadata> key_value_metadata(
+    const std::unordered_map<std::string, std::string>& pairs);
+
+/// \brief Create a KeyValueMetadata instance
+///
+/// \param keys sequence of metadata keys
+/// \param values sequence of corresponding metadata values
+ARROW_EXPORT std::shared_ptr<KeyValueMetadata> key_value_metadata(
+    std::vector<std::string> keys, std::vector<std::string> values);
 
 }  // namespace arrow
-
-#endif  //  ARROW_UTIL_KEY_VALUE_METADATA_H

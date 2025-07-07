@@ -18,38 +18,64 @@
 Memory (management)
 ===================
 
+Devices
+-------
+
+.. doxygenclass:: arrow::Device
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::CPUDevice
+   :project: arrow_cpp
+   :members:
+
+.. doxygenfunction:: arrow::default_cpu_memory_manager
+   :project: arrow_cpp
+
+Memory Managers
+---------------
+
+.. doxygenclass:: arrow::MemoryManager
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::CPUMemoryManager
+   :project: arrow_cpp
+   :members:
+
 Buffers
 -------
 
 .. doxygenclass:: arrow::Buffer
-   :project: arrow_cpp
    :members:
 
 .. doxygenclass:: arrow::MutableBuffer
-   :project: arrow_cpp
    :members:
 
 .. doxygenclass:: arrow::ResizableBuffer
-   :project: arrow_cpp
    :members:
 
 Memory Pools
 ------------
 
 .. doxygenfunction:: arrow::default_memory_pool
-   :project: arrow_cpp
+
+.. doxygenfunction:: arrow::jemalloc_memory_pool
+
+.. doxygenfunction:: arrow::mimalloc_memory_pool
+
+.. doxygenfunction:: arrow::system_memory_pool
 
 .. doxygenclass:: arrow::MemoryPool
-   :project: arrow_cpp
    :members:
 
 .. doxygenclass:: arrow::LoggingMemoryPool
-   :project: arrow_cpp
    :members:
 
 .. doxygenclass:: arrow::ProxyMemoryPool
-   :project: arrow_cpp
    :members:
+
+.. doxygenfunction:: arrow::SupportedMemoryBackendNames
 
 Allocation Functions
 --------------------
@@ -57,34 +83,28 @@ Allocation Functions
 These functions allocate a buffer from a particular memory pool.
 
 .. doxygengroup:: buffer-allocation-functions
-   :project: arrow_cpp
    :content-only:
 
 Slicing
 -------
 
 .. doxygengroup:: buffer-slicing-functions
-   :project: arrow_cpp
    :content-only:
 
 Buffer Builders
 ---------------
 
 .. doxygenclass:: arrow::BufferBuilder
-   :project: arrow_cpp
    :members:
 
 .. doxygenclass:: arrow::TypedBufferBuilder
-   :project: arrow_cpp
    :members:
 
 STL Integration
 ---------------
 
-.. doxygenclass:: arrow::stl_allocator
-   :project: arrow_cpp
+.. doxygenclass:: arrow::stl::allocator
    :members:
 
-.. doxygenclass:: arrow::STLMemoryPool
-   :project: arrow_cpp
+.. doxygenclass:: arrow::stl::STLMemoryPool
    :members:

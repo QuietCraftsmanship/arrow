@@ -15,36 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef PARQUET_FILE_WRITER_H
-#define PARQUET_FILE_WRITER_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
-#include <ostream>
+#include <utility>
 
-#include "arrow/util/macros.h"
-
-#include "parquet/exception.h"
 #include "parquet/metadata.h"
+#include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/schema.h"
-#include "parquet/util/visibility.h"
-
-namespace arrow {
-
-class MemoryPool;
-
-namespace io {
-
-class OutputStream;
-
-}  // namespace io
-}  // namespace arrow
 
 namespace parquet {
 
 class ColumnWriter;
-class OutputStream;
+
+// FIXME: copied from reader-internal.cc
+static constexpr uint8_t kParquetMagic[4] = {'P', 'A', 'R', '1'};
+static constexpr uint8_t kParquetEMagic[4] = {'P', 'A', 'R', 'E'};
 
 class PARQUET_EXPORT RowGroupWriter {
  public:
@@ -64,10 +52,14 @@ class PARQUET_EXPORT RowGroupWriter {
     virtual int current_column() const = 0;
     virtual void Close() = 0;
 
-    // total bytes written by the page writer
+    /// \brief total uncompressed bytes written by the page writer
     virtual int64_t total_bytes_written() const = 0;
-    // total bytes still compressed but not written
+    /// \brief total bytes still compressed but not written by the page writer
     virtual int64_t total_compressed_bytes() const = 0;
+    /// \brief total compressed bytes written by the page writer
+    virtual int64_t total_compressed_bytes_written() const = 0;
+
+    virtual bool buffered() const = 0;
   };
 
   explicit RowGroupWriter(std::unique_ptr<Contents> contents);
@@ -80,7 +72,8 @@ class PARQUET_EXPORT RowGroupWriter {
   /// directly written to the sink, once a new column is started, the contents
   /// of the previous one cannot be modified anymore.
   ColumnWriter* NextColumn();
-  /// Index of currently written column
+  /// Index of currently written column. Equal to -1 if NextColumn()
+  /// has not been called yet.
   int current_column();
   void Close();
 
@@ -99,8 +92,17 @@ class PARQUET_EXPORT RowGroupWriter {
    */
   int64_t num_rows() const;
 
+  /// \brief total uncompressed bytes written by the page writer
   int64_t total_bytes_written() const;
+  /// \brief total bytes still compressed but not written by the page writer.
+  /// It will always return 0 from the SerializedPageWriter.
   int64_t total_compressed_bytes() const;
+  /// \brief total compressed bytes written by the page writer
+  int64_t total_compressed_bytes_written() const;
+
+  /// Returns whether the current RowGroupWriter is in the buffered mode and is created
+  /// by calling ParquetFileWriter::AppendBufferedRowGroup.
+  bool buffered() const;
 
  private:
   // Holds a pointer to an instance of Contents implementation
@@ -108,7 +110,27 @@ class PARQUET_EXPORT RowGroupWriter {
 };
 
 PARQUET_EXPORT
-void WriteFileMetaData(const FileMetaData& file_metadata, OutputStream* sink);
+void WriteFileMetaData(const FileMetaData& file_metadata,
+                       ::arrow::io::OutputStream* sink);
+
+PARQUET_EXPORT
+void WriteMetaDataFile(const FileMetaData& file_metadata,
+                       ::arrow::io::OutputStream* sink);
+
+PARQUET_EXPORT
+void WriteEncryptedFileMetadata(const FileMetaData& file_metadata,
+                                ArrowOutputStream* sink,
+                                const std::shared_ptr<Encryptor>& encryptor,
+                                bool encrypt_footer);
+
+PARQUET_EXPORT
+void WriteEncryptedFileMetadata(const FileMetaData& file_metadata,
+                                ::arrow::io::OutputStream* sink,
+                                const std::shared_ptr<Encryptor>& encryptor = NULLPTR,
+                                bool encrypt_footer = false);
+PARQUET_EXPORT
+void WriteFileCryptoMetaData(const FileCryptoMetaData& crypto_metadata,
+                             ::arrow::io::OutputStream* sink);
 
 class PARQUET_EXPORT ParquetFileWriter {
  public:
@@ -116,17 +138,14 @@ class PARQUET_EXPORT ParquetFileWriter {
   // easily create test fixtures
   // An implementation of the Contents class is defined in the .cc file
   struct Contents {
-    Contents(const std::shared_ptr<::parquet::schema::GroupNode>& schema,
-             const std::shared_ptr<const KeyValueMetadata>& key_value_metadata)
-        : schema_(), key_value_metadata_(key_value_metadata) {
-      schema_.Init(schema);
+    Contents(std::shared_ptr<::parquet::schema::GroupNode> schema,
+             std::shared_ptr<const KeyValueMetadata> key_value_metadata)
+        : schema_(), key_value_metadata_(std::move(key_value_metadata)) {
+      schema_.Init(std::move(schema));
     }
     virtual ~Contents() {}
     // Perform any cleanup associated with the file contents
     virtual void Close() = 0;
-
-    /// \note Deprecated since 1.3.0
-    RowGroupWriter* AppendRowGroup(int64_t num_rows);
 
     virtual RowGroupWriter* AppendRowGroup() = 0;
     virtual RowGroupWriter* AppendBufferedRowGroup() = 0;
@@ -141,6 +160,9 @@ class PARQUET_EXPORT ParquetFileWriter {
       return key_value_metadata_;
     }
 
+    virtual void AddKeyValueMetadata(
+        const std::shared_ptr<const KeyValueMetadata>& key_value_metadata) = 0;
+
     // Return const-pointer to make it clear that this object is not to be copied
     const SchemaDescriptor* schema() const { return &schema_; }
 
@@ -148,34 +170,22 @@ class PARQUET_EXPORT ParquetFileWriter {
 
     /// This should be the only place this is stored. Everything else is a const reference
     std::shared_ptr<const KeyValueMetadata> key_value_metadata_;
+
+    const std::shared_ptr<FileMetaData>& metadata() const { return file_metadata_; }
+    std::shared_ptr<FileMetaData> file_metadata_;
   };
 
   ParquetFileWriter();
   ~ParquetFileWriter();
 
   static std::unique_ptr<ParquetFileWriter> Open(
-      const std::shared_ptr<::arrow::io::OutputStream>& sink,
-      const std::shared_ptr<schema::GroupNode>& schema,
-      const std::shared_ptr<WriterProperties>& properties = default_writer_properties(),
-      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = NULLPTR);
-
-  static std::unique_ptr<ParquetFileWriter> Open(
-      const std::shared_ptr<OutputStream>& sink,
-      const std::shared_ptr<schema::GroupNode>& schema,
-      const std::shared_ptr<WriterProperties>& properties = default_writer_properties(),
-      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = NULLPTR);
+      std::shared_ptr<::arrow::io::OutputStream> sink,
+      std::shared_ptr<schema::GroupNode> schema,
+      std::shared_ptr<WriterProperties> properties = default_writer_properties(),
+      std::shared_ptr<const KeyValueMetadata> key_value_metadata = NULLPTR);
 
   void Open(std::unique_ptr<Contents> contents);
   void Close();
-
-  // Construct a RowGroupWriter for the indicated number of rows.
-  //
-  // Ownership is solely within the ParquetFileWriter. The RowGroupWriter is only valid
-  // until the next call to AppendRowGroup or AppendBufferedRowGroup or Close.
-  // @param num_rows The number of rows that are stored in the new RowGroup
-  //
-  // \deprecated Since 1.3.0
-  RowGroupWriter* AppendRowGroup(int64_t num_rows);
 
   /// Construct a RowGroupWriter with an arbitrary number of rows.
   ///
@@ -189,6 +199,13 @@ class PARQUET_EXPORT ParquetFileWriter {
   /// Ownership is solely within the ParquetFileWriter. The RowGroupWriter is only valid
   /// until the next call to AppendRowGroup or AppendBufferedRowGroup or Close.
   RowGroupWriter* AppendBufferedRowGroup();
+
+  /// \brief Add key-value metadata to the file.
+  /// \param[in] key_value_metadata the metadata to add.
+  /// \note This will overwrite any existing metadata with the same key(s).
+  /// \throw ParquetException if Close() has been called.
+  void AddKeyValueMetadata(
+      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata);
 
   /// Number of columns.
   ///
@@ -216,11 +233,13 @@ class PARQUET_EXPORT ParquetFileWriter {
   /// Returns the file custom metadata
   const std::shared_ptr<const KeyValueMetadata>& key_value_metadata() const;
 
+  /// Returns the file metadata, only available after calling Close().
+  const std::shared_ptr<FileMetaData> metadata() const;
+
  private:
   // Holds a pointer to an instance of Contents implementation
   std::unique_ptr<Contents> contents_;
+  std::shared_ptr<FileMetaData> file_metadata_;
 };
 
 }  // namespace parquet
-
-#endif  // PARQUET_FILE_WRITER_H

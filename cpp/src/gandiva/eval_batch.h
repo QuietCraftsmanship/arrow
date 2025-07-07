@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EXPR_EVALBATCH_H
-#define GANDIVA_EXPR_EVALBATCH_H
+#pragma once
 
 #include <memory>
 
@@ -37,6 +36,7 @@ class EvalBatch {
       : num_records_(num_records), num_buffers_(num_buffers) {
     if (num_buffers > 0) {
       buffers_array_.reset(new uint8_t*[num_buffers]);
+      buffer_offsets_array_.reset(new int64_t[num_buffers]);
     }
     local_bitmaps_holder_.reset(new LocalBitMapsHolder(num_records, num_local_bitmaps));
     execution_context_.reset(new ExecutionContext());
@@ -44,18 +44,33 @@ class EvalBatch {
 
   int64_t num_records() const { return num_records_; }
 
-  uint8_t** GetBufferArray() const { return buffers_array_.get(); }
+  const uint8_t* const* GetBufferArray() const { return buffers_array_.get(); }
+  uint8_t** GetBufferArray() { return buffers_array_.get(); }
+
+  const int64_t* GetBufferOffsetArray() const { return buffer_offsets_array_.get(); }
+  int64_t* GetBufferOffsetArray() { return buffer_offsets_array_.get(); }
 
   int GetNumBuffers() const { return num_buffers_; }
 
-  uint8_t* GetBuffer(int idx) const {
-    DCHECK(idx <= num_buffers_);
+  const uint8_t* GetBuffer(int idx) const {
+    ARROW_DCHECK(idx <= num_buffers_);
     return (buffers_array_.get())[idx];
   }
 
-  void SetBuffer(int idx, uint8_t* buffer) {
-    DCHECK(idx <= num_buffers_);
+  uint8_t* GetBuffer(int idx) {
+    ARROW_DCHECK(idx <= num_buffers_);
+    return (buffers_array_.get())[idx];
+  }
+
+  int64_t GetBufferOffset(int idx) const {
+    ARROW_DCHECK(idx <= num_buffers_);
+    return (buffer_offsets_array_.get())[idx];
+  }
+
+  void SetBuffer(int idx, uint8_t* buffer, int64_t offset) {
+    ARROW_DCHECK(idx <= num_buffers_);
     (buffers_array_.get())[idx] = buffer;
+    (buffer_offsets_array_.get())[idx] = offset;
   }
 
   int GetNumLocalBitMaps() const { return local_bitmaps_holder_->GetNumLocalBitMaps(); }
@@ -64,16 +79,21 @@ class EvalBatch {
     return local_bitmaps_holder_->GetLocalBitMapSize();
   }
 
-  uint8_t* GetLocalBitMap(int idx) const {
-    DCHECK(idx <= GetNumLocalBitMaps());
+  const uint8_t* GetLocalBitMap(int idx) const {
+    ARROW_DCHECK(idx <= GetNumLocalBitMaps());
+    return local_bitmaps_holder_->GetLocalBitMap(idx);
+  }
+  uint8_t* GetLocalBitMap(int idx) {
+    ARROW_DCHECK(idx <= GetNumLocalBitMaps());
     return local_bitmaps_holder_->GetLocalBitMap(idx);
   }
 
-  uint8_t** GetLocalBitMapArray() const {
+  const uint8_t* const* GetLocalBitMapArray() const {
     return local_bitmaps_holder_->GetLocalBitMapArray();
   }
+  uint8_t** GetLocalBitMapArray() { return local_bitmaps_holder_->GetLocalBitMapArray(); }
 
-  ExecutionContext* GetExecutionContext() const { return execution_context_.get(); }
+  const ExecutionContext* GetExecutionContext() const { return execution_context_.get(); }
 
  private:
   /// number of records in the current batch.
@@ -87,11 +107,13 @@ class EvalBatch {
   /// number of slots (equal to num_records_).
   std::unique_ptr<uint8_t*[]> buffers_array_;
 
+  /// An array of 'num_buffers_', each containing the offset for
+  /// corresponding buffer.
+  std::unique_ptr<int64_t[]> buffer_offsets_array_;
+
   std::unique_ptr<LocalBitMapsHolder> local_bitmaps_holder_;
 
   std::unique_ptr<ExecutionContext> execution_context_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_EXPR_EVALBATCH_H

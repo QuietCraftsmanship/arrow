@@ -18,32 +18,70 @@
 #pragma once
 
 #include <algorithm>  // IWYU pragma: keep
-#include <array>
-#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <iterator>
 #include <limits>
 #include <memory>
-#include <string>
-#include <type_traits>
+#include <utility>
 #include <vector>
 
-#include "arrow/buffer-builder.h"
-#include "arrow/memory_pool.h"
+#include "arrow/array/array_base.h"
+#include "arrow/array/array_primitive.h"
+#include "arrow/buffer.h"
+#include "arrow/buffer_builder.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/type.h"
-#include "arrow/type_traits.h"
-#include "arrow/util/bit-util.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
-#include "arrow/util/string_view.h"
-#include "arrow/util/type_traits.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
 
-class Array;
-struct ArrayData;
+namespace internal {
+
+template <class Builder, class V>
+class ArrayBuilderExtraOps {
+ public:
+  /// \brief Append a value from an optional or null if it has no value.
+  Status AppendOrNull(const std::optional<V>& value) {
+    auto* self = static_cast<Builder*>(this);
+    return value.has_value() ? self->Append(*value) : self->AppendNull();
+  }
+
+  /// \brief Append a value from an optional or null if it has no value.
+  ///
+  /// Unsafe methods don't check existing size.
+  void UnsafeAppendOrNull(const std::optional<V>& value) {
+    auto* self = static_cast<Builder*>(this);
+    return value.has_value() ? self->UnsafeAppend(*value) : self->UnsafeAppendNull();
+  }
+};
+
+}  // namespace internal
+
+/// \defgroup numeric-builders Concrete builder subclasses for numeric types
+/// @{
+/// @}
+
+/// \defgroup temporal-builders Concrete builder subclasses for temporal types
+/// @{
+/// @}
+
+/// \defgroup binary-builders Concrete builder subclasses for binary types
+/// @{
+/// @}
+
+/// \defgroup nested-builders Concrete builder subclasses for nested types
+/// @{
+/// @}
+
+/// \defgroup dictionary-builders Concrete builder subclasses for dictionary types
+/// @{
+/// @}
+
+/// \defgroup run-end-encoded-builders Concrete builder subclasses for run-end encoded
+/// arrays
+/// @{
+/// @}
 
 constexpr int64_t kMinBuilderCapacity = 1 << 5;
 constexpr int64_t kListMaximumElements = std::numeric_limits<int32_t>::max() - 1;
@@ -58,8 +96,10 @@ constexpr int64_t kListMaximumElements = std::numeric_limits<int32_t>::max() - 1
 /// For example, ArrayBuilder* pointing to BinaryBuilder should be downcast before use.
 class ARROW_EXPORT ArrayBuilder {
  public:
-  explicit ArrayBuilder(const std::shared_ptr<DataType>& type, MemoryPool* pool)
-      : type_(type), pool_(pool), null_bitmap_builder_(pool) {}
+  explicit ArrayBuilder(MemoryPool* pool, int64_t alignment = kDefaultBufferAlignment)
+      : pool_(pool), alignment_(alignment), null_bitmap_builder_(pool, alignment) {}
+
+  ARROW_DEFAULT_MOVE_AND_ASSIGN(ArrayBuilder);
 
   virtual ~ArrayBuilder() = default;
 
@@ -67,9 +107,11 @@ class ARROW_EXPORT ArrayBuilder {
   /// skip shared pointers and just return a raw pointer
   ArrayBuilder* child(int i) { return children_[i].get(); }
 
+  const std::shared_ptr<ArrayBuilder>& child_builder(int i) const { return children_[i]; }
+
   int num_children() const { return static_cast<int>(children_.size()); }
 
-  int64_t length() const { return length_; }
+  virtual int64_t length() const { return length_; }
   int64_t null_count() const { return null_count_; }
   int64_t capacity() const { return capacity_; }
 
@@ -84,28 +126,60 @@ class ARROW_EXPORT ArrayBuilder {
   /// \return Status
   virtual Status Resize(int64_t capacity);
 
-  /// \brief Ensure that there is enough space allocated to add the indicated
-  /// number of elements without any further calls to Resize. The memory
-  /// allocated is rounded up to the next highest power of 2 similar to memory
-  /// allocations in STL containers like std::vector
+  /// \brief Ensure that there is enough space allocated to append the indicated
+  /// number of elements without any further reallocation. Overallocation is
+  /// used in order to minimize the impact of incremental Reserve() calls.
+  /// Note that additional_capacity is relative to the current number of elements
+  /// rather than to the current capacity, so calls to Reserve() which are not
+  /// interspersed with addition of new elements may not increase the capacity.
+  ///
   /// \param[in] additional_capacity the number of additional array values
   /// \return Status
   Status Reserve(int64_t additional_capacity) {
+    auto current_capacity = capacity();
     auto min_capacity = length() + additional_capacity;
-    if (min_capacity <= capacity()) return Status::OK();
+    if (min_capacity <= current_capacity) return Status::OK();
 
     // leave growth factor up to BufferBuilder
-    auto new_capacity = BufferBuilder::GrowByFactor(min_capacity);
+    auto new_capacity = BufferBuilder::GrowByFactor(current_capacity, min_capacity);
     return Resize(new_capacity);
   }
 
   /// Reset the builder.
   virtual void Reset();
 
-  /// For cases where raw data was memcpy'd into the internal buffers, allows us
-  /// to advance the length of the builder. It is your responsibility to use
-  /// this function responsibly.
-  Status Advance(int64_t elements);
+  /// \brief Append a null value to builder
+  virtual Status AppendNull() = 0;
+  /// \brief Append a number of null values to builder
+  virtual Status AppendNulls(int64_t length) = 0;
+
+  /// \brief Append a non-null value to builder
+  ///
+  /// The appended value is an implementation detail, but the corresponding
+  /// memory slot is guaranteed to be initialized.
+  /// This method is useful when appending a null value to a parent nested type.
+  virtual Status AppendEmptyValue() = 0;
+
+  /// \brief Append a number of non-null values to builder
+  ///
+  /// The appended values are an implementation detail, but the corresponding
+  /// memory slot is guaranteed to be initialized.
+  /// This method is useful when appending null values to a parent nested type.
+  virtual Status AppendEmptyValues(int64_t length) = 0;
+
+  /// \brief Append a value from a scalar
+  Status AppendScalar(const Scalar& scalar) { return AppendScalar(scalar, 1); }
+  virtual Status AppendScalar(const Scalar& scalar, int64_t n_repeats);
+  virtual Status AppendScalars(const ScalarVector& scalars);
+
+  /// \brief Append a range of values from an array.
+  ///
+  /// The given array must be the same type as the builder.
+  virtual Status AppendArraySlice(const ArraySpan& ARROW_ARG_UNUSED(array),
+                                  int64_t ARROW_ARG_UNUSED(offset),
+                                  int64_t ARROW_ARG_UNUSED(length)) {
+    return Status::NotImplemented("AppendArraySlice for builder for ", *type());
+  }
 
   /// \brief Return result of builder as an internal generic ArrayData
   /// object. Resets builder except for dictionary builder
@@ -128,7 +202,15 @@ class ARROW_EXPORT ArrayBuilder {
   /// \return Status
   Status Finish(std::shared_ptr<Array>* out);
 
-  std::shared_ptr<DataType> type() const { return type_; }
+  /// \brief Return result of builder as an Array object.
+  ///
+  /// The builder is reset except for DictionaryBuilder.
+  ///
+  /// \return The finalized Array object
+  Result<std::shared_ptr<Array>> Finish();
+
+  /// \brief Return the type of the built Array
+  virtual std::shared_ptr<DataType> type() const = 0;
 
  protected:
   /// Append to null bitmap
@@ -137,6 +219,9 @@ class ARROW_EXPORT ArrayBuilder {
   /// Vector append. Treat each zero byte as a null.   If valid_bytes is null
   /// assume all of length bits are valid.
   Status AppendToBitmap(const uint8_t* valid_bytes, int64_t length);
+
+  /// Uniform append.  Append N times the same validity bit.
+  Status AppendToBitmap(int64_t num_bits, bool value);
 
   /// Set the next length bits to not null (i.e. valid).
   Status SetNotNull(int64_t length);
@@ -163,25 +248,68 @@ class ARROW_EXPORT ArrayBuilder {
     null_count_ = null_bitmap_builder_.false_count();
   }
 
+  // Vector append. Copy from a given bitmap. If bitmap is null assume
+  // all of length bits are valid.
+  void UnsafeAppendToBitmap(const uint8_t* bitmap, int64_t offset, int64_t length) {
+    if (bitmap == NULLPTR) {
+      return UnsafeSetNotNull(length);
+    }
+    null_bitmap_builder_.UnsafeAppend(bitmap, offset, length);
+    length_ += length;
+    null_count_ = null_bitmap_builder_.false_count();
+  }
+
+  // Append the same validity value a given number of times.
+  void UnsafeAppendToBitmap(const int64_t num_bits, bool value) {
+    if (value) {
+      UnsafeSetNotNull(num_bits);
+    } else {
+      UnsafeSetNull(num_bits);
+    }
+  }
+
   void UnsafeAppendToBitmap(const std::vector<bool>& is_valid);
 
-  // Set the next length bits to not null (i.e. valid).
+  // Set the next validity bits to not null (i.e. valid).
   void UnsafeSetNotNull(int64_t length);
+
+  // Set the next validity bits to null (i.e. invalid).
+  void UnsafeSetNull(int64_t length);
 
   static Status TrimBuffer(const int64_t bytes_filled, ResizableBuffer* buffer);
 
-  static Status CheckCapacity(int64_t new_capacity, int64_t old_capacity) {
-    if (new_capacity < 0) {
-      return Status::Invalid("Resize capacity must be positive");
-    }
-    if (new_capacity < old_capacity) {
-      return Status::Invalid("Resize cannot downsize");
-    }
+  /// \brief Finish to an array of the specified ArrayType
+  template <typename ArrayType>
+  Status FinishTyped(std::shared_ptr<ArrayType>* out) {
+    std::shared_ptr<Array> out_untyped;
+    ARROW_RETURN_NOT_OK(Finish(&out_untyped));
+    *out = std::static_pointer_cast<ArrayType>(std::move(out_untyped));
     return Status::OK();
   }
 
-  std::shared_ptr<DataType> type_;
+  // Check the requested capacity for validity
+  Status CheckCapacity(int64_t new_capacity) {
+    if (ARROW_PREDICT_FALSE(new_capacity < 0)) {
+      return Status::Invalid(
+          "Resize capacity must be positive (requested: ", new_capacity, ")");
+    }
+
+    if (ARROW_PREDICT_FALSE(new_capacity < length_)) {
+      return Status::Invalid("Resize cannot downsize (requested: ", new_capacity,
+                             ", current length: ", length_, ")");
+    }
+
+    return Status::OK();
+  }
+
+  // Check for array type
+  Status CheckArrayType(const std::shared_ptr<DataType>& expected_type,
+                        const Array& array, const char* message);
+  Status CheckArrayType(Type::type expected_type, const Array& array,
+                        const char* message);
+
   MemoryPool* pool_;
+  int64_t alignment_;
 
   TypedBufferBuilder<bool> null_bitmap_builder_;
   int64_t null_count_ = 0;
@@ -196,5 +324,54 @@ class ARROW_EXPORT ArrayBuilder {
  private:
   ARROW_DISALLOW_COPY_AND_ASSIGN(ArrayBuilder);
 };
+
+/// \brief Construct an empty ArrayBuilder corresponding to the data
+/// type
+/// \param[in] pool the MemoryPool to use for allocations
+/// \param[in] type the data type to create the builder for
+/// \param[out] out the created ArrayBuilder
+ARROW_EXPORT
+Status MakeBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                   std::unique_ptr<ArrayBuilder>* out);
+
+inline Result<std::unique_ptr<ArrayBuilder>> MakeBuilder(
+    const std::shared_ptr<DataType>& type, MemoryPool* pool = default_memory_pool()) {
+  std::unique_ptr<ArrayBuilder> out;
+  ARROW_RETURN_NOT_OK(MakeBuilder(pool, type, &out));
+  return out;
+}
+
+/// \brief Construct an empty ArrayBuilder corresponding to the data
+/// type, where any top-level or nested dictionary builders return the
+/// exact index type specified by the type.
+ARROW_EXPORT
+Status MakeBuilderExactIndex(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                             std::unique_ptr<ArrayBuilder>* out);
+
+inline Result<std::unique_ptr<ArrayBuilder>> MakeBuilderExactIndex(
+    const std::shared_ptr<DataType>& type, MemoryPool* pool = default_memory_pool()) {
+  std::unique_ptr<ArrayBuilder> out;
+  ARROW_RETURN_NOT_OK(MakeBuilderExactIndex(pool, type, &out));
+  return out;
+}
+
+/// \brief Construct an empty DictionaryBuilder initialized optionally
+/// with a preexisting dictionary
+/// \param[in] pool the MemoryPool to use for allocations
+/// \param[in] type the dictionary type to create the builder for
+/// \param[in] dictionary the initial dictionary, if any. May be nullptr
+/// \param[out] out the created ArrayBuilder
+ARROW_EXPORT
+Status MakeDictionaryBuilder(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                             const std::shared_ptr<Array>& dictionary,
+                             std::unique_ptr<ArrayBuilder>* out);
+
+inline Result<std::unique_ptr<ArrayBuilder>> MakeDictionaryBuilder(
+    const std::shared_ptr<DataType>& type, const std::shared_ptr<Array>& dictionary,
+    MemoryPool* pool = default_memory_pool()) {
+  std::unique_ptr<ArrayBuilder> out;
+  ARROW_RETURN_NOT_OK(MakeDictionaryBuilder(pool, type, dictionary, &out));
+  return out;
+}
 
 }  // namespace arrow

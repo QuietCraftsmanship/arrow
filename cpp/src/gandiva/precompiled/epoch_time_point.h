@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_EPOCH_TIME_POINT_H
-#define GANDIVA_EPOCH_TIME_POINT_H
+#pragma once
 
 // TODO(wesm): IR compilation does not have any include directories set
 #include "../../arrow/vendored/datetime/date.h"
+
+bool is_leap_year(int yy);
+bool did_days_overflow(arrow_vendored::date::year_month_day ymd);
+int last_possible_day_in_month(int month, int year);
 
 // A point of time measured in millis since epoch.
 class EpochTimePoint {
@@ -35,18 +38,19 @@ class EpochTimePoint {
   int TmMon() const { return static_cast<unsigned int>(YearMonthDay().month()) - 1; }
 
   int TmYday() const {
-    auto to_days = arrow::util::date::floor<arrow::util::date::days>(tp_);
-    auto first_day_in_year =
-        arrow::util::date::sys_days{YearMonthDay().year() / arrow::util::date::jan / 1};
+    auto to_days = arrow_vendored::date::floor<arrow_vendored::date::days>(tp_);
+    auto first_day_in_year = arrow_vendored::date::sys_days{
+        YearMonthDay().year() / arrow_vendored::date::jan / 1};
     return (to_days - first_day_in_year).count();
   }
 
   int TmMday() const { return static_cast<unsigned int>(YearMonthDay().day()); }
 
   int TmWday() const {
-    auto to_days = arrow::util::date::floor<arrow::util::date::days>(tp_);
-    return (arrow::util::date::weekday{to_days} - arrow::util::date::Sunday)  // NOLINT
-        .count();                                                             // NOLINT
+    auto to_days = arrow_vendored::date::floor<arrow_vendored::date::days>(tp_);
+    return (arrow_vendored::date::weekday{to_days} -  // NOLINT
+            arrow_vendored::date::Sunday)
+        .count();
   }
 
   int TmHour() const { return static_cast<int>(TimeOfDay().hours().count()); }
@@ -54,27 +58,37 @@ class EpochTimePoint {
   int TmMin() const { return static_cast<int>(TimeOfDay().minutes().count()); }
 
   int TmSec() const {
-    // TODO(wesm): UNIX y2k issue on int=int32 platforms
+    // TODO(wesm): UNIX y2k issue on int=gdv_int32 platforms
     return static_cast<int>(TimeOfDay().seconds().count());
   }
 
   EpochTimePoint AddYears(int num_years) const {
-    auto ymd = YearMonthDay() + arrow::util::date::years(num_years);
-    return EpochTimePoint((arrow::util::date::sys_days{ymd} +  // NOLINT
+    auto ymd = YearMonthDay() + arrow_vendored::date::years(num_years);
+    return EpochTimePoint((arrow_vendored::date::sys_days{ymd} +  // NOLINT
                            TimeOfDay().to_duration())
                               .time_since_epoch());
   }
 
   EpochTimePoint AddMonths(int num_months) const {
-    auto ymd = YearMonthDay() + arrow::util::date::months(num_months);
-    return EpochTimePoint((arrow::util::date::sys_days{ymd} +  // NOLINT
-                           TimeOfDay().to_duration())
-                              .time_since_epoch());
+    auto ymd = YearMonthDay() + arrow_vendored::date::months(num_months);
+
+    EpochTimePoint tp = EpochTimePoint((arrow_vendored::date::sys_days{ymd} +  // NOLINT
+                                        TimeOfDay().to_duration())
+                                           .time_since_epoch());
+
+    if (did_days_overflow(ymd)) {
+      int days_to_offset =
+          last_possible_day_in_month(static_cast<int>(ymd.year()),
+                                     static_cast<unsigned int>(ymd.month())) -
+          static_cast<unsigned int>(ymd.day());
+      tp = tp.AddDays(days_to_offset);
+    }
+    return tp;
   }
 
   EpochTimePoint AddDays(int num_days) const {
-    auto days_since_epoch = arrow::util::date::sys_days{YearMonthDay()}  // NOLINT
-                            + arrow::util::date::days(num_days);
+    auto days_since_epoch = arrow_vendored::date::sys_days{YearMonthDay()} +  // NOLINT
+                            arrow_vendored::date::days(num_days);
     return EpochTimePoint(
         (days_since_epoch + TimeOfDay().to_duration()).time_since_epoch());
   }
@@ -87,20 +101,18 @@ class EpochTimePoint {
 
   int64_t MillisSinceEpoch() const { return tp_.time_since_epoch().count(); }
 
- private:
-  arrow::util::date::year_month_day YearMonthDay() const {
-    return arrow::util::date::year_month_day{
-        arrow::util::date::floor<arrow::util::date::days>(tp_)};  // NOLINT
+  arrow_vendored::date::time_of_day<std::chrono::milliseconds> TimeOfDay() const {
+    auto millis_since_midnight =
+        tp_ - arrow_vendored::date::floor<arrow_vendored::date::days>(tp_);
+    return arrow_vendored::date::time_of_day<std::chrono::milliseconds>(
+        millis_since_midnight);
   }
 
-  arrow::util::date::time_of_day<std::chrono::milliseconds> TimeOfDay() const {
-    auto millis_since_midnight =
-        tp_ - arrow::util::date::floor<arrow::util::date::days>(tp_);
-    return arrow::util::date::time_of_day<std::chrono::milliseconds>(
-        millis_since_midnight);
+ private:
+  arrow_vendored::date::year_month_day YearMonthDay() const {
+    return arrow_vendored::date::year_month_day{
+        arrow_vendored::date::floor<arrow_vendored::date::days>(tp_)};  // NOLINT
   }
 
   std::chrono::time_point<std::chrono::system_clock, std::chrono::milliseconds> tp_;
 };
-
-#endif  // GANDIVA_EPOCH_TIME_POINT_H

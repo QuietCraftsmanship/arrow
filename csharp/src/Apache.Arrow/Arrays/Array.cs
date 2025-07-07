@@ -31,7 +31,7 @@ namespace Apache.Arrow
 
         public int Offset => Data.Offset;
 
-        public int NullCount => Data.NullCount;
+        public int NullCount => Data.GetNullCount();
 
         public ArrowBuffer NullBitmapBuffer => Data.Buffers[0];
 
@@ -41,7 +41,7 @@ namespace Apache.Arrow
         }
 
         public bool IsValid(int index) =>
-            NullBitmapBuffer.IsEmpty || BitUtility.GetBit(NullBitmapBuffer.Span, index);
+            NullCount == 0 || NullBitmapBuffer.IsEmpty || BitUtility.GetBit(NullBitmapBuffer.Span, index + Offset);
 
         public bool IsNull(int index) => !IsValid(index);
 
@@ -57,6 +57,25 @@ namespace Apache.Arrow
                 default:
                     visitor.Visit(array);
                     break;
+            }
+        }
+
+        public Array Slice(int offset, int length)
+        {
+            return ArrowArrayFactory.Slice(this, offset, length) as Array;
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Data.Dispose();
             }
         }
     }

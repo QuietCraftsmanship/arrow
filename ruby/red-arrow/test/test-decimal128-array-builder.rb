@@ -17,7 +17,7 @@
 
 class Decimal128ArrayBuilderTest < Test::Unit::TestCase
   def setup
-    @data_type = Arrow::Decimal128DataType.new(8, 2)
+    @data_type = Arrow::Decimal128DataType.new(3, 1)
     @builder = Arrow::Decimal128ArrayBuilder.new(@data_type)
   end
 
@@ -31,29 +31,43 @@ class Decimal128ArrayBuilderTest < Test::Unit::TestCase
     test("Arrow::Decimal128") do
       @builder.append_value(Arrow::Decimal128.new("10.1"))
       array = @builder.finish
-      assert_equal(Arrow::Decimal128.new("10.1"),
+      assert_equal(BigDecimal("10.1"),
                    array[0])
     end
 
     test("String") do
       @builder.append_value("10.1")
       array = @builder.finish
-      assert_equal(Arrow::Decimal128.new("10.1"),
+      assert_equal(BigDecimal("10.1"),
                    array[0])
     end
 
     test("Float") do
       @builder.append_value(10.1)
       array = @builder.finish
-      assert_equal(Arrow::Decimal128.new("10.1"),
+      assert_equal(BigDecimal("10.1"),
                    array[0])
     end
 
     test("BigDecimal") do
       @builder.append_value(BigDecimal("10.1"))
       array = @builder.finish
-      assert_equal(Arrow::Decimal128.new("10.1"),
+      assert_equal(BigDecimal("10.1"),
                    array[0])
+    end
+
+    test("BigDecimal::NAN") do
+      message = "can't use NaN as an Arrow::Decimal128Array value"
+      assert_raise(FloatDomainError.new(message)) do
+        @builder.append_value(BigDecimal::NAN)
+      end
+    end
+
+    test("BigDecimal::INFINITY") do
+      message = "can't use Infinity as an Arrow::Decimal128Array value"
+      assert_raise(FloatDomainError.new(message)) do
+        @builder.append_value(BigDecimal::INFINITY)
+      end
     end
   end
 
@@ -68,11 +82,11 @@ class Decimal128ArrayBuilderTest < Test::Unit::TestCase
                              ])
       array = @builder.finish
       assert_equal([
-                     Arrow::Decimal128.new("10.1"),
+                     BigDecimal("10.1"),
                      nil,
-                     Arrow::Decimal128.new("10.1"),
-                     Arrow::Decimal128.new("10.1"),
-                     Arrow::Decimal128.new("10.1"),
+                     BigDecimal("10.1"),
+                     BigDecimal("10.1"),
+                     BigDecimal("10.1"),
                    ],
                    array.to_a)
     end
@@ -80,14 +94,31 @@ class Decimal128ArrayBuilderTest < Test::Unit::TestCase
     test("is_valids") do
       @builder.append_values([
                                Arrow::Decimal128.new("10.1"),
-                               nil,
                                Arrow::Decimal128.new("10.1"),
+                               Arrow::Decimal128.new("10.1"),
+                             ],
+                             [
+                               true,
+                               false,
+                               true,
                              ])
       array = @builder.finish
       assert_equal([
-                     Arrow::Decimal128.new("10.1"),
+                     BigDecimal("10.1"),
                      nil,
-                     Arrow::Decimal128.new("10.1"),
+                     BigDecimal("10.1"),
+                   ],
+                   array.to_a)
+    end
+
+    test("packed") do
+      @builder.append_values(Arrow::Decimal128.new("10.1").to_bytes.to_s * 3,
+                             [true, false, true])
+      array = @builder.finish
+      assert_equal([
+                     BigDecimal("10.1"),
+                     nil,
+                     BigDecimal("10.1"),
                    ],
                    array.to_a)
     end

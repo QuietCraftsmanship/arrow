@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:18.04
+FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND noninteractive
 
@@ -26,15 +26,21 @@ RUN \
   apt update ${quiet} && \
   apt install -y -V ${quiet} \
     apt-utils \
-    createrepo \
+    createrepo-c \
     devscripts \
     gpg \
-    jq \
+    locales \
     openssh-server \
+    rake \
     rpm \
+    ruby \
     sudo && \
   apt clean && \
   rm -rf /var/lib/apt/lists/*
+
+RUN gem install apt-dists-merge -v ">= 1.0.2"
+
+RUN locale-gen en_US.UTF-8
 
 RUN mkdir -p /run/sshd
 RUN echo "StreamLocalBindUnlink yes" >> /etc/ssh/sshd_config
@@ -47,9 +53,18 @@ RUN \
   useradd --uid ${ARROW_UID} --gid ${ARROW_UID} --create-home ${ARROW_USER} && \
   mkdir -p /home/arrow/.gnupg /home/arrow/.ssh && \
   chown -R arrow: /home/arrow/.gnupg /home/arrow/.ssh && \
-  chmod -R og-rwx /home/arrow/.gnupg /home/arrow/.ssh
+  chmod -R og-rwx /home/arrow/.gnupg /home/arrow/.ssh && \
+  echo "${ARROW_USER} ALL=(ALL:ALL) NOPASSWD:ALL" | \
+    EDITOR=tee visudo -f /etc/sudoers.d/arrow
 
 COPY id_rsa.pub /home/arrow/.ssh/authorized_keys
 RUN \
   chown -R arrow: /home/arrow/.ssh && \
   chmod -R og-rwx /home/arrow/.ssh
+
+COPY runner.sh /home/arrow/runner.sh
+RUN \
+  chown -R arrow: /home/arrow/runner.sh && \
+  chmod +x /home/arrow/runner.sh
+
+EXPOSE 22

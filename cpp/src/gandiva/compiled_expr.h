@@ -15,36 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_COMPILED_EXPR_H
-#define GANDIVA_COMPILED_EXPR_H
+#pragma once
 
+#include <vector>
 #include "gandiva/llvm_includes.h"
+#include "gandiva/selection_vector.h"
 #include "gandiva/value_validity_pair.h"
 
 namespace gandiva {
 
-using EvalFunc = int (*)(uint8_t** buffers, uint8_t** local_bitmaps,
+using EvalFunc = int (*)(uint8_t** buffers, int64_t* offsets, uint8_t** local_bitmaps,
+                         const void* const* holder_ptrs, const uint8_t* selection_buffer,
                          int64_t execution_ctx_ptr, int64_t record_count);
 
 /// \brief Tracks the compiled state for one expression.
 class CompiledExpr {
  public:
-  CompiledExpr(ValueValidityPairPtr value_validity, FieldDescriptorPtr output,
-               llvm::Function* ir_function)
-      : value_validity_(value_validity),
-        output_(output),
-        ir_function_(ir_function),
-        jit_function_(NULL) {}
+  CompiledExpr(ValueValidityPairPtr value_validity, FieldDescriptorPtr output)
+      : value_validity_(value_validity), output_(output) {}
 
   ValueValidityPairPtr value_validity() const { return value_validity_; }
 
   FieldDescriptorPtr output() const { return output_; }
 
-  llvm::Function* ir_function() const { return ir_function_; }
+  void SetFunctionName(SelectionVector::Mode mode, std::string& name) {
+    ir_functions_[static_cast<int>(mode)] = name;
+  }
 
-  EvalFunc jit_function() const { return jit_function_; }
+  std::string GetFunctionName(SelectionVector::Mode mode) const {
+    return ir_functions_[static_cast<int>(mode)];
+  }
 
-  void set_jit_function(EvalFunc jit_function) { jit_function_ = jit_function; }
+  void SetJITFunction(SelectionVector::Mode mode, EvalFunc jit_function) {
+    jit_functions_[static_cast<int>(mode)] = jit_function;
+  }
+
+  EvalFunc GetJITFunction(SelectionVector::Mode mode) const {
+    return jit_functions_[static_cast<int>(mode)];
+  }
 
  private:
   // value & validities for the expression tree (root)
@@ -53,13 +61,11 @@ class CompiledExpr {
   // output field
   FieldDescriptorPtr output_;
 
-  // IR function in the generated code
-  llvm::Function* ir_function_;
+  // Function names for various modes in the generated code
+  std::array<std::string, SelectionVector::kNumModes> ir_functions_;
 
-  // JIT function in the generated code (set after the module is optimised and finalized)
-  EvalFunc jit_function_;
+  // JIT functions in the generated code (set after the module is optimised and finalized)
+  std::array<EvalFunc, SelectionVector::kNumModes> jit_functions_;
 };
 
 }  // namespace gandiva
-
-#endif  // GANDIVA_COMPILED_EXPR_H

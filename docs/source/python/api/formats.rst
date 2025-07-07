@@ -18,20 +18,27 @@
 Tabular File Formats
 ====================
 
-.. currentmodule:: pyarrow.csv
-
-.. _api.csv:
+.. _py-api-csv:
 
 CSV Files
 ---------
 
+.. currentmodule:: pyarrow.csv
+
 .. autosummary::
    :toctree: ../generated/
 
-   ReadOptions
-   ParseOptions
    ConvertOptions
+   CSVStreamingReader
+   CSVWriter
+   ISO8601
+   ParseOptions
+   ReadOptions
+   WriteOptions
+   open_csv
    read_csv
+   write_csv
+   InvalidRow
 
 .. _api.feather:
 
@@ -44,9 +51,23 @@ Feather Files
    :toctree: ../generated/
 
    read_feather
+   read_table
    write_feather
 
-.. currentmodule:: pyarrow
+.. _api.json:
+
+JSON Files
+----------
+
+.. currentmodule:: pyarrow.json
+
+.. autosummary::
+   :toctree: ../generated/
+
+   ReadOptions
+   ParseOptions
+   open_json
+   read_json
 
 .. _api.parquet:
 
@@ -68,3 +89,47 @@ Parquet Files
    write_metadata
    write_table
    write_to_dataset
+
+Parquet Metadata
+~~~~~~~~~~~~~~~~
+
+.. autosummary::
+   :toctree: ../generated/
+
+   FileMetaData
+   RowGroupMetaData
+   SortingColumn
+   ColumnChunkMetaData
+   Statistics
+   ParquetSchema
+   ColumnSchema
+   ParquetLogicalType
+
+Encrypted Parquet Files
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: pyarrow.parquet.encryption
+
+.. autosummary::
+   :toctree: ../generated/
+
+   CryptoFactory
+   KmsClient
+   KmsConnectionConfig
+   EncryptionConfiguration
+   DecryptionConfiguration
+
+.. _api.orc:
+
+ORC Files
+---------
+
+.. currentmodule:: pyarrow.orc
+
+.. autosummary::
+   :toctree: ../generated/
+
+   ORCFile
+   ORCWriter
+   read_table
+   write_table

@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef GANDIVA_NATIVE_FUNCTION_H
-#define GANDIVA_NATIVE_FUNCTION_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "gandiva/arrow.h"
 #include "gandiva/function_signature.h"
 #include "gandiva/visibility.h"
 
@@ -40,12 +40,12 @@ enum ResultNullableType {
 /// precompiled function.
 class GANDIVA_EXPORT NativeFunction {
  public:
-  // fucntion attributes.
+  // function attributes.
   static constexpr int32_t kNeedsContext = (1 << 1);
   static constexpr int32_t kNeedsFunctionHolder = (1 << 2);
   static constexpr int32_t kCanReturnErrors = (1 << 3);
 
-  const FunctionSignature& signature() const { return signature_; }
+  const std::vector<FunctionSignature>& signatures() const { return signatures_; }
   std::string pc_name() const { return pc_name_; }
   ResultNullableType result_nullable_type() const { return result_nullable_type_; }
 
@@ -53,16 +53,22 @@ class GANDIVA_EXPORT NativeFunction {
   bool NeedsFunctionHolder() const { return (flags_ & kNeedsFunctionHolder) != 0; }
   bool CanReturnErrors() const { return (flags_ & kCanReturnErrors) != 0; }
 
-  NativeFunction(const std::string& base_name, const DataTypeVector& param_types,
-                 DataTypePtr ret_type, const ResultNullableType& result_nullable_type,
-                 const std::string& pc_name, int32_t flags = 0)
-      : signature_(base_name, param_types, ret_type),
+  NativeFunction(const std::string& base_name, const std::vector<std::string>& aliases,
+                 const DataTypeVector& param_types, const DataTypePtr& ret_type,
+                 const ResultNullableType& result_nullable_type, std::string pc_name,
+                 int32_t flags = 0)
+      : signatures_(),
         flags_(flags),
         result_nullable_type_(result_nullable_type),
-        pc_name_(pc_name) {}
+        pc_name_(std::move(pc_name)) {
+    signatures_.emplace_back(base_name, param_types, ret_type);
+    for (auto& func_name : aliases) {
+      signatures_.emplace_back(func_name, param_types, ret_type);
+    }
+  }
 
  private:
-  FunctionSignature signature_;
+  std::vector<FunctionSignature> signatures_;
 
   /// attributes
   int32_t flags_;
@@ -73,5 +79,3 @@ class GANDIVA_EXPORT NativeFunction {
 };
 
 }  // end namespace gandiva
-
-#endif  // GANDIVA_NATIVE_FUNCTION_H

@@ -31,54 +31,85 @@ FieldDescriptorPtr Annotator::CheckAndAddInputFieldDescriptor(FieldPtr field) {
     return found->second;
   }
 
-  auto desc = MakeDesc(field);
+  auto desc = MakeDesc(field, false /*is_output*/);
   in_name_to_desc_[field->name()] = desc;
   return desc;
 }
 
 FieldDescriptorPtr Annotator::AddOutputFieldDescriptor(FieldPtr field) {
-  auto desc = MakeDesc(field);
+  auto desc = MakeDesc(field, true /*is_output*/);
   out_descs_.push_back(desc);
   return desc;
 }
 
-FieldDescriptorPtr Annotator::MakeDesc(FieldPtr field) {
+FieldDescriptorPtr Annotator::MakeDesc(FieldPtr field, bool is_output) {
   int data_idx = buffer_count_++;
   int validity_idx = buffer_count_++;
   int offsets_idx = FieldDescriptor::kInvalidIdx;
   if (arrow::is_binary_like(field->type()->id())) {
     offsets_idx = buffer_count_++;
   }
-  return std::make_shared<FieldDescriptor>(field, data_idx, validity_idx, offsets_idx);
+  int data_buffer_ptr_idx = FieldDescriptor::kInvalidIdx;
+  if (is_output) {
+    data_buffer_ptr_idx = buffer_count_++;
+  }
+  return std::make_shared<FieldDescriptor>(field, data_idx, validity_idx, offsets_idx,
+                                           data_buffer_ptr_idx);
+<<<<<<< HEAD
+}
+
+int Annotator::AddHolderPointer(void* holder) {
+  int size = static_cast<int>(holder_pointers_.size());
+  holder_pointers_.push_back(holder);
+  return size;
+=======
+>>>>>>> 5588-Better-support-for-building-UnionArrays
 }
 
 void Annotator::PrepareBuffersForField(const FieldDescriptor& desc,
                                        const arrow::ArrayData& array_data,
-                                       EvalBatch* eval_batch) {
+<<<<<<< HEAD
+                                       EvalBatch* eval_batch, bool is_output) const {
+=======
+                                       EvalBatch* eval_batch, bool is_output) {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
   int buffer_idx = 0;
 
   // The validity buffer is optional. Use nullptr if it does not have one.
   if (array_data.buffers[buffer_idx]) {
     uint8_t* validity_buf = const_cast<uint8_t*>(array_data.buffers[buffer_idx]->data());
-    eval_batch->SetBuffer(desc.validity_idx(), validity_buf);
+    eval_batch->SetBuffer(desc.validity_idx(), validity_buf, array_data.offset);
   } else {
-    eval_batch->SetBuffer(desc.validity_idx(), nullptr);
+    eval_batch->SetBuffer(desc.validity_idx(), nullptr, array_data.offset);
   }
   ++buffer_idx;
 
   if (desc.HasOffsetsIdx()) {
     uint8_t* offsets_buf = const_cast<uint8_t*>(array_data.buffers[buffer_idx]->data());
-    eval_batch->SetBuffer(desc.offsets_idx(), offsets_buf);
+    eval_batch->SetBuffer(desc.offsets_idx(), offsets_buf, array_data.offset);
     ++buffer_idx;
   }
 
   uint8_t* data_buf = const_cast<uint8_t*>(array_data.buffers[buffer_idx]->data());
+<<<<<<< HEAD
+  eval_batch->SetBuffer(desc.data_idx(), data_buf, array_data.offset);
+=======
   eval_batch->SetBuffer(desc.data_idx(), data_buf);
-  ++buffer_idx;
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+  if (is_output) {
+    // pass in the Buffer object for output data buffers. Can be used for resizing.
+    uint8_t* data_buf_ptr =
+        reinterpret_cast<uint8_t*>(array_data.buffers[buffer_idx].get());
+<<<<<<< HEAD
+    eval_batch->SetBuffer(desc.data_buffer_ptr_idx(), data_buf_ptr, array_data.offset);
+=======
+    eval_batch->SetBuffer(desc.data_buffer_ptr_idx(), data_buf_ptr);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+  }
 }
 
 EvalBatchPtr Annotator::PrepareEvalBatch(const arrow::RecordBatch& record_batch,
-                                         const ArrayDataVector& out_vector) {
+                                         const ArrayDataVector& out_vector) const {
   EvalBatchPtr eval_batch = std::make_shared<EvalBatch>(
       record_batch.num_rows(), buffer_count_, local_bitmap_count_);
 
@@ -91,15 +122,19 @@ EvalBatchPtr Annotator::PrepareEvalBatch(const arrow::RecordBatch& record_batch,
       continue;
     }
 
+<<<<<<< HEAD
+    PrepareBuffersForField(*(found->second), *(record_batch.column_data(i)),
+=======
     PrepareBuffersForField(*(found->second), *(record_batch.column(i))->data(),
-                           eval_batch.get());
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+                           eval_batch.get(), false /*is_output*/);
   }
 
   // Fill in the entries for the output fields.
   int idx = 0;
   for (auto& arraydata : out_vector) {
     const FieldDescriptorPtr& desc = out_descs_.at(idx);
-    PrepareBuffersForField(*desc, *arraydata, eval_batch.get());
+    PrepareBuffersForField(*desc, *arraydata, eval_batch.get(), true /*is_output*/);
     ++idx;
   }
   return eval_batch;

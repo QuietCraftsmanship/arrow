@@ -15,343 +15,368 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Flight server lifecycle implementation on top of the transport
+// interface
+
+// Platform-specific defines
+#include "arrow/flight/platform.h"
+
 #include "arrow/flight/server.h"
 
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
 
-#include "grpcpp/grpcpp.h"
-
-#include "arrow/ipc/reader.h"
-#include "arrow/ipc/writer.h"
-#include "arrow/record_batch.h"
-#include "arrow/status.h"
-#include "arrow/util/logging.h"
-
-#include "arrow/flight/Flight.grpc.pb.h"
-#include "arrow/flight/Flight.pb.h"
-#include "arrow/flight/internal.h"
-#include "arrow/flight/serialization-internal.h"
+#include "arrow/device.h"
+#include "arrow/flight/transport.h"
+#include "arrow/flight/transport/grpc/grpc_server.h"
+#include "arrow/flight/transport_server.h"
 #include "arrow/flight/types.h"
-
-using FlightService = arrow::flight::protocol::FlightService;
-using ServerContext = grpc::ServerContext;
-
-using arrow::ipc::internal::IpcPayload;
-
-template <typename T>
-using ServerWriter = grpc::ServerWriter<T>;
-
-namespace pb = arrow::flight::protocol;
+#include "arrow/status.h"
+#include "arrow/util/io_util.h"
+#include "arrow/util/logging.h"
+#include "arrow/util/uri.h"
 
 namespace arrow {
 namespace flight {
 
-#define CHECK_ARG_NOT_NULL(VAL, MESSAGE)                              \
-  if (VAL == nullptr) {                                               \
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, MESSAGE); \
-  }
+namespace {
+#if (ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_POINTER_LOCK_FREE != 2)
+#  error "atomic ints and atomic pointers not always lock-free!"
+#endif
 
-class FlightMessageReaderImpl : public FlightMessageReader {
+using ::arrow::internal::SelfPipe;
+using ::arrow::internal::SetSignalHandler;
+using ::arrow::internal::SignalHandler;
+
+/// RAII guard that manages a self-pipe and a thread that listens on
+/// the self-pipe, shutting down the server when a signal handler
+/// writes to the pipe.
+class ServerSignalHandler {
  public:
-  FlightMessageReaderImpl(const FlightDescriptor& descriptor,
-                          std::shared_ptr<Schema> schema,
-                          grpc::ServerReader<pb::FlightData>* reader)
-      : descriptor_(descriptor),
-        schema_(schema),
-        reader_(reader),
-        stream_finished_(false) {}
+  ARROW_DISALLOW_COPY_AND_ASSIGN(ServerSignalHandler);
+  ServerSignalHandler() = default;
 
-  const FlightDescriptor& descriptor() const override { return descriptor_; }
-
-  std::shared_ptr<Schema> schema() const override { return schema_; }
-
-  Status ReadNext(std::shared_ptr<RecordBatch>* out) override {
-    if (stream_finished_) {
-      *out = nullptr;
-      return Status::OK();
-    }
-
-    // XXX this cast is undefined behavior
-    auto custom_reader = reinterpret_cast<grpc::ServerReader<FlightData>*>(reader_);
-
-    FlightData data;
-    // Explicitly specify the override to invoke - otherwise compiler
-    // may invoke through vtable (not updated by reinterpret_cast)
-    if (custom_reader->grpc::ServerReader<FlightData>::Read(&data)) {
-      std::unique_ptr<ipc::Message> message;
-
-      // Validate IPC message
-      RETURN_NOT_OK(ipc::Message::Open(data.metadata, data.body, &message));
-      if (message->type() == ipc::Message::Type::RECORD_BATCH) {
-        return ipc::ReadRecordBatch(*message, schema_, out);
-      } else {
-        return Status(StatusCode::Invalid, "Unrecognized message in Flight stream");
-      }
-    } else {
-      // Stream is completed
-      stream_finished_ = true;
-      *out = nullptr;
-      return Status::OK();
-    }
+  /// Create the pipe and handler thread.
+  ///
+  /// \return the fd of the write side of the pipe.
+  template <typename Fn>
+  arrow::Result<std::shared_ptr<SelfPipe>> Init(Fn handler) {
+    ARROW_ASSIGN_OR_RAISE(self_pipe_, SelfPipe::Make(/*signal_safe=*/true));
+    handle_signals_ = std::thread(handler, self_pipe_);
+    return self_pipe_;
   }
+
+  Status Shutdown() {
+    RETURN_NOT_OK(self_pipe_->Shutdown());
+    handle_signals_.join();
+    return Status::OK();
+  }
+
+  ~ServerSignalHandler() { ARROW_CHECK_OK(Shutdown()); }
 
  private:
-  FlightDescriptor descriptor_;
-  std::shared_ptr<Schema> schema_;
-  grpc::ServerReader<pb::FlightData>* reader_;
-  bool stream_finished_;
+  std::shared_ptr<SelfPipe> self_pipe_;
+  std::thread handle_signals_;
+};
+}  // namespace
+
+/// Server implementation. Manages the lifecycle of the "real" server
+/// (ServerTransport) and contains
+struct FlightServerBase::Impl {
+  std::unique_ptr<internal::ServerTransport> transport_;
+
+  // Signal handlers (on Windows) and the shutdown handler (other platforms)
+  // are executed in a separate thread, so getting the current thread instance
+  // wouldn't make sense.  This means only a single instance can receive signals.
+  static std::atomic<Impl*> running_instance_;
+  // We'll use the self-pipe trick to notify a thread from the signal
+  // handler. The thread will then shut down the server.
+  std::shared_ptr<SelfPipe> self_pipe_;
+
+  // Signal handling
+  std::vector<int> signals_;
+  std::vector<SignalHandler> old_signal_handlers_;
+  std::atomic<int> got_signal_;
+
+  static void HandleSignal(int signum) {
+    auto instance = running_instance_.load();
+    if (instance != nullptr) {
+      instance->DoHandleSignal(signum);
+    }
+  }
+
+  void DoHandleSignal(int signum) {
+    got_signal_ = signum;
+
+    // Send dummy payload over self-pipe
+    self_pipe_->Send(/*payload=*/0);
+  }
+
+  static void WaitForSignals(std::shared_ptr<SelfPipe> self_pipe) {
+    // Wait for a signal handler to wake up the pipe
+    auto st = self_pipe->Wait().status();
+    // Status::Invalid means the pipe was shutdown without any wakeup
+    if (!st.ok() && !st.IsInvalid()) {
+      ARROW_LOG(FATAL) << "Failed to wait on self-pipe: " << st.ToString();
+    }
+    auto instance = running_instance_.load();
+    if (instance != nullptr) {
+      ARROW_WARN_NOT_OK(instance->transport_->Shutdown(), "Error shutting down server");
+    }
+  }
 };
 
-// This class glues an implementation of FlightServerBase together with the
-// gRPC service definition, so the latter is not exposed in the public API
-class FlightServiceImpl : public FlightService::Service {
- public:
-  explicit FlightServiceImpl(FlightServerBase* server) : server_(server) {}
+std::atomic<FlightServerBase::Impl*> FlightServerBase::Impl::running_instance_;
 
-  template <typename UserType, typename Iterator, typename ProtoType>
-  grpc::Status WriteStream(Iterator* iterator, ServerWriter<ProtoType>* writer) {
-    // Write flight info to stream until listing is exhausted
-    ProtoType pb_value;
-    std::unique_ptr<UserType> value;
-    while (true) {
-      GRPC_RETURN_NOT_OK(iterator->Next(&value));
-      if (!value) {
-        break;
-      }
-      GRPC_RETURN_NOT_OK(internal::ToProto(*value, &pb_value));
+FlightServerOptions::FlightServerOptions(const Location& location_)
+    : location(location_),
+      auth_handler(nullptr),
+      tls_certificates(),
+      verify_client(false),
+      root_certificates(),
+      middleware(),
+      memory_manager(CPUDevice::Instance()->default_memory_manager()),
+      builder_hook(nullptr) {}
 
-      // Blocking write
-      if (!writer->Write(pb_value)) {
-        // Write returns false if the stream is closed
-        break;
-      }
-    }
-    return grpc::Status::OK;
-  }
+FlightServerOptions::~FlightServerOptions() = default;
 
-  template <typename UserType, typename ProtoType>
-  grpc::Status WriteStream(const std::vector<UserType>& values,
-                           ServerWriter<ProtoType>* writer) {
-    // Write flight info to stream until listing is exhausted
-    ProtoType pb_value;
-    for (const UserType& value : values) {
-      GRPC_RETURN_NOT_OK(internal::ToProto(value, &pb_value));
-      // Blocking write
-      if (!writer->Write(pb_value)) {
-        // Write returns false if the stream is closed
-        break;
-      }
-    }
-    return grpc::Status::OK;
-  }
-
-  grpc::Status ListFlights(ServerContext* context, const pb::Criteria* request,
-                           ServerWriter<pb::FlightGetInfo>* writer) {
-    // Retrieve the listing from the implementation
-    std::unique_ptr<FlightListing> listing;
-
-    Criteria criteria;
-    if (request) {
-      GRPC_RETURN_NOT_OK(internal::FromProto(*request, &criteria));
-    }
-    GRPC_RETURN_NOT_OK(server_->ListFlights(&criteria, &listing));
-    return WriteStream<FlightInfo>(listing.get(), writer);
-  }
-
-  grpc::Status GetFlightInfo(ServerContext* context, const pb::FlightDescriptor* request,
-                             pb::FlightGetInfo* response) {
-    CHECK_ARG_NOT_NULL(request, "FlightDescriptor cannot be null");
-
-    FlightDescriptor descr;
-    GRPC_RETURN_NOT_OK(internal::FromProto(*request, &descr));
-
-    std::unique_ptr<FlightInfo> info;
-    GRPC_RETURN_NOT_OK(server_->GetFlightInfo(descr, &info));
-
-    GRPC_RETURN_NOT_OK(internal::ToProto(*info, response));
-    return grpc::Status::OK;
-  }
-
-  grpc::Status DoGet(ServerContext* context, const pb::Ticket* request,
-                     ServerWriter<pb::FlightData>* writer) {
-    CHECK_ARG_NOT_NULL(request, "ticket cannot be null");
-
-    Ticket ticket;
-    GRPC_RETURN_NOT_OK(internal::FromProto(*request, &ticket));
-
-    std::unique_ptr<FlightDataStream> data_stream;
-    GRPC_RETURN_NOT_OK(server_->DoGet(ticket, &data_stream));
-
-    // Requires ServerWriter customization in grpc_customizations.h
-    // XXX this cast is undefined behavior
-    auto custom_writer = reinterpret_cast<ServerWriter<IpcPayload>*>(writer);
-
-    // Write the schema as the first message in the stream
-    IpcPayload schema_payload;
-    MemoryPool* pool = default_memory_pool();
-    ipc::DictionaryMemo dictionary_memo;
-    GRPC_RETURN_NOT_OK(ipc::internal::GetSchemaPayload(
-        *data_stream->schema(), pool, &dictionary_memo, &schema_payload));
-    // Explicitly specify the override to invoke - otherwise compiler
-    // may invoke through vtable (not updated by reinterpret_cast)
-    custom_writer->grpc::ServerWriter<IpcPayload>::Write(schema_payload,
-                                                         grpc::WriteOptions());
-
-    while (true) {
-      IpcPayload payload;
-      GRPC_RETURN_NOT_OK(data_stream->Next(&payload));
-      if (payload.metadata == nullptr ||
-          !custom_writer->Write(payload, grpc::WriteOptions())) {
-        // No more messages to write, or connection terminated for some other
-        // reason
-        break;
-      }
-    }
-    return grpc::Status::OK;
-  }
-
-  grpc::Status DoPut(ServerContext* context, grpc::ServerReader<pb::FlightData>* reader,
-                     pb::PutResult* response) {
-    // Get metadata
-    pb::FlightData data;
-    if (reader->Read(&data)) {
-      FlightDescriptor descriptor;
-      // Message only lives as long as data
-      std::unique_ptr<ipc::Message> message;
-      GRPC_RETURN_NOT_OK(internal::FromProto(data, &descriptor, &message));
-
-      if (!message || message->type() != ipc::Message::Type::SCHEMA) {
-        return internal::ToGrpcStatus(
-            Status(StatusCode::Invalid, "DoPut must start with schema/descriptor"));
-      } else {
-        std::shared_ptr<Schema> schema;
-        GRPC_RETURN_NOT_OK(ipc::ReadSchema(*message, &schema));
-
-        auto message_reader = std::unique_ptr<FlightMessageReader>(
-            new FlightMessageReaderImpl(descriptor, schema, reader));
-        return internal::ToGrpcStatus(server_->DoPut(std::move(message_reader)));
-      }
-    } else {
-      return internal::ToGrpcStatus(
-          Status(StatusCode::Invalid,
-                 "Client provided malformed message or did not provide message"));
-    }
-  }
-
-  grpc::Status ListActions(ServerContext* context, const pb::Empty* request,
-                           ServerWriter<pb::ActionType>* writer) {
-    // Retrieve the listing from the implementation
-    std::vector<ActionType> types;
-    GRPC_RETURN_NOT_OK(server_->ListActions(&types));
-    return WriteStream<ActionType>(types, writer);
-  }
-
-  grpc::Status DoAction(ServerContext* context, const pb::Action* request,
-                        ServerWriter<pb::Result>* writer) {
-    CHECK_ARG_NOT_NULL(request, "Action cannot be null");
-    Action action;
-    GRPC_RETURN_NOT_OK(internal::FromProto(*request, &action));
-
-    std::unique_ptr<ResultStream> results;
-    GRPC_RETURN_NOT_OK(server_->DoAction(action, &results));
-
-    std::unique_ptr<Result> result;
-    pb::Result pb_result;
-    while (true) {
-      GRPC_RETURN_NOT_OK(results->Next(&result));
-      if (!result) {
-        // No more results
-        break;
-      }
-      GRPC_RETURN_NOT_OK(internal::ToProto(*result, &pb_result));
-      if (!writer->Write(pb_result)) {
-        // Stream may be closed
-        break;
-      }
-    }
-    return grpc::Status::OK;
-  }
-
- private:
-  FlightServerBase* server_;
-};
-
-struct FlightServerBase::FlightServerBaseImpl {
-  std::unique_ptr<grpc::Server> server;
-};
-
-FlightServerBase::FlightServerBase() { impl_.reset(new FlightServerBaseImpl); }
+FlightServerBase::FlightServerBase() { impl_.reset(new Impl); }
 
 FlightServerBase::~FlightServerBase() {}
 
-void FlightServerBase::Run(int port) {
-  std::string address = "localhost:" + std::to_string(port);
+Status FlightServerBase::Init(const FlightServerOptions& options) {
+  flight::transport::grpc::InitializeFlightGrpcServer();
 
-  FlightServiceImpl service(this);
-  grpc::ServerBuilder builder;
-  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
-  builder.RegisterService(&service);
-
-  impl_->server = builder.BuildAndStart();
-  std::cout << "Server listening on " << address << std::endl;
-  impl_->server->Wait();
+  const auto scheme = options.location.scheme();
+  ARROW_ASSIGN_OR_RAISE(impl_->transport_,
+                        internal::GetDefaultTransportRegistry()->MakeServer(
+                            scheme, this, options.memory_manager));
+  return impl_->transport_->Init(options, *options.location.uri_);
 }
 
-void FlightServerBase::Shutdown() {
-  DCHECK(impl_->server);
-  impl_->server->Shutdown();
+int FlightServerBase::port() const { return location().uri_->port(); }
+
+Location FlightServerBase::location() const { return impl_->transport_->location(); }
+
+Status FlightServerBase::SetShutdownOnSignals(const std::vector<int> sigs) {
+  impl_->signals_ = sigs;
+  impl_->old_signal_handlers_.clear();
+  return Status::OK();
 }
 
-Status FlightServerBase::ListFlights(const Criteria* criteria,
+Status FlightServerBase::Serve() {
+  if (!impl_->transport_) {
+    return Status::UnknownError("Server did not start properly");
+  }
+  impl_->got_signal_ = 0;
+  impl_->old_signal_handlers_.clear();
+  impl_->running_instance_ = impl_.get();
+
+  ServerSignalHandler signal_handler;
+  ARROW_ASSIGN_OR_RAISE(impl_->self_pipe_, signal_handler.Init(&Impl::WaitForSignals));
+  // Override existing signal handlers with our own handler so as to stop the server.
+  for (size_t i = 0; i < impl_->signals_.size(); ++i) {
+    int signum = impl_->signals_[i];
+    SignalHandler new_handler(&Impl::HandleSignal), old_handler;
+    ARROW_ASSIGN_OR_RAISE(old_handler, SetSignalHandler(signum, new_handler));
+    impl_->old_signal_handlers_.push_back(std::move(old_handler));
+  }
+
+  RETURN_NOT_OK(impl_->transport_->Wait());
+  impl_->running_instance_ = nullptr;
+
+  // Restore signal handlers
+  for (size_t i = 0; i < impl_->signals_.size(); ++i) {
+    RETURN_NOT_OK(
+        SetSignalHandler(impl_->signals_[i], impl_->old_signal_handlers_[i]).status());
+  }
+  return Status::OK();
+}
+
+int FlightServerBase::GotSignal() const { return impl_->got_signal_; }
+
+Status FlightServerBase::Shutdown(const std::chrono::system_clock::time_point* deadline) {
+  auto server = impl_->transport_.get();
+  if (!server) {
+    return Status::Invalid("Shutdown() on uninitialized FlightServerBase");
+  }
+  impl_->running_instance_ = nullptr;
+  if (deadline) {
+    return impl_->transport_->Shutdown(*deadline);
+  }
+  return impl_->transport_->Shutdown();
+}
+
+Status FlightServerBase::Wait() {
+  RETURN_NOT_OK(impl_->transport_->Wait());
+  impl_->running_instance_ = nullptr;
+  return Status::OK();
+}
+
+Status FlightServerBase::ListFlights(const ServerCallContext& context,
+                                     const Criteria* criteria,
                                      std::unique_ptr<FlightListing>* listings) {
   return Status::NotImplemented("NYI");
 }
 
-Status FlightServerBase::GetFlightInfo(const FlightDescriptor& request,
+Status FlightServerBase::GetFlightInfo(const ServerCallContext& context,
+                                       const FlightDescriptor& request,
                                        std::unique_ptr<FlightInfo>* info) {
-  std::cout << "GetFlightInfo" << std::endl;
   return Status::NotImplemented("NYI");
 }
 
-Status FlightServerBase::DoGet(const Ticket& request,
+Status FlightServerBase::PollFlightInfo(const ServerCallContext& context,
+                                        const FlightDescriptor& request,
+                                        std::unique_ptr<PollInfo>* info) {
+  return Status::NotImplemented("NYI");
+}
+
+Status FlightServerBase::DoGet(const ServerCallContext& context, const Ticket& request,
                                std::unique_ptr<FlightDataStream>* data_stream) {
   return Status::NotImplemented("NYI");
 }
 
-Status FlightServerBase::DoPut(std::unique_ptr<FlightMessageReader> reader) {
+Status FlightServerBase::DoPut(const ServerCallContext& context,
+                               std::unique_ptr<FlightMessageReader> reader,
+                               std::unique_ptr<FlightMetadataWriter> writer) {
   return Status::NotImplemented("NYI");
 }
 
-Status FlightServerBase::DoAction(const Action& action,
+Status FlightServerBase::DoExchange(const ServerCallContext& context,
+                                    std::unique_ptr<FlightMessageReader> reader,
+                                    std::unique_ptr<FlightMessageWriter> writer) {
+  return Status::NotImplemented("NYI");
+}
+
+Status FlightServerBase::DoAction(const ServerCallContext& context, const Action& action,
                                   std::unique_ptr<ResultStream>* result) {
   return Status::NotImplemented("NYI");
 }
 
-Status FlightServerBase::ListActions(std::vector<ActionType>* actions) {
+Status FlightServerBase::ListActions(const ServerCallContext& context,
+                                     std::vector<ActionType>* actions) {
+  return Status::NotImplemented("NYI");
+}
+
+Status FlightServerBase::GetSchema(const ServerCallContext& context,
+                                   const FlightDescriptor& request,
+                                   std::unique_ptr<SchemaResult>* schema) {
   return Status::NotImplemented("NYI");
 }
 
 // ----------------------------------------------------------------------
 // Implement RecordBatchStream
 
-RecordBatchStream::RecordBatchStream(const std::shared_ptr<RecordBatchReader>& reader)
-    : pool_(default_memory_pool()), reader_(reader) {}
+class RecordBatchStream::RecordBatchStreamImpl {
+ public:
+  // Stages of the stream when producing payloads
+  enum class Stage {
+    NEW,          // The stream has been created, but Next has not been called yet
+    DICTIONARY,   // Dictionaries have been collected, and are being sent
+    RECORD_BATCH  // Initial have been sent
+  };
 
-std::shared_ptr<Schema> RecordBatchStream::schema() { return reader_->schema(); }
+  RecordBatchStreamImpl(const std::shared_ptr<RecordBatchReader>& reader,
+                        const ipc::IpcWriteOptions& options)
+      : reader_(reader), mapper_(*reader_->schema()), ipc_options_(options) {}
 
-Status RecordBatchStream::Next(IpcPayload* payload) {
-  std::shared_ptr<RecordBatch> batch;
-  RETURN_NOT_OK(reader_->ReadNext(&batch));
+  std::shared_ptr<Schema> schema() { return reader_->schema(); }
 
-  if (!batch) {
-    // Signal that iteration is over
-    payload->metadata = nullptr;
-    return Status::OK();
-  } else {
-    return ipc::internal::GetRecordBatchPayload(*batch, pool_, payload);
+  Status GetSchemaPayload(FlightPayload* payload) {
+    return ipc::GetSchemaPayload(*reader_->schema(), ipc_options_, mapper_,
+                                 &payload->ipc_message);
   }
+
+  Status Next(FlightPayload* payload) {
+    if (stage_ == Stage::NEW) {
+      RETURN_NOT_OK(reader_->ReadNext(&current_batch_));
+      if (!current_batch_) {
+        // Signal that iteration is over
+        payload->ipc_message.metadata = nullptr;
+        return Status::OK();
+      }
+      ARROW_ASSIGN_OR_RAISE(dictionaries_,
+                            ipc::CollectDictionaries(*current_batch_, mapper_));
+      stage_ = Stage::DICTIONARY;
+    }
+
+    if (stage_ == Stage::DICTIONARY) {
+      if (dictionary_index_ == static_cast<int>(dictionaries_.size())) {
+        stage_ = Stage::RECORD_BATCH;
+        return ipc::GetRecordBatchPayload(*current_batch_, ipc_options_,
+                                          &payload->ipc_message);
+      } else {
+        return GetNextDictionary(payload);
+      }
+    }
+
+    RETURN_NOT_OK(reader_->ReadNext(&current_batch_));
+
+    // TODO(ARROW-10787): Delta dictionaries
+    if (!current_batch_) {
+      // Signal that iteration is over
+      payload->ipc_message.metadata = nullptr;
+      return Status::OK();
+    } else {
+      return ipc::GetRecordBatchPayload(*current_batch_, ipc_options_,
+                                        &payload->ipc_message);
+    }
+  }
+
+  Status Close() { return reader_->Close(); }
+
+ private:
+  Status GetNextDictionary(FlightPayload* payload) {
+    const auto& it = dictionaries_[dictionary_index_++];
+    return ipc::GetDictionaryPayload(it.first, it.second, ipc_options_,
+                                     &payload->ipc_message);
+  }
+
+  Stage stage_ = Stage::NEW;
+  std::shared_ptr<RecordBatchReader> reader_;
+  ipc::DictionaryFieldMapper mapper_;
+  ipc::IpcWriteOptions ipc_options_;
+  std::shared_ptr<RecordBatch> current_batch_;
+  std::vector<std::pair<int64_t, std::shared_ptr<Array>>> dictionaries_;
+
+  // Index of next dictionary to send
+  int dictionary_index_ = 0;
+};
+
+FlightMetadataWriter::~FlightMetadataWriter() = default;
+
+FlightDataStream::~FlightDataStream() {}
+Status FlightDataStream::Close() { return Status::OK(); }
+
+RecordBatchStream::RecordBatchStream(const std::shared_ptr<RecordBatchReader>& reader,
+                                     const ipc::IpcWriteOptions& options) {
+  impl_.reset(new RecordBatchStreamImpl(reader, options));
+}
+
+RecordBatchStream::~RecordBatchStream() {
+  ARROW_WARN_NOT_OK(impl_->Close(), "Failed to close FlightDataStream");
+}
+
+Status RecordBatchStream::Close() { return impl_->Close(); }
+
+std::shared_ptr<Schema> RecordBatchStream::schema() { return impl_->schema(); }
+
+arrow::Result<FlightPayload> RecordBatchStream::GetSchemaPayload() {
+  FlightPayload payload;
+  RETURN_NOT_OK(impl_->GetSchemaPayload(&payload));
+  return payload;
+}
+
+arrow::Result<FlightPayload> RecordBatchStream::Next() {
+  FlightPayload payload;
+  RETURN_NOT_OK(impl_->Next(&payload));
+  return payload;
 }
 
 }  // namespace flight

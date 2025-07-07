@@ -55,8 +55,9 @@ module Arrow
           append_null
         when ::Array
           append_value_raw
+          return if value.empty?
           @value_builder ||= value_builder
-          @value_builder.append_values(value, nil)
+          @value_builder.append(*value)
         else
           message = "list value must be nil or Array: #{value.inspect}"
           raise ArgumentError, message

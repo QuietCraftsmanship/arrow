@@ -26,6 +26,7 @@ arrow-src.tar.gz
 *.py[ocd]
 *.so
 *.so.*
+*.bundle
 *.dylib
 .build_cache_dir
 dependency-reduced-pom.xml
@@ -44,17 +45,66 @@ perf.data
 perf.data.old
 
 cpp/.idea/
+.clangd/
+cpp/.clangd/
+.cache/clangd/
+cpp/.cache/clangd/
 cpp/apidoc/xml/
 docs/example.gz
 docs/example1.dat
 docs/example3.dat
 python/.eggs/
 python/doc/
+# Egg metadata
+*.egg-info
 
 .vscode
 .idea/
 .pytest_cache/
 pkgs
-.Rproj.user
-arrow.Rcheck/
 docker_cache
+.gdb_history
+*.orig
+.*.swp
+.*.swo
+
+site/
+
+# R files
+**/.Rproj.user
+**/*.Rcheck/
+**/.Rhistory
+.Rproj.user
+
+# macOS
+cpp/Brewfile.lock.json
+.DS_Store
+
+# docker volumes used for caching
+.docker
+
+# generated native binaries created by java JNI build
+java-dist/
+java-native-c/
+java-native-cpp/
+
+# archery files
+dev/archery/build
+
+swift/Arrow/.build
+
+# Go dependencies
+go/vendor
+# go debug binaries
+__debug_bin
+
+# direnv
+.envrc
+
+# Develocity
+java/.mvn/.gradle-enterprise/
+java/.mvn/.develocity/
+
+# rat
+filtered_rat.txt
+rat.txt

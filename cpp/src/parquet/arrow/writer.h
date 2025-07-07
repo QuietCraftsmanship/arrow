@@ -15,256 +15,169 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef PARQUET_ARROW_WRITER_H
-#define PARQUET_ARROW_WRITER_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
 
+#include "parquet/platform.h"
 #include "parquet/properties.h"
-#include "parquet/types.h"
-#include "parquet/util/visibility.h"
-
-#include "arrow/type.h"
 
 namespace arrow {
 
 class Array;
 class ChunkedArray;
-class MemoryPool;
-class Status;
+class RecordBatch;
+class Schema;
 class Table;
-
-namespace io {
-
-class OutputStream;
-
-}  // namespace io
 
 }  // namespace arrow
 
 namespace parquet {
 
 class FileMetaData;
-class OutputStream;
 class ParquetFileWriter;
 
 namespace arrow {
 
-class PARQUET_EXPORT ArrowWriterProperties {
- public:
-  class Builder {
-   public:
-    Builder()
-        : write_timestamps_as_int96_(false),
-          coerce_timestamps_enabled_(false),
-          coerce_timestamps_unit_(::arrow::TimeUnit::SECOND),
-          truncated_timestamps_allowed_(false) {}
-    virtual ~Builder() {}
-
-    Builder* disable_deprecated_int96_timestamps() {
-      write_timestamps_as_int96_ = false;
-      return this;
-    }
-
-    Builder* enable_deprecated_int96_timestamps() {
-      write_timestamps_as_int96_ = true;
-      return this;
-    }
-
-    Builder* coerce_timestamps(::arrow::TimeUnit::type unit) {
-      coerce_timestamps_enabled_ = true;
-      coerce_timestamps_unit_ = unit;
-      return this;
-    }
-
-    Builder* allow_truncated_timestamps() {
-      truncated_timestamps_allowed_ = true;
-      return this;
-    }
-
-    Builder* disallow_truncated_timestamps() {
-      truncated_timestamps_allowed_ = false;
-      return this;
-    }
-
-    std::shared_ptr<ArrowWriterProperties> build() {
-      return std::shared_ptr<ArrowWriterProperties>(new ArrowWriterProperties(
-          write_timestamps_as_int96_, coerce_timestamps_enabled_, coerce_timestamps_unit_,
-          truncated_timestamps_allowed_));
-    }
-
-   private:
-    bool write_timestamps_as_int96_;
-
-    bool coerce_timestamps_enabled_;
-    ::arrow::TimeUnit::type coerce_timestamps_unit_;
-    bool truncated_timestamps_allowed_;
-  };
-
-  bool support_deprecated_int96_timestamps() const { return write_timestamps_as_int96_; }
-
-  bool coerce_timestamps_enabled() const { return coerce_timestamps_enabled_; }
-  ::arrow::TimeUnit::type coerce_timestamps_unit() const {
-    return coerce_timestamps_unit_;
-  }
-
-  bool truncated_timestamps_allowed() const { return truncated_timestamps_allowed_; }
-
- private:
-  explicit ArrowWriterProperties(bool write_nanos_as_int96,
-                                 bool coerce_timestamps_enabled,
-                                 ::arrow::TimeUnit::type coerce_timestamps_unit,
-                                 bool truncated_timestamps_allowed)
-      : write_timestamps_as_int96_(write_nanos_as_int96),
-        coerce_timestamps_enabled_(coerce_timestamps_enabled),
-        coerce_timestamps_unit_(coerce_timestamps_unit),
-        truncated_timestamps_allowed_(truncated_timestamps_allowed) {}
-
-  const bool write_timestamps_as_int96_;
-  const bool coerce_timestamps_enabled_;
-  const ::arrow::TimeUnit::type coerce_timestamps_unit_;
-  const bool truncated_timestamps_allowed_;
-};
-
-std::shared_ptr<ArrowWriterProperties> PARQUET_EXPORT default_arrow_writer_properties();
-
-/**
- * Iterative API:
- *  Start a new RowGroup/Chunk with NewRowGroup
- *  Write column-by-column the whole column chunk
- */
+/// \brief Iterative FileWriter class
+///
+/// For basic usage, can write a Table at a time, creating one or more row
+/// groups per write call.
+///
+/// For advanced usage, can write column-by-column: Start a new RowGroup or
+/// Chunk with NewRowGroup, then write column-by-column the whole column chunk.
+///
+/// If PARQUET:field_id is present as a metadata key on a field, and the corresponding
+/// value is a nonnegative integer, then it will be used as the field_id in the parquet
+/// file.
 class PARQUET_EXPORT FileWriter {
  public:
-  FileWriter(::arrow::MemoryPool* pool, std::unique_ptr<ParquetFileWriter> writer,
-             const std::shared_ptr<ArrowWriterProperties>& arrow_properties =
-                 default_arrow_writer_properties());
+  static ::arrow::Status Make(MemoryPool* pool, std::unique_ptr<ParquetFileWriter> writer,
+                              std::shared_ptr<::arrow::Schema> schema,
+                              std::shared_ptr<ArrowWriterProperties> arrow_properties,
+                              std::unique_ptr<FileWriter>* out);
 
-  static ::arrow::Status Open(const ::arrow::Schema& schema, ::arrow::MemoryPool* pool,
-                              const std::shared_ptr<OutputStream>& sink,
-                              const std::shared_ptr<WriterProperties>& properties,
-                              std::unique_ptr<FileWriter>* writer);
+  /// \brief Try to create an Arrow to Parquet file writer.
+  ///
+  /// \param schema schema of data that will be passed.
+  /// \param pool memory pool to use.
+  /// \param sink output stream to write Parquet data.
+  /// \param properties general Parquet writer properties.
+  /// \param arrow_properties Arrow-specific writer properties.
+  ///
+  /// \since 11.0.0
+  static ::arrow::Result<std::unique_ptr<FileWriter>> Open(
+      const ::arrow::Schema& schema, MemoryPool* pool,
+      std::shared_ptr<::arrow::io::OutputStream> sink,
+      std::shared_ptr<WriterProperties> properties = default_writer_properties(),
+      std::shared_ptr<ArrowWriterProperties> arrow_properties =
+          default_arrow_writer_properties());
 
-  static ::arrow::Status Open(
-      const ::arrow::Schema& schema, ::arrow::MemoryPool* pool,
-      const std::shared_ptr<OutputStream>& sink,
-      const std::shared_ptr<WriterProperties>& properties,
-      const std::shared_ptr<ArrowWriterProperties>& arrow_properties,
-      std::unique_ptr<FileWriter>* writer);
-
-  static ::arrow::Status Open(const ::arrow::Schema& schema, ::arrow::MemoryPool* pool,
-                              const std::shared_ptr<::arrow::io::OutputStream>& sink,
-                              const std::shared_ptr<WriterProperties>& properties,
-                              std::unique_ptr<FileWriter>* writer);
-
-  static ::arrow::Status Open(
-      const ::arrow::Schema& schema, ::arrow::MemoryPool* pool,
-      const std::shared_ptr<::arrow::io::OutputStream>& sink,
-      const std::shared_ptr<WriterProperties>& properties,
-      const std::shared_ptr<ArrowWriterProperties>& arrow_properties,
-      std::unique_ptr<FileWriter>* writer);
+  /// Return the Arrow schema to be written to.
+  virtual std::shared_ptr<::arrow::Schema> schema() const = 0;
 
   /// \brief Write a Table to Parquet.
-  ::arrow::Status WriteTable(const ::arrow::Table& table, int64_t chunk_size);
+  ///
+  /// \param table Arrow table to write.
+  /// \param chunk_size maximum number of rows to write per row group.
+  virtual ::arrow::Status WriteTable(
+      const ::arrow::Table& table, int64_t chunk_size = DEFAULT_MAX_ROW_GROUP_LENGTH) = 0;
 
-  ::arrow::Status NewRowGroup(int64_t chunk_size);
-  ::arrow::Status WriteColumnChunk(const ::arrow::Array& data);
+  /// \brief Start a new row group.
+  ///
+  /// Returns an error if not all columns have been written.
+  virtual ::arrow::Status NewRowGroup() = 0;
+
+  /// \brief Start a new row group.
+  ///
+  /// \deprecated Deprecated in 19.0.0.
+  ARROW_DEPRECATED(
+      "Deprecated in 19.0.0. Use NewRowGroup() without the `chunk_size` argument.")
+  virtual ::arrow::Status NewRowGroup(int64_t chunk_size) { return NewRowGroup(); }
+
+  /// \brief Write ColumnChunk in row group using an array.
+  virtual ::arrow::Status WriteColumnChunk(const ::arrow::Array& data) = 0;
 
   /// \brief Write ColumnChunk in row group using slice of a ChunkedArray
-  ::arrow::Status WriteColumnChunk(const std::shared_ptr<::arrow::ChunkedArray>& data,
-                                   const int64_t offset, const int64_t size);
-  ::arrow::Status WriteColumnChunk(const std::shared_ptr<::arrow::ChunkedArray>& data);
-  ::arrow::Status Close();
+  virtual ::arrow::Status WriteColumnChunk(
+      const std::shared_ptr<::arrow::ChunkedArray>& data, int64_t offset,
+      int64_t size) = 0;
 
+  /// \brief Write ColumnChunk in a row group using a ChunkedArray
+  virtual ::arrow::Status WriteColumnChunk(
+      const std::shared_ptr<::arrow::ChunkedArray>& data) = 0;
+
+  /// \brief Start a new buffered row group.
+  ///
+  /// Returns an error if not all columns have been written.
+  virtual ::arrow::Status NewBufferedRowGroup() = 0;
+
+  /// \brief Write a RecordBatch into the buffered row group.
+  ///
+  /// Multiple RecordBatches can be written into the same row group
+  /// through this method.
+  ///
+  /// WriterProperties.max_row_group_length() is respected and a new
+  /// row group will be created if the current row group exceeds the
+  /// limit.
+  ///
+  /// Batches get flushed to the output stream once NewBufferedRowGroup()
+  /// or Close() is called.
+  ///
+  /// WARNING: If you are writing multiple files in parallel in the same
+  /// executor, deadlock may occur if ArrowWriterProperties::use_threads
+  /// is set to true to write columns in parallel. Please disable use_threads
+  /// option in this case.
+  virtual ::arrow::Status WriteRecordBatch(const ::arrow::RecordBatch& batch) = 0;
+
+  /// \brief Write the footer and close the file.
+  virtual ::arrow::Status Close() = 0;
   virtual ~FileWriter();
 
-  ::arrow::MemoryPool* memory_pool() const;
-
- private:
-  class PARQUET_NO_EXPORT Impl;
-  std::unique_ptr<Impl> impl_;
+  virtual MemoryPool* memory_pool() const = 0;
+  /// \brief Add key-value metadata to the file.
+  /// \param[in] key_value_metadata the metadata to add.
+  /// \note This will overwrite any existing metadata with the same key.
+  /// \return Error if Close() has been called.
+  ///
+  /// WARNING: If `store_schema` is enabled, `ARROW:schema` would be stored
+  /// in the key-value metadata. Overwriting this key would result in
+  /// `store_schema` being unusable during read.
+  virtual ::arrow::Status AddKeyValueMetadata(
+      const std::shared_ptr<const ::arrow::KeyValueMetadata>& key_value_metadata) = 0;
+  /// \brief Return the file metadata, only available after calling Close().
+  virtual const std::shared_ptr<FileMetaData> metadata() const = 0;
 };
-
-/// \brief Write Parquet file metadata only to indicated OutputStream
-PARQUET_EXPORT
-::arrow::Status WriteFileMetaData(const FileMetaData& file_metadata, OutputStream* sink);
 
 /// \brief Write Parquet file metadata only to indicated Arrow OutputStream
 PARQUET_EXPORT
 ::arrow::Status WriteFileMetaData(const FileMetaData& file_metadata,
-                                  const std::shared_ptr<::arrow::io::OutputStream>& sink);
+                                  ::arrow::io::OutputStream* sink);
 
-/**
- * Write a Table to Parquet.
- *
- * The table shall only consist of columns of primitive type or of primitive lists.
- */
-::arrow::Status PARQUET_EXPORT WriteTable(
-    const ::arrow::Table& table, ::arrow::MemoryPool* pool,
-    const std::shared_ptr<OutputStream>& sink, int64_t chunk_size,
-    const std::shared_ptr<WriterProperties>& properties = default_writer_properties(),
-    const std::shared_ptr<ArrowWriterProperties>& arrow_properties =
-        default_arrow_writer_properties());
+/// \brief Write metadata-only Parquet file to indicated Arrow OutputStream
+PARQUET_EXPORT
+::arrow::Status WriteMetaDataFile(const FileMetaData& file_metadata,
+                                  ::arrow::io::OutputStream* sink);
 
-::arrow::Status PARQUET_EXPORT WriteTable(
-    const ::arrow::Table& table, ::arrow::MemoryPool* pool,
-    const std::shared_ptr<::arrow::io::OutputStream>& sink, int64_t chunk_size,
-    const std::shared_ptr<WriterProperties>& properties = default_writer_properties(),
-    const std::shared_ptr<ArrowWriterProperties>& arrow_properties =
-        default_arrow_writer_properties());
-
-namespace internal {
-
-/**
- * Timestamp conversion constants
- */
-constexpr int64_t kJulianEpochOffsetDays = INT64_C(2440588);
-
-template <int64_t UnitPerDay, int64_t NanosecondsPerUnit>
-inline void ArrowTimestampToImpalaTimestamp(const int64_t time, Int96* impala_timestamp) {
-  int64_t julian_days = (time / UnitPerDay) + kJulianEpochOffsetDays;
-  (*impala_timestamp).value[2] = (uint32_t)julian_days;
-
-  int64_t last_day_units = time % UnitPerDay;
-  int64_t* impala_last_day_nanos = reinterpret_cast<int64_t*>(impala_timestamp);
-  *impala_last_day_nanos = last_day_units * NanosecondsPerUnit;
-}
-
-constexpr int64_t kSecondsInNanos = INT64_C(1000000000);
-
-inline void SecondsToImpalaTimestamp(const int64_t seconds, Int96* impala_timestamp) {
-  ArrowTimestampToImpalaTimestamp<kSecondsPerDay, kSecondsInNanos>(seconds,
-                                                                   impala_timestamp);
-}
-
-constexpr int64_t kMillisecondsInNanos = kSecondsInNanos / INT64_C(1000);
-
-inline void MillisecondsToImpalaTimestamp(const int64_t milliseconds,
-                                          Int96* impala_timestamp) {
-  ArrowTimestampToImpalaTimestamp<kMillisecondsPerDay, kMillisecondsInNanos>(
-      milliseconds, impala_timestamp);
-}
-
-constexpr int64_t kMicrosecondsInNanos = kMillisecondsInNanos / INT64_C(1000);
-
-inline void MicrosecondsToImpalaTimestamp(const int64_t microseconds,
-                                          Int96* impala_timestamp) {
-  ArrowTimestampToImpalaTimestamp<kMicrosecondsPerDay, kMicrosecondsInNanos>(
-      microseconds, impala_timestamp);
-}
-
-constexpr int64_t kNanosecondsInNanos = INT64_C(1);
-
-inline void NanosecondsToImpalaTimestamp(const int64_t nanoseconds,
-                                         Int96* impala_timestamp) {
-  ArrowTimestampToImpalaTimestamp<kNanosecondsPerDay, kNanosecondsInNanos>(
-      nanoseconds, impala_timestamp);
-}
-
-}  // namespace internal
+/// \brief Write a Table to Parquet.
+///
+/// This writes one table in a single shot. To write a Parquet file with
+/// multiple tables iteratively, see parquet::arrow::FileWriter.
+///
+/// \param table Table to write.
+/// \param pool memory pool to use.
+/// \param sink output stream to write Parquet data.
+/// \param chunk_size maximum number of rows to write per row group.
+/// \param properties general Parquet writer properties.
+/// \param arrow_properties Arrow-specific writer properties.
+::arrow::Status PARQUET_EXPORT
+WriteTable(const ::arrow::Table& table, MemoryPool* pool,
+           std::shared_ptr<::arrow::io::OutputStream> sink,
+           int64_t chunk_size = DEFAULT_MAX_ROW_GROUP_LENGTH,
+           std::shared_ptr<WriterProperties> properties = default_writer_properties(),
+           std::shared_ptr<ArrowWriterProperties> arrow_properties =
+               default_arrow_writer_properties());
 
 }  // namespace arrow
-
 }  // namespace parquet
-
-#endif  // PARQUET_ARROW_WRITER_H

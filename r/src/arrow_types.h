@@ -17,186 +17,329 @@
 
 #pragma once
 
-#include <RcppCommon.h>
+#include <cpp11/R.hpp>
 
-#undef Free
-#include <arrow/api.h>
-#include <arrow/compute/api.h>
-#include <arrow/csv/reader.h>
-#include <arrow/io/compressed.h>
-#include <arrow/io/file.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/feather.h>
-#include <arrow/ipc/reader.h>
-#include <arrow/ipc/writer.h>
-#include <arrow/type.h>
-#include <arrow/util/compression.h>
+#include "./arrow_cpp11.h"
 
-#define STOP_IF_NOT(TEST, MSG)  \
-  do {                          \
-    if (!TEST) Rcpp::stop(MSG); \
-  } while (0)
+#include <arrow/buffer.h>  // for RBuffer definition below
+#include <arrow/result.h>
+#include <arrow/status.h>
 
-#define STOP_IF_NOT_OK(s) STOP_IF_NOT(s.ok(), s.ToString())
+#include <limits>
+#include <memory>
+#include <utility>
 
-template <typename T>
-inline void STOP_IF_NULL(T* ptr) {
-  STOP_IF_NOT(ptr, "invalid data");
-}
+// forward declaration-only headers
+#include <arrow/c/abi.h>
+#include <arrow/compute/type_fwd.h>
+#include <arrow/csv/type_fwd.h>
 
-template <typename T>
-struct NoDelete {
-  inline void operator()(T* ptr){};
-};
+#if defined(ARROW_R_WITH_ACERO)
+#include <arrow/acero/options.h>
+#include <arrow/acero/type_fwd.h>
+namespace acero = ::arrow::acero;
+#endif
+
+#if defined(ARROW_R_WITH_DATASET)
+#include <arrow/dataset/type_fwd.h>
+#endif
+
+#include <arrow/filesystem/type_fwd.h>
+#include <arrow/io/type_fwd.h>
+#include <arrow/ipc/type_fwd.h>
+
+#if defined(ARROW_R_WITH_JSON)
+#include <arrow/json/type_fwd.h>
+#endif
+
+#include <arrow/type_fwd.h>
+#include <arrow/util/type_fwd.h>
+
+class ExecPlanReader;
+
+#if defined(ARROW_R_WITH_PARQUET)
+#include <parquet/type_fwd.h>
+#endif
+
+#if defined(ARROW_R_WITH_DATASET)
+namespace ds = ::arrow::dataset;
+#endif
+
+namespace compute = ::arrow::compute;
+namespace fs = ::arrow::fs;
+
+std::shared_ptr<arrow::RecordBatch> RecordBatch__from_arrays(SEXP, SEXP);
+arrow::MemoryPool* gc_memory_pool();
+arrow::compute::ExecContext* gc_context();
+
+#define VECTOR_PTR_RO(x) ((const SEXP*)DATAPTR_RO(x))
 
 namespace arrow {
-namespace r {
-struct symbols {
-  static SEXP units;
-  static SEXP xp;
-  static SEXP dot_Internal;
-  static SEXP inspect;
-};
-}  // namespace r
-}  // namespace arrow
 
-namespace Rcpp {
-namespace internal {
-
-template <typename Pointer>
-Pointer r6_to_smart_pointer(SEXP self) {
-  return reinterpret_cast<Pointer>(
-      EXTPTR_PTR(Rf_findVarInFrame(self, arrow::r::symbols::xp)));
-}
-
-}  // namespace internal
-
-template <typename T>
-class ConstReferenceSmartPtrInputParameter {
+// Most of the time we can safely call R code and assume that any evaluation
+// error will throw a cpp11::unwind_exception. There are other times (e.g.,
+// when using RTasks) that we need to wait for a background task to finish or
+// run cleanup code if execution fails. This class allows us to attach
+// the `token` required to reconstruct the cpp11::unwind_exception and throw it
+// when it is safe to do so. This is done automatically by StopIfNotOk(), which
+// checks for a .detail() inheriting from UnwindProtectDetail.
+class UnwindProtectDetail : public StatusDetail {
  public:
-  using const_reference = const T&;
-
-  ConstReferenceSmartPtrInputParameter(SEXP self)
-      : ptr(internal::r6_to_smart_pointer<const T*>(self)) {}
-
-  inline operator const_reference() { return *ptr; }
-
- private:
-  const T* ptr;
+  SEXP token;
+  explicit UnwindProtectDetail(SEXP token) : token(token) {}
+  virtual const char* type_id() const { return "UnwindProtectDetail"; }
+  virtual std::string ToString() const { return "R code execution error"; }
 };
 
-namespace traits {
-
-template <typename T>
-struct input_parameter<const std::shared_ptr<T>&> {
-  typedef typename Rcpp::ConstReferenceSmartPtrInputParameter<std::shared_ptr<T>> type;
-};
-
-template <typename T>
-struct input_parameter<const std::unique_ptr<T>&> {
-  typedef typename Rcpp::ConstReferenceSmartPtrInputParameter<std::unique_ptr<T>> type;
-};
-
-struct wrap_type_shared_ptr_tag {};
-struct wrap_type_unique_ptr_tag {};
-
-template <typename T>
-struct wrap_type_traits<std::shared_ptr<T>> {
-  using wrap_category = wrap_type_shared_ptr_tag;
-};
-
-template <typename T>
-struct wrap_type_traits<std::unique_ptr<T>> {
-  using wrap_category = wrap_type_unique_ptr_tag;
-};
-
-}  // namespace traits
-namespace internal {
-
-template <typename T>
-inline SEXP wrap_dispatch(const T& x, Rcpp::traits::wrap_type_shared_ptr_tag);
-
-template <typename T>
-inline SEXP wrap_dispatch(const T& x, Rcpp::traits::wrap_type_unique_ptr_tag);
-
-}  // namespace internal
-
-}  // namespace Rcpp
-
-#include <Rcpp.h>
-
-RCPP_EXPOSED_ENUM_NODECL(arrow::Type::type)
-RCPP_EXPOSED_ENUM_NODECL(arrow::DateUnit)
-RCPP_EXPOSED_ENUM_NODECL(arrow::TimeUnit::type)
-RCPP_EXPOSED_ENUM_NODECL(arrow::StatusCode)
-RCPP_EXPOSED_ENUM_NODECL(arrow::io::FileMode::type)
-RCPP_EXPOSED_ENUM_NODECL(arrow::ipc::Message::Type)
-RCPP_EXPOSED_ENUM_NODECL(arrow::Compression::type)
-
-namespace Rcpp {
-namespace internal {
-
-template <typename T>
-inline SEXP wrap_dispatch(const T& x, Rcpp::traits::wrap_type_shared_ptr_tag) {
-  return Rcpp::XPtr<std::shared_ptr<typename T::element_type>>(
-      new std::shared_ptr<typename T::element_type>(x));
+static inline Status StatusUnwindProtect(SEXP token, std::string reason = "") {
+  return Status::Invalid("R code execution error (", reason, ")")
+      .WithDetail(std::make_shared<UnwindProtectDetail>(token));
 }
 
-template <typename T>
-inline SEXP wrap_dispatch(const T& x, Rcpp::traits::wrap_type_unique_ptr_tag) {
-  return Rcpp::XPtr<std::unique_ptr<typename T::element_type>>(
-      new std::unique_ptr<typename T::element_type>(const_cast<T&>(x).release()));
+static inline void StopIfNotOk(const Status& status) {
+  if (!status.ok()) {
+    auto detail = status.detail();
+    const UnwindProtectDetail* unwind_detail =
+        dynamic_cast<const UnwindProtectDetail*>(detail.get());
+    if (unwind_detail) {
+      throw cpp11::unwind_exception(unwind_detail->token);
+    } else {
+      // We need to translate this to "native" encoding for the error to be
+      // displayed properly using cpp11::stop()
+      std::string s = status.ToString();
+      cpp11::strings s_utf8 = cpp11::as_sexp(s);
+      const char* s_native = cpp11::safe[Rf_translateChar](s_utf8[0]);
+
+      // ARROW-13039: be careful not to interpret our error message as a %-format string
+      cpp11::stop("%s", s_native);
+    }
+  }
 }
 
-}  // namespace internal
-
-}  // namespace Rcpp
-
-namespace Rcpp {
-using NumericVector_ = Rcpp::Vector<REALSXP, Rcpp::NoProtectStorage>;
-using IntegerVector_ = Rcpp::Vector<INTSXP, Rcpp::NoProtectStorage>;
-using LogicalVector_ = Rcpp::Vector<LGLSXP, Rcpp::NoProtectStorage>;
-using StringVector_ = Rcpp::Vector<STRSXP, Rcpp::NoProtectStorage>;
-using CharacterVector_ = StringVector_;
-using RawVector_ = Rcpp::Vector<RAWSXP, Rcpp::NoProtectStorage>;
-using List_ = Rcpp::Vector<VECSXP, Rcpp::NoProtectStorage>;
-
-template <int RTYPE>
-inline constexpr typename Rcpp::Vector<RTYPE>::stored_type default_value() {
-  return Rcpp::Vector<RTYPE>::get_na();
-}
-template <>
-inline constexpr Rbyte default_value<RAWSXP>() {
-  return 0;
+template <typename R>
+auto ValueOrStop(R&& result) -> decltype(std::forward<R>(result).ValueOrDie()) {
+  StopIfNotOk(result.status());
+  return std::forward<R>(result).ValueOrDie();
 }
 
-}  // namespace Rcpp
-
-SEXP ChunkedArray__as_vector(const std::shared_ptr<arrow::ChunkedArray>& chunked_array);
-SEXP Array__as_vector(const std::shared_ptr<arrow::Array>& array);
-std::shared_ptr<arrow::Array> Array__from_vector(SEXP x);
-std::shared_ptr<arrow::RecordBatch> RecordBatch__from_dataframe(Rcpp::DataFrame tbl);
-
-namespace arrow {
 namespace r {
+class RTasks;
+
+std::shared_ptr<arrow::DataType> InferArrowType(SEXP x);
+std::shared_ptr<arrow::Array> vec_to_arrow__reuse_memory(SEXP x);
+bool can_reuse_memory(SEXP x, const std::shared_ptr<arrow::DataType>& type);
+
+// These are the types of objects whose conversion to Arrow Arrays is handled
+// entirely in C++. Other types of objects are converted using the
+// infer_type() S3 generic and the as_arrow_array() S3 generic.
+// For data.frame, we need to recurse because the internal conversion
+// can't accomodate calling into R. If the user specifies a target type
+// and that target type is an ExtensionType, we also can't convert
+// natively (but we check for this separately when it applies).
+static inline bool can_convert_native(SEXP x) {
+  if (!Rf_isObject(x)) {
+    return true;
+  } else if (Rf_inherits(x, "data.frame")) {
+    for (R_xlen_t i = 0; i < Rf_xlength(x); i++) {
+      if (!can_convert_native(VECTOR_ELT(x, i))) {
+        return false;
+      }
+    }
+
+    return true;
+  } else {
+    return Rf_inherits(x, "factor") || Rf_inherits(x, "Date") ||
+           Rf_inherits(x, "integer64") || Rf_inherits(x, "POSIXct") ||
+           Rf_inherits(x, "hms") || Rf_inherits(x, "difftime") ||
+           Rf_inherits(x, "data.frame") || Rf_inherits(x, "blob") ||
+           Rf_inherits(x, "arrow_binary") || Rf_inherits(x, "arrow_large_binary") ||
+           Rf_inherits(x, "arrow_fixed_size_binary") ||
+           Rf_inherits(x, "vctrs_unspecified") || Rf_inherits(x, "AsIs");
+  }
+}
+
+Status count_fields(SEXP lst, int* out);
 
 void inspect(SEXP obj);
+std::shared_ptr<arrow::Array> vec_to_arrow_Array(
+    SEXP x, const std::shared_ptr<arrow::DataType>& type, bool type_inferred);
+std::shared_ptr<arrow::ChunkedArray> vec_to_arrow_ChunkedArray(
+    SEXP x, const std::shared_ptr<arrow::DataType>& type, bool type_inferred);
 
 // the integer64 sentinel
 constexpr int64_t NA_INT64 = std::numeric_limits<int64_t>::min();
 
-template <int RTYPE, typename Vec = Rcpp::Vector<RTYPE>>
+template <typename RVector>
 class RBuffer : public MutableBuffer {
  public:
-  RBuffer(Vec vec)
-      : MutableBuffer(reinterpret_cast<uint8_t*>(vec.begin()),
-                      vec.size() * sizeof(typename Vec::stored_type)),
+  explicit RBuffer(RVector vec)
+      : MutableBuffer(reinterpret_cast<uint8_t*>(getDataPointer(vec)),
+                      vec.size() * sizeof(typename RVector::value_type),
+                      arrow::CPUDevice::memory_manager(gc_memory_pool())),
         vec_(vec) {}
 
  private:
   // vec_ holds the memory
-  Vec vec_;
+  RVector vec_;
+
+  static void* getDataPointer(RVector& vec) {
+    if (TYPEOF(vec) == LGLSXP) {
+      return LOGICAL(vec);
+    } else if (TYPEOF(vec) == INTSXP) {
+      return INTEGER(vec);
+    } else if (TYPEOF(vec) == REALSXP) {
+      return REAL(vec);
+    } else if (TYPEOF(vec) == CPLXSXP) {
+      return COMPLEX(vec);
+    } else if (TYPEOF(vec) == STRSXP) {
+      // We don't want to expose the string data here, so we error
+      cpp11::stop("Operation not supported for string vectors.");
+    } else {
+      // raw
+      return RAW(vec);
+    }
+  }
 };
+
+std::shared_ptr<arrow::DataType> InferArrowTypeFromFactor(SEXP);
+
+void validate_slice_offset(R_xlen_t offset, int64_t len);
+
+void validate_slice_length(R_xlen_t length, int64_t available);
+
+void validate_index(int64_t i, int64_t len);
+
+template <typename Lambda>
+void TraverseDots(cpp11::list dots, int num_fields, Lambda lambda) {
+  cpp11::strings names(dots.attr(R_NamesSymbol));
+
+  for (int i = 0, j = 0; j < num_fields; i++) {
+    auto name_i = names[i];
+
+    if (name_i.size() == 0) {
+      cpp11::list x_i = dots[i];
+      cpp11::strings names_x_i(x_i.attr(R_NamesSymbol));
+      R_xlen_t n_i = x_i.size();
+      for (R_xlen_t k = 0; k < n_i; k++, j++) {
+        lambda(j, x_i[k], names_x_i[k]);
+      }
+    } else {
+      lambda(j, dots[i], name_i);
+      j++;
+    }
+  }
+}
+
+inline cpp11::writable::list FlattenDots(cpp11::list dots, int num_fields) {
+  std::vector<SEXP> out(num_fields);
+  auto set = [&](int j, SEXP x, cpp11::r_string) { out[j] = x; };
+  TraverseDots(dots, num_fields, set);
+
+  return cpp11::writable::list(out.begin(), out.end());
+}
+
+arrow::Status InferSchemaFromDots(SEXP lst, SEXP schema_sxp, int num_fields,
+                                  std::shared_ptr<arrow::Schema>& schema);
+
+arrow::Status AddMetadataFromDots(SEXP lst, int num_fields,
+                                  std::shared_ptr<arrow::Schema>& schema);
+
+namespace altrep {
+
+#if defined(HAS_ALTREP)
+void Init_Altrep_classes(DllInfo* dll);
+#endif
+
+SEXP MakeAltrepVector(const std::shared_ptr<ChunkedArray>& chunked_array);
+bool is_arrow_altrep(SEXP x);
+bool is_unmaterialized_arrow_altrep(SEXP x);
+std::shared_ptr<ChunkedArray> vec_to_arrow_altrep_bypass(SEXP);
+
+}  // namespace altrep
+
+bool DictionaryChunkArrayNeedUnification(
+    const std::shared_ptr<ChunkedArray>& chunked_array);
 
 }  // namespace r
 }  // namespace arrow
+
+namespace cpp11 {
+
+template <typename T>
+struct r6_class_name {
+  static const char* get(const std::shared_ptr<T>& ptr) {
+    static const std::string name = arrow::util::nameof<T>(/*strip_namespace=*/true);
+    return name.c_str();
+  }
+};
+
+// Overrides of default R6 class names:
+#define R6_CLASS_NAME(CLASS, NAME)                                         \
+  template <>                                                              \
+  struct r6_class_name<CLASS> {                                            \
+    static const char* get(const std::shared_ptr<CLASS>&) { return NAME; } \
+  }
+
+R6_CLASS_NAME(arrow::csv::ReadOptions, "CsvReadOptions");
+R6_CLASS_NAME(arrow::csv::ParseOptions, "CsvParseOptions");
+R6_CLASS_NAME(arrow::csv::ConvertOptions, "CsvConvertOptions");
+R6_CLASS_NAME(arrow::csv::TableReader, "CsvTableReader");
+R6_CLASS_NAME(arrow::csv::WriteOptions, "CsvWriteOptions");
+
+#if defined(ARROW_R_WITH_PARQUET)
+R6_CLASS_NAME(parquet::ArrowReaderProperties, "ParquetArrowReaderProperties");
+R6_CLASS_NAME(parquet::ReaderProperties, "ParquetReaderProperties");
+R6_CLASS_NAME(parquet::ArrowWriterProperties, "ParquetArrowWriterProperties");
+R6_CLASS_NAME(parquet::WriterProperties, "ParquetWriterProperties");
+R6_CLASS_NAME(parquet::arrow::FileReader, "ParquetFileReader");
+R6_CLASS_NAME(parquet::WriterPropertiesBuilder, "ParquetWriterPropertiesBuilder");
+R6_CLASS_NAME(parquet::arrow::FileWriter, "ParquetFileWriter");
+#endif
+
+R6_CLASS_NAME(arrow::ipc::feather::Reader, "FeatherReader");
+
+#if defined(ARROW_R_WITH_JSON)
+R6_CLASS_NAME(arrow::json::ReadOptions, "JsonReadOptions");
+R6_CLASS_NAME(arrow::json::ParseOptions, "JsonParseOptions");
+R6_CLASS_NAME(arrow::json::TableReader, "JsonTableReader");
+#endif
+
+#undef R6_CLASS_NAME
+
+// Declarations of discriminated base classes.
+// Definitions reside in corresponding .cpp files.
+template <>
+struct r6_class_name<fs::FileSystem> {
+  static const char* get(const std::shared_ptr<fs::FileSystem>&);
+};
+
+template <>
+struct r6_class_name<arrow::Array> {
+  static const char* get(const std::shared_ptr<arrow::Array>&);
+};
+
+template <>
+struct r6_class_name<arrow::Scalar> {
+  static const char* get(const std::shared_ptr<arrow::Scalar>&);
+};
+
+template <>
+struct r6_class_name<arrow::DataType> {
+  static const char* get(const std::shared_ptr<arrow::DataType>&);
+};
+
+#if defined(ARROW_R_WITH_DATASET)
+
+template <>
+struct r6_class_name<ds::Dataset> {
+  static const char* get(const std::shared_ptr<ds::Dataset>&);
+};
+
+template <>
+struct r6_class_name<ds::FileFormat> {
+  static const char* get(const std::shared_ptr<ds::FileFormat>&);
+};
+
+#endif
+
+}  // namespace cpp11

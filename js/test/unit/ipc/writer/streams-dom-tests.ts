@@ -15,46 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../../data/tables';
+import { as, from } from 'ix/Ix.asynciterable';
+import { flatMap, tap } from 'ix/Ix.asynciterable.operators';
 
-import { AsyncIterable } from 'ix';
-
+import { generateRandomTables } from '../../../data/tables.js';
 import {
-    Table,
-    RecordBatchReader,
-    RecordBatchWriter,
-    RecordBatchFileWriter,
-    RecordBatchJSONWriter,
-    RecordBatchStreamWriter,
-} from '../../../Arrow';
-
-import {
-    nodeToDOMStream,
     ArrowIOTestHelper,
     concatBuffersAsync,
     readableDOMStreamToAsyncIterator
-} from '../helpers';
+} from '../helpers.js';
+import {
+    validateAsyncRecordBatchReader,
+    validateRecordBatchAsyncIterator, validateRecordBatchReader
+} from '../validate.js';
 
 import {
-    validateRecordBatchReader,
-    validateAsyncRecordBatchReader,
-    validateRecordBatchAsyncIterator
-} from '../validate';
+    RecordBatchFileWriter,
+    RecordBatchJSONWriter, RecordBatchReader, RecordBatchStreamWriter, RecordBatchWriter, Table
+} from 'apache-arrow';
 
 (() => {
 
     if (process.env.TEST_DOM_STREAMS !== 'true') {
-        return test('not testing DOM streams because process.env.TEST_DOM_STREAMS !== "true"', () => {});
+        return test('not testing DOM streams because process.env.TEST_DOM_STREAMS !== "true"', () => { });
     }
-
-    /* tslint:disable */
-    const { PassThrough } = require('stream');
-
-    /* tslint:disable */
-    const { parse: bignumJSONParse } = require('json-bignum');
 
     for (const table of generateRandomTables([10, 20, 30])) {
 
@@ -110,13 +94,13 @@ import {
 
             describe(`RecordBatchJSONWriter`, () => {
 
-                const toJSON = (x: any): { schema: any } => bignumJSONParse(`${Buffer.from(x)}`);
+                const toJSON = (x: any): { schema: any } => JSON.parse(`${Buffer.from(x)}`);
 
                 test('Uint8Array', json.buffer((source) => validate(toJSON(source))));
                 test('Promise<Uint8Array>', json.buffer((source) => validate(Promise.resolve(toJSON(source)))));
 
                 async function validate(source: { schema: any } | Promise<{ schema: any }>) {
-                    const reader = await RecordBatchReader.from(<any> source);
+                    const reader = await RecordBatchReader.from(<any>source);
                     const writer = await RecordBatchJSONWriter.writeAll(reader);
                     const buffer = await concatBuffersAsync(writer.toDOMStream());
                     validateRecordBatchReader('json', 3, RecordBatchReader.from(toJSON(buffer)));
@@ -166,7 +150,7 @@ import {
                     test('Promise<stream.Readable>', file.nodeReadableStream(wrapArgInPromise(validate)));
                     test('Promise<ReadableStream>', file.whatwgReadableStream(wrapArgInPromise(validate)));
                     test('Promise<ReadableByteStream>', file.whatwgReadableByteStream(wrapArgInPromise(validate)));
-    
+
                     async function validate(source: any) {
                         const writer = new RecordBatchFileWriter();
                         /* no await */ writer.writeAll(await RecordBatchReader.from(source));
@@ -233,49 +217,44 @@ import {
 
     describe(`RecordBatchStreamWriter.throughDOM`, () => {
 
-        const psOpts = { objectMode: true };
         const opts = { autoDestroy: false };
         const sleep = (n: number) => new Promise((r) => setTimeout(r, n));
 
         it(`should write a stream of tables to the same output stream`, async () => {
 
             const tables = [] as Table[];
-            const stream = (AsyncIterable.from(generateRandomTables([10, 20, 30]))
+            const stream: ReadableStream<any> = from(generateRandomTables([10, 20, 30]))
                 // insert some asynchrony
-                .tap({ async next(table) { tables.push(table); await sleep(1); } })
-                // have to bail out to `any` until Ix supports DOM streams
-                .pipe((xs: any) => <any> nodeToDOMStream(xs.pipe(new PassThrough(psOpts)))) as any)
-                .pipeThrough(RecordBatchStreamWriter.throughDOM(opts)) as ReadableStream<Uint8Array>;
+                .pipe(tap({ async next(table: Table) { tables.push(table); await sleep(1); } }))
+                .pipeThrough(RecordBatchStreamWriter.throughDOM(opts));
 
             for await (const reader of RecordBatchReader.readAll(stream)) {
                 const sourceTable = tables.shift()!;
-                const streamTable = await Table.from(reader);
+                const streamTable = new Table(await reader.readAll());
                 expect(streamTable).toEqualTable(sourceTable);
             }
 
-            expect(tables.length).toBe(0);
+            expect(tables).toHaveLength(0);
             expect(stream.locked).toBe(false);
         });
 
         it(`should write a stream of record batches to the same output stream`, async () => {
 
             const tables = [] as Table[];
-            const stream = (AsyncIterable.from(generateRandomTables([10, 20, 30]))
+            const stream = from(generateRandomTables([10, 20, 30]))
                 // insert some asynchrony
-                .tap({ async next(table) { tables.push(table); await sleep(1); } })
+                .pipe(tap({ async next(table: Table) { tables.push(table); await sleep(1); } }))
                 // flatMap from Table -> RecordBatches[]
-                .flatMap((table) => AsyncIterable.as(table.chunks))
-                // have to bail out to `any` until Ix supports DOM streams
-                .pipe((xs: any) => <any> nodeToDOMStream(xs.pipe(new PassThrough(psOpts)))) as any)
-                .pipeThrough(RecordBatchStreamWriter.throughDOM(opts)) as ReadableStream<Uint8Array>;
-    
+                .pipe(flatMap((table) => as(table.batches)))
+                .pipeThrough(RecordBatchStreamWriter.throughDOM(opts));
+
             for await (const reader of RecordBatchReader.readAll(stream)) {
                 const sourceTable = tables.shift()!;
-                const streamTable = await Table.from(reader);
+                const streamTable = new Table(await reader.readAll());
                 expect(streamTable).toEqualTable(sourceTable);
             }
 
-            expect(tables.length).toBe(0);
+            expect(tables).toHaveLength(0);
             expect(stream.locked).toBe(false);
         });
     });

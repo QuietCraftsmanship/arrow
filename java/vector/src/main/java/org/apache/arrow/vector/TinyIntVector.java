@@ -17,7 +17,10 @@
 
 package org.apache.arrow.vector;
 
+import static org.apache.arrow.vector.NullCheckingForGet.NULL_CHECKING_ENABLED;
+
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.complex.impl.TinyIntReaderImpl;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.holders.NullableTinyIntHolder;
@@ -33,7 +36,15 @@ import io.netty.buffer.ArrowBuf;
  * byte values which could be null. A validity buffer (bit vector) is
  * maintained to track which elements in the vector are null.
  */
-public class TinyIntVector extends BaseFixedWidthVector {
+<<<<<<< HEAD
+<<<<<<< HEAD
+public final class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+=======
+public class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+public class TinyIntVector extends BaseFixedWidthVector implements BaseIntVector {
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   public static final byte TYPE_WIDTH = 1;
   private final FieldReader reader;
 
@@ -97,7 +108,7 @@ public class TinyIntVector extends BaseFixedWidthVector {
    * @return element at given index
    */
   public byte get(int index) throws IllegalStateException {
-    if (isSet(index) == 0) {
+    if (NULL_CHECKING_ENABLED && isSet(index) == 0) {
       throw new IllegalStateException("Value at index is null");
     }
     return valueBuffer.getByte(index * TYPE_WIDTH);
@@ -366,6 +377,33 @@ public class TinyIntVector extends BaseFixedWidthVector {
   @Override
   public TransferPair makeTransferPair(ValueVector to) {
     return new TransferImpl((TinyIntVector) to);
+  }
+
+  @Override
+<<<<<<< HEAD
+<<<<<<< HEAD
+  public void setWithPossibleTruncate(int index, long value) {
+    this.setSafe(index, (int) value);
+  }
+
+  @Override
+  public void setUnsafeWithPossibleTruncate(int index, long value) {
+    this.set(index, (int) value);
+  }
+
+  @Override
+  public long getValueAsLong(int index) {
+    return this.get(index);
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Byte.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 5588-Better-support-for-building-UnionArrays
+=======
+  public void setEncodedValue(int index, int value) {
+    Preconditions.checkArgument(value <= Byte.MAX_VALUE, "value is overflow: %s", value);
+    this.setSafe(index, value);
+>>>>>>> 106ca580414f7d55261394f0155476baa894f98a
   }
 
   private class TransferImpl implements TransferPair {

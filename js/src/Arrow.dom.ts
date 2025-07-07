@@ -15,72 +15,87 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import streamAdapters from './io/adapters';
-import { RecordBatchReader } from './ipc/reader';
-import { RecordBatchWriter } from './ipc/writer';
-import { toDOMStream } from './ipc/whatwg/iterable';
-import { recordBatchReaderThroughDOMStream } from './ipc/whatwg/reader';
-import { recordBatchWriterThroughDOMStream } from './ipc/whatwg/writer';
+import streamAdapters from './io/adapters.js';
+import { Builder } from './builder.js';
+import { RecordBatchReader, RecordBatchFileReader, RecordBatchStreamReader, } from './ipc/reader.js';
+import { RecordBatchWriter, RecordBatchFileWriter, RecordBatchStreamWriter, } from './ipc/writer.js';
+import { toDOMStream } from './io/whatwg/iterable.js';
+import { builderThroughDOMStream } from './io/whatwg/builder.js';
+import { recordBatchReaderThroughDOMStream } from './io/whatwg/reader.js';
+import { recordBatchWriterThroughDOMStream } from './io/whatwg/writer.js';
 
 streamAdapters.toDOMStream = toDOMStream;
+Builder['throughDOM'] = builderThroughDOMStream;
 RecordBatchReader['throughDOM'] = recordBatchReaderThroughDOMStream;
+RecordBatchFileReader['throughDOM'] = recordBatchReaderThroughDOMStream;
+RecordBatchStreamReader['throughDOM'] = recordBatchReaderThroughDOMStream;
 RecordBatchWriter['throughDOM'] = recordBatchWriterThroughDOMStream;
+RecordBatchFileWriter['throughDOM'] = recordBatchWriterThroughDOMStream;
+RecordBatchStreamWriter['throughDOM'] = recordBatchWriterThroughDOMStream;
+
+export type {
+    TypeMap, StructRowProxy,
+    ReadableSource, WritableSink,
+    ArrowJSONLike, FileHandle, Readable, Writable, ReadableWritable, ReadableDOMStreamOptions,
+    IntervalDayTimeObject, IntervalMonthDayNanoObject,
+} from './Arrow.js';
 
 export {
-    ArrowType, DateUnit, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type, UnionMode, VectorType,
-    Data,
+    DateUnit, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type, UnionMode, BufferType,
+    Data, makeData,
     DataType,
     Null,
     Bool,
     Int, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64,
     Float, Float16, Float32, Float64,
-    Utf8,
-    Binary,
+    Utf8, LargeUtf8,
+    Binary, LargeBinary,
     FixedSizeBinary,
     Date_, DateDay, DateMillisecond,
     Timestamp, TimestampSecond, TimestampMillisecond, TimestampMicrosecond, TimestampNanosecond,
     Time, TimeSecond, TimeMillisecond, TimeMicrosecond, TimeNanosecond,
     Decimal,
     List,
-    Struct,
+    Struct, StructRow,
     Union, DenseUnion, SparseUnion,
     Dictionary,
-    Interval, IntervalDayTime, IntervalYearMonth,
+    Interval, IntervalDayTime, IntervalYearMonth, IntervalMonthDayNano,
+    Duration, DurationSecond, DurationMillisecond, DurationMicrosecond, DurationNanosecond,
     FixedSizeList,
-    Map_,
-    Table,
-    Column,
+    Map_, MapRow,
+    Table, makeTable, tableFromArrays,
     Schema, Field,
     Visitor,
-    Vector,
-    BaseVector,
-    BinaryVector,
-    BoolVector,
-    Chunked,
-    DateVector, DateDayVector, DateMillisecondVector,
-    DecimalVector,
-    DictionaryVector,
-    FixedSizeBinaryVector,
-    FixedSizeListVector,
-    FloatVector, Float16Vector, Float32Vector, Float64Vector,
-    IntervalVector, IntervalDayTimeVector, IntervalYearMonthVector,
-    IntVector, Int8Vector, Int16Vector, Int32Vector, Int64Vector, Uint8Vector, Uint16Vector, Uint32Vector, Uint64Vector,
-    ListVector,
-    MapVector,
-    NullVector,
-    StructVector,
-    TimestampVector, TimestampSecondVector, TimestampMillisecondVector, TimestampMicrosecondVector, TimestampNanosecondVector,
-    TimeVector, TimeSecondVector, TimeMillisecondVector, TimeMicrosecondVector, TimeNanosecondVector,
-    UnionVector, DenseUnionVector, SparseUnionVector,
-    Utf8Vector,
-    ByteStream, AsyncByteStream, AsyncByteQueue, ReadableSource, WritableSink,
+    Vector, makeVector, vectorFromArray, tableFromJSON,
+    ByteStream, AsyncByteStream, AsyncByteQueue,
     RecordBatchReader, RecordBatchFileReader, RecordBatchStreamReader, AsyncRecordBatchFileReader, AsyncRecordBatchStreamReader,
     RecordBatchWriter, RecordBatchFileWriter, RecordBatchStreamWriter, RecordBatchJSONWriter,
+    tableFromIPC, tableToIPC,
     MessageReader, AsyncMessageReader, JSONMessageReader,
     Message,
     RecordBatch,
-    ArrowJSONLike, FileHandle, Readable, Writable, ReadableWritable, ReadableDOMStreamOptions,
-    DataFrame, FilteredDataFrame, CountByResult, BindFunc, NextFunc,
-    predicate,
-    util
-} from './Arrow';
+    util,
+    Builder, makeBuilder, builderThroughIterable, builderThroughAsyncIterable,
+} from './Arrow.js';
+
+export {
+    BinaryBuilder, LargeBinaryBuilder,
+    BoolBuilder,
+    DateBuilder, DateDayBuilder, DateMillisecondBuilder,
+    DecimalBuilder,
+    DictionaryBuilder,
+    FixedSizeBinaryBuilder,
+    FixedSizeListBuilder,
+    FloatBuilder, Float16Builder, Float32Builder, Float64Builder,
+    IntervalBuilder, IntervalDayTimeBuilder, IntervalYearMonthBuilder, IntervalMonthDayNanoBuilder,
+    DurationBuilder, DurationSecondBuilder, DurationMillisecondBuilder, DurationMicrosecondBuilder, DurationNanosecondBuilder,
+    IntBuilder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, Uint8Builder, Uint16Builder, Uint32Builder, Uint64Builder,
+    ListBuilder,
+    MapBuilder,
+    NullBuilder,
+    StructBuilder,
+    TimestampBuilder, TimestampSecondBuilder, TimestampMillisecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
+    TimeBuilder, TimeSecondBuilder, TimeMillisecondBuilder, TimeMicrosecondBuilder, TimeNanosecondBuilder,
+    UnionBuilder, DenseUnionBuilder, SparseUnionBuilder,
+    Utf8Builder, LargeUtf8Builder
+} from './Arrow.js';

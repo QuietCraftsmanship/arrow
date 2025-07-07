@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System;
+
 namespace Apache.Arrow
 {
-    public interface IArrowArray
+    public interface IArrowArray : IDisposable
     {
         bool IsNull(int index);
 
@@ -30,9 +32,5 @@ namespace Apache.Arrow
         ArrayData Data { get; }
 
         void Accept(IArrowArrayVisitor visitor);
-
-        //IArrowArray Slice(int offset);
-
-        //IArrowArray Slice(int offset, int length);
     }
 }

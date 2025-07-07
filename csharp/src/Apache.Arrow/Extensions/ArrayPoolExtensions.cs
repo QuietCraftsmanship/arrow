@@ -16,46 +16,36 @@
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
-using System.Threading.Tasks;
 
 namespace Apache.Arrow
 {
     internal static class ArrayPoolExtensions
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void RentReturn(this ArrayPool<byte> pool, int length, Action<byte[]> action)
+        public static ArrayLease RentReturn(this ArrayPool<byte> pool, int length, out Memory<byte> buffer)
         {
-            byte[] array = null;
-
-            try
-            {
-                array = pool.Rent(length);
-                action(array);
-            }
-            finally
-            {
-                if (array != null)
-                {
-                    pool.Return(array);
-                }
-            }
+            byte[] array = pool.Rent(length);
+            buffer = array.AsMemory(0, length);
+            return new ArrayLease(pool, array);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static Task RentReturnAsync(this ArrayPool<byte> pool, int length, Func<byte[], Task> action)
+        internal struct ArrayLease : IDisposable
         {
-            byte[] array = null;
+            private readonly ArrayPool<byte> _pool;
+            private byte[] _array;
 
-            try
+            public ArrayLease(ArrayPool<byte> pool, byte[] array)
             {
-                array = pool.Rent(length);
-                return action(array);
+                _pool = pool;
+                _array = array;
             }
-            finally
+
+            public void Dispose()
             {
-                if (array != null)
+                if (_array != null)
                 {
-                    pool.Return(array);
+                    _pool.Return(_array);
+                    _array = null;
                 }
             }
         }

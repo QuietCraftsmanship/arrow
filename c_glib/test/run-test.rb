@@ -20,6 +20,10 @@
 require "pathname"
 require "test-unit"
 
+(ENV["ARROW_DLL_PATH"] || "").split(File::PATH_SEPARATOR).each do |path|
+  RubyInstaller::Runtime.add_dll_directory(path)
+end
+
 base_dir = Pathname(__dir__).parent
 test_dir = base_dir + "test"
 
@@ -35,10 +39,44 @@ module Arrow
       @data = data
     end
   end
+
+  class BooleanScalar
+    alias_method :value, :value?
+  end
 end
 
 begin
   ArrowCUDA = GI.load("ArrowCUDA")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  ArrowDataset = GI.load("ArrowDataset")
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  class ArrowFlightLoader < GI::Loader
+    def should_unlock_gvl?(info, klass)
+      true
+    end
+  end
+  flight_module = Module.new
+  ArrowFlightLoader.load("ArrowFlight", flight_module)
+  ArrowFlight = flight_module
+  GObjectIntrospection::Loader.start_callback_dispatch_thread
+rescue GObjectIntrospection::RepositoryError::TypelibNotFound
+end
+
+begin
+  class ArrowFlightSQLLoader < GI::Loader
+    def should_unlock_gvl?(info, klass)
+      true
+    end
+  end
+  flight_sql_module = Module.new
+  ArrowFlightSQLLoader.load("ArrowFlightSQL", flight_sql_module)
+  ArrowFlightSQL = flight_sql_module
 rescue GObjectIntrospection::RepositoryError::TypelibNotFound
 end
 
@@ -52,18 +90,23 @@ begin
 rescue GObjectIntrospection::RepositoryError::TypelibNotFound
 end
 
-begin
-  Plasma = GI.load("Plasma")
-rescue GObjectIntrospection::RepositoryError::TypelibNotFound
-end
-
 require "fileutils"
+require "find"
 require "rbconfig"
+require "stringio"
 require "tempfile"
 require "zlib"
 require_relative "helper/buildable"
+require_relative "helper/data-type"
 require_relative "helper/fixture"
+if defined?(ArrowFlight)
+  require_relative "helper/flight-server"
+end
+if defined?(ArrowFlightSQL)
+  require_relative "helper/flight-sql-server"
+end
 require_relative "helper/omittable"
-require_relative "helper/plasma-store"
+require_relative "helper/readable"
+require_relative "helper/writable"
 
 exit(Test::Unit::AutoRunner.run(true, test_dir.to_s))

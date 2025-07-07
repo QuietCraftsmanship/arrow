@@ -15,48 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const {
-    targetDir, observableFromStreams
-} = require('./util');
+import { mainExport, targetDir, observableFromStreams } from './util.js';
 
-const del = require('del');
-const gulp = require('gulp');
-const { promisify } = require('util');
-const gulpRename = require(`gulp-rename`);
-const { memoizeTask } = require('./memoize-task');
-const exec = promisify(require('child_process').exec);
-const { Observable, ReplaySubject } = require('rxjs');
+import gulp from 'gulp';
+import path from 'node:path';
+import { mkdirp } from 'mkdirp';
+import * as fs from 'node:fs/promises';
+import gulpRename from 'gulp-rename';
+import gulpReplace from 'gulp-replace';
+import { memoizeTask } from './memoize-task.js';
+import { ReplaySubject, forkJoin as ObservableForkJoin } from 'rxjs';
+import { share } from 'rxjs/operators';
+import { pipeline } from 'stream/promises';
 
-const arrowTask = ((cache) => memoizeTask(cache, function copyMain(target) {
+export const arrowTask = ((cache) => memoizeTask(cache, function copyMain(target) {
     const out = targetDir(target);
-    const dtsGlob = `${targetDir(`es2015`, `cjs`)}/**/*.ts`;
+    const dtsGlob = `${targetDir(`es2015`, `esm`)}/**/*.ts`;
     const cjsGlob = `${targetDir(`es2015`, `cjs`)}/**/*.js`;
-    const esmGlob = `${targetDir(`esnext`, `esm`)}/**/*.js`;
-    const es5UmdGlob = `${targetDir(`es5`, `umd`)}/*.js`;
-    const es5UmdMaps = `${targetDir(`es5`, `umd`)}/*.map`;
+    const esmGlob = `${targetDir(`es2015`, `esm`)}/**/*.js`;
     const es2015UmdGlob = `${targetDir(`es2015`, `umd`)}/*.js`;
-    const es2015UmdMaps = `${targetDir(`es2015`, `umd`)}/*.map`;
-    const ch_ext = (ext) => gulpRename((p) => { p.extname = ext; });
-    const append = (ap) => gulpRename((p) => { p.basename += ap; });
-    return Observable.forkJoin(
-      observableFromStreams(gulp.src(dtsGlob), gulp.dest(out)), // copy d.ts files
-      observableFromStreams(gulp.src(cjsGlob), gulp.dest(out)), // copy es2015 cjs files
-      observableFromStreams(gulp.src(esmGlob), ch_ext(`.mjs`), gulp.dest(out)), // copy es2015 esm files and rename to `.mjs`
-      observableFromStreams(gulp.src(es5UmdGlob), append(`.es5.min`), gulp.dest(out)), // copy es5 umd files and add `.min`
-      observableFromStreams(gulp.src(es5UmdMaps),                     gulp.dest(out)), // copy es5 umd sourcemap files, but don't rename
-      observableFromStreams(gulp.src(es2015UmdGlob), append(`.es2015.min`), gulp.dest(out)), // copy es2015 umd files and add `.es2015.min`
-      observableFromStreams(gulp.src(es2015UmdMaps),                        gulp.dest(out)), // copy es2015 umd sourcemap files, but don't rename
-    ).publish(new ReplaySubject()).refCount();
+    const esnextUmdGlob = `${targetDir(`esnext`, `umd`)}/*.js`;
+    const cjsSourceMapsGlob = `${targetDir(`es2015`, `cjs`)}/**/*.js.map`;
+    const esmSourceMapsGlob = `${targetDir(`es2015`, `esm`)}/**/*.map`;
+    const es2015UmdSourceMapsGlob = `${targetDir(`es2015`, `umd`)}/*.map`;
+    const esnextUmdSourceMapsGlob = `${targetDir(`esnext`, `umd`)}/*.map`;
+    return ObservableForkJoin([
+        observableFromStreams(gulp.src(dtsGlob), gulp.dest(out)), // copy d.ts files
+        observableFromStreams(gulp.src(cjsGlob), gulp.dest(out)), // copy es2015 cjs files
+        observableFromStreams(gulp.src(cjsSourceMapsGlob), gulp.dest(out)), // copy es2015 cjs sourcemaps
+        observableFromStreams(gulp.src(esmSourceMapsGlob), gulpRename((p) => { p.basename = p.basename.replace('.js', '.mjs'); }), gulpReplace(`.js"`, `.mjs"`), gulp.dest(out)), // copy es2015 esm sourcemaps
+        observableFromStreams(gulp.src(es2015UmdSourceMapsGlob), gulp.dest(out)), // copy es2015 umd sourcemap files, but don't rename
+        observableFromStreams(gulp.src(esnextUmdSourceMapsGlob), gulp.dest(out)), // copy esnext umd sourcemap files, but don't rename
+        observableFromStreams(gulp.src(esmGlob), gulpRename((p) => { p.extname = '.mjs'; }), gulpReplace(`.js'`, `.mjs'`), gulpReplace(`.js.map`, `.mjs.map`), gulp.dest(out)), // copy es2015 esm files and rename to `.mjs`
+        observableFromStreams(gulp.src(es2015UmdGlob), gulpRename((p) => { p.basename += `.es2015.min`; }), gulp.dest(out)), // copy es2015 umd files and add `.es2015.min`
+        observableFromStreams(gulp.src(esnextUmdGlob), gulpRename((p) => { p.basename += `.esnext.min`; }), gulp.dest(out)), // copy esnext umd files and add `.esnext.min`
+    ]).pipe(share({ connector: () => new ReplaySubject(), resetOnError: false, resetOnComplete: false, resetOnRefCountZero: false }));
 }))({});
 
-const arrowTSTask = ((cache) => memoizeTask(cache, async function copyTS(target, format) {
+export const arrowTSTask = ((cache) => memoizeTask(cache, async function copyTS(target, format) {
+    const umd = targetDir(`es5`, `umd`);
     const out = targetDir(target, format);
-    await exec(`mkdirp ${out}`);
-    await exec(`shx cp -r src/* ${out}`);
-    await del(`${out}/**/*.js`);
+    const arrowUMD = path.join(umd, `${mainExport}.js`);
+    const arrow2csvUMD = path.join(umd, `bin`, `arrow2csv.js`);
+
+    await mkdirp(path.join(out, 'bin'));
+
+    await Promise.all([
+        pipeline(gulp.src(`src/**/*`), gulp.dest(out)),
+        pipeline(
+            gulp.src([arrowUMD, arrow2csvUMD]),
+            gulpReplace(`../${mainExport}.js`, `./${mainExport}.js`),
+            gulp.dest(path.join(out, 'bin'))
+        ),
+        fs.writeFile(path.join(out, 'bin', 'package.json'), '{"type": "commonjs"}')
+    ]);
 }))({});
-  
-  
-module.exports = arrowTask;
-module.exports.arrowTask = arrowTask;
-module.exports.arrowTSTask = arrowTSTask;

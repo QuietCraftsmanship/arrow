@@ -47,16 +47,45 @@ These should be used to create Arrow data types and schemas.
    timestamp
    date32
    date64
+   duration
+   month_day_nano_interval
    binary
    string
    utf8
+   large_binary
+   large_string
+   large_utf8
+   binary_view
+   string_view
    decimal128
+   decimal256
    list_
+   large_list
+   list_view
+   large_list_view
+   map_
    struct
    dictionary
+   run_end_encoded
+   fixed_shape_tensor
+   union
+   dense_union
+   sparse_union
+   opaque
+   bool8
+   uuid
+   json_
    field
    schema
    from_numpy_dtype
+
+Utility Functions
+-----------------
+
+.. autosummary::
+   :toctree: ../generated/
+
+   unify_schemas
 
 .. _api.type_classes:
 .. currentmodule:: pyarrow
@@ -73,15 +102,51 @@ functions above.
    DataType
    DictionaryType
    ListType
+   ListViewType
+   FixedSizeListType
+   LargeListType
+   LargeListViewType
+   MapType
    StructType
    UnionType
+   DenseUnionType
+   SparseUnionType
    TimestampType
    Time32Type
    Time64Type
+   DurationType
    FixedSizeBinaryType
+   Decimal32Type
+   Decimal64Type
    Decimal128Type
+   Decimal256Type
    Field
    Schema
+   RunEndEncodedType
+
+Specific classes and functions for extension types.
+
+.. autosummary::
+   :toctree: ../generated/
+
+   BaseExtensionType
+   ExtensionType
+   PyExtensionType
+   UnknownExtensionType
+   register_extension_type
+   unregister_extension_type
+
+:doc:`Canonical extension types <../../format/CanonicalExtensions>`
+implemented by PyArrow.
+
+.. autosummary::
+   :toctree: ../generated/
+
+   FixedShapeTensorType
+   OpaqueType
+   JsonType
+   UuidType
+   Bool8Type
 
 .. _api.types.checking:
 .. currentmodule:: pyarrow.types
@@ -113,10 +178,17 @@ represents a given data type (such as ``int32``) or general category
    is_float32
    is_float64
    is_decimal
+   is_decimal128
+   is_decimal256
    is_list
+   is_large_list
+   is_fixed_size_list
+   is_list_view
+   is_large_list_view
    is_struct
    is_union
    is_nested
+   is_run_end_encoded
    is_temporal
    is_timestamp
    is_date
@@ -125,10 +197,18 @@ represents a given data type (such as ``int32``) or general category
    is_time
    is_time32
    is_time64
+   is_duration
+   is_interval
    is_null
    is_binary
    is_unicode
    is_string
+   is_large_binary
+   is_large_unicode
+   is_large_string
+   is_binary_view
+   is_string_view
    is_fixed_size_binary
    is_map
    is_dictionary
+   is_primitive

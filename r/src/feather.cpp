@@ -15,144 +15,80 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow_types.h"
+#include "./arrow_types.h"
 
-using namespace Rcpp;
+#include "./safe-call-into-r.h"
 
-// ---------- TableWriter
+#include <arrow/ipc/feather.h>
+#include <arrow/type.h>
 
-// [[Rcpp::export]]
-void ipc___feather___TableWriter__SetDescription(
-    const std::unique_ptr<arrow::ipc::feather::TableWriter>& writer,
-    const std::string& description) {
-  writer->SetDescription(description);
-}
+// ---------- WriteFeather
 
-// [[Rcpp::export]]
-void ipc___feather___TableWriter__SetNumRows(
-    const std::unique_ptr<arrow::ipc::feather::TableWriter>& writer, int64_t num_rows) {
-  writer->SetNumRows(num_rows);
-}
-
-// [[Rcpp::export]]
-void ipc___feather___TableWriter__Append(
-    const std::unique_ptr<arrow::ipc::feather::TableWriter>& writer,
-    const std::string& name, const std::shared_ptr<arrow::Array>& values) {
-  STOP_IF_NOT_OK(writer->Append(name, *values));
-}
-
-// [[Rcpp::export]]
-void ipc___feather___TableWriter__Finalize(
-    const std::unique_ptr<arrow::ipc::feather::TableWriter>& writer) {
-  STOP_IF_NOT_OK(writer->Finalize());
-}
-
-// [[Rcpp::export]]
-std::unique_ptr<arrow::ipc::feather::TableWriter> ipc___feather___TableWriter__Open(
-    const std::shared_ptr<arrow::io::OutputStream>& stream) {
-  std::unique_ptr<arrow::ipc::feather::TableWriter> writer;
-  STOP_IF_NOT_OK(arrow::ipc::feather::TableWriter::Open(stream, &writer));
-  return writer;
-}
-
-// [[Rcpp::export]]
-void ipc___TableWriter__RecordBatch__WriteFeather(
-    const std::unique_ptr<arrow::ipc::feather::TableWriter>& writer,
-    const std::shared_ptr<arrow::RecordBatch>& batch) {
-  writer->SetNumRows(batch->num_rows());
-
-  for (int i = 0; i < batch->num_columns(); i++) {
-    STOP_IF_NOT_OK(writer->Append(batch->column_name(i), *batch->column(i)));
+// [[arrow::export]]
+void ipc___WriteFeather__Table(const std::shared_ptr<arrow::io::OutputStream>& stream,
+                               const std::shared_ptr<arrow::Table>& table, int version,
+                               int chunk_size, arrow::Compression::type compression,
+                               int compression_level) {
+  auto properties = arrow::ipc::feather::WriteProperties::Defaults();
+  properties.version = version;
+  properties.chunksize = chunk_size;
+  properties.compression = compression;
+  if (compression_level != -1) {
+    properties.compression_level = compression_level;
   }
-  STOP_IF_NOT_OK(writer->Finalize());
+  StopIfNotOk(arrow::ipc::feather::WriteTable(*table, stream.get(), properties));
 }
 
-// ----------- TableReader
+// ----------- Reader
 
-// [[Rcpp::export]]
-std::string ipc___feather___TableReader__GetDescription(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader) {
-  return reader->GetDescription();
-}
-
-// [[Rcpp::export]]
-bool ipc___feather___TableReader__HasDescription(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader) {
-  return reader->HasDescription();
-}
-
-// [[Rcpp::export]]
-int ipc___feather___TableReader__version(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader) {
+// [[arrow::export]]
+int ipc___feather___Reader__version(
+    const std::shared_ptr<arrow::ipc::feather::Reader>& reader) {
   return reader->version();
 }
 
-// [[Rcpp::export]]
-int64_t ipc___feather___TableReader__num_rows(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader) {
-  return reader->num_rows();
-}
-
-// [[Rcpp::export]]
-int64_t ipc___feather___TableReader__num_columns(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader) {
-  return reader->num_columns();
-}
-
-// [[Rcpp::export]]
-std::string ipc___feather___TableReader__GetColumnName(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader, int i) {
-  return reader->GetColumnName(i);
-}
-
-// [[Rcpp::export]]
-std::shared_ptr<arrow::Column> ipc___feather___TableReader__GetColumn(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader, int i) {
-  std::shared_ptr<arrow::Column> column;
-  STOP_IF_NOT_OK(reader->GetColumn(i, &column));
-  return column;
-}
-
-// [[Rcpp::export]]
-std::shared_ptr<arrow::Table> ipc___feather___TableReader__Read(
-    const std::unique_ptr<arrow::ipc::feather::TableReader>& reader, SEXP columns) {
-  std::shared_ptr<arrow::Table> table;
-
-  switch (TYPEOF(columns)) {
-    case INTSXP: {
-      R_xlen_t n = XLENGTH(columns);
-      std::vector<int> indices(n);
-      int* p_columns = INTEGER(columns);
-      for (int i = 0; i < n; i++) {
-        indices[i] = p_columns[i] - 1;
-      }
-      STOP_IF_NOT_OK(reader->Read(indices, &table));
-      break;
+// [[arrow::export]]
+std::shared_ptr<arrow::Table> ipc___feather___Reader__Read(
+    const std::shared_ptr<arrow::ipc::feather::Reader>& reader, cpp11::sexp columns) {
+  bool use_names = columns != R_NilValue;
+  std::vector<std::string> names;
+  if (use_names) {
+    cpp11::strings columns_chr(columns);
+    names.reserve(columns_chr.size());
+    for (const auto& name : columns_chr) {
+      names.push_back(name);
     }
-    case STRSXP: {
-      R_xlen_t n = XLENGTH(columns);
-      std::vector<std::string> names(n);
-      for (R_xlen_t i = 0; i < n; i++) {
-        names[i] = CHAR(STRING_ELT(columns, i));
-      }
-      STOP_IF_NOT_OK(reader->Read(names, &table));
-      break;
-    }
-    case NILSXP:
-      STOP_IF_NOT_OK(reader->Read(&table));
-      break;
-    default:
-      Rcpp::stop("incompatible column specification");
-      break;
-  };
+  }
 
-  return table;
+  auto result = RunWithCapturedRIfPossible<std::shared_ptr<arrow::Table>>([&]() {
+    std::shared_ptr<arrow::Table> table;
+    arrow::Status read_result;
+    if (use_names) {
+      read_result = reader->Read(names, &table);
+    } else {
+      read_result = reader->Read(&table);
+    }
+
+    if (read_result.ok()) {
+      return arrow::Result<std::shared_ptr<arrow::Table>>(table);
+    } else {
+      return arrow::Result<std::shared_ptr<arrow::Table>>(read_result);
+    }
+  });
+
+  return ValueOrStop(result);
 }
 
-// [[Rcpp::export]]
-std::unique_ptr<arrow::ipc::feather::TableReader> ipc___feather___TableReader__Open(
+// [[arrow::export]]
+std::shared_ptr<arrow::ipc::feather::Reader> ipc___feather___Reader__Open(
     const std::shared_ptr<arrow::io::RandomAccessFile>& stream) {
-  std::unique_ptr<arrow::ipc::feather::TableReader> reader;
-  STOP_IF_NOT_OK(arrow::ipc::feather::TableReader::Open(stream, &reader));
-  return reader;
+  auto result = RunWithCapturedRIfPossible<std::shared_ptr<arrow::ipc::feather::Reader>>(
+      [&]() { return arrow::ipc::feather::Reader::Open(stream); });
+  return ValueOrStop(result);
+}
+
+// [[arrow::export]]
+std::shared_ptr<arrow::Schema> ipc___feather___Reader__schema(
+    const std::shared_ptr<arrow::ipc::feather::Reader>& reader) {
+  return reader->schema();
 }

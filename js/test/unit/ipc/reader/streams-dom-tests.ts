@@ -15,30 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-    generateRandomTables,
-    // generateDictionaryTables
-} from '../../../data/tables';
+import { generateRandomTables } from '../../../data/tables.js';
+import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers.js';
+import { validateRecordBatchAsyncIterator } from '../validate.js';
 
 import {
-    Table,
     RecordBatchReader,
-    RecordBatchStreamWriter
-} from '../../../Arrow';
-
-import { validateRecordBatchAsyncIterator } from '../validate';
-import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers';
+    RecordBatchStreamWriter,
+    Table
+} from 'apache-arrow';
 
 (() => {
-
     if (process.env.TEST_DOM_STREAMS !== 'true') {
-        return test('not testing DOM streams because process.env.TEST_DOM_STREAMS !== "true"', () => {});
+        return test('not testing DOM streams because process.env.TEST_DOM_STREAMS !== "true"', () => { });
     }
-
-    /* tslint:disable */
-    const { parse: bignumJSONParse } = require('json-bignum');
-    /* tslint:disable */
-    const { concatStream } = require('web-stream-tools').default;
 
     for (const table of generateRandomTables([10, 20, 30])) {
 
@@ -65,7 +55,7 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
         describe(`toDOMStream (${name})`, () => {
 
             describe(`RecordBatchJSONReader`, () => {
-                test('Uint8Array', json.buffer((source) => validate(bignumJSONParse(`${Buffer.from(source)}`))));
+                test('Uint8Array', json.buffer((source) => validate(JSON.parse(`${Buffer.from(source)}`))));
             });
 
             describe(`RecordBatchFileReader`, () => {
@@ -110,7 +100,49 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
         });
     }
 
+    it('readAll() should pipe to separate WhatWG WritableStreams', async () => {
+        // @ts-ignore
+        const { concatStream } = await import('@openpgp/web-stream-tools');
+
+        expect.hasAssertions();
+
+        const tables = [...generateRandomTables([10, 20, 30])];
+
+        const stream = concatStream(tables.map((table, i) =>
+            RecordBatchStreamWriter.writeAll(table).toDOMStream({
+                // Alternate between bytes mode and regular mode because code coverage
+                type: i % 2 === 0 ? 'bytes' : undefined
+            })
+        )) as ReadableStream<Uint8Array>;
+
+        let tableIndex = -1;
+        let reader: RecordBatchReader | undefined;
+
+        for await (reader of RecordBatchReader.readAll(stream)) {
+
+            validateStreamState(reader, stream, false);
+
+            const output = reader
+                .pipeThrough(RecordBatchStreamWriter.throughDOM())
+                .pipeThrough(new TransformStream());
+
+            validateStreamState(reader, output, false, false);
+
+            const sourceTable = tables[++tableIndex];
+            const streamReader = await RecordBatchReader.from(output);
+            const streamTable = new Table(await streamReader.readAll());
+            expect(streamTable).toEqualTable(sourceTable);
+            expect(output.locked).toBe(false);
+        }
+
+        expect(reader).toBeDefined();
+        validateStreamState(reader!, stream, true);
+        expect(tableIndex).toBe(tables.length - 1);
+    });
+
     it('should not close the underlying WhatWG ReadableStream when reading multiple tables to completion', async () => {
+        // @ts-ignore
+        const { concatStream } = await import('@openpgp/web-stream-tools');
 
         expect.hasAssertions();
 
@@ -133,7 +165,7 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
             validateStreamState(reader, stream, false);
 
             const sourceTable = tables[++tableIndex];
-            const streamTable = await Table.from(reader);
+            const streamTable = new Table(await reader.readAll());
             expect(streamTable).toEqualTable(sourceTable);
         }
 
@@ -142,6 +174,8 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
     });
 
     it('should close the underlying WhatWG ReadableStream when reading multiple tables and we break early', async () => {
+        // @ts-ignore
+        const { concatStream } = await import('@openpgp/web-stream-tools');
 
         expect.hasAssertions();
 
@@ -165,10 +199,10 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
 
             let batchIndex = -1;
             const sourceTable = tables[++tableIndex];
-            const breakEarly = tableIndex === (tables.length / 2 | 0);
+            const breakEarly = tableIndex === (Math.trunc(tables.length / 2));
 
             for await (const streamBatch of reader) {
-                expect(streamBatch).toEqualRecordBatch(sourceTable.chunks[++batchIndex]);
+                expect(streamBatch).toEqualRecordBatch(sourceTable.batches[++batchIndex]);
                 if (breakEarly && batchIndex === 1) { break; }
             }
             if (breakEarly) {
@@ -179,11 +213,11 @@ import { ArrowIOTestHelper, readableDOMStreamToAsyncIterator } from '../helpers'
         }
 
         validateStreamState(reader, stream, true);
-        expect(tableIndex).toBe(tables.length / 2 | 0);
+        expect(tableIndex).toBe(Math.trunc(tables.length / 2));
     });
 })();
 
-function validateStreamState(reader: RecordBatchReader, stream: ReadableStream, closed: boolean) {
+function validateStreamState(reader: RecordBatchReader, stream: ReadableStream, closed: boolean, locked = !closed) {
     expect(reader.closed).toBe(closed);
-    expect(stream.locked).toBe(!closed);
+    expect(stream.locked).toBe(locked);
 }

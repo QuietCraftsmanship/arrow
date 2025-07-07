@@ -32,11 +32,7 @@
 # if TARGET_OS_IPHONE
 #   include <string>
 
-    namespace arrow
-    {
-    namespace util
-    {
-    namespace date
+    namespace arrow_vendored::date
     {
     namespace iOSUtils
     {
@@ -45,9 +41,7 @@
     std::string get_current_timezone();
 
     }  // namespace iOSUtils
-    }  // namespace date
-    }  // namespace util
-    }  // namespace arrow
+    }  // namespace arrow_vendored::date
 
 # endif  // TARGET_OS_IPHONE
 #else   // !__APPLE__

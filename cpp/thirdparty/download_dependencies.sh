@@ -25,20 +25,21 @@ set -eu
 SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 if [ "$#" -ne 1 ]; then
-  DESTDIR=$(pwd)
+  orig_destdir=$(pwd)
 else
-  DESTDIR=$1
+  orig_destdir=$1
 fi
 
-DESTDIR=$(readlink -f "${DESTDIR}")
+# Try to canonicalize. Not all platforms support `readlink -f` or `realpath`.
+# This only matters if there are symlinks you need to resolve before downloading
+DESTDIR=$(readlink -f "${orig_destdir}" 2> /dev/null) || DESTDIR="${orig_destdir}"
 
 download_dependency() {
   local url=$1
   local out=$2
 
-  # --show-progress will not output to stdout, it is safe to pipe the result of
-  # the script into eval.
-  wget --quiet --continue --output-document="${out}" "${url}"
+  wget --quiet --continue --output-document="${out}" "${url}" || \
+    (echo "Failed downloading ${url}" 1>&2; exit 1)
 }
 
 main() {

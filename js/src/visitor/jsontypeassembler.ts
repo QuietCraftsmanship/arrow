@@ -15,16 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import * as type from '../type';
-import { Visitor } from '../visitor';
-import { ArrowType, Precision, DateUnit, TimeUnit, IntervalUnit, UnionMode } from '../enum';
+import * as type from '../type.js';
+import { Visitor } from '../visitor.js';
+import { Type as ArrowType } from '../fb/type.js';
+import { Precision, DateUnit, TimeUnit, IntervalUnit, UnionMode } from '../enum.js';
 
+/** @ignore */
 export interface JSONTypeAssembler extends Visitor {
-    visit<T extends type.DataType>(node: T): object | undefined;
+    visit<T extends type.DataType>(node: T): Record<string, unknown> | undefined;
 }
 
+/** @ignore */
 export class JSONTypeAssembler extends Visitor {
-    public visit<T extends type.DataType>(node: T): object | undefined {
+    public visit<T extends type.DataType>(node: T): Record<string, unknown> | undefined {
         return node == null ? undefined : super.visit(node);
     }
     public visitNull<T extends type.Null>({ typeId }: T) {
@@ -39,14 +42,20 @@ export class JSONTypeAssembler extends Visitor {
     public visitBinary<T extends type.Binary>({ typeId }: T) {
         return { 'name': ArrowType[typeId].toLowerCase() };
     }
+    public visitLargeBinary<T extends type.LargeBinary>({ typeId }: T) {
+        return { 'name': ArrowType[typeId].toLowerCase() };
+    }
     public visitBool<T extends type.Bool>({ typeId }: T) {
         return { 'name': ArrowType[typeId].toLowerCase() };
     }
     public visitUtf8<T extends type.Utf8>({ typeId }: T) {
         return { 'name': ArrowType[typeId].toLowerCase() };
     }
-    public visitDecimal<T extends type.Decimal>({ typeId, scale, precision }: T) {
-        return { 'name': ArrowType[typeId].toLowerCase(), 'scale': scale, 'precision': precision };
+    public visitLargeUtf8<T extends type.LargeUtf8>({ typeId }: T) {
+        return { 'name': ArrowType[typeId].toLowerCase() };
+    }
+    public visitDecimal<T extends type.Decimal>({ typeId, scale, precision, bitWidth }: T) {
+        return { 'name': ArrowType[typeId].toLowerCase(), 'scale': scale, 'precision': precision, 'bitWidth': bitWidth };
     }
     public visitDate<T extends type.Date_>({ typeId, unit }: T) {
         return { 'name': ArrowType[typeId].toLowerCase(), 'unit': DateUnit[unit] };
@@ -60,6 +69,9 @@ export class JSONTypeAssembler extends Visitor {
     public visitInterval<T extends type.Interval>({ typeId, unit }: T) {
         return { 'name': ArrowType[typeId].toLowerCase(), 'unit': IntervalUnit[unit] };
     }
+    public visitDuration<T extends type.Duration>({ typeId, unit }: T) {
+        return { 'name': ArrowType[typeId].toLocaleLowerCase(), 'unit': TimeUnit[unit] };
+    }
     public visitList<T extends type.List>({ typeId }: T) {
         return { 'name': ArrowType[typeId].toLowerCase() };
     }
@@ -69,7 +81,7 @@ export class JSONTypeAssembler extends Visitor {
     public visitUnion<T extends type.Union>({ typeId, mode, typeIds }: T) {
         return {
             'name': ArrowType[typeId].toLowerCase(),
-            'mode': UnionMode[mode],
+            'mode': UnionMode[mode].toUpperCase(),
             'typeIds': [...typeIds]
         };
     }

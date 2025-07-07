@@ -15,15 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import streamAdapters from './io/adapters';
-import { RecordBatchReader } from './ipc/reader';
-import { RecordBatchWriter } from './ipc/writer';
-import { toNodeStream } from './ipc/node/iterable';
-import { recordBatchReaderThroughNodeStream } from './ipc/node/reader';
-import { recordBatchWriterThroughNodeStream } from './ipc/node/writer';
+import streamAdapters from './io/adapters.js';
+import { Builder } from './builder.js';
+import { RecordBatchReader } from './ipc/reader.js';
+import { RecordBatchWriter } from './ipc/writer.js';
+import { toNodeStream } from './io/node/iterable.js';
+import { builderThroughNodeStream } from './io/node/builder.js';
+import { recordBatchReaderThroughNodeStream } from './io/node/reader.js';
+import { recordBatchWriterThroughNodeStream } from './io/node/writer.js';
 
 streamAdapters.toNodeStream = toNodeStream;
+Builder['throughNode'] = builderThroughNodeStream;
 RecordBatchReader['throughNode'] = recordBatchReaderThroughNodeStream;
 RecordBatchWriter['throughNode'] = recordBatchWriterThroughNodeStream;
 
-export * from './Arrow.dom';
+export * from './Arrow.dom.js';

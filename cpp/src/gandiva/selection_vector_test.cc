@@ -18,9 +18,12 @@
 #include "gandiva/selection_vector.h"
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "arrow/testing/gtest_util.h"
 
 namespace gandiva {
 
@@ -45,12 +48,10 @@ TEST_F(TestSelectionVector, TestInt16Make) {
 
   // Test with pre-alloced buffer
   std::shared_ptr<SelectionVector> selection2;
-  std::shared_ptr<arrow::Buffer> buffer;
   auto buffer_len = max_slots * sizeof(int16_t);
-  auto astatus = arrow::AllocateBuffer(pool_, buffer_len, &buffer);
-  EXPECT_EQ(astatus.ok(), true);
+  ASSERT_OK_AND_ASSIGN(auto buffer, arrow::AllocateBuffer(buffer_len, pool_));
 
-  status = SelectionVector::MakeInt16(max_slots, buffer, &selection2);
+  status = SelectionVector::MakeInt16(max_slots, std::move(buffer), &selection2);
   EXPECT_EQ(status.ok(), true) << status.message();
   EXPECT_EQ(selection2->GetMaxSlots(), max_slots);
   EXPECT_EQ(selection2->GetNumSlots(), 0);
@@ -60,14 +61,12 @@ TEST_F(TestSelectionVector, TestInt16MakeNegative) {
   int max_slots = 10;
 
   std::shared_ptr<SelectionVector> selection;
-  std::shared_ptr<arrow::Buffer> buffer;
   auto buffer_len = max_slots * sizeof(int16_t);
 
   // alloc a buffer that's insufficient.
-  auto astatus = arrow::AllocateBuffer(pool_, buffer_len - 16, &buffer);
-  EXPECT_EQ(astatus.ok(), true);
+  ASSERT_OK_AND_ASSIGN(auto buffer, arrow::AllocateBuffer(buffer_len - 16, pool_));
 
-  auto status = SelectionVector::MakeInt16(max_slots, buffer, &selection);
+  auto status = SelectionVector::MakeInt16(max_slots, std::move(buffer), &selection);
   EXPECT_EQ(status.IsInvalid(), true);
 }
 
@@ -105,10 +104,10 @@ TEST_F(TestSelectionVector, TestInt16PopulateFromBitMap) {
   int bitmap_size = RoundUpNumi64(max_slots) * 8;
   std::vector<uint8_t> bitmap(bitmap_size);
 
-  arrow::BitUtil::SetBit(&bitmap[0], 0);
-  arrow::BitUtil::SetBit(&bitmap[0], 5);
-  arrow::BitUtil::SetBit(&bitmap[0], 121);
-  arrow::BitUtil::SetBit(&bitmap[0], 220);
+  arrow::bit_util::SetBit(&bitmap[0], 0);
+  arrow::bit_util::SetBit(&bitmap[0], 5);
+  arrow::bit_util::SetBit(&bitmap[0], 121);
+  arrow::bit_util::SetBit(&bitmap[0], 220);
 
   status = selection->PopulateFromBitMap(&bitmap[0], bitmap_size, max_slots - 1);
   EXPECT_EQ(status.ok(), true) << status.message();
@@ -129,9 +128,9 @@ TEST_F(TestSelectionVector, TestInt16PopulateFromBitMapNegative) {
   int bitmap_size = 16;
   std::vector<uint8_t> bitmap(bitmap_size);
 
-  arrow::BitUtil::SetBit(&bitmap[0], 0);
-  arrow::BitUtil::SetBit(&bitmap[0], 1);
-  arrow::BitUtil::SetBit(&bitmap[0], 2);
+  arrow::bit_util::SetBit(&bitmap[0], 0);
+  arrow::bit_util::SetBit(&bitmap[0], 1);
+  arrow::bit_util::SetBit(&bitmap[0], 2);
 
   // The bitmap has three set bits, whereas the selection vector has capacity for only 2.
   status = selection->PopulateFromBitMap(&bitmap[0], bitmap_size, 2);
@@ -176,10 +175,10 @@ TEST_F(TestSelectionVector, TestInt32PopulateFromBitMap) {
   int bitmap_size = RoundUpNumi64(max_slots) * 8;
   std::vector<uint8_t> bitmap(bitmap_size);
 
-  arrow::BitUtil::SetBit(&bitmap[0], 0);
-  arrow::BitUtil::SetBit(&bitmap[0], 5);
-  arrow::BitUtil::SetBit(&bitmap[0], 121);
-  arrow::BitUtil::SetBit(&bitmap[0], 220);
+  arrow::bit_util::SetBit(&bitmap[0], 0);
+  arrow::bit_util::SetBit(&bitmap[0], 5);
+  arrow::bit_util::SetBit(&bitmap[0], 121);
+  arrow::bit_util::SetBit(&bitmap[0], 220);
 
   status = selection->PopulateFromBitMap(&bitmap[0], bitmap_size, max_slots - 1);
   EXPECT_EQ(status.ok(), true) << status.message();
@@ -194,14 +193,12 @@ TEST_F(TestSelectionVector, TestInt32MakeNegative) {
   int max_slots = 10;
 
   std::shared_ptr<SelectionVector> selection;
-  std::shared_ptr<arrow::Buffer> buffer;
   auto buffer_len = max_slots * sizeof(int32_t);
 
   // alloc a buffer that's insufficient.
-  auto astatus = arrow::AllocateBuffer(pool_, buffer_len - 1, &buffer);
-  EXPECT_EQ(astatus.ok(), true);
+  ASSERT_OK_AND_ASSIGN(auto buffer, arrow::AllocateBuffer(buffer_len - 1, pool_));
 
-  auto status = SelectionVector::MakeInt32(max_slots, buffer, &selection);
+  auto status = SelectionVector::MakeInt32(max_slots, std::move(buffer), &selection);
   EXPECT_EQ(status.IsInvalid(), true);
 }
 
@@ -243,10 +240,10 @@ TEST_F(TestSelectionVector, TestInt64PopulateFromBitMap) {
   int bitmap_size = RoundUpNumi64(max_slots) * 8;
   std::vector<uint8_t> bitmap(bitmap_size);
 
-  arrow::BitUtil::SetBit(&bitmap[0], 0);
-  arrow::BitUtil::SetBit(&bitmap[0], 5);
-  arrow::BitUtil::SetBit(&bitmap[0], 121);
-  arrow::BitUtil::SetBit(&bitmap[0], 220);
+  arrow::bit_util::SetBit(&bitmap[0], 0);
+  arrow::bit_util::SetBit(&bitmap[0], 5);
+  arrow::bit_util::SetBit(&bitmap[0], 121);
+  arrow::bit_util::SetBit(&bitmap[0], 220);
 
   status = selection->PopulateFromBitMap(&bitmap[0], bitmap_size, max_slots - 1);
   EXPECT_EQ(status.ok(), true) << status.message();
@@ -261,14 +258,12 @@ TEST_F(TestSelectionVector, TestInt64MakeNegative) {
   int max_slots = 10;
 
   std::shared_ptr<SelectionVector> selection;
-  std::shared_ptr<arrow::Buffer> buffer;
   auto buffer_len = max_slots * sizeof(int64_t);
 
   // alloc a buffer that's insufficient.
-  auto astatus = arrow::AllocateBuffer(pool_, buffer_len - 1, &buffer);
-  EXPECT_EQ(astatus.ok(), true);
+  ASSERT_OK_AND_ASSIGN(auto buffer, arrow::AllocateBuffer(buffer_len - 1, pool_));
 
-  auto status = SelectionVector::MakeInt64(max_slots, buffer, &selection);
+  auto status = SelectionVector::MakeInt64(max_slots, std::move(buffer), &selection);
   EXPECT_EQ(status.IsInvalid(), true);
 }
 

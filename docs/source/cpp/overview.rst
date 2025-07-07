@@ -36,7 +36,7 @@ The one-dimensional layer
 -------------------------
 
 **Data types** govern the *logical* interpretation of *physical* data.
-Many operations in Arrow are parametered, at compile-time or at runtime,
+Many operations in Arrow are parameterized, at compile-time or at runtime,
 by a data type.
 
 **Arrays** assemble one or several buffers with a data type, allowing to
@@ -51,10 +51,8 @@ The two-dimensional layer
 **Schemas** describe a logical collection of several pieces of data,
 each with a distinct name and type, and optional metadata.
 
-**Columns** are like chunked arrays, but with optional metadata.
-
-**Tables** are collections of columns in accordance to a schema.  They are
-the most capable dataset-providing abstraction in Arrow.
+**Tables** are collections of chunked array in accordance to a schema. They
+are the most capable dataset-providing abstraction in Arrow.
 
 **Record batches** are collections of contiguous arrays, described
 by a schema.  They allow incremental construction or serialization of tables.
@@ -67,6 +65,9 @@ reference.
 
 **Kernels** are specialized computation functions running in a loop over a
 given set of datums representing input and output parameters to the functions.
+
+**Acero** (pronounced [aˈsɜɹo] / ah-SERR-oh) is a streaming execution engine that allows
+computation to be expressed as a graph of operators which can transform streams of data.
 
 The IO layer
 ------------
@@ -91,3 +92,9 @@ The devices layer
 
 Basic **CUDA** integration is provided, allowing to describe Arrow data backed
 by GPU-allocated memory.
+
+The filesystem layer
+--------------------
+
+A filesystem abstraction allows reading and writing data from different storage
+backends, such as the local filesystem or a S3 bucket.

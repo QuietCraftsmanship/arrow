@@ -14,21 +14,37 @@
 // limitations under the License.
 
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using Apache.Arrow.Memory;
 
 namespace Apache.Arrow
 {
-    public readonly partial struct ArrowBuffer: IEquatable<ArrowBuffer>
+    public readonly partial struct ArrowBuffer : IEquatable<ArrowBuffer>, IDisposable
     {
+        private readonly IMemoryOwner<byte> _memoryOwner;
+        private readonly ReadOnlyMemory<byte> _memory;
+
         public static ArrowBuffer Empty => new ArrowBuffer(Memory<byte>.Empty);
 
-        private ArrowBuffer(Memory<byte> data)
+        public ArrowBuffer(ReadOnlyMemory<byte> data)
         {
-            Memory = data;
+            _memoryOwner = null;
+            _memory = data;
         }
 
-        public ReadOnlyMemory<byte> Memory { get; }
+        internal ArrowBuffer(IMemoryOwner<byte> memoryOwner)
+        {
+            // When wrapping an IMemoryOwner, don't cache the Memory<byte>
+            // since the owner may be disposed, and the cached Memory would
+            // be invalid.
+
+            _memoryOwner = memoryOwner;
+            _memory = Memory<byte>.Empty;
+        }
+
+        public ReadOnlyMemory<byte> Memory =>
+            _memoryOwner != null ? _memoryOwner.Memory : _memory;
 
         public bool IsEmpty => Memory.IsEmpty;
 
@@ -40,16 +56,41 @@ namespace Apache.Arrow
             get => Memory.Span;
         }
 
-        public ArrowBuffer Clone(MemoryPool pool = default)
+        public ArrowBuffer Clone(MemoryAllocator allocator = default)
         {
-            return new Builder<byte>(Span.Length)
+            return Span.Length == 0 ? Empty : new Builder<byte>(Span.Length)
                 .Append(Span)
-                .Build(pool);
+                .Build(allocator);
         }
 
         public bool Equals(ArrowBuffer other)
         {
             return Span.SequenceEqual(other.Span);
+        }
+
+        public void Dispose()
+        {
+            _memoryOwner?.Dispose();
+        }
+
+        internal bool TryExport(ExportedAllocationOwner newOwner, out IntPtr ptr)
+        {
+            if (IsEmpty)
+            {
+                // _memoryOwner could be anything (for example null or a NullMemoryOwner), but it doesn't matter here
+                ptr = IntPtr.Zero;
+                return true;
+            }
+
+            if (_memoryOwner is IOwnableAllocation ownable && ownable.TryAcquire(out ptr, out int offset, out int length))
+            {
+                newOwner.Acquire(ptr, offset, length);
+                ptr += offset;
+                return true;
+            }
+
+            ptr = IntPtr.Zero;
+            return false;
         }
     }
 }

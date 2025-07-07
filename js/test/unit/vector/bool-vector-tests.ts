@@ -15,44 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Data, Bool, Vector, BoolVector } from '../../Arrow';
+import { Bool, makeVector, vectorFromArray } from 'apache-arrow';
 
-const newBoolVector = (length: number, data: Uint8Array) => Vector.new(Data.Bool(new Bool(), 0, length, 0, null, data));
+const newBoolVector = (length: number, data: Uint8Array) => makeVector({ type: new Bool(), length, data });
+
 
 describe(`BoolVector`, () => {
     const values = [true, true, false, true, true, false, false, false];
     const n = values.length;
     const vector = newBoolVector(n, new Uint8Array([27, 0, 0, 0, 0, 0, 0, 0]));
     test(`gets expected values`, () => {
-        let i = -1;
-        while (++i < n) {
+        for (let i = 0; i < values.length; i++) {
             expect(vector.get(i)).toEqual(values[i]);
+            expect(vector.at(i)).toEqual(values.at(i));
+            expect(vector.at(-i)).toEqual(values.at(-i));
         }
     });
     test(`iterates expected values`, () => {
         let i = -1;
-        for (let v of vector) {
+        for (const v of vector) {
             expect(++i).toBeLessThan(n);
             expect(v).toEqual(values[i]);
         }
     });
     test(`indexOf returns expected values`, () => {
-        for (let test_value of [true, false]) {
+        for (const test_value of [true, false]) {
             const expected = values.indexOf(test_value);
             expect(vector.indexOf(test_value)).toEqual(expected);
         }
     });
     test(`indexOf returns -1 when value not found`, () => {
         const v = newBoolVector(3, new Uint8Array([0xFF]));
-        expect(v.indexOf(false)).toEqual(-1);
+        expect(v.indexOf(false)).toBe(-1);
     });
     test(`can set values to true and false`, () => {
         const v = newBoolVector(n, new Uint8Array([27, 0, 0, 0, 0, 0, 0, 0]));
         const expected1 = [true, true, false, true, true, false, false, false];
-        const expected2 = [true, true,  true, true, true, false, false, false];
+        const expected2 = [true, true, true, true, true, false, false, false];
         const expected3 = [true, true, false, false, false, false, true, true];
         function validate(expected: boolean[]) {
-            for (let i = -1; ++i < n;) {
+            for (let i = 0; i < n; i++) {
                 expect(v.get(i)).toEqual(expected[i]);
             }
         }
@@ -73,30 +75,38 @@ describe(`BoolVector`, () => {
         validate(expected1);
     });
     test(`packs 0 values`, () => {
-        expect(BoolVector.from([]).values).toEqual(
-            new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0]));
+        const expected = new Uint8Array(64);
+        expect(vectorFromArray([], new Bool()).data[0].values).toEqual(expected);
     });
     test(`packs 3 values`, () => {
-        expect(BoolVector.from([
+        const expected = new Uint8Array(64);
+        expected[0] = 5;
+        expect(vectorFromArray([
             true, false, true
-        ]).values).toEqual(new Uint8Array([5, 0, 0, 0, 0, 0, 0, 0]));
+        ]).data[0].values).toEqual(expected);
     });
     test(`packs 8 values`, () => {
-        expect(BoolVector.from([
+        const expected = new Uint8Array(64);
+        expected[0] = 27;
+        expect(vectorFromArray([
             true, true, false, true, true, false, false, false
-        ]).values).toEqual(new Uint8Array([27, 0, 0, 0, 0, 0, 0, 0]));
+        ]).data[0].values).toEqual(expected);
     });
     test(`packs 25 values`, () => {
-        expect(BoolVector.from([
+        const expected = new Uint8Array(64);
+        expected[0] = 27;
+        expected[1] = 216;
+        expect(vectorFromArray([
             true, true, false, true, true, false, false, false,
             false, false, false, true, true, false, true, true,
             false
-        ]).values).toEqual(new Uint8Array([27, 216, 0, 0, 0, 0, 0, 0]));
+        ]).data[0].values).toEqual(expected);
     });
     test(`from with boolean Array packs values`, () => {
-        expect(BoolVector
-            .from([true, false, true])
-            .slice().values
-        ).toEqual(new Uint8Array([5, 0, 0, 0, 0, 0, 0, 0]));
+        const expected = new Uint8Array(64);
+        expected[0] = 5;
+        expect(vectorFromArray([true, false, true])
+            .slice().data[0].values
+        ).toEqual(expected);
     });
 });

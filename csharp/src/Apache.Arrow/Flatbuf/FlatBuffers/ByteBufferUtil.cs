@@ -16,12 +16,12 @@
 
 using System;
 
-namespace FlatBuffers
+namespace Google.FlatBuffers
 {
 	/// <summary>
 	/// Class that collects utility functions around `ByteBuffer`.
 	/// </summary>
-	public class ByteBufferUtil
+	internal class ByteBufferUtil
 	{
 		// Extract the size prefix from a `ByteBuffer`.
 		public static int GetSizePrefix(ByteBuffer bb) {
